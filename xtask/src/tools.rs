@@ -269,15 +269,25 @@ enum Status {
 /// `cargo xtask setup`: installs every pinned tool that is missing or drifted.
 pub(crate) fn setup(root: &Path, out: &mut impl Write) -> anyhow::Result<()> {
     let manifest = Manifest::load(root)?;
-    let target = Target::host()?;
+    install_unready(root, &manifest, Target::host()?, out, &mut download)
+}
+
+/// Installs, with archives from `fetch`, every tool that is not ready: missing, or reporting
+/// another version.
+fn install_unready(
+    root: &Path,
+    manifest: &Manifest,
+    target: Target,
+    out: &mut impl Write,
+    fetch: &mut impl FnMut(&str) -> anyhow::Result<Vec<u8>>,
+) -> anyhow::Result<()> {
     for tool in &manifest.tools {
         if tool.status(root)? == Status::Ready {
             writeln!(out, "ok       {} {}", tool.name, tool.version)?;
         } else {
             let url = tool.render(&tool.url, tool.asset(target)?);
             writeln!(out, "install  {} {} from {url}", tool.name, tool.version)?;
-            let archive = download(&url)?;
-            install(root, tool, target, &archive)?;
+            install(root, tool, target, &fetch(&url)?)?;
         }
         remove_other_versions(root, tool)?;
     }
@@ -502,6 +512,7 @@ fn set_sha256(
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::fs;
     use std::io::Write as _;
     use std::path::Path;
@@ -510,8 +521,8 @@ mod tests {
     use flate2::write::GzEncoder;
 
     use super::{
-        Manifest, Status, Target, Tool, extract, install, remove_other_versions, reports_version,
-        set_sha256, sha256_hex,
+        Manifest, Status, Target, Tool, extract, install, install_unready, remove_other_versions,
+        reports_version, set_sha256, sha256_hex,
     };
 
     const SHA_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -698,6 +709,58 @@ targets.aarch64-unknown-linux-gnu = {{ platform = "linux-arm64", sha256 = "{sha2
             "the executable lives under its version"
         );
         assert!(!stale.exists(), "other versions are removed");
+    }
+
+    #[test]
+    fn setup_reinstalls_a_tool_that_reports_another_version() {
+        let root = tempfile::tempdir().unwrap();
+        let script: &[u8] = b"#!/bin/sh\necho 'fake 1.2.3'\n";
+        let archive = tarball(&[("fake-1.2.3/fake", script, 0o755)]);
+        let manifest = Manifest::parse(&manifest_text(&sha256_hex(&archive))).unwrap();
+        let downloads = Cell::new(0_u32);
+        let mut fetch = |_: &str| {
+            downloads.set(downloads.get().saturating_add(1));
+            Ok(archive.clone())
+        };
+        let executable = root.path().join(".tools/fake/1.2.3/fake");
+
+        install_unready(
+            root.path(),
+            &manifest,
+            Target::MacArm64,
+            &mut Vec::new(),
+            &mut fetch,
+        )
+        .unwrap();
+        install_unready(
+            root.path(),
+            &manifest,
+            Target::MacArm64,
+            &mut Vec::new(),
+            &mut fetch,
+        )
+        .unwrap();
+        assert_eq!(downloads.get(), 1, "a ready tool is not downloaded again");
+
+        fs::write(&executable, b"#!/bin/sh\necho 'fake 9.9.9'\n").unwrap();
+        install_unready(
+            root.path(),
+            &manifest,
+            Target::MacArm64,
+            &mut Vec::new(),
+            &mut fetch,
+        )
+        .unwrap();
+        assert_eq!(
+            downloads.get(),
+            2,
+            "a tool at another version is downloaded again"
+        );
+        assert_eq!(
+            fs::read(&executable).unwrap(),
+            script,
+            "and replaced by the pinned build"
+        );
     }
 
     #[test]
