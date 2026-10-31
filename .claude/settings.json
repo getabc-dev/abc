@@ -1,15 +1,4 @@
 {
-  "extraKnownMarketplaces": {
-    "cursor-plugins": {
-      "source": {
-        "source": "github",
-        "repo": "cursor/plugins"
-      }
-    }
-  },
-  "enabledPlugins": {
-    "pstack@cursor-plugins": true
-  },
   "hooks": {
     "PreToolUse": [
       {
@@ -47,5 +36,23 @@
         ]
       }
     ]
+  },
+  "enabledPlugins": {
+    "pstack@cursor-plugins": true,
+    "egm@egm": true
+  },
+  "extraKnownMarketplaces": {
+    "cursor-plugins": {
+      "source": {
+        "source": "github",
+        "repo": "cursor/plugins"
+      }
+    },
+    "egm": {
+      "source": {
+        "source": "github",
+        "repo": "google/elephant-goldfish-model"
+      }
+    }
   }
 }
