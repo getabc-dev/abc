@@ -1,4 +1,4 @@
-//! The Claude Code `PreToolUse` hook for Bash: blocks git commands that skip hooks or force-push.
+//! The Claude Code `PreToolUse` hook for Bash: blocks git commands that force-push.
 //!
 //! It reads the hook input JSON, lexes the command with [`crate::shell`], and looks at every git
 //! invocation in it, including ones nested in substitutions, `sh -c` scripts and `eval`. Anything
@@ -60,8 +60,6 @@ pub(crate) fn decide(hook_input: &str) -> Decision {
 /// A git shortcut the guard refuses.
 #[derive(Debug, PartialEq, Eq)]
 enum Violation {
-    /// `--no-verify`, or `-n` on `git commit`: skips the repository's git hooks.
-    NoVerify,
     /// A force push, through the given flag or refspec.
     ForcePush(String),
 }
@@ -69,11 +67,6 @@ enum Violation {
 impl Violation {
     fn message(&self) -> String {
         match self {
-            Self::NoVerify => {
-                "Blocked: --no-verify skips the repository's git hooks. Run the command \
-                               without it and fix what the hooks report."
-                    .to_owned()
-            }
             Self::ForcePush(how) => format!(
                 "Blocked: `{how}` force-pushes, which rewrites published history. Push new commits \
                  instead; if history really has to change, ask the user to do it."
@@ -166,13 +159,6 @@ fn git_violation(words: &[String]) -> Option<Violation> {
     };
     let args: Vec<&str> = args.map(String::as_str).collect();
     match subcommand {
-        "commit" => parse_args(&args, &COMMIT)
-            .into_iter()
-            .find_map(|arg| match arg {
-                Arg::Short('n') => Some(Violation::NoVerify),
-                Arg::Long(name) if is_no_verify(name) => Some(Violation::NoVerify),
-                Arg::Short(_) | Arg::Long(_) | Arg::Positional(_) => None,
-            }),
         "push" => parse_args(&args, &PUSH)
             .into_iter()
             .find_map(|arg| match arg {
@@ -180,25 +166,13 @@ fn git_violation(words: &[String]) -> Option<Violation> {
                 Arg::Long(name) if is_force(name) => {
                     Some(Violation::ForcePush(format!("--{name}")))
                 }
-                Arg::Long(name) if is_no_verify(name) => Some(Violation::NoVerify),
                 Arg::Positional(refspec) if refspec.starts_with('+') => {
                     Some(Violation::ForcePush(refspec.to_owned()))
                 }
                 Arg::Short(_) | Arg::Long(_) | Arg::Positional(_) => None,
             }),
-        _ => parse_args(&args, &OTHER)
-            .into_iter()
-            .find_map(|arg| match arg {
-                Arg::Long(name) if is_no_verify(name) => Some(Violation::NoVerify),
-                Arg::Short(_) | Arg::Long(_) | Arg::Positional(_) => None,
-            }),
+        _ => None,
     }
-}
-
-/// Git accepts any unambiguous prefix of a long option; `--no-veri` is the shortest for
-/// `--no-verify`, since `--no-ver` could also be `--no-verbose`.
-fn is_no_verify(name: &str) -> bool {
-    name.len() >= "no-veri".len() && "no-verify".starts_with(name)
 }
 
 /// `--force`, `--force-with-lease`, `--force-if-includes`, their prefixes, and `--mirror`, which
@@ -222,35 +196,10 @@ struct ValueOptions {
     long: &'static [&'static str],
 }
 
-const COMMIT: ValueOptions = ValueOptions {
-    short: "mFCct",
-    short_attached: "Su",
-    long: &[
-        "message",
-        "file",
-        "reuse-message",
-        "reedit-message",
-        "fixup",
-        "squash",
-        "author",
-        "date",
-        "template",
-        "cleanup",
-        "trailer",
-        "pathspec-from-file",
-    ],
-};
-
 const PUSH: ValueOptions = ValueOptions {
     short: "o",
     short_attached: "",
     long: &["push-option", "repo", "receive-pack", "exec"],
-};
-
-const OTHER: ValueOptions = ValueOptions {
-    short: "",
-    short_attached: "",
-    long: &[],
 };
 
 /// One parsed argument; option values are skipped.
@@ -318,31 +267,14 @@ mod tests {
     }
 
     #[test]
-    fn blocks_no_verify_on_commit() {
+    fn allows_skipping_git_hooks() {
+        // abc installs no git hooks; its gates are the Claude Code hooks and CI.
         for command in [
             "git commit --no-verify -m wip",
-            "git commit -m wip --no-verify",
             "git commit -n -m wip",
-            "git commit -anm wip",
-            "git commit -am wip --no-veri",
-            "git commit --amend --no-verify",
-            "git commit -C HEAD -n",
-            "git -c user.name=agent commit -n",
-            "git -C repo commit --no-verify",
+            "git push --no-verify origin main",
         ] {
-            assert_blocked(command, &Violation::NoVerify);
-        }
-    }
-
-    #[test]
-    fn blocks_no_verify_on_any_subcommand() {
-        for command in [
-            "git push --no-verify",
-            "git merge --no-verify feature",
-            "git rebase --no-verify main",
-            "git am --no-verify patch",
-        ] {
-            assert_blocked(command, &Violation::NoVerify);
+            assert_allowed(command);
         }
     }
 
