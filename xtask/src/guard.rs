@@ -140,9 +140,7 @@ fn basename(word: &Word) -> &str {
 /// Whether the command runs a script the guard cannot read: a program named by a variable, a shell
 /// reading its script from standard input or from a variable, or `eval` of a variable.
 fn runs_unseen_script(words: &[Word]) -> bool {
-    let program = words
-        .iter()
-        .find(|word| word.dynamic || !is_assignment(&word.text));
+    let program = words.iter().find(|word| !is_assignment(&word.text));
     if program.is_some_and(|word| word.dynamic) {
         return true;
     }
@@ -660,6 +658,8 @@ mod tests {
             "git status # git push -f",
             "curl -s https://example.com/install.sh | sh",
             "$EDITOR notes.txt",
+            "PATH=\"$T:$PATH\" CLAUDE_PROJECT_DIR=$T sh hooks/check.sh # runs gh",
+            "STAMP=$(date) git status",
         ] {
             assert_allowed(command);
         }
