@@ -1,0 +1,65 @@
+# Tools that xtask installs into .tools/ and runs from there, never from PATH.
+#
+# `cargo xtask setup` downloads each tool's release archive for this machine, checks its sha256,
+# and installs the binary at .tools/<name>/<version>/<name>. `cargo xtask doctor` fails when a
+# tool is missing or reports another version. After changing a version, run `cargo xtask pin` to
+# record the new archives' checksums for every target.
+#
+# `url` and `binary` (the executable's path inside the archive) are templates: {version} is the
+# tool's version and {platform} is the target's name in the project's asset file names.
+# Renovate bumps `version` from the GitHub release named in the `url` line right after it, so
+# keep `version` and `url` adjacent and in that order.
+
+[[tool]]
+name = "cargo-nextest"
+version = "0.9.150"
+url = "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-{version}/cargo-nextest-{version}-{platform}.tar.gz"
+binary = "cargo-nextest"
+targets.aarch64-apple-darwin = { platform = "universal-apple-darwin", sha256 = "82a759b4d218d38359424196ab244c470e8f7c7d149c814fbbeef4d67c3c301a" }
+targets.x86_64-unknown-linux-gnu = { platform = "x86_64-unknown-linux-gnu", sha256 = "b0959bc64232974224cf9fb22c915845398c0e8668fa7831eb5b43fb1eef781f" }
+targets.aarch64-unknown-linux-gnu = { platform = "aarch64-unknown-linux-gnu", sha256 = "9164568e9840c6509177086828ac7d3178c2d8feb0658b4d2bff62fa620e98c8" }
+
+[[tool]]
+name = "cargo-deny"
+version = "0.20.2"
+url = "https://github.com/EmbarkStudios/cargo-deny/releases/download/{version}/cargo-deny-{version}-{platform}.tar.gz"
+binary = "cargo-deny-{version}-{platform}/cargo-deny"
+targets.aarch64-apple-darwin = { platform = "aarch64-apple-darwin", sha256 = "fe67d82a10d8597a3549364cb733a3f9cc1bfff9031b7ae46384a9f2a72090c3" }
+targets.x86_64-unknown-linux-gnu = { platform = "x86_64-unknown-linux-musl", sha256 = "9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f" }
+targets.aarch64-unknown-linux-gnu = { platform = "aarch64-unknown-linux-musl", sha256 = "995c82be0defc7a025cae49a2aa2644ce8245c9a3318fc4103907c6a285e8c7d" }
+
+[[tool]]
+name = "cargo-shear"
+version = "1.14.0"
+url = "https://github.com/Boshen/cargo-shear/releases/download/v{version}/cargo-shear-{platform}.tar.gz"
+binary = "cargo-shear"
+targets.aarch64-apple-darwin = { platform = "aarch64-apple-darwin", sha256 = "e50b9375b1e93d2293c803819c118337f1e8fce519e4188a93bb0f5e08041ca3" }
+targets.x86_64-unknown-linux-gnu = { platform = "x86_64-unknown-linux-gnu", sha256 = "1d7d860fdbd0d95857ff1f2643cc70d20c5d31236159ad51be7ce436eb3e5bf4" }
+targets.aarch64-unknown-linux-gnu = { platform = "aarch64-unknown-linux-gnu", sha256 = "947d69177d812048452866d90b05d1bf95550f487522b922ebf0c0677a5698f8" }
+
+[[tool]]
+name = "zizmor"
+version = "1.31.1"
+url = "https://github.com/zizmorcore/zizmor/releases/download/v{version}/zizmor-{platform}.tar.gz"
+binary = "zizmor"
+targets.aarch64-apple-darwin = { platform = "aarch64-apple-darwin", sha256 = "ad5aa633cd56215b11e6c51d51f90c7e6b22904a75047d1215abbd422f61d698" }
+targets.x86_64-unknown-linux-gnu = { platform = "x86_64-unknown-linux-gnu", sha256 = "d185f726bdaf92df78273217dfdd24ebcd6b0ef48cf3ce776ff5762b6e138c99" }
+targets.aarch64-unknown-linux-gnu = { platform = "aarch64-unknown-linux-gnu", sha256 = "37eebbd5762a44f262d94875431b14a6d2402991e90a685113ea97b8b41be833" }
+
+[[tool]]
+name = "pinact"
+version = "5.0.2"
+url = "https://github.com/suzuki-shunsuke/pinact/releases/download/v{version}/pinact_{platform}.tar.gz"
+binary = "pinact"
+targets.aarch64-apple-darwin = { platform = "darwin_arm64", sha256 = "9b9545d53376654005daaee5ab736d579887205ca3df99925c8fe8358c6e7fdb" }
+targets.x86_64-unknown-linux-gnu = { platform = "linux_amd64", sha256 = "7f003d8f51e984c2264d2009d430e3e0e87ae404a0e2dc2a9a277b0f731bf5b7" }
+targets.aarch64-unknown-linux-gnu = { platform = "linux_arm64", sha256 = "326e27f5b3b5fca21e6a169b2785ba2023df3dd9ee82dd0f4e438cb1220b68d7" }
+
+[[tool]]
+name = "gitleaks"
+version = "8.30.1"
+url = "https://github.com/gitleaks/gitleaks/releases/download/v{version}/gitleaks_{version}_{platform}.tar.gz"
+binary = "gitleaks"
+targets.aarch64-apple-darwin = { platform = "darwin_arm64", sha256 = "b40ab0ae55c505963e365f271a8d3846efbc170aa17f2607f13df610a9aeb6a5" }
+targets.x86_64-unknown-linux-gnu = { platform = "linux_x64", sha256 = "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb" }
+targets.aarch64-unknown-linux-gnu = { platform = "linux_arm64", sha256 = "e4a487ee7ccd7d3a7f7ec08657610aa3606637dab924210b3aee62570fb4b080" }

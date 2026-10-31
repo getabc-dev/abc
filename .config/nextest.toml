@@ -1,0 +1,7 @@
+[profile.default]
+# A flaky test is a bug to fix, never something to retry.
+retries = 0
+# Report every failing test in one run.
+fail-fast = false
+# A test still running after two minutes is hung: stop it and fail.
+slow-timeout = { period = "30s", terminate-after = 4 }

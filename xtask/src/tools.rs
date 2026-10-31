@@ -1,0 +1,780 @@
+//! The pinned tools in `xtask/tools.toml`: installing them into `.tools/`, checking them, and
+//! running them from there. Nothing here runs a tool from `PATH`.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsString;
+use std::fmt;
+use std::fs::{self, Permissions};
+use std::io::{Read, Write};
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Component, Path, PathBuf};
+use std::process::{Command, ExitCode, ExitStatus};
+
+use anyhow::{Context, bail, ensure};
+use flate2::read::GzDecoder;
+use serde::Deserialize;
+use sha2::{Digest, Sha256};
+use toml_edit::DocumentMut;
+
+/// The tool list, relative to the repository root.
+const MANIFEST: &str = "xtask/tools.toml";
+
+/// Where tools are installed, relative to the repository root.
+const TOOLS_DIR: &str = ".tools";
+
+/// The largest archive `setup` and `pin` download: 256 MiB.
+const MAX_ARCHIVE_BYTES: u64 = 268_435_456;
+
+/// The platforms abc supports, each with its own release asset per tool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
+pub(crate) enum Target {
+    #[serde(rename = "aarch64-apple-darwin")]
+    MacArm64,
+    #[serde(rename = "x86_64-unknown-linux-gnu")]
+    LinuxX64,
+    #[serde(rename = "aarch64-unknown-linux-gnu")]
+    LinuxArm64,
+}
+
+impl Target {
+    const ALL: [Self; 3] = [Self::MacArm64, Self::LinuxX64, Self::LinuxArm64];
+
+    const fn triple(self) -> &'static str {
+        match self {
+            Self::MacArm64 => "aarch64-apple-darwin",
+            Self::LinuxX64 => "x86_64-unknown-linux-gnu",
+            Self::LinuxArm64 => "aarch64-unknown-linux-gnu",
+        }
+    }
+
+    /// The target of the machine xtask runs on.
+    fn host() -> anyhow::Result<Self> {
+        match (std::env::consts::OS, std::env::consts::ARCH) {
+            ("macos", "aarch64") => Ok(Self::MacArm64),
+            ("linux", "x86_64") => Ok(Self::LinuxX64),
+            ("linux", "aarch64") => Ok(Self::LinuxArm64),
+            (os, arch) => bail!(
+                "abc pins tools for {} only, not for {arch} {os}",
+                Self::ALL.map(Self::triple).join(", ")
+            ),
+        }
+    }
+}
+
+impl fmt::Display for Target {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.triple())
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawManifest {
+    tool: Vec<Tool>,
+}
+
+/// One pinned tool.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct Tool {
+    name: String,
+    version: String,
+    /// Download URL template; `{version}` and `{platform}` are filled in.
+    url: String,
+    /// Path of the executable inside the archive, with the same placeholders.
+    binary: String,
+    targets: BTreeMap<Target, Asset>,
+}
+
+/// A tool's release asset for one target.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Asset {
+    /// The target's name in the project's asset file names.
+    platform: String,
+    /// Lowercase hex sha256 of the archive.
+    sha256: String,
+}
+
+/// The validated tool list.
+#[derive(Debug)]
+pub(crate) struct Manifest {
+    tools: Vec<Tool>,
+}
+
+impl Manifest {
+    pub(crate) fn load(root: &Path) -> anyhow::Result<Self> {
+        let path = root.join(MANIFEST);
+        let text = fs::read_to_string(&path)
+            .with_context(|| format!("could not read {}", path.display()))?;
+        Self::parse(&text).with_context(|| format!("{MANIFEST} is invalid"))
+    }
+
+    fn parse(text: &str) -> anyhow::Result<Self> {
+        let raw: RawManifest = toml_edit::de::from_str(text)?;
+        let mut names = BTreeSet::new();
+        for tool in &raw.tool {
+            ensure!(
+                names.insert(tool.name.as_str()),
+                "{} is listed twice",
+                tool.name
+            );
+            tool.validate()
+                .with_context(|| format!("tool {:?}", tool.name))?;
+        }
+        Ok(Self { tools: raw.tool })
+    }
+
+    pub(crate) fn tool(&self, name: &str) -> anyhow::Result<&Tool> {
+        self.tools
+            .iter()
+            .find(|tool| tool.name == name)
+            .with_context(|| {
+                let names: Vec<&str> = self.tools.iter().map(|tool| tool.name.as_str()).collect();
+                format!(
+                    "{name} is not a pinned tool; pinned tools: {}",
+                    names.join(", ")
+                )
+            })
+    }
+}
+
+impl Tool {
+    fn validate(&self) -> anyhow::Result<()> {
+        ensure!(
+            is_safe_name(&self.name),
+            "the name must be ASCII letters, digits, '-' or '_'"
+        );
+        ensure!(
+            !self.version.is_empty()
+                && self
+                    .version
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || ".+-".contains(c)),
+            "version {:?} must be ASCII letters, digits, '.', '+' or '-'",
+            self.version
+        );
+        ensure!(self.url.starts_with("https://"), "the url must use https");
+        for target in Target::ALL {
+            let asset = self.asset(target)?;
+            ensure!(
+                is_safe_name(&asset.platform),
+                "{target}: platform {:?} must be ASCII letters, digits, '-' or '_'",
+                asset.platform
+            );
+            ensure!(
+                asset.sha256.len() == 64
+                    && asset
+                        .sha256
+                        .chars()
+                        .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)),
+                "{target}: sha256 must be 64 lowercase hex digits"
+            );
+            let url = self.render(&self.url, asset);
+            let binary = self.render(&self.binary, asset);
+            for (field, value) in [("url", &url), ("binary", &binary)] {
+                ensure!(
+                    !value.contains(['{', '}']),
+                    "{target}: {field} {value:?} has a placeholder other than {{version}} and {{platform}}"
+                );
+            }
+            ensure!(
+                Path::new(&binary)
+                    .components()
+                    .all(|component| matches!(component, Component::Normal(_))),
+                "{target}: binary {binary:?} must be a relative path inside the archive"
+            );
+        }
+        Ok(())
+    }
+
+    fn asset(&self, target: Target) -> anyhow::Result<&Asset> {
+        self.targets
+            .get(&target)
+            .with_context(|| format!("no asset for {target}"))
+    }
+
+    fn render(&self, template: &str, asset: &Asset) -> String {
+        template
+            .replace("{version}", &self.version)
+            .replace("{platform}", &asset.platform)
+    }
+
+    fn executable(&self, root: &Path) -> PathBuf {
+        root.join(TOOLS_DIR)
+            .join(&self.name)
+            .join(&self.version)
+            .join(&self.name)
+    }
+
+    /// The installed executable, or an error saying how to install it.
+    pub(crate) fn installed(&self, root: &Path) -> anyhow::Result<PathBuf> {
+        let executable = self.executable(root);
+        ensure!(
+            executable.is_file(),
+            "{} {} is not installed: run `cargo xtask setup`",
+            self.name,
+            self.version
+        );
+        Ok(executable)
+    }
+
+    fn status(&self, root: &Path) -> anyhow::Result<Status> {
+        let executable = self.executable(root);
+        if !executable.is_file() {
+            return Ok(Status::Missing);
+        }
+        let output = Command::new(&executable)
+            .arg("--version")
+            .output()
+            .with_context(|| format!("could not run {} --version", executable.display()))?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if output.status.success() && reports_version(&format!("{stdout}\n{stderr}"), &self.version)
+        {
+            Ok(Status::Ready)
+        } else {
+            Ok(Status::Drift {
+                reported: stdout.lines().next().unwrap_or_default().trim().to_owned(),
+            })
+        }
+    }
+}
+
+fn is_safe_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+/// Whether `--version` output names `version` as a whole word, with or without a leading `v`.
+fn reports_version(output: &str, version: &str) -> bool {
+    output
+        .split_whitespace()
+        .any(|word| word.strip_prefix('v').unwrap_or(word) == version)
+}
+
+/// An installed tool's state.
+#[derive(Debug, PartialEq, Eq)]
+enum Status {
+    Ready,
+    Missing,
+    /// Installed, but `--version` does not report the pinned version.
+    Drift {
+        reported: String,
+    },
+}
+
+/// `cargo xtask setup`: installs every pinned tool that is missing or drifted.
+pub(crate) fn setup(root: &Path, out: &mut impl Write) -> anyhow::Result<()> {
+    let manifest = Manifest::load(root)?;
+    let target = Target::host()?;
+    for tool in &manifest.tools {
+        if tool.status(root)? == Status::Ready {
+            writeln!(out, "ok       {} {}", tool.name, tool.version)?;
+        } else {
+            let url = tool.render(&tool.url, tool.asset(target)?);
+            writeln!(out, "install  {} {} from {url}", tool.name, tool.version)?;
+            let archive = download(&url)?;
+            install(root, tool, target, &archive)?;
+        }
+        remove_other_versions(root, tool)?;
+    }
+    Ok(())
+}
+
+/// `cargo xtask doctor`: reports each tool's state and fails unless all are ready.
+pub(crate) fn doctor(root: &Path, out: &mut impl Write) -> anyhow::Result<ExitCode> {
+    let manifest = Manifest::load(root)?;
+    let mut ready = true;
+    for tool in &manifest.tools {
+        match tool.status(root)? {
+            Status::Ready => writeln!(out, "ok       {} {}", tool.name, tool.version)?,
+            Status::Missing => {
+                ready = false;
+                writeln!(out, "missing  {} {}", tool.name, tool.version)?;
+            }
+            Status::Drift { reported } => {
+                ready = false;
+                writeln!(
+                    out,
+                    "drift    {} {}: the installed binary reports {reported:?}",
+                    tool.name, tool.version
+                )?;
+            }
+        }
+    }
+    if ready {
+        Ok(ExitCode::SUCCESS)
+    } else {
+        writeln!(
+            out,
+            "run `cargo xtask setup` to install the pinned versions"
+        )?;
+        Ok(ExitCode::FAILURE)
+    }
+}
+
+/// `cargo xtask pin`: downloads every tool for every target and records the archives' sha256 in
+/// the tool list, keeping its layout and comments.
+pub(crate) fn pin(root: &Path, out: &mut impl Write) -> anyhow::Result<()> {
+    let path = root.join(MANIFEST);
+    let text =
+        fs::read_to_string(&path).with_context(|| format!("could not read {}", path.display()))?;
+    let manifest = Manifest::parse(&text).with_context(|| format!("{MANIFEST} is invalid"))?;
+    let mut document: DocumentMut = text.parse()?;
+    for tool in &manifest.tools {
+        for target in Target::ALL {
+            let asset = tool.asset(target)?;
+            let url = tool.render(&tool.url, asset);
+            let sha256 = sha256_hex(&download(&url)?);
+            let state = if sha256 == asset.sha256 {
+                "same"
+            } else {
+                "changed"
+            };
+            writeln!(out, "{state:<8} {} {} {target}", tool.name, tool.version)?;
+            set_sha256(&mut document, &tool.name, target, &sha256)?;
+        }
+    }
+    fs::write(&path, document.to_string())
+        .with_context(|| format!("could not write {}", path.display()))
+}
+
+/// `cargo xtask tool`: runs a pinned tool with the given arguments from the repository root.
+pub(crate) fn run(root: &Path, name: &str, args: &[OsString]) -> anyhow::Result<ExitCode> {
+    let manifest = Manifest::load(root)?;
+    let executable = manifest.tool(name)?.installed(root)?;
+    let status = Command::new(&executable)
+        .args(args)
+        .current_dir(root)
+        .status()
+        .with_context(|| format!("could not run {}", executable.display()))?;
+    Ok(exit_code(status))
+}
+
+/// The exit code that passes a child's status on.
+pub(crate) fn exit_code(status: ExitStatus) -> ExitCode {
+    status
+        .code()
+        .and_then(|code| u8::try_from(code).ok())
+        .map_or(ExitCode::FAILURE, ExitCode::from)
+}
+
+fn download(url: &str) -> anyhow::Result<Vec<u8>> {
+    let mut response = ureq::get(url)
+        .call()
+        .with_context(|| format!("could not download {url}"))?;
+    response
+        .body_mut()
+        .with_config()
+        .limit(MAX_ARCHIVE_BYTES)
+        .read_to_vec()
+        .with_context(|| format!("could not read {url}"))
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut hex = String::with_capacity(64);
+    for byte in Sha256::digest(bytes) {
+        for nibble in [byte.wrapping_shr(4), byte & 0x0f] {
+            hex.extend(char::from_digit(u32::from(nibble), 16));
+        }
+    }
+    hex
+}
+
+/// Verifies `archive` and installs the tool's executable from it.
+fn install(root: &Path, tool: &Tool, target: Target, archive: &[u8]) -> anyhow::Result<()> {
+    let asset = tool.asset(target)?;
+    let actual = sha256_hex(archive);
+    ensure!(
+        actual == asset.sha256,
+        "sha256 mismatch for {} {} on {target}: {MANIFEST} pins {}, the download is {actual}. \
+         If the version changed, run `cargo xtask pin` to record the new checksums.",
+        tool.name,
+        tool.version,
+        asset.sha256
+    );
+    let member = tool.render(&tool.binary, asset);
+    let binary = extract(archive, Path::new(&member))?;
+
+    let tool_dir = root.join(TOOLS_DIR).join(&tool.name);
+    let staging = tool_dir.join(format!("{}.partial", tool.version));
+    let destination = tool_dir.join(&tool.version);
+    remove_dir_if_present(&staging)?;
+    fs::create_dir_all(&staging)
+        .with_context(|| format!("could not create {}", staging.display()))?;
+    let executable = staging.join(&tool.name);
+    fs::write(&executable, binary)
+        .with_context(|| format!("could not write {}", executable.display()))?;
+    fs::set_permissions(&executable, Permissions::from_mode(0o755))
+        .with_context(|| format!("could not make {} executable", executable.display()))?;
+    remove_dir_if_present(&destination)?;
+    fs::rename(&staging, &destination)
+        .with_context(|| format!("could not move {} into place", staging.display()))?;
+
+    match tool.status(root)? {
+        Status::Ready => Ok(()),
+        Status::Missing => bail!("{} vanished after install", tool.name),
+        Status::Drift { reported } => bail!(
+            "{} {} was installed, but `--version` reports {reported:?}",
+            tool.name,
+            tool.version
+        ),
+    }
+}
+
+/// Reads the regular file at `member` out of a gzipped tarball.
+fn extract(archive: &[u8], member: &Path) -> anyhow::Result<Vec<u8>> {
+    let mut tarball = tar::Archive::new(GzDecoder::new(archive));
+    let entries = tarball
+        .entries()
+        .context("the archive is not a gzipped tarball")?;
+    for entry in entries {
+        let mut entry = entry.context("the archive is corrupt")?;
+        let path = entry.path().context("the archive has an unreadable path")?;
+        if path.strip_prefix(".").unwrap_or(&path) == member {
+            ensure!(
+                entry.header().entry_type().is_file(),
+                "{} in the archive is not a regular file",
+                member.display()
+            );
+            let mut bytes = Vec::new();
+            entry
+                .read_to_end(&mut bytes)
+                .with_context(|| format!("could not read {} from the archive", member.display()))?;
+            return Ok(bytes);
+        }
+    }
+    bail!("the archive has no {}", member.display())
+}
+
+/// Removes installed versions of `tool` other than the pinned one.
+fn remove_other_versions(root: &Path, tool: &Tool) -> anyhow::Result<()> {
+    let tool_dir = root.join(TOOLS_DIR).join(&tool.name);
+    for entry in
+        fs::read_dir(&tool_dir).with_context(|| format!("could not list {}", tool_dir.display()))?
+    {
+        let path = entry?.path();
+        if path.file_name() != Some(tool.version.as_ref()) {
+            fs::remove_dir_all(&path)
+                .with_context(|| format!("could not remove {}", path.display()))?;
+        }
+    }
+    Ok(())
+}
+
+fn remove_dir_if_present(path: &Path) -> anyhow::Result<()> {
+    if path.exists() {
+        fs::remove_dir_all(path).with_context(|| format!("could not remove {}", path.display()))?;
+    }
+    Ok(())
+}
+
+/// Sets one tool's sha256 for one target in the tool list document.
+fn set_sha256(
+    document: &mut DocumentMut,
+    name: &str,
+    target: Target,
+    sha256: &str,
+) -> anyhow::Result<()> {
+    let tool = document
+        .get_mut("tool")
+        .and_then(toml_edit::Item::as_array_of_tables_mut)
+        .context("the tool list has no [[tool]] tables")?
+        .iter_mut()
+        .find(|tool| tool.get("name").and_then(toml_edit::Item::as_str) == Some(name))
+        .with_context(|| format!("the tool list has no tool named {name}"))?;
+    let value = tool
+        .get_mut("targets")
+        .and_then(toml_edit::Item::as_table_like_mut)
+        .and_then(|targets| targets.get_mut(target.triple()))
+        .and_then(toml_edit::Item::as_table_like_mut)
+        .and_then(|asset| asset.get_mut("sha256"))
+        .and_then(toml_edit::Item::as_value_mut)
+        .with_context(|| format!("{name} has no sha256 for {target}"))?;
+    let decor = value.decor().clone();
+    *value = sha256.into();
+    *value.decor_mut() = decor;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::io::Write as _;
+    use std::path::Path;
+
+    use flate2::Compression;
+    use flate2::write::GzEncoder;
+
+    use super::{
+        Manifest, Status, Target, Tool, extract, install, remove_other_versions, reports_version,
+        set_sha256, sha256_hex,
+    };
+
+    const SHA_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    fn manifest_text(sha256: &str) -> String {
+        format!(
+            r#"# The tools.
+[[tool]]
+name = "fake"
+version = "1.2.3"
+url = "https://example.com/fake-{{version}}-{{platform}}.tar.gz"
+binary = "fake-{{version}}/fake"
+targets.aarch64-apple-darwin = {{ platform = "mac", sha256 = "{sha256}" }}
+targets.x86_64-unknown-linux-gnu = {{ platform = "linux-x64", sha256 = "{sha256}" }}
+targets.aarch64-unknown-linux-gnu = {{ platform = "linux-arm64", sha256 = "{sha256}" }}
+"#
+        )
+    }
+
+    fn only_tool(manifest: &Manifest) -> &Tool {
+        manifest.tool("fake").expect("the test manifest lists fake")
+    }
+
+    fn tarball(entries: &[(&str, &[u8], u32)]) -> Vec<u8> {
+        let mut builder = tar::Builder::new(GzEncoder::new(Vec::new(), Compression::fast()));
+        for &(path, contents, mode) in entries {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(u64::try_from(contents.len()).unwrap());
+            header.set_mode(mode);
+            header.set_cksum();
+            builder.append_data(&mut header, path, contents).unwrap();
+        }
+        builder.into_inner().unwrap().finish().unwrap()
+    }
+
+    #[test]
+    fn checked_in_tool_list_is_valid() {
+        let root = crate::repo_root().unwrap();
+        let manifest = Manifest::load(&root).unwrap();
+        for name in [
+            "cargo-nextest",
+            "cargo-deny",
+            "cargo-shear",
+            "zizmor",
+            "pinact",
+            "gitleaks",
+        ] {
+            manifest.tool(name).unwrap();
+        }
+    }
+
+    #[test]
+    fn parses_a_valid_manifest() {
+        let manifest = Manifest::parse(&manifest_text(SHA_A)).unwrap();
+        let tool = only_tool(&manifest);
+        let asset = tool.asset(Target::LinuxX64).unwrap();
+        assert_eq!(
+            tool.render(&tool.url, asset),
+            "https://example.com/fake-1.2.3-linux-x64.tar.gz",
+            "placeholders are filled in"
+        );
+        assert_eq!(
+            tool.render(&tool.binary, asset),
+            "fake-1.2.3/fake",
+            "the binary path is a template too"
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_manifests() {
+        let valid = manifest_text(SHA_A);
+        let cases = [
+            (valid.replace(SHA_A, &SHA_A.to_uppercase()), "lowercase hex"),
+            (valid.replace(SHA_A, "abc"), "64 lowercase hex"),
+            (
+                valid.replace("targets.aarch64-unknown-linux-gnu", "# none"),
+                "no asset for aarch64-unknown-linux-gnu",
+            ),
+            (valid.replace("https://", "http://"), "https"),
+            (valid.replace("{platform}", "{arch}"), "placeholder"),
+            (
+                valid.replace("fake-{version}/fake", "../fake"),
+                "relative path",
+            ),
+            (
+                valid.replace("version = \"1.2.3\"", "version = \"../1\""),
+                "version",
+            ),
+            (valid.replace("name = \"fake\"", "name = \"a/b\""), "name"),
+            (
+                valid.replace("binary =", "mirror = \"x\"\nbinary ="),
+                "unknown field",
+            ),
+            (
+                format!("{valid}\n{}", valid.replace("# The tools.", "")),
+                "listed twice",
+            ),
+        ];
+        for (text, expected) in cases {
+            let error = format!("{:#}", Manifest::parse(&text).unwrap_err());
+            assert!(
+                error.contains(expected),
+                "expected {expected:?} in {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn version_must_be_a_whole_word() {
+        assert!(
+            reports_version("cargo-nextest 0.9.150 (abc 2026-10-26)", "0.9.150"),
+            "nextest"
+        );
+        assert!(
+            reports_version("Version: 1.14.0\n", "1.14.0"),
+            "cargo-shear"
+        );
+        assert!(reports_version("pinact version 5.0.2", "5.0.2"), "pinact");
+        assert!(
+            reports_version("v8.30.1", "8.30.1"),
+            "a leading v is allowed"
+        );
+        assert!(
+            !reports_version("tool 0.9.1500", "0.9.150"),
+            "a longer version is drift"
+        );
+        assert!(
+            !reports_version("tool 10.9.150", "0.9.150"),
+            "a prefix is drift"
+        );
+        assert!(!reports_version("", "1.0.0"), "no output is drift");
+    }
+
+    #[test]
+    fn extracts_a_member_from_a_tarball() {
+        let archive = tarball(&[
+            ("README.md", b"readme", 0o644),
+            ("fake-1.2.3/fake", b"binary", 0o755),
+            ("./top", b"top", 0o755),
+        ]);
+        assert_eq!(
+            extract(&archive, Path::new("fake-1.2.3/fake")).unwrap(),
+            b"binary",
+            "a nested member"
+        );
+        assert_eq!(
+            extract(&archive, Path::new("top")).unwrap(),
+            b"top",
+            "a leading ./ is ignored"
+        );
+        let missing = extract(&archive, Path::new("other")).unwrap_err();
+        assert!(
+            missing.to_string().contains("the archive has no other"),
+            "{missing:#}"
+        );
+        let garbage = extract(b"not a tarball", Path::new("fake")).unwrap_err();
+        assert!(
+            format!("{garbage:#}").contains("corrupt") || format!("{garbage:#}").contains("gzip"),
+            "{garbage:#}"
+        );
+    }
+
+    #[test]
+    fn installs_a_verified_archive_and_removes_other_versions() {
+        let root = tempfile::tempdir().unwrap();
+        let script = b"#!/bin/sh\necho 'fake 1.2.3'\n";
+        let archive = tarball(&[("fake-1.2.3/fake", script, 0o644)]);
+        let manifest = Manifest::parse(&manifest_text(&sha256_hex(&archive))).unwrap();
+        let tool = only_tool(&manifest);
+        let stale = root.path().join(".tools/fake/1.0.0");
+        fs::create_dir_all(&stale).unwrap();
+
+        install(root.path(), tool, Target::MacArm64, &archive).unwrap();
+        remove_other_versions(root.path(), tool).unwrap();
+
+        assert_eq!(
+            tool.status(root.path()).unwrap(),
+            Status::Ready,
+            "the installed script reports the pinned version"
+        );
+        assert_eq!(
+            tool.installed(root.path()).unwrap(),
+            root.path().join(".tools/fake/1.2.3/fake"),
+            "the executable lives under its version"
+        );
+        assert!(!stale.exists(), "other versions are removed");
+    }
+
+    #[test]
+    fn refuses_an_archive_with_the_wrong_checksum() {
+        let root = tempfile::tempdir().unwrap();
+        let archive = tarball(&[("fake-1.2.3/fake", b"x", 0o755)]);
+        let manifest = Manifest::parse(&manifest_text(SHA_A)).unwrap();
+        let error = install(
+            root.path(),
+            only_tool(&manifest),
+            Target::LinuxX64,
+            &archive,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("sha256 mismatch"), "{error}");
+        assert!(
+            error.contains(&sha256_hex(&archive)),
+            "names the actual hash: {error}"
+        );
+        assert!(
+            !root.path().join(".tools/fake").exists(),
+            "nothing is installed from a mismatched archive"
+        );
+    }
+
+    #[test]
+    fn reports_missing_and_drifted_tools() {
+        let root = tempfile::tempdir().unwrap();
+        let manifest = Manifest::parse(&manifest_text(SHA_A)).unwrap();
+        let tool = only_tool(&manifest);
+        assert_eq!(
+            tool.status(root.path()).unwrap(),
+            Status::Missing,
+            "not installed"
+        );
+        let error = tool.installed(root.path()).unwrap_err().to_string();
+        assert!(error.contains("run `cargo xtask setup`"), "{error}");
+
+        let executable = root.path().join(".tools/fake/1.2.3/fake");
+        fs::create_dir_all(executable.parent().unwrap()).unwrap();
+        let mut file = fs::File::create(&executable).unwrap();
+        file.write_all(b"#!/bin/sh\necho 'fake 1.2.4'\n").unwrap();
+        drop(file);
+        fs::set_permissions(
+            &executable,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
+        assert_eq!(
+            tool.status(root.path()).unwrap(),
+            Status::Drift {
+                reported: "fake 1.2.4".to_owned()
+            },
+            "a binary reporting another version has drifted"
+        );
+    }
+
+    #[test]
+    fn pinning_rewrites_only_the_checksum() {
+        let text = manifest_text(SHA_A);
+        let mut document: toml_edit::DocumentMut = text.parse().unwrap();
+        let new = "b".repeat(64);
+        set_sha256(&mut document, "fake", Target::LinuxArm64, &new).unwrap();
+        let expected = text.replace(
+            &format!(r#"platform = "linux-arm64", sha256 = "{SHA_A}""#),
+            &format!(r#"platform = "linux-arm64", sha256 = "{new}""#),
+        );
+        assert_eq!(
+            document.to_string(),
+            expected,
+            "comments, layout and other targets are untouched"
+        );
+        assert!(
+            set_sha256(&mut document, "other", Target::LinuxArm64, &new)
+                .is_err_and(|error| error.to_string().contains("no tool named other")),
+            "an unknown tool is an error"
+        );
+    }
+}
