@@ -83,6 +83,8 @@ pub(crate) struct Tool {
     url: String,
     /// Path of the executable inside the archive, with the same placeholders.
     binary: String,
+    /// URL template of the checksums the project publishes for its assets, if it publishes any.
+    checksums: Option<String>,
     targets: BTreeMap<Target, Asset>,
 }
 
@@ -157,6 +159,12 @@ impl Tool {
             self.version
         );
         ensure!(self.url.starts_with("https://"), "the url must use https");
+        if let Some(checksums) = &self.checksums {
+            ensure!(
+                checksums.starts_with("https://"),
+                "the checksums url must use https"
+            );
+        }
         for target in Target::ALL {
             let asset = self.asset(target)?;
             ensure!(
@@ -175,7 +183,16 @@ impl Tool {
             }
             let url = self.render(&self.url, asset);
             let binary = self.render(&self.binary, asset);
-            for (field, value) in [("url", &url), ("binary", &binary)] {
+            let checksums = self
+                .checksums
+                .as_ref()
+                .map(|template| self.render(template, asset))
+                .unwrap_or_default();
+            for (field, value) in [
+                ("url", &url),
+                ("binary", &binary),
+                ("checksums", &checksums),
+            ] {
                 ensure!(
                     !value.contains(['{', '}']),
                     "{target}: {field} {value:?} has a placeholder other than {{version}} and {{platform}}"
@@ -391,7 +408,8 @@ pub(crate) fn pin(root: &Path, out: &mut impl Write) -> anyhow::Result<()> {
     fs::write(&path, pinned).with_context(|| format!("could not write {}", path.display()))
 }
 
-/// The tool list `text` with every sha256 recomputed from downloads by `fetch`.
+/// The tool list `text` with every sha256 recomputed from downloads by `fetch`. Where a tool
+/// publishes checksums, each download must match them.
 fn pin_text(
     text: &str,
     out: &mut impl Write,
@@ -399,19 +417,50 @@ fn pin_text(
 ) -> anyhow::Result<String> {
     let manifest = Manifest::parse(text).with_context(|| format!("{MANIFEST} is invalid"))?;
     let mut document: DocumentMut = text.parse()?;
+    let mut published: BTreeMap<String, String> = BTreeMap::new();
     for tool in &manifest.tools {
         for target in Target::ALL {
             let asset = tool.asset(target)?;
             let url = tool.render(&tool.url, asset);
             let archive = fetch(&url)?;
             let sha256 = sha256_hex(&archive);
+            let source = match &tool.checksums {
+                Some(template) => {
+                    let checksums_url = tool.render(template, asset);
+                    if !published.contains_key(&checksums_url) {
+                        let listing = String::from_utf8(fetch(&checksums_url)?)
+                            .with_context(|| format!("{checksums_url} is not text"))?;
+                        published.insert(checksums_url.clone(), listing);
+                    }
+                    let listing = published
+                        .get(&checksums_url)
+                        .context("the checksums were fetched above")?;
+                    let file_name = url.rsplit('/').next().unwrap_or(&url);
+                    let expected = published_sha256(listing, file_name).with_context(|| {
+                        format!("{checksums_url} has no sha256 for {file_name}")
+                    })?;
+                    ensure!(
+                        expected == sha256,
+                        "{} {} on {target}: the download's sha256 is {sha256}, but {checksums_url} \
+                         publishes {expected}",
+                        tool.name,
+                        tool.version
+                    );
+                    "matches the published checksum"
+                }
+                None => "the project publishes no checksums; pinned as downloaded",
+            };
             let binary_sha256 = sha256_hex(&tool.executable_in(&archive, asset)?);
             let state = if sha256 == asset.sha256 && binary_sha256 == asset.binary_sha256 {
                 "same"
             } else {
                 "changed"
             };
-            writeln!(out, "{state:<8} {} {} {target}", tool.name, tool.version)?;
+            writeln!(
+                out,
+                "{state:<8} {} {} {target}: {source}",
+                tool.name, tool.version
+            )?;
             set_pin(&mut document, &tool.name, target, "sha256", &sha256)?;
             set_pin(
                 &mut document,
@@ -455,6 +504,31 @@ fn download(url: &str) -> anyhow::Result<Vec<u8>> {
         .limit(MAX_ARCHIVE_BYTES)
         .read_to_vec()
         .with_context(|| format!("could not read {url}"))
+}
+
+/// The sha256 a published checksums file gives for `file_name`. The file either lists
+/// `<sha256> <name>` lines (`*<name>` in binary mode), or holds the one asset's sha256 alone.
+fn published_sha256(listing: &str, file_name: &str) -> Option<String> {
+    let lines: Vec<Vec<&str>> = listing
+        .lines()
+        .map(|line| line.split_whitespace().collect::<Vec<_>>())
+        .filter(|words| !words.is_empty())
+        .collect();
+    let listed = lines.iter().find_map(|words| match words.as_slice() {
+        [hash, name] if name.strip_prefix('*').unwrap_or(name) == file_name => Some(*hash),
+        _ => None,
+    });
+    let alone = match lines.as_slice() {
+        [words] => match words.as_slice() {
+            [hash] => Some(*hash),
+            _ => None,
+        },
+        _ => None,
+    };
+    listed
+        .or(alone)
+        .map(str::to_ascii_lowercase)
+        .filter(|hash| is_sha256_hex(hash))
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -610,7 +684,7 @@ mod tests {
 
     use super::{
         Manifest, Status, Target, Tool, extract, install, install_unready, pin_text,
-        remove_other_versions, report, reports_version, set_pin, sha256_hex,
+        published_sha256, remove_other_versions, report, reports_version, set_pin, sha256_hex,
     };
 
     const SHA_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -730,6 +804,13 @@ targets.aarch64-unknown-linux-gnu = {{ platform = "linux-arm64", sha256 = "{sha2
                 "no asset for aarch64-unknown-linux-gnu",
             ),
             (valid.replace("https://", "http://"), "https"),
+            (
+                valid.replace(
+                    "binary =",
+                    "checksums = \"http://example.com/sums\"\nbinary =",
+                ),
+                "the checksums url must use https",
+            ),
             (valid.replace("{platform}", "{arch}"), "placeholder"),
             (
                 valid.replace("fake-{version}/fake", "../fake"),
@@ -973,6 +1054,98 @@ targets.aarch64-unknown-linux-gnu = {{ platform = "linux-arm64", sha256 = "{sha2
             .replace(SHA_A, &sha256_hex(&archive))
             .replace(SHA_B, &sha256_hex(SCRIPT));
         assert_eq!(pinned, expected, "both pins change, nothing else does");
+    }
+
+    #[test]
+    fn pin_requires_a_match_with_published_checksums() {
+        let archive = tarball(&[("fake-1.2.3/fake", SCRIPT, 0o755)]);
+        let text = manifest_text(SHA_A, SHA_B).replace(
+            "binary =",
+            "checksums = \"https://example.com/fake-{version}-sums.txt\"\nbinary =",
+        );
+        let listing = |hash: &str| {
+            ["mac", "linux-x64", "linux-arm64"]
+                .map(|platform| format!("{hash}  fake-1.2.3-{platform}.tar.gz\n"))
+                .concat()
+        };
+        let serve = |sums: String| {
+            let archive = archive.clone();
+            move |url: &str| {
+                Ok(if url.ends_with("sums.txt") {
+                    sums.clone().into_bytes()
+                } else {
+                    archive.clone()
+                })
+            }
+        };
+
+        let mut out = Vec::new();
+        let mut matching = serve(listing(&sha256_hex(&archive)));
+        let pinned = pin_text(&text, &mut out, &mut matching).unwrap();
+        assert!(
+            pinned.contains(&sha256_hex(&archive)),
+            "a matching download is pinned"
+        );
+        assert!(
+            String::from_utf8(out)
+                .unwrap()
+                .contains("matches the published checksum"),
+            "and reported as verified"
+        );
+
+        let mut tampered = serve(listing(SHA_B));
+        let mismatch = pin_text(&text, &mut Vec::new(), &mut tampered).unwrap_err();
+        assert!(
+            format!("{mismatch:#}").contains("publishes"),
+            "{mismatch:#}"
+        );
+
+        let mut unlisted = serve(format!("{SHA_B}  other.tar.gz\n"));
+        let absent = pin_text(&text, &mut Vec::new(), &mut unlisted).unwrap_err();
+        assert!(
+            format!("{absent:#}").contains("has no sha256 for fake-1.2.3-mac.tar.gz"),
+            "{absent:#}"
+        );
+    }
+
+    #[test]
+    fn pin_says_when_nothing_is_published() {
+        let archive = tarball(&[("fake-1.2.3/fake", SCRIPT, 0o755)]);
+        let mut out = Vec::new();
+        let mut fetch = |_: &str| Ok(archive.clone());
+        pin_text(&manifest_text(SHA_A, SHA_B), &mut out, &mut fetch).unwrap();
+        assert!(
+            String::from_utf8(out)
+                .unwrap()
+                .contains("publishes no checksums"),
+            "an unverified pin is never silent"
+        );
+    }
+
+    #[test]
+    fn reads_published_checksum_formats() {
+        let listing = format!("{SHA_A}  a.tar.gz\n{SHA_B} *b.tar.gz\n");
+        assert_eq!(
+            published_sha256(&listing, "a.tar.gz").as_deref(),
+            Some(SHA_A),
+            "text mode"
+        );
+        assert_eq!(
+            published_sha256(&listing, "b.tar.gz").as_deref(),
+            Some(SHA_B),
+            "binary mode"
+        );
+        assert_eq!(published_sha256(&listing, "c.tar.gz"), None, "not listed");
+        assert_eq!(
+            published_sha256(&format!("{}\n", SHA_A.to_uppercase()), "any.tar.gz").as_deref(),
+            Some(SHA_A),
+            "a file holding one asset's sha256 alone"
+        );
+        assert_eq!(
+            published_sha256("not-a-hash  a.tar.gz\n", "a.tar.gz"),
+            None,
+            "not a sha256"
+        );
     }
 
     #[test]
