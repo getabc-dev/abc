@@ -17,7 +17,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "cd \"$CLAUDE_PROJECT_DIR\" && cargo xtask guard"
+            "command": "cd \"$CLAUDE_PROJECT_DIR\" && cargo xtask hook pre-tool-use"
           }
         ]
       }
@@ -27,7 +27,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "cd \"$CLAUDE_PROJECT_DIR\" && cargo xtask check --changed 1>&2 || { echo 'cargo xtask check failed'; exit 2; }",
+            "command": "cd \"$CLAUDE_PROJECT_DIR\" && cargo xtask hook stop 1>&2 || { echo 'cargo xtask check failed'; exit 2; }",
             "timeout": 900,
             "statusMessage": "cargo xtask check --changed"
           }
@@ -40,7 +40,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "cd \"$CLAUDE_PROJECT_DIR\" && cargo xtask check --changed 1>&2 || { echo 'cargo xtask check failed'; exit 2; }",
+            "command": "cd \"$CLAUDE_PROJECT_DIR\" && cargo xtask hook stop 1>&2 || { echo 'cargo xtask check failed'; exit 2; }",
             "timeout": 900,
             "statusMessage": "cargo xtask check --changed"
           }

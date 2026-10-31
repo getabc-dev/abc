@@ -4,7 +4,7 @@ use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode};
+use std::process::Command;
 
 use anyhow::{Context, ensure};
 use serde::Deserialize;
@@ -60,7 +60,9 @@ struct Failure {
     fix: &'static str,
 }
 
-pub(crate) fn run(root: &Path, changed: bool, out: &mut impl Write) -> anyhow::Result<ExitCode> {
+/// Runs the check from `root` and reports whether it passed. With `changed`, clippy and the tests
+/// cover only the crates the changes since the merge base with [`BASE`] can affect.
+pub(crate) fn run(root: &Path, changed: bool, out: &mut impl Write) -> anyhow::Result<bool> {
     let nextest = Manifest::load(root)?
         .tool("cargo-nextest")?
         .installed(root)?;
@@ -118,13 +120,13 @@ pub(crate) fn run(root: &Path, changed: bool, out: &mut impl Write) -> anyhow::R
 
     if failures.is_empty() {
         writeln!(out, "xtask check: passed")?;
-        return Ok(ExitCode::SUCCESS);
+        return Ok(true);
     }
     writeln!(out, "xtask check: failed")?;
     for failure in failures {
         writeln!(out, "  {}: {}", failure.step, failure.fix)?;
     }
-    Ok(ExitCode::FAILURE)
+    Ok(false)
 }
 
 /// Cargo as chosen by `cargo xtask`, so every step uses the pinned toolchain.

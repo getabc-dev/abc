@@ -2,6 +2,7 @@
 
 mod check;
 mod guard;
+mod hook;
 mod shell;
 mod tools;
 
@@ -43,9 +44,13 @@ enum Task {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<OsString>,
     },
-    /// Claude Code `PreToolUse` hook for Bash: reads the hook input on stdin and exits 2 to block
-    /// git commands that skip hooks or force-push.
-    Guard,
+    /// Run a Claude Code hook on the hook input from stdin, in the checkout the agent is in.
+    /// Exit code 2 blocks the tool call or keeps the agent working.
+    Hook {
+        /// The hook event.
+        #[arg(value_enum)]
+        event: hook::Event,
+    },
 }
 
 fn main() -> ExitCode {
@@ -62,7 +67,14 @@ fn main() -> ExitCode {
 fn run(task: Task) -> anyhow::Result<ExitCode> {
     let root = repo_root()?;
     match task {
-        Task::Check { changed } => check::run(&root, changed, &mut io::stderr().lock()),
+        Task::Check { changed } => {
+            let passed = check::run(&root, changed, &mut io::stderr().lock())?;
+            Ok(if passed {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            })
+        }
         Task::Setup => {
             tools::setup(&root, &mut io::stdout().lock())?;
             Ok(ExitCode::SUCCESS)
@@ -73,18 +85,14 @@ fn run(task: Task) -> anyhow::Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         Task::Tool { name, args } => tools::run(&root, &name, &args),
-        Task::Guard => {
+        Task::Hook { event } => {
             let mut input = String::new();
             io::stdin()
                 .read_to_string(&mut input)
                 .context("could not read the hook input from stdin")?;
-            match guard::decide(&input) {
-                guard::Decision::Allow => Ok(ExitCode::SUCCESS),
-                guard::Decision::Block(message) => {
-                    writeln!(io::stderr().lock(), "{message}")?;
-                    Ok(ExitCode::from(2))
-                }
-            }
+            let context = hook::Context::from_env(root);
+            let code = hook::run(event, &input, &context, &mut io::stderr().lock())?;
+            Ok(ExitCode::from(code))
         }
     }
 }

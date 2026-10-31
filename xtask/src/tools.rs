@@ -351,15 +351,15 @@ pub(crate) fn run(root: &Path, name: &str, args: &[OsString]) -> anyhow::Result<
         .current_dir(root)
         .status()
         .with_context(|| format!("could not run {}", executable.display()))?;
-    Ok(exit_code(status))
+    Ok(ExitCode::from(status_code(status)))
 }
 
-/// The exit code that passes a child's status on.
-pub(crate) fn exit_code(status: ExitStatus) -> ExitCode {
+/// The exit code that passes a child's status on; 1 when it has none, as after a signal.
+pub(crate) fn status_code(status: ExitStatus) -> u8 {
     status
         .code()
         .and_then(|code| u8::try_from(code).ok())
-        .map_or(ExitCode::FAILURE, ExitCode::from)
+        .unwrap_or(1)
 }
 
 fn download(url: &str) -> anyhow::Result<Vec<u8>> {
