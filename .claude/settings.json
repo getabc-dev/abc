@@ -1,0 +1,51 @@
+{
+  "extraKnownMarketplaces": {
+    "cursor-plugins": {
+      "source": {
+        "source": "github",
+        "repo": "cursor/plugins"
+      }
+    }
+  },
+  "enabledPlugins": {
+    "pstack@cursor-plugins": true
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cd \"$CLAUDE_PROJECT_DIR\" && cargo xtask guard"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cd \"$CLAUDE_PROJECT_DIR\" && cargo xtask check --changed 1>&2 || { echo 'cargo xtask check failed'; exit 2; }",
+            "timeout": 900,
+            "statusMessage": "cargo xtask check --changed"
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "matcher": "^(?!(?:Explore|Plan|claude-code-guide|statusline-setup|web-fetch)$).+",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cd \"$CLAUDE_PROJECT_DIR\" && cargo xtask check --changed 1>&2 || { echo 'cargo xtask check failed'; exit 2; }",
+            "timeout": 900,
+            "statusMessage": "cargo xtask check --changed"
+          }
+        ]
+      }
+    ]
+  }
+}
