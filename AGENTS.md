@@ -114,6 +114,9 @@ cargo-shear --deny-warnings --locked`, `cargo xtask tool osv-scanner scan source
 Cargo.lock`, `cargo xtask tool zizmor --pedantic .github`, `cargo xtask tool pinact run --check
 --verify-comment` and `cargo xtask tool gitleaks git --redact --no-banner .`.
 
+The git guard in the agent hooks blocks force pushes and git or gh commands it cannot read, but
+it is best effort: branch protection on GitHub is the real gate.
+
 Commit the `proptest-regressions/` files proptest writes when a property test fails: they replay
 the failing cases first on every run.
 
