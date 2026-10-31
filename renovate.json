@@ -7,15 +7,10 @@
   "internalChecksAsSuccess": true,
   "prCreation": "not-pending",
   "lockFileMaintenance": {
-    "enabled": true,
-    "schedule": ["* 0-3 * * 1"]
+    "description": "Off: refreshing Cargo.lock would pull transitive versions that never passed the 3-day minimum release age. Transitive updates arrive only with age-gated direct updates.",
+    "enabled": false
   },
   "packageRules": [
-    {
-      "description": "Lock file maintenance has no release timestamp, so the age check would hold it forever.",
-      "matchUpdateTypes": ["lockFileMaintenance"],
-      "minimumReleaseAge": null
-    },
     {
       "description": "Bump the toolchain and the workspace rust-version together; an xtask test requires them equal.",
       "matchDatasources": ["rust-version"],
