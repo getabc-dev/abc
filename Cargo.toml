@@ -27,6 +27,10 @@ thiserror = "2.0.21"
 toml_edit = { version = "0.25.17", features = ["serde"] }
 ureq = "3.5.0"
 
+# xtask hashes every pinned tool before running it; optimise sha2 so debug builds hash quickly.
+[profile.dev.package.sha2]
+opt-level = 3
+
 [workspace.lints.rust]
 unsafe_code = "forbid"
 unreachable_pub = "deny"

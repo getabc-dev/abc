@@ -31,6 +31,8 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Install the pinned tools
         run: cargo xtask setup
+      - name: Check the installed tools against their pins
+        run: cargo xtask doctor
       - name: Format, clippy and tests
         run: cargo xtask check
 
@@ -49,6 +51,8 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Install the pinned tools
         run: cargo xtask setup
+      - name: Check the installed tools against their pins
+        run: cargo xtask doctor
       - name: Advisories, licences, bans and sources
         run: cargo xtask tool cargo-deny check
       - name: Unused dependencies
@@ -71,6 +75,8 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Install the pinned tools
         run: cargo xtask setup
+      - name: Check the installed tools against their pins
+        run: cargo xtask doctor
       - name: Workflow security
         run: cargo xtask tool zizmor --pedantic .github
         env:

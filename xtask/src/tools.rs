@@ -88,12 +88,14 @@ pub(crate) struct Tool {
 
 /// A tool's release asset for one target.
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
 struct Asset {
     /// The target's name in the project's asset file names.
     platform: String,
-    /// Lowercase hex sha256 of the archive.
+    /// Lowercase hex sha256 of the downloaded archive.
     sha256: String,
+    /// Lowercase hex sha256 of the installed executable, checked whenever xtask uses it.
+    binary_sha256: String,
 }
 
 /// The validated tool list.
@@ -162,14 +164,15 @@ impl Tool {
                 "{target}: platform {:?} must be ASCII letters, digits, '-' or '_'",
                 asset.platform
             );
-            ensure!(
-                asset.sha256.len() == 64
-                    && asset
-                        .sha256
-                        .chars()
-                        .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)),
-                "{target}: sha256 must be 64 lowercase hex digits"
-            );
+            for (field, value) in [
+                ("sha256", &asset.sha256),
+                ("binary-sha256", &asset.binary_sha256),
+            ] {
+                ensure!(
+                    is_sha256_hex(value),
+                    "{target}: {field} must be 64 lowercase hex digits"
+                );
+            }
             let url = self.render(&self.url, asset);
             let binary = self.render(&self.binary, asset);
             for (field, value) in [("url", &url), ("binary", &binary)] {
@@ -194,6 +197,11 @@ impl Tool {
             .with_context(|| format!("no asset for {target}"))
     }
 
+    /// The executable inside a downloaded archive.
+    fn executable_in(&self, archive: &[u8], asset: &Asset) -> anyhow::Result<Vec<u8>> {
+        extract(archive, Path::new(&self.render(&self.binary, asset)))
+    }
+
     fn render(&self, template: &str, asset: &Asset) -> String {
         template
             .replace("{version}", &self.version)
@@ -207,7 +215,8 @@ impl Tool {
             .join(&self.name)
     }
 
-    /// The installed executable, or an error saying how to install it.
+    /// The installed executable, once its sha256 matches the pin; otherwise an error saying how
+    /// to install it.
     pub(crate) fn installed(&self, root: &Path) -> anyhow::Result<PathBuf> {
         let executable = self.executable(root);
         ensure!(
@@ -216,13 +225,24 @@ impl Tool {
             self.name,
             self.version
         );
+        let pinned = &self.asset(Target::host()?)?.binary_sha256;
+        let actual = file_sha256(&executable)?;
+        ensure!(
+            actual == *pinned,
+            "{} has sha256 {actual}, but {MANIFEST} pins {pinned}: run `cargo xtask setup`",
+            executable.display()
+        );
         Ok(executable)
     }
 
-    fn status(&self, root: &Path) -> anyhow::Result<Status> {
+    fn status(&self, root: &Path, target: Target) -> anyhow::Result<Status> {
         let executable = self.executable(root);
         if !executable.is_file() {
             return Ok(Status::Missing);
+        }
+        let sha256 = file_sha256(&executable)?;
+        if sha256 != self.asset(target)?.binary_sha256 {
+            return Ok(Status::Modified { sha256 });
         }
         let output = Command::new(&executable)
             .arg("--version")
@@ -239,6 +259,18 @@ impl Tool {
             })
         }
     }
+}
+
+fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .chars()
+            .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
+}
+
+fn file_sha256(path: &Path) -> anyhow::Result<String> {
+    let bytes = fs::read(path).with_context(|| format!("could not read {}", path.display()))?;
+    Ok(sha256_hex(&bytes))
 }
 
 fn is_safe_name(name: &str) -> bool {
@@ -260,7 +292,11 @@ fn reports_version(output: &str, version: &str) -> bool {
 enum Status {
     Ready,
     Missing,
-    /// Installed, but `--version` does not report the pinned version.
+    /// Installed, but the executable is not the pinned one.
+    Modified {
+        sha256: String,
+    },
+    /// Installed with the pinned sha256, but `--version` does not report the pinned version.
     Drift {
         reported: String,
     },
@@ -272,8 +308,8 @@ pub(crate) fn setup(root: &Path, out: &mut impl Write) -> anyhow::Result<()> {
     install_unready(root, &manifest, Target::host()?, out, &mut download)
 }
 
-/// Installs, with archives from `fetch`, every tool that is not ready: missing, or reporting
-/// another version.
+/// Installs, with archives from `fetch`, every tool that is not ready: missing, modified, or
+/// reporting another version.
 fn install_unready(
     root: &Path,
     manifest: &Manifest,
@@ -282,7 +318,7 @@ fn install_unready(
     fetch: &mut impl FnMut(&str) -> anyhow::Result<Vec<u8>>,
 ) -> anyhow::Result<()> {
     for tool in &manifest.tools {
-        if tool.status(root)? == Status::Ready {
+        if tool.status(root, target)? == Status::Ready {
             writeln!(out, "ok       {} {}", tool.name, tool.version)?;
         } else {
             let url = tool.render(&tool.url, tool.asset(target)?);
@@ -297,13 +333,32 @@ fn install_unready(
 /// `cargo xtask doctor`: reports each tool's state and fails unless all are ready.
 pub(crate) fn doctor(root: &Path, out: &mut impl Write) -> anyhow::Result<ExitCode> {
     let manifest = Manifest::load(root)?;
+    report(root, &manifest, Target::host()?, out)
+}
+
+fn report(
+    root: &Path,
+    manifest: &Manifest,
+    target: Target,
+    out: &mut impl Write,
+) -> anyhow::Result<ExitCode> {
     let mut ready = true;
     for tool in &manifest.tools {
-        match tool.status(root)? {
+        match tool.status(root, target)? {
             Status::Ready => writeln!(out, "ok       {} {}", tool.name, tool.version)?,
             Status::Missing => {
                 ready = false;
                 writeln!(out, "missing  {} {}", tool.name, tool.version)?;
+            }
+            Status::Modified { sha256 } => {
+                ready = false;
+                writeln!(
+                    out,
+                    "modified {} {}: the installed binary has sha256 {sha256}, {MANIFEST} pins {}",
+                    tool.name,
+                    tool.version,
+                    tool.asset(target)?.binary_sha256
+                )?;
             }
             Status::Drift { reported } => {
                 ready = false;
@@ -326,30 +381,48 @@ pub(crate) fn doctor(root: &Path, out: &mut impl Write) -> anyhow::Result<ExitCo
     }
 }
 
-/// `cargo xtask pin`: downloads every tool for every target and records the archives' sha256 in
-/// the tool list, keeping its layout and comments.
+/// `cargo xtask pin`: downloads every tool for every target and records the sha256 of each
+/// archive and of the executable in it, keeping the tool list's layout and comments.
 pub(crate) fn pin(root: &Path, out: &mut impl Write) -> anyhow::Result<()> {
     let path = root.join(MANIFEST);
     let text =
         fs::read_to_string(&path).with_context(|| format!("could not read {}", path.display()))?;
-    let manifest = Manifest::parse(&text).with_context(|| format!("{MANIFEST} is invalid"))?;
+    let pinned = pin_text(&text, out, &mut download)?;
+    fs::write(&path, pinned).with_context(|| format!("could not write {}", path.display()))
+}
+
+/// The tool list `text` with every sha256 recomputed from downloads by `fetch`.
+fn pin_text(
+    text: &str,
+    out: &mut impl Write,
+    fetch: &mut impl FnMut(&str) -> anyhow::Result<Vec<u8>>,
+) -> anyhow::Result<String> {
+    let manifest = Manifest::parse(text).with_context(|| format!("{MANIFEST} is invalid"))?;
     let mut document: DocumentMut = text.parse()?;
     for tool in &manifest.tools {
         for target in Target::ALL {
             let asset = tool.asset(target)?;
             let url = tool.render(&tool.url, asset);
-            let sha256 = sha256_hex(&download(&url)?);
-            let state = if sha256 == asset.sha256 {
+            let archive = fetch(&url)?;
+            let sha256 = sha256_hex(&archive);
+            let binary_sha256 = sha256_hex(&tool.executable_in(&archive, asset)?);
+            let state = if sha256 == asset.sha256 && binary_sha256 == asset.binary_sha256 {
                 "same"
             } else {
                 "changed"
             };
             writeln!(out, "{state:<8} {} {} {target}", tool.name, tool.version)?;
-            set_sha256(&mut document, &tool.name, target, &sha256)?;
+            set_pin(&mut document, &tool.name, target, "sha256", &sha256)?;
+            set_pin(
+                &mut document,
+                &tool.name,
+                target,
+                "binary-sha256",
+                &binary_sha256,
+            )?;
         }
     }
-    fs::write(&path, document.to_string())
-        .with_context(|| format!("could not write {}", path.display()))
+    Ok(document.to_string())
 }
 
 /// `cargo xtask tool`: runs a pinned tool with the given arguments from the repository root.
@@ -406,8 +479,16 @@ fn install(root: &Path, tool: &Tool, target: Target, archive: &[u8]) -> anyhow::
         tool.version,
         asset.sha256
     );
-    let member = tool.render(&tool.binary, asset);
-    let binary = extract(archive, Path::new(&member))?;
+    let binary = tool.executable_in(archive, asset)?;
+    let binary_sha256 = sha256_hex(&binary);
+    ensure!(
+        binary_sha256 == asset.binary_sha256,
+        "sha256 mismatch for the {} {} executable on {target}: {MANIFEST} pins {}, the archive \
+         holds {binary_sha256}",
+        tool.name,
+        tool.version,
+        asset.binary_sha256
+    );
 
     let tool_dir = root.join(TOOLS_DIR).join(&tool.name);
     let staging = tool_dir.join(format!("{}.partial", tool.version));
@@ -424,9 +505,13 @@ fn install(root: &Path, tool: &Tool, target: Target, archive: &[u8]) -> anyhow::
     fs::rename(&staging, &destination)
         .with_context(|| format!("could not move {} into place", staging.display()))?;
 
-    match tool.status(root)? {
+    match tool.status(root, target)? {
         Status::Ready => Ok(()),
         Status::Missing => bail!("{} vanished after install", tool.name),
+        Status::Modified { sha256 } => bail!(
+            "{} changed while it was installed: its sha256 is now {sha256}",
+            tool.name
+        ),
         Status::Drift { reported } => bail!(
             "{} {} was installed, but `--version` reports {reported:?}",
             tool.name,
@@ -482,11 +567,13 @@ fn remove_dir_if_present(path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Sets one tool's sha256 for one target in the tool list document.
-fn set_sha256(
+/// Sets one of a tool's pins, `sha256` or `binary-sha256`, for one target in the tool list
+/// document.
+fn set_pin(
     document: &mut DocumentMut,
     name: &str,
     target: Target,
+    key: &str,
     sha256: &str,
 ) -> anyhow::Result<()> {
     let tool = document
@@ -501,9 +588,9 @@ fn set_sha256(
         .and_then(toml_edit::Item::as_table_like_mut)
         .and_then(|targets| targets.get_mut(target.triple()))
         .and_then(toml_edit::Item::as_table_like_mut)
-        .and_then(|asset| asset.get_mut("sha256"))
+        .and_then(|asset| asset.get_mut(key))
         .and_then(toml_edit::Item::as_value_mut)
-        .with_context(|| format!("{name} has no sha256 for {target}"))?;
+        .with_context(|| format!("{name} has no {key} for {target}"))?;
     let decor = value.decor().clone();
     *value = sha256.into();
     *value.decor_mut() = decor;
@@ -514,20 +601,23 @@ fn set_sha256(
 mod tests {
     use std::cell::Cell;
     use std::fs;
-    use std::io::Write as _;
+    use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
+    use std::process::ExitCode;
 
     use flate2::Compression;
     use flate2::write::GzEncoder;
 
     use super::{
-        Manifest, Status, Target, Tool, extract, install, install_unready, remove_other_versions,
-        reports_version, set_sha256, sha256_hex,
+        Manifest, Status, Target, Tool, extract, install, install_unready, pin_text,
+        remove_other_versions, report, reports_version, set_pin, sha256_hex,
     };
 
     const SHA_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const SHA_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const SCRIPT: &[u8] = b"#!/bin/sh\necho 'fake 1.2.3'\n";
 
-    fn manifest_text(sha256: &str) -> String {
+    fn manifest_text(sha256: &str, binary_sha256: &str) -> String {
         format!(
             r#"# The tools.
 [[tool]]
@@ -535,11 +625,16 @@ name = "fake"
 version = "1.2.3"
 url = "https://example.com/fake-{{version}}-{{platform}}.tar.gz"
 binary = "fake-{{version}}/fake"
-targets.aarch64-apple-darwin = {{ platform = "mac", sha256 = "{sha256}" }}
-targets.x86_64-unknown-linux-gnu = {{ platform = "linux-x64", sha256 = "{sha256}" }}
-targets.aarch64-unknown-linux-gnu = {{ platform = "linux-arm64", sha256 = "{sha256}" }}
+targets.aarch64-apple-darwin = {{ platform = "mac", sha256 = "{sha256}", binary-sha256 = "{binary_sha256}" }}
+targets.x86_64-unknown-linux-gnu = {{ platform = "linux-x64", sha256 = "{sha256}", binary-sha256 = "{binary_sha256}" }}
+targets.aarch64-unknown-linux-gnu = {{ platform = "linux-arm64", sha256 = "{sha256}", binary-sha256 = "{binary_sha256}" }}
 "#
         )
+    }
+
+    /// The tool list pinning `archive`, whose executable is `binary`.
+    fn pinned(archive: &[u8], binary: &[u8]) -> Manifest {
+        Manifest::parse(&manifest_text(&sha256_hex(archive), &sha256_hex(binary))).unwrap()
     }
 
     fn only_tool(manifest: &Manifest) -> &Tool {
@@ -556,6 +651,29 @@ targets.aarch64-unknown-linux-gnu = {{ platform = "linux-arm64", sha256 = "{sha2
             builder.append_data(&mut header, path, contents).unwrap();
         }
         builder.into_inner().unwrap().finish().unwrap()
+    }
+
+    fn write_executable(path: &Path, contents: &[u8]) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, contents).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    fn install_from(root: &Path, manifest: &Manifest, archive: &[u8]) -> u32 {
+        let downloads = Cell::new(0_u32);
+        let mut fetch = |_: &str| {
+            downloads.set(downloads.get().saturating_add(1));
+            Ok(archive.to_vec())
+        };
+        install_unready(
+            root,
+            manifest,
+            Target::MacArm64,
+            &mut Vec::new(),
+            &mut fetch,
+        )
+        .unwrap();
+        downloads.get()
     }
 
     #[test]
@@ -576,7 +694,7 @@ targets.aarch64-unknown-linux-gnu = {{ platform = "linux-arm64", sha256 = "{sha2
 
     #[test]
     fn parses_a_valid_manifest() {
-        let manifest = Manifest::parse(&manifest_text(SHA_A)).unwrap();
+        let manifest = Manifest::parse(&manifest_text(SHA_A, SHA_B)).unwrap();
         let tool = only_tool(&manifest);
         let asset = tool.asset(Target::LinuxX64).unwrap();
         assert_eq!(
@@ -593,10 +711,20 @@ targets.aarch64-unknown-linux-gnu = {{ platform = "linux-arm64", sha256 = "{sha2
 
     #[test]
     fn rejects_invalid_manifests() {
-        let valid = manifest_text(SHA_A);
+        let valid = manifest_text(SHA_A, SHA_B);
         let cases = [
-            (valid.replace(SHA_A, &SHA_A.to_uppercase()), "lowercase hex"),
-            (valid.replace(SHA_A, "abc"), "64 lowercase hex"),
+            (
+                valid.replace(SHA_A, &SHA_A.to_uppercase()),
+                "sha256 must be",
+            ),
+            (
+                valid.replace(SHA_A, "abc"),
+                "sha256 must be 64 lowercase hex",
+            ),
+            (
+                valid.replace(SHA_B, "abc"),
+                "binary-sha256 must be 64 lowercase hex",
+            ),
             (
                 valid.replace("targets.aarch64-unknown-linux-gnu", "# none"),
                 "no asset for aarch64-unknown-linux-gnu",
@@ -688,9 +816,8 @@ targets.aarch64-unknown-linux-gnu = {{ platform = "linux-arm64", sha256 = "{sha2
     #[test]
     fn installs_a_verified_archive_and_removes_other_versions() {
         let root = tempfile::tempdir().unwrap();
-        let script = b"#!/bin/sh\necho 'fake 1.2.3'\n";
-        let archive = tarball(&[("fake-1.2.3/fake", script, 0o644)]);
-        let manifest = Manifest::parse(&manifest_text(&sha256_hex(&archive))).unwrap();
+        let archive = tarball(&[("fake-1.2.3/fake", SCRIPT, 0o644)]);
+        let manifest = pinned(&archive, SCRIPT);
         let tool = only_tool(&manifest);
         let stale = root.path().join(".tools/fake/1.0.0");
         fs::create_dir_all(&stale).unwrap();
@@ -699,9 +826,9 @@ targets.aarch64-unknown-linux-gnu = {{ platform = "linux-arm64", sha256 = "{sha2
         remove_other_versions(root.path(), tool).unwrap();
 
         assert_eq!(
-            tool.status(root.path()).unwrap(),
+            tool.status(root.path(), Target::MacArm64).unwrap(),
             Status::Ready,
-            "the installed script reports the pinned version"
+            "the installed script is the pinned one and reports the pinned version"
         );
         assert_eq!(
             tool.installed(root.path()).unwrap(),
@@ -714,60 +841,65 @@ targets.aarch64-unknown-linux-gnu = {{ platform = "linux-arm64", sha256 = "{sha2
     #[test]
     fn setup_reinstalls_a_tool_that_reports_another_version() {
         let root = tempfile::tempdir().unwrap();
-        let script: &[u8] = b"#!/bin/sh\necho 'fake 1.2.3'\n";
-        let archive = tarball(&[("fake-1.2.3/fake", script, 0o755)]);
-        let manifest = Manifest::parse(&manifest_text(&sha256_hex(&archive))).unwrap();
-        let downloads = Cell::new(0_u32);
-        let mut fetch = |_: &str| {
-            downloads.set(downloads.get().saturating_add(1));
-            Ok(archive.clone())
-        };
+        let archive = tarball(&[("fake-1.2.3/fake", SCRIPT, 0o755)]);
+        let manifest = pinned(&archive, SCRIPT);
         let executable = root.path().join(".tools/fake/1.2.3/fake");
 
-        install_unready(
-            root.path(),
-            &manifest,
-            Target::MacArm64,
-            &mut Vec::new(),
-            &mut fetch,
-        )
-        .unwrap();
-        install_unready(
-            root.path(),
-            &manifest,
-            Target::MacArm64,
-            &mut Vec::new(),
-            &mut fetch,
-        )
-        .unwrap();
-        assert_eq!(downloads.get(), 1, "a ready tool is not downloaded again");
-
-        fs::write(&executable, b"#!/bin/sh\necho 'fake 9.9.9'\n").unwrap();
-        install_unready(
-            root.path(),
-            &manifest,
-            Target::MacArm64,
-            &mut Vec::new(),
-            &mut fetch,
-        )
-        .unwrap();
         assert_eq!(
-            downloads.get(),
-            2,
+            install_from(root.path(), &manifest, &archive),
+            1,
+            "installed"
+        );
+        assert_eq!(
+            install_from(root.path(), &manifest, &archive),
+            0,
+            "a ready tool is not downloaded again"
+        );
+        write_executable(&executable, b"#!/bin/sh\necho 'fake 9.9.9'\n");
+        assert_eq!(
+            install_from(root.path(), &manifest, &archive),
+            1,
             "a tool at another version is downloaded again"
         );
         assert_eq!(
             fs::read(&executable).unwrap(),
-            script,
+            SCRIPT,
             "and replaced by the pinned build"
         );
+    }
+
+    #[test]
+    fn a_swapped_binary_is_caught_everywhere() {
+        let root = tempfile::tempdir().unwrap();
+        let archive = tarball(&[("fake-1.2.3/fake", SCRIPT, 0o755)]);
+        let manifest = pinned(&archive, SCRIPT);
+        let tool = only_tool(&manifest);
+        install_from(root.path(), &manifest, &archive);
+        // Same --version output, different bytes.
+        let swapped = b"#!/bin/sh\necho 'fake 1.2.3'\nexit 0\n";
+        write_executable(&root.path().join(".tools/fake/1.2.3/fake"), swapped);
+
+        assert_eq!(
+            tool.status(root.path(), Target::MacArm64).unwrap(),
+            Status::Modified {
+                sha256: sha256_hex(swapped)
+            },
+            "the version output is not trusted"
+        );
+        let error = tool.installed(root.path()).unwrap_err().to_string();
+        assert!(error.contains("run `cargo xtask setup`"), "{error}");
+        let mut out = Vec::new();
+        let code = report(root.path(), &manifest, Target::MacArm64, &mut out).unwrap();
+        let printed = String::from_utf8(out).unwrap();
+        assert_eq!(code, ExitCode::FAILURE, "doctor fails: {printed}");
+        assert!(printed.contains("modified fake 1.2.3"), "{printed}");
     }
 
     #[test]
     fn refuses_an_archive_with_the_wrong_checksum() {
         let root = tempfile::tempdir().unwrap();
         let archive = tarball(&[("fake-1.2.3/fake", b"x", 0o755)]);
-        let manifest = Manifest::parse(&manifest_text(SHA_A)).unwrap();
+        let manifest = Manifest::parse(&manifest_text(SHA_A, SHA_B)).unwrap();
         let error = install(
             root.path(),
             only_tool(&manifest),
@@ -788,43 +920,67 @@ targets.aarch64-unknown-linux-gnu = {{ platform = "linux-arm64", sha256 = "{sha2
     }
 
     #[test]
+    fn refuses_an_archive_holding_another_executable() {
+        let root = tempfile::tempdir().unwrap();
+        let archive = tarball(&[("fake-1.2.3/fake", SCRIPT, 0o755)]);
+        let manifest = Manifest::parse(&manifest_text(&sha256_hex(&archive), SHA_B)).unwrap();
+        let error = install(
+            root.path(),
+            only_tool(&manifest),
+            Target::MacArm64,
+            &archive,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("executable"), "{error}");
+        assert!(
+            !root.path().join(".tools/fake").exists(),
+            "nothing is installed"
+        );
+    }
+
+    #[test]
     fn reports_missing_and_drifted_tools() {
         let root = tempfile::tempdir().unwrap();
-        let manifest = Manifest::parse(&manifest_text(SHA_A)).unwrap();
+        let drifted: &[u8] = b"#!/bin/sh\necho 'fake 1.2.4'\n";
+        let manifest = Manifest::parse(&manifest_text(SHA_A, &sha256_hex(drifted))).unwrap();
         let tool = only_tool(&manifest);
         assert_eq!(
-            tool.status(root.path()).unwrap(),
+            tool.status(root.path(), Target::MacArm64).unwrap(),
             Status::Missing,
             "not installed"
         );
         let error = tool.installed(root.path()).unwrap_err().to_string();
         assert!(error.contains("run `cargo xtask setup`"), "{error}");
 
-        let executable = root.path().join(".tools/fake/1.2.3/fake");
-        fs::create_dir_all(executable.parent().unwrap()).unwrap();
-        let mut file = fs::File::create(&executable).unwrap();
-        file.write_all(b"#!/bin/sh\necho 'fake 1.2.4'\n").unwrap();
-        drop(file);
-        fs::set_permissions(
-            &executable,
-            std::os::unix::fs::PermissionsExt::from_mode(0o755),
-        )
-        .unwrap();
+        write_executable(&root.path().join(".tools/fake/1.2.3/fake"), drifted);
         assert_eq!(
-            tool.status(root.path()).unwrap(),
+            tool.status(root.path(), Target::MacArm64).unwrap(),
             Status::Drift {
                 reported: "fake 1.2.4".to_owned()
             },
-            "a binary reporting another version has drifted"
+            "a pinned binary reporting another version has drifted"
         );
     }
 
     #[test]
+    fn pin_records_the_archive_and_executable_checksums() {
+        let archive = tarball(&[("fake-1.2.3/fake", SCRIPT, 0o755)]);
+        let text = manifest_text(SHA_A, SHA_B);
+        let mut fetch = |_: &str| Ok(archive.clone());
+        let pinned = pin_text(&text, &mut Vec::new(), &mut fetch).unwrap();
+        let expected = text
+            .replace(SHA_A, &sha256_hex(&archive))
+            .replace(SHA_B, &sha256_hex(SCRIPT));
+        assert_eq!(pinned, expected, "both pins change, nothing else does");
+    }
+
+    #[test]
     fn pinning_rewrites_only_the_checksum() {
-        let text = manifest_text(SHA_A);
+        let text = manifest_text(SHA_A, SHA_B);
         let mut document: toml_edit::DocumentMut = text.parse().unwrap();
-        let new = "b".repeat(64);
-        set_sha256(&mut document, "fake", Target::LinuxArm64, &new).unwrap();
+        let new = "c".repeat(64);
+        set_pin(&mut document, "fake", Target::LinuxArm64, "sha256", &new).unwrap();
         let expected = text.replace(
             &format!(r#"platform = "linux-arm64", sha256 = "{SHA_A}""#),
             &format!(r#"platform = "linux-arm64", sha256 = "{new}""#),
@@ -835,7 +991,7 @@ targets.aarch64-unknown-linux-gnu = {{ platform = "linux-arm64", sha256 = "{sha2
             "comments, layout and other targets are untouched"
         );
         assert!(
-            set_sha256(&mut document, "other", Target::LinuxArm64, &new)
+            set_pin(&mut document, "other", Target::LinuxArm64, "sha256", &new)
                 .is_err_and(|error| error.to_string().contains("no tool named other")),
             "an unknown tool is an error"
         );
