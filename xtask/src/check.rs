@@ -6,7 +6,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use anyhow::{Context, ensure};
+use anyhow::{Context, bail, ensure};
 use serde::Deserialize;
 
 use crate::tools::Manifest;
@@ -23,8 +23,9 @@ const WORKSPACE_FILES: [&str; 5] = [
 /// Root directories whose change can affect every crate: cargo and nextest configuration.
 const WORKSPACE_DIRS: [&str; 2] = [".cargo", ".config"];
 
-/// The branch whose merge base `--changed` diffs against.
-const BASE: &str = "origin/main";
+/// Remotes whose `HEAD` names the default branch `--changed` diffs against, in order of
+/// preference: a fork's `upstream`, then `origin`.
+const DEFAULT_BRANCH_REMOTES: [&str; 2] = ["upstream", "origin"];
 
 /// Which crates clippy and the tests cover.
 #[derive(Debug, PartialEq, Eq)]
@@ -61,7 +62,7 @@ struct Failure {
 }
 
 /// Runs the check from `root` and reports whether it passed. With `changed`, clippy and the tests
-/// cover only the crates the changes since the merge base with [`BASE`] can affect.
+/// cover only the crates that the changes since the merge base with the default branch can affect.
 pub(crate) fn run(root: &Path, changed: bool, out: &mut impl Write) -> anyhow::Result<bool> {
     let nextest = Manifest::load(root)?
         .tool("cargo-nextest")?
@@ -208,16 +209,39 @@ fn workspace_packages(root: &Path) -> anyhow::Result<Vec<Package>> {
         .collect()
 }
 
-/// Files changed since the merge base with [`BASE`]: committed, staged, unstaged and untracked.
+/// Files changed since the merge base with the default branch.
 fn changed_files(root: &Path) -> anyhow::Result<Vec<PathBuf>> {
-    let merge_base = git(root, &["merge-base", "HEAD", BASE]).with_context(|| {
-        format!("could not find the merge base with {BASE}; run `git fetch origin main`")
+    let branch = default_branch(root)?;
+    let merge_base = git(root, &["merge-base", "HEAD", &branch]).with_context(|| {
+        format!("could not find the merge base with {branch}; fetch it and try again")
     })?;
-    let merge_base = merge_base.trim();
-    let tracked = git(
-        root,
-        &["diff", "--name-only", "--no-renames", "-z", merge_base],
-    )?;
+    changed_since(root, merge_base.trim())
+}
+
+/// The remote-tracking ref of the repository's default branch, such as `refs/remotes/origin/main`.
+fn default_branch(root: &Path) -> anyhow::Result<String> {
+    for remote in DEFAULT_BRANCH_REMOTES {
+        let output = Command::new("git")
+            .args(["symbolic-ref", "--quiet"])
+            .arg(format!("refs/remotes/{remote}/HEAD"))
+            .current_dir(root)
+            .output()
+            .context("could not run git")?;
+        if output.status.success() {
+            let target = String::from_utf8(output.stdout).context("git printed a non-UTF-8 ref")?;
+            return Ok(target.trim().to_owned());
+        }
+    }
+    bail!(
+        "cannot tell this repository's default branch: neither upstream/HEAD nor origin/HEAD is \
+         set; run `git remote set-head origin --auto`"
+    )
+}
+
+/// Files changed since commit `base`: committed, staged, unstaged and untracked, including deleted
+/// ones but not ignored ones.
+fn changed_since(root: &Path, base: &str) -> anyhow::Result<Vec<PathBuf>> {
+    let tracked = git(root, &["diff", "--name-only", "--no-renames", "-z", base])?;
     let untracked = git(root, &["ls-files", "--others", "--exclude-standard", "-z"])?;
     Ok(tracked
         .split('\0')
@@ -284,7 +308,8 @@ mod tests {
     use std::collections::BTreeSet;
     use std::path::PathBuf;
 
-    use super::{Package, Scope, affected};
+    use super::{Package, Scope, affected, default_branch};
+    use crate::testing::{git, repository};
 
     fn package(name: &str, dir: &str, path_dependencies: &[&str]) -> Package {
         Package {
@@ -383,6 +408,43 @@ mod tests {
             scope_for(&["AGENTS.md", ".github/workflows/ci.yml", "deny.toml"]),
             Scope::Packages(BTreeSet::new()),
             "documentation and CI files need no crate checks"
+        );
+    }
+
+    #[test]
+    fn the_default_branch_comes_from_the_remote_head() {
+        let temp = tempfile::tempdir().unwrap();
+        let work = repository(&temp.path().join("work"));
+        for (remote, branch) in [("origin", "main"), ("upstream", "trunk")] {
+            let bare = temp.path().join(format!("{remote}.git"));
+            git(
+                temp.path(),
+                &["init", "--quiet", "--bare", bare.to_str().unwrap()],
+            );
+            git(&work, &["remote", "add", remote, bare.to_str().unwrap()]);
+            git(
+                &work,
+                &["push", "--quiet", remote, &format!("HEAD:{branch}")],
+            );
+            git(&work, &["fetch", "--quiet", remote]);
+            git(&work, &["remote", "set-head", remote, branch]);
+            let expected = format!("refs/remotes/{remote}/{branch}");
+            assert_eq!(
+                default_branch(&work).unwrap(),
+                expected,
+                "a fork's upstream wins over origin"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unknown_default_branch_is_an_error() {
+        let temp = tempfile::tempdir().unwrap();
+        let work = repository(&temp.path().join("work"));
+        let error = default_branch(&work).unwrap_err().to_string();
+        assert!(
+            error.contains("git remote set-head origin --auto"),
+            "{error}"
         );
     }
 

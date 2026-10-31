@@ -215,44 +215,11 @@ fn delegate(root: &Path, event: Event, input: &str) -> anyhow::Result<u8> {
 mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
-    use std::process::Command;
 
     use tempfile::TempDir;
 
     use super::{Context, Event, Location, locate, run};
-
-    fn git(dir: &Path, args: &[&str]) {
-        let status = Command::new("git")
-            .arg("-C")
-            .arg(dir)
-            .args([
-                "-c",
-                "user.name=xtask",
-                "-c",
-                "user.email=xtask@example.com",
-            ])
-            .args([
-                "-c",
-                "commit.gpgsign=false",
-                "-c",
-                "init.defaultBranch=main",
-            ])
-            .args(args)
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env_remove("GIT_DIR")
-            .env_remove("GIT_WORK_TREE")
-            .status()
-            .unwrap();
-        assert!(status.success(), "git {args:?} failed in {}", dir.display());
-    }
-
-    fn repository(path: &Path) -> PathBuf {
-        fs::create_dir_all(path).unwrap();
-        git(path, &["init", "--quiet"]);
-        git(path, &["commit", "--quiet", "--allow-empty", "-m", "start"]);
-        path.canonicalize().unwrap()
-    }
+    use crate::testing::{git, repository};
 
     /// A repository with a worktree nested inside it, where Claude Code puts its worktrees.
     fn repository_with_nested_worktree() -> (TempDir, PathBuf, PathBuf) {

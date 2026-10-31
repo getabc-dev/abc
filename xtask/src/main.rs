@@ -4,6 +4,8 @@ mod check;
 mod guard;
 mod hook;
 mod shell;
+#[cfg(test)]
+mod testing;
 mod tools;
 
 use std::ffi::OsString;
