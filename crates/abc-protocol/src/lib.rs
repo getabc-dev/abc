@@ -283,6 +283,7 @@ mod tests {
     use std::error::Error as _;
 
     use proptest::prelude::*;
+    use proptest::test_runner::FileFailurePersistence;
     use semver::{BuildMetadata, Prerelease};
 
     use super::*;
@@ -592,7 +593,21 @@ mod tests {
         ]
     }
 
+    /// Proptest's defaults, with failing cases saved where this repository keeps them:
+    /// `proptest-regressions/` beside the source file. Commit those files; proptest replays them
+    /// before new cases.
+    fn proptest_config() -> ProptestConfig {
+        ProptestConfig {
+            failure_persistence: Some(Box::new(FileFailurePersistence::SourceParallel(
+                "proptest-regressions",
+            ))),
+            ..ProptestConfig::default()
+        }
+    }
+
     proptest! {
+        #![proptest_config(proptest_config())]
+
         #[test]
         fn worker_messages_survive_the_wire(message in worker_message()) {
             let text = message.encode().unwrap();

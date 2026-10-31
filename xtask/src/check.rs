@@ -23,6 +23,10 @@ const WORKSPACE_FILES: [&str; 5] = [
 /// Root directories whose change can affect every crate: cargo and nextest configuration.
 const WORKSPACE_DIRS: [&str; 2] = [".cargo", ".config"];
 
+/// The seed for property tests run by the check, so a run can be repeated exactly. Plain
+/// `cargo test` keeps proptest's random seed and explores new cases.
+const PROPTEST_RNG_SEED: &str = "20261031";
+
 /// Remotes whose `HEAD` names the default branch `--changed` diffs against, in order of
 /// preference: a fork's `upstream`, then `origin`.
 const DEFAULT_BRANCH_REMOTES: [&str; 2] = ["upstream", "origin"];
@@ -135,12 +139,7 @@ fn run_scope(
             "warnings",
         ]);
         if step(root, out, &mut clippy)? {
-            let mut tests = Command::new(nextest);
-            tests
-                .args(["nextest", "run"])
-                .args(scope.cargo_args())
-                .arg("--locked");
-            if !step(root, out, &mut tests)? {
+            if !step(root, out, &mut test_command(nextest, scope))? {
                 failures.push(Failure {
                     step: "tests",
                     fix: "fix the cause of each failing test above; never skip or weaken a test",
@@ -190,6 +189,17 @@ fn run_scope(
         writeln!(out, "  {}: {}", failure.step, failure.fix)?;
     }
     Ok(false)
+}
+
+/// The nextest run for `scope`, with property tests seeded by [`PROPTEST_RNG_SEED`].
+fn test_command(nextest: &Path, scope: &Scope) -> Command {
+    let mut command = Command::new(nextest);
+    command
+        .args(["nextest", "run"])
+        .args(scope.cargo_args())
+        .arg("--locked")
+        .env("PROPTEST_RNG_SEED", PROPTEST_RNG_SEED);
+    command
 }
 
 /// Cargo as chosen by `cargo xtask`, so every step uses the pinned toolchain.
@@ -385,12 +395,16 @@ fn affected(packages: &[Package], changed: &[PathBuf]) -> Scope {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsStr;
     use std::fs;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     use tempfile::TempDir;
 
-    use super::{Package, Scope, affected, changed_since, default_branch, run_scope};
+    use super::{
+        PROPTEST_RNG_SEED, Package, Scope, affected, changed_since, default_branch, run_scope,
+        test_command,
+    };
     use crate::testing::{git, repository};
     use crate::tools::Manifest;
 
@@ -696,6 +710,20 @@ mod tests {
             packages(&["xtask"]).doc_test_args(),
             None,
             "nothing to doctest"
+        );
+    }
+
+    #[test]
+    fn property_tests_run_with_a_fixed_seed() {
+        let command = test_command(Path::new("cargo-nextest"), &Scope::Workspace);
+        let seed = command
+            .get_envs()
+            .find(|(name, _)| *name == "PROPTEST_RNG_SEED")
+            .and_then(|(_, value)| value);
+        assert_eq!(
+            seed,
+            Some(OsStr::new(PROPTEST_RNG_SEED)),
+            "the check repeats the same property test cases on every run"
         );
     }
 

@@ -103,8 +103,8 @@ toolchain is pinned in `rust-toolchain.toml`; rustup installs it on first use.
 | --- | --- |
 | `cargo xtask setup` | Installs the tools pinned in `xtask/tools.toml` into `.tools/`, checking each archive's sha256. Run it in every new clone or worktree, and after the list changes. |
 | `cargo xtask doctor` | Fails unless every pinned tool is installed at its pinned version. |
-| `cargo xtask check` | Format check, clippy (`--all-targets --locked -D warnings`) and nextest on the whole workspace. |
-| `cargo xtask check --changed` | The same, with clippy and tests limited to the crates affected by changes since the merge base with `origin/main`. |
+| `cargo xtask check` | Format check, clippy (`--all-targets --locked -D warnings`), nextest, doctests and rustdoc with warnings denied, on the whole workspace. Property tests run with a fixed seed. |
+| `cargo xtask check --changed` | The same, limited to the crates affected by changes since the merge base with the default branch (`upstream/HEAD`, else `origin/HEAD`). |
 | `cargo xtask tool <name> [args]` | Runs a pinned tool from `.tools/`, such as `cargo xtask tool cargo-deny check`. Never run these tools from `PATH`. |
 | `cargo xtask pin` | After a version changes in `xtask/tools.toml`, downloads each target's archive and records its sha256. |
 | `cargo fmt --all` | Fixes formatting. |
@@ -112,6 +112,9 @@ toolchain is pinned in `rust-toolchain.toml`; rustup installs it on first use.
 CI also runs `cargo xtask tool cargo-deny check`, `cargo xtask tool cargo-shear --deny-warnings
 --locked`, `cargo xtask tool zizmor --pedantic .github`, `cargo xtask tool pinact run --check
 --verify-comment` and `cargo xtask tool gitleaks git --redact --no-banner .`.
+
+Commit the `proptest-regressions/` files proptest writes when a property test fails: they replay
+the failing cases first on every run.
 
 Lints are set for every crate in the root `Cargo.toml`. `#[allow]` is denied: silence a lint only
 with `#[expect(lint, reason = "...")]`, and only when the code is right.
