@@ -21,6 +21,9 @@ use thiserror::Error;
 /// The protocol version this build speaks.
 pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(1);
 
+/// The protocol versions this build supports: [`PROTOCOL_VERSION`] alone.
+pub const SUPPORTED_VERSIONS: VersionRange = VersionRange::single(PROTOCOL_VERSION);
+
 /// One version of the worker-server protocol.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -157,6 +160,17 @@ pub struct Hello {
     pub protocol: VersionRange,
     /// The abc release the worker runs.
     pub build: Version,
+}
+
+impl Hello {
+    /// The hello a worker of this build sends: [`SUPPORTED_VERSIONS`] and its release.
+    #[must_use]
+    pub const fn new(build: Version) -> Self {
+        Self {
+            protocol: SUPPORTED_VERSIONS,
+            build,
+        }
+    }
 }
 
 /// A message the server sends to a worker.
@@ -367,6 +381,25 @@ mod tests {
             error.to_string(),
             "protocol version range is inverted: min 3 is greater than max 1",
             "the error explains the inversion"
+        );
+    }
+
+    #[test]
+    fn this_build_offers_its_protocol_version() {
+        let hello = Hello::new(Version::new(0, 1, 0));
+        assert_eq!(
+            hello.protocol,
+            VersionRange::single(PROTOCOL_VERSION),
+            "a worker offers exactly the version it was built with"
+        );
+        assert_eq!(
+            negotiate(SUPPORTED_VERSIONS, hello.protocol),
+            Ok(PROTOCOL_VERSION),
+            "a worker and a server of the same build agree on PROTOCOL_VERSION"
+        );
+        insta::assert_snapshot!(
+            WorkerMessage::Hello(hello).encode().unwrap(),
+            @r#"{"type":"hello","protocol":{"min":1,"max":1},"build":"0.1.0"}"#
         );
     }
 
