@@ -54,7 +54,16 @@ enum Task {
 }
 
 fn main() -> ExitCode {
-    let cli = Cli::parse();
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(error) => {
+            let code = usage_exit_code(&error);
+            return match error.print() {
+                // With the terminal gone there is nowhere left to report; the code still tells.
+                Ok(()) | Err(_) => ExitCode::from(code),
+            };
+        }
+    };
     match run(cli.command) {
         Ok(code) => code,
         Err(error) => match writeln!(io::stderr().lock(), "error: {error:#}") {
@@ -62,6 +71,13 @@ fn main() -> ExitCode {
             Ok(()) | Err(_) => ExitCode::FAILURE,
         },
     }
+}
+
+/// The exit code for clap's help, version and usage errors. Clap exits 2 on usage errors, but 2
+/// is how a Claude Code hook blocks an action, so a hook command xtask does not understand exits 1
+/// and reports a hook error instead of posing as a decision.
+fn usage_exit_code(error: &clap::Error) -> u8 {
+    u8::from(error.use_stderr())
 }
 
 fn run(task: Task) -> anyhow::Result<ExitCode> {
@@ -111,11 +127,31 @@ mod tests {
 
     use clap::CommandFactory;
 
-    use super::{Cli, repo_root};
+    use clap::Parser as _;
+
+    use super::{Cli, repo_root, usage_exit_code};
 
     #[test]
     fn cli_is_well_formed() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn usage_errors_never_exit_2() {
+        let unknown = Cli::try_parse_from(["xtask", "guard"]).unwrap_err();
+        assert_eq!(
+            usage_exit_code(&unknown),
+            1,
+            "an unknown command must not read as a hook's block"
+        );
+        let bad_event = Cli::try_parse_from(["xtask", "hook", "post-tool-use"]).unwrap_err();
+        assert_eq!(
+            usage_exit_code(&bad_event),
+            1,
+            "an unknown hook event fails with 1"
+        );
+        let help = Cli::try_parse_from(["xtask", "--help"]).unwrap_err();
+        assert_eq!(usage_exit_code(&help), 0, "help is not an error");
     }
 
     #[test]
