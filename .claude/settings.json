@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "cd \"$CLAUDE_PROJECT_DIR\" && cargo xtask hook pre-tool-use"
+            "command": "sh \"$CLAUDE_PROJECT_DIR/xtask/hooks/pre-tool-use.sh\""
           }
         ]
       }

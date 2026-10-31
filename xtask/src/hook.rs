@@ -9,6 +9,10 @@
 //! - hands the input to that checkout's own `cargo xtask hook` when it is another worktree of this
 //!   repository, so the checkout is held to its own toolchain, tools and gate;
 //! - does nothing when the directory is in no repository, or in a different one.
+//!
+//! When the `PreToolUse` guard cannot run, it blocks commands that mention git or gh and lets the
+//! rest through, so a broken build never locks the agent out of the shell. When xtask cannot even
+//! start, `xtask/hooks/pre-tool-use.sh` applies the same rule.
 
 use std::ffi::OsStr;
 use std::io::Write;
@@ -50,6 +54,8 @@ pub(crate) struct Context {
     project_dir: Option<PathBuf>,
     /// Whether another checkout's xtask handed this hook over.
     delegated: bool,
+    /// The cargo that runs another checkout's xtask.
+    cargo: PathBuf,
 }
 
 impl Context {
@@ -58,6 +64,7 @@ impl Context {
             own_root,
             project_dir: std::env::var_os("CLAUDE_PROJECT_DIR").map(PathBuf::from),
             delegated: std::env::var_os(DELEGATED).is_some(),
+            cargo: PathBuf::from("cargo"),
         }
     }
 }
@@ -86,6 +93,45 @@ pub(crate) fn run(
     context: &Context,
     out: &mut impl Write,
 ) -> anyhow::Result<u8> {
+    match event {
+        Event::PreToolUse => match act(event, input, context, out) {
+            Ok(code @ (0 | 2)) => Ok(code),
+            Ok(code) => guard_unavailable(&format!("it exited {code}"), input, out),
+            Err(error) => guard_unavailable(&format!("{error:#}"), input, out),
+        },
+        Event::Stop => act(event, input, context, out),
+    }
+}
+
+/// When the guard cannot run, blocks a command that mentions git or gh and lets any other through
+/// with a warning.
+fn guard_unavailable(reason: &str, input: &str, out: &mut impl Write) -> anyhow::Result<u8> {
+    let command = match serde_json::from_str::<serde_json::Value>(input) {
+        Ok(fields) => fields
+            .pointer("/tool_input/command")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+        Err(_) => Some(String::from("git")),
+    };
+    if command.as_deref().is_some_and(guard::mentions_git_or_gh) {
+        writeln!(
+            out,
+            "Blocked: the git guard could not run ({reason}), so git and gh commands are blocked \
+             until it can. Commands that do not mention git or gh still run."
+        )?;
+        Ok(2)
+    } else {
+        writeln!(
+            out,
+            "warning: the git guard could not run ({reason}); allowing a command that does not \
+             mention git or gh"
+        )?;
+        Ok(0)
+    }
+}
+
+/// Finds where the agent works and runs the hook there.
+fn act(event: Event, input: &str, context: &Context, out: &mut impl Write) -> anyhow::Result<u8> {
     let cwd = match (event, serde_json::from_str::<HookInput>(input)) {
         (_, Ok(fields)) => fields.cwd,
         // The guard blocks input it cannot read and gives the parse error as the reason.
@@ -112,7 +158,7 @@ pub(crate) fn run(
                 context.own_root.display(),
                 root.display()
             );
-            delegate(&root, event, input)
+            delegate(&context.cargo, &root, event, input)
         }
         Location::Elsewhere(reason) => {
             if event == Event::Stop {
@@ -142,6 +188,11 @@ fn locate(
     let Some(dir) = cwd.or(project_dir) else {
         bail!("the hook input has no cwd and CLAUDE_PROJECT_DIR is not set");
     };
+    ensure!(
+        dir.is_dir(),
+        "the agent's working directory {} does not exist",
+        dir.display()
+    );
     let Some(root) = git_path(dir, &["rev-parse", "--show-toplevel"])? else {
         return Ok(Location::Elsewhere(format!(
             "{} is not in a git repository",
@@ -166,7 +217,7 @@ fn locate(
 }
 
 /// Runs git in `dir` and resolves the path it prints. `None` when git refuses, as it does outside a
-/// repository or in a directory that no longer exists.
+/// repository.
 fn git_path(dir: &Path, args: &[&str]) -> anyhow::Result<Option<PathBuf>> {
     let output = Command::new("git")
         .arg("-C")
@@ -188,8 +239,8 @@ fn git_path(dir: &Path, args: &[&str]) -> anyhow::Result<Option<PathBuf>> {
 }
 
 /// Hands the hook to the checkout at `root`, which runs it with its own xtask and toolchain.
-fn delegate(root: &Path, event: Event, input: &str) -> anyhow::Result<u8> {
-    let mut child = Command::new("cargo")
+fn delegate(cargo: &Path, root: &Path, event: Event, input: &str) -> anyhow::Result<u8> {
+    let mut child = Command::new(cargo)
         .args(["xtask", "hook", event.name()])
         .current_dir(root)
         // Let the checkout's rust-toolchain.toml choose the toolchain, not the one running here.
@@ -214,7 +265,10 @@ fn delegate(root: &Path, event: Event, input: &str) -> anyhow::Result<u8> {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::io::Write as _;
+    use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
+    use std::process::{Command, Stdio};
 
     use tempfile::TempDir;
 
@@ -239,7 +293,22 @@ mod tests {
             own_root: own_root.to_path_buf(),
             project_dir: project_dir.map(Path::to_path_buf),
             delegated: false,
+            cargo: PathBuf::from("cargo"),
         }
+    }
+
+    /// A script at `dir/cargo` that drains its input and exits with `code`.
+    fn fake_cargo(dir: &Path, code: u8) -> PathBuf {
+        let path = dir.join("cargo");
+        fs::write(&path, format!("#!/bin/sh\ncat >/dev/null\nexit {code}\n")).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    fn run_pre_tool_use(context: &Context, cwd: Option<&Path>, command: &str) -> (u8, String) {
+        let mut out = Vec::new();
+        let code = run(Event::PreToolUse, &input(cwd, command), context, &mut out).unwrap();
+        (code, String::from_utf8(out).unwrap())
     }
 
     fn input(cwd: Option<&Path>, command: &str) -> String {
@@ -372,19 +441,145 @@ mod tests {
     }
 
     #[test]
+    fn a_missing_cwd_blocks_git_and_allows_the_rest() {
+        let (temp, main, _worktree) = repository_with_nested_worktree();
+        let gone = temp.path().join("removed-worktree");
+        let context = context(&main, Some(&main));
+
+        let (push_code, push_out) = run_pre_tool_use(&context, Some(&gone), "git push origin main");
+        assert_eq!(
+            push_code, 2,
+            "git is blocked when the guard cannot locate the agent: {push_out}"
+        );
+        assert!(
+            push_out.contains("does not exist"),
+            "the reason is given: {push_out}"
+        );
+
+        let (listing_code, listing_out) = run_pre_tool_use(&context, Some(&gone), "ls -la");
+        assert_eq!(listing_code, 0, "other commands still run: {listing_out}");
+        assert!(
+            listing_out.starts_with("warning: "),
+            "with a warning: {listing_out}"
+        );
+
+        let error = run(
+            Event::Stop,
+            &input(Some(&gone), ""),
+            &context,
+            &mut Vec::new(),
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("does not exist"),
+            "stop fails: {error:#}"
+        );
+    }
+
+    #[test]
+    fn a_worktree_whose_xtask_fails_blocks_git() {
+        let (temp, main, worktree) = repository_with_nested_worktree();
+        let mut broken = context(&main, Some(&main));
+        broken.cargo = fake_cargo(temp.path(), 101);
+
+        let (merge_code, merge_out) = run_pre_tool_use(&broken, Some(&worktree), "gh pr merge 1");
+        assert_eq!(merge_code, 2, "{merge_out}");
+        assert!(merge_out.contains("it exited 101"), "{merge_out}");
+        let (build_code, build_out) = run_pre_tool_use(&broken, Some(&worktree), "cargo build");
+        assert_eq!(build_code, 0, "{build_out}");
+
+        broken.cargo = fake_cargo(temp.path(), 2);
+        assert_eq!(
+            run_pre_tool_use(&broken, Some(&worktree), "git push -f").0,
+            2,
+            "the worktree's own block passes through"
+        );
+    }
+
+    /// Runs the shell hook as Claude Code would, with `cargo` on `PATH` exiting `code`.
+    fn run_hook_script(code: u8, input: &str) -> (Option<i32>, String) {
+        let temp = tempfile::tempdir().unwrap();
+        fake_cargo(temp.path(), code);
+        let script = crate::repo_root()
+            .unwrap()
+            .join("xtask/hooks/pre-tool-use.sh");
+        let path = format!(
+            "{}:{}",
+            temp.path().display(),
+            std::env::var("PATH").unwrap()
+        );
+        let mut child = Command::new("sh")
+            .arg(&script)
+            .env("PATH", path)
+            .env("CLAUDE_PROJECT_DIR", temp.path())
+            .stdin(Stdio::piped())
+            .stderr(Stdio::piped())
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        (
+            output.status.code(),
+            String::from_utf8(output.stderr).unwrap(),
+        )
+    }
+
+    #[test]
+    fn the_hook_script_blocks_git_when_xtask_cannot_run() {
+        let git_push = r#"{"cwd":"/home/me/git/abc","tool_name":"Bash","tool_input":{"command":"git push origin main"}}"#;
+        let (code, stderr) = run_hook_script(101, git_push);
+        assert_eq!(code, Some(2), "{stderr}");
+        assert!(stderr.contains("could not run"), "{stderr}");
+
+        let quoted =
+            r#"{"tool_name":"Bash","tool_input":{"command":"echo \"x\" && gh api repos/o/r"}}"#;
+        assert_eq!(run_hook_script(101, quoted).0, Some(2), "escaped quotes");
+    }
+
+    #[test]
+    fn the_hook_script_lets_other_commands_through_when_xtask_cannot_run() {
+        let listing = r#"{"cwd":"/home/me/git/abc","tool_name":"Bash","tool_input":{"command":"ls .github .gitignore"}}"#;
+        let (code, stderr) = run_hook_script(101, listing);
+        assert_eq!(
+            code,
+            Some(0),
+            "a git path in cwd is not a git command: {stderr}"
+        );
+        assert!(stderr.starts_with("warning: "), "{stderr}");
+
+        let socket = r#"{"tool_name":"Monitor","tool_input":{"ws":{"url":"wss://example.com"}}}"#;
+        assert_eq!(run_hook_script(101, socket).0, Some(0), "no command at all");
+    }
+
+    #[test]
+    fn the_hook_script_passes_on_the_guards_verdict() {
+        let input = r#"{"tool_name":"Bash","tool_input":{"command":"git push -f"}}"#;
+        assert_eq!(run_hook_script(2, input).0, Some(2), "a block");
+        assert_eq!(run_hook_script(0, input).0, Some(0), "an allow");
+    }
+
+    #[test]
     fn a_handed_over_hook_is_not_handed_on() {
         let (_temp, main, worktree) = repository_with_nested_worktree();
         let mut handed_over = context(&main, Some(&main));
         handed_over.delegated = true;
         let error = run(
-            Event::PreToolUse,
-            &input(Some(&worktree), "git status"),
+            Event::Stop,
+            &input(Some(&worktree), ""),
             &handed_over,
             &mut Vec::new(),
         )
         .unwrap_err()
         .to_string();
         assert!(error.contains("another checkout"), "{error}");
+        let (code, out) = run_pre_tool_use(&handed_over, Some(&worktree), "git status");
+        assert_eq!(code, 2, "the guard fails closed for git: {out}");
     }
 
     #[test]
