@@ -129,6 +129,18 @@ pub struct NoCommonVersion {
 /// Chooses the protocol version for a connection: the highest version that both the server and
 /// the worker support.
 ///
+/// ```
+/// use abc_protocol::{ProtocolVersion, VersionRange, negotiate};
+///
+/// let server = VersionRange::new(ProtocolVersion::new(1), ProtocolVersion::new(3))?;
+/// let worker = VersionRange::new(ProtocolVersion::new(2), ProtocolVersion::new(5))?;
+/// assert_eq!(negotiate(server, worker)?, ProtocolVersion::new(3));
+///
+/// let old_worker = VersionRange::single(ProtocolVersion::new(0));
+/// assert!(negotiate(server, old_worker).is_err());
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+///
 /// # Errors
 ///
 /// Returns [`NoCommonVersion`] when the two ranges share no version.

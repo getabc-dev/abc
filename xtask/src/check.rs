@@ -27,23 +27,48 @@ const WORKSPACE_DIRS: [&str; 2] = [".cargo", ".config"];
 /// preference: a fork's `upstream`, then `origin`.
 const DEFAULT_BRANCH_REMOTES: [&str; 2] = ["upstream", "origin"];
 
-/// Which crates clippy and the tests cover.
+/// Which crates the lint, test and documentation steps cover.
 #[derive(Debug, PartialEq, Eq)]
 enum Scope {
     Workspace,
-    Packages(BTreeSet<String>),
+    Packages {
+        names: BTreeSet<String>,
+        /// The named crates that have a library, the only target doctests run on.
+        libraries: BTreeSet<String>,
+    },
 }
 
 impl Scope {
+    fn is_empty(&self) -> bool {
+        match self {
+            Self::Workspace => false,
+            Self::Packages { names, .. } => names.is_empty(),
+        }
+    }
+
     fn cargo_args(&self) -> Vec<String> {
         match self {
             Self::Workspace => vec!["--workspace".to_owned()],
-            Self::Packages(names) => names
-                .iter()
-                .flat_map(|name| ["-p".to_owned(), name.clone()])
-                .collect(),
+            Self::Packages { names, .. } => package_args(names),
         }
     }
+
+    /// Arguments for `cargo test --doc`, or `None` when no crate in scope has a library.
+    fn doc_test_args(&self) -> Option<Vec<String>> {
+        match self {
+            Self::Workspace => Some(vec!["--workspace".to_owned()]),
+            Self::Packages { libraries, .. } => {
+                (!libraries.is_empty()).then(|| package_args(libraries))
+            }
+        }
+    }
+}
+
+fn package_args(names: &BTreeSet<String>) -> Vec<String> {
+    names
+        .iter()
+        .flat_map(|name| ["-p".to_owned(), name.clone()])
+        .collect()
 }
 
 /// A workspace member, with paths relative to the workspace root.
@@ -51,6 +76,8 @@ impl Scope {
 struct Package {
     name: String,
     dir: PathBuf,
+    /// Whether it has a library target.
+    library: bool,
     /// Directories of the packages it depends on by path, in any dependency section.
     path_dependencies: Vec<PathBuf>,
 }
@@ -93,10 +120,10 @@ fn run_scope(
             fix: "run `cargo fmt --all`",
         });
     }
-    if *scope == Scope::Packages(BTreeSet::new()) {
+    if scope.is_empty() {
         writeln!(
             out,
-            "xtask: no crate is affected by the changes; skipping clippy and tests"
+            "xtask: no crate is affected by the changes; skipping clippy, tests and docs"
         )?;
     } else {
         let mut clippy = Command::new(cargo());
@@ -119,11 +146,37 @@ fn run_scope(
                     fix: "fix the cause of each failing test above; never skip or weaken a test",
                 });
             }
+            if let Some(args) = scope.doc_test_args() {
+                let mut doc_tests = Command::new(cargo());
+                doc_tests.args(["test", "--doc"]).args(args).arg("--locked");
+                if !step(root, out, &mut doc_tests)? {
+                    failures.push(Failure {
+                        step: "doctests",
+                        fix: "fix each failing example above; examples are tests too",
+                    });
+                }
+            } else {
+                writeln!(
+                    out,
+                    "xtask: no affected crate has a library; skipping doctests"
+                )?;
+            }
+            let mut docs = Command::new(cargo());
+            docs.args(["doc", "--no-deps"])
+                .args(scope.cargo_args())
+                .arg("--locked")
+                .env("RUSTDOCFLAGS", "-D warnings");
+            if !step(root, out, &mut docs)? {
+                failures.push(Failure {
+                    step: "docs",
+                    fix: "fix each rustdoc warning above, such as a broken intra-doc link",
+                });
+            }
         } else {
             failures.push(Failure {
                 step: "clippy",
-                fix: "fix each finding above (tests run once clippy passes); silence a lint only \
-                      with #[expect(lint, reason = \"...\")] when the code is right",
+                fix: "fix each finding above (tests and docs run once clippy passes); silence a \
+                      lint only with #[expect(lint, reason = \"...\")] when the code is right",
             });
         }
     }
@@ -169,7 +222,13 @@ struct Metadata {
 struct MetadataPackage {
     name: String,
     manifest_path: PathBuf,
+    targets: Vec<MetadataTarget>,
     dependencies: Vec<MetadataDependency>,
+}
+
+#[derive(Deserialize)]
+struct MetadataTarget {
+    kind: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -209,9 +268,16 @@ fn workspace_packages(root: &Path) -> anyhow::Result<Vec<Package>> {
                 .iter()
                 .filter_map(|dependency| dependency.path.as_deref().and_then(relative))
                 .collect();
+            let library = package.targets.iter().any(|target| {
+                target
+                    .kind
+                    .iter()
+                    .any(|kind| ["lib", "rlib", "proc-macro"].contains(&kind.as_str()))
+            });
             Ok(Package {
                 name: package.name.clone(),
                 dir,
+                library,
                 path_dependencies,
             })
         })
@@ -306,7 +372,12 @@ fn affected(packages: &[Package], changed: &[PathBuf]) -> Scope {
             })
             .collect();
         if dependents.is_empty() {
-            return Scope::Packages(names);
+            let libraries = packages
+                .iter()
+                .filter(|package| package.library && names.contains(&package.name))
+                .map(|package| package.name.clone())
+                .collect();
+            return Scope::Packages { names, libraries };
         }
         names.extend(dependents.into_iter().map(|package| package.name.clone()));
     }
@@ -314,10 +385,8 @@ fn affected(packages: &[Package], changed: &[PathBuf]) -> Scope {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
-    use std::path::PathBuf;
-
     use std::fs;
+    use std::path::PathBuf;
 
     use tempfile::TempDir;
 
@@ -325,25 +394,32 @@ mod tests {
     use crate::testing::{git, repository};
     use crate::tools::Manifest;
 
-    fn package(name: &str, dir: &str, path_dependencies: &[&str]) -> Package {
+    fn package(name: &str, dir: &str, library: bool, path_dependencies: &[&str]) -> Package {
         Package {
             name: name.to_owned(),
             dir: PathBuf::from(dir),
+            library,
             path_dependencies: path_dependencies.iter().map(PathBuf::from).collect(),
         }
     }
 
     fn workspace() -> Vec<Package> {
         vec![
-            package("abc-protocol", "crates/abc-protocol", &[]),
-            package("abc-worker", "crates/abc-worker", &["crates/abc-protocol"]),
-            package("abc", "crates/abc", &["crates/abc-worker"]),
+            package("abc-protocol", "crates/abc-protocol", true, &[]),
+            package(
+                "abc-worker",
+                "crates/abc-worker",
+                true,
+                &["crates/abc-protocol"],
+            ),
+            package("abc", "crates/abc", false, &["crates/abc-worker"]),
             package(
                 "abc-fuzz",
                 "crates/abc-protocol/fuzz",
+                false,
                 &["crates/abc-protocol"],
             ),
-            package("xtask", "xtask", &[]),
+            package("xtask", "xtask", false, &[]),
         ]
     }
 
@@ -352,8 +428,17 @@ mod tests {
         affected(&workspace(), &changed)
     }
 
+    /// The scope naming `names`, with their libraries taken from [`workspace`].
     fn packages(names: &[&str]) -> Scope {
-        Scope::Packages(names.iter().map(|name| (*name).to_owned()).collect())
+        let libraries = workspace()
+            .into_iter()
+            .filter(|package| package.library && names.contains(&package.name.as_str()))
+            .map(|package| package.name)
+            .collect();
+        Scope::Packages {
+            names: names.iter().map(|name| (*name).to_owned()).collect(),
+            libraries,
+        }
     }
 
     #[test]
@@ -392,7 +477,7 @@ mod tests {
     fn crate_directories_match_whole_components() {
         assert_eq!(
             scope_for(&["crates/abc-protocol-extra/src/lib.rs"]),
-            Scope::Packages(BTreeSet::new()),
+            packages(&[]),
             "crates/abc-protocol is not a prefix of crates/abc-protocol-extra"
         );
     }
@@ -420,7 +505,7 @@ mod tests {
     fn files_outside_crates_affect_none() {
         assert_eq!(
             scope_for(&["AGENTS.md", ".github/workflows/ci.yml", "deny.toml"]),
-            Scope::Packages(BTreeSet::new()),
+            packages(&[]),
             "documentation and CI files need no crate checks"
         );
     }
@@ -579,6 +664,39 @@ mod tests {
         let (passed, out) = check_fixture(&CLEAN.replace("add_one(1), 2", "add_one(1), 3"));
         assert!(!passed, "{out}");
         assert!(out.contains("  tests: "), "{out}");
+    }
+
+    #[test]
+    fn a_failing_doctest_fails() {
+        let lib = CLEAN.replace(
+            "/// Adds one.\n",
+            "/// Adds one.\n///\n/// ```\n/// assert_eq!(fixture::add_one(1), 3);\n/// ```\n",
+        );
+        let (passed, out) = check_fixture(&lib);
+        assert!(!passed, "{out}");
+        assert!(out.contains("  doctests: "), "{out}");
+    }
+
+    #[test]
+    fn a_broken_doc_link_fails() {
+        let lib = CLEAN.replace("/// Adds one.", "/// Adds one, unlike [`subtract_one`].");
+        let (passed, out) = check_fixture(&lib);
+        assert!(!passed, "{out}");
+        assert!(out.contains("  docs: "), "{out}");
+    }
+
+    #[test]
+    fn doctests_cover_only_crates_with_a_library() {
+        assert_eq!(
+            packages(&["abc", "abc-worker"]).doc_test_args(),
+            Some(vec!["-p".to_owned(), "abc-worker".to_owned()]),
+            "a binary-only crate has no doctests"
+        );
+        assert_eq!(
+            packages(&["xtask"]).doc_test_args(),
+            None,
+            "nothing to doctest"
+        );
     }
 
     #[test]
