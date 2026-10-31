@@ -109,8 +109,9 @@ toolchain is pinned in `rust-toolchain.toml`; rustup installs it on first use.
 | `cargo xtask pin` | After a version changes in `xtask/tools.toml`, downloads each target's archive and records its sha256 and its executable's. To add a tool, write zeros for both and run it. |
 | `cargo fmt --all` | Fixes formatting. |
 
-CI also runs `cargo xtask tool cargo-deny check`, `cargo xtask tool cargo-shear --deny-warnings
---locked`, `cargo xtask tool zizmor --pedantic .github`, `cargo xtask tool pinact run --check
+CI also runs `cargo xtask doctor`, `cargo xtask tool cargo-deny check`, `cargo xtask tool
+cargo-shear --deny-warnings --locked`, `cargo xtask tool osv-scanner scan source --lockfile
+Cargo.lock`, `cargo xtask tool zizmor --pedantic .github`, `cargo xtask tool pinact run --check
 --verify-comment` and `cargo xtask tool gitleaks git --redact --no-banner .`.
 
 Commit the `proptest-regressions/` files proptest writes when a property test fails: they replay

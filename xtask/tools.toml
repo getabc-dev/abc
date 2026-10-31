@@ -6,7 +6,8 @@
 # `cargo xtask doctor` fails when a tool is missing, modified or reports another version. After
 # changing a version, run `cargo xtask pin` to record the new checksums for every target.
 #
-# `url`, `binary` (the executable's path inside the archive) and `checksums` are templates:
+# `url`, `binary` (the executable's path inside a .tar.gz archive; omitted when the asset is the
+# executable itself) and `checksums` are templates:
 # {version} is the tool's version and {platform} is the target's name in the project's asset file
 # names. `checksums` is where the project publishes its assets' sha256; when it is set,
 # `cargo xtask pin` refuses a download that does not match. zizmor and cargo-shear publish none.
@@ -70,3 +71,12 @@ checksums = "https://github.com/gitleaks/gitleaks/releases/download/v{version}/g
 targets.aarch64-apple-darwin = { platform = "darwin_arm64", sha256 = "b40ab0ae55c505963e365f271a8d3846efbc170aa17f2607f13df610a9aeb6a5", binary-sha256 = "ba52fb1bfabbcde42f032afad3d6e0b19dff8ed105229a16e7caa338bbc0e84f" }
 targets.x86_64-unknown-linux-gnu = { platform = "linux_x64", sha256 = "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb", binary-sha256 = "88f91962aa2f93ac6ab281d553b9e125f5197bbbce38f9f2437f7299c32e5509" }
 targets.aarch64-unknown-linux-gnu = { platform = "linux_arm64", sha256 = "e4a487ee7ccd7d3a7f7ec08657610aa3606637dab924210b3aee62570fb4b080", binary-sha256 = "00e91bbe655bd7c47753e8cfe61cb76ea1a5d7e7702fe161ee40102b46b3823b" }
+
+[[tool]]
+name = "osv-scanner"
+version = "2.7.0"
+url = "https://github.com/google/osv-scanner/releases/download/v{version}/osv-scanner_{platform}"
+checksums = "https://github.com/google/osv-scanner/releases/download/v{version}/osv-scanner_SHA256SUMS"
+targets.aarch64-apple-darwin = { platform = "darwin_arm64", sha256 = "d4926ef8da134332543be276dff157e4c170f99ad91fc48e89448a8816bdf70b", binary-sha256 = "d4926ef8da134332543be276dff157e4c170f99ad91fc48e89448a8816bdf70b" }
+targets.x86_64-unknown-linux-gnu = { platform = "linux_amd64", sha256 = "160c6253e2922e9e0a6a9771c5c4c40a4b3c6090b34a3cdd5e80c96cc2e4218b", binary-sha256 = "160c6253e2922e9e0a6a9771c5c4c40a4b3c6090b34a3cdd5e80c96cc2e4218b" }
+targets.aarch64-unknown-linux-gnu = { platform = "linux_arm64", sha256 = "4061ef4c021ed3c47f203b818f337e351336cc5cd67c0274fc36bd1dfc728dd7", binary-sha256 = "4061ef4c021ed3c47f203b818f337e351336cc5cd67c0274fc36bd1dfc728dd7" }

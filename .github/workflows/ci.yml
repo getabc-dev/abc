@@ -57,6 +57,8 @@ jobs:
         run: cargo xtask tool cargo-deny check
       - name: Unused dependencies
         run: cargo xtask tool cargo-shear --deny-warnings --locked
+      - name: Known vulnerabilities (OSV)
+        run: cargo xtask tool osv-scanner scan source --lockfile Cargo.lock
 
   scans:
     name: Secrets and workflows

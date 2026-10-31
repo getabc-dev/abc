@@ -81,8 +81,9 @@ pub(crate) struct Tool {
     version: String,
     /// Download URL template; `{version}` and `{platform}` are filled in.
     url: String,
-    /// Path of the executable inside the archive, with the same placeholders.
-    binary: String,
+    /// Path of the executable inside the `.tar.gz` archive, with the same placeholders; absent
+    /// when the downloaded asset is the executable itself.
+    binary: Option<String>,
     /// URL template of the checksums the project publishes for its assets, if it publishes any.
     checksums: Option<String>,
     targets: BTreeMap<Target, Asset>,
@@ -182,7 +183,11 @@ impl Tool {
                 );
             }
             let url = self.render(&self.url, asset);
-            let binary = self.render(&self.binary, asset);
+            let binary = self
+                .binary
+                .as_ref()
+                .map(|template| self.render(template, asset))
+                .unwrap_or_default();
             let checksums = self
                 .checksums
                 .as_ref()
@@ -204,6 +209,10 @@ impl Tool {
                     .all(|component| matches!(component, Component::Normal(_))),
                 "{target}: binary {binary:?} must be a relative path inside the archive"
             );
+            ensure!(
+                self.binary.is_none() || !binary.is_empty(),
+                "{target}: binary must not be empty; omit it when the asset is the executable"
+            );
         }
         Ok(())
     }
@@ -214,9 +223,12 @@ impl Tool {
             .with_context(|| format!("no asset for {target}"))
     }
 
-    /// The executable inside a downloaded archive.
-    fn executable_in(&self, archive: &[u8], asset: &Asset) -> anyhow::Result<Vec<u8>> {
-        extract(archive, Path::new(&self.render(&self.binary, asset)))
+    /// The executable in a downloaded asset: a member of the archive, or the asset itself.
+    fn executable_in(&self, download: &[u8], asset: &Asset) -> anyhow::Result<Vec<u8>> {
+        match &self.binary {
+            Some(member) => extract(download, Path::new(&self.render(member, asset))),
+            None => Ok(download.to_vec()),
+        }
     }
 
     fn render(&self, template: &str, asset: &Asset) -> String {
@@ -761,6 +773,7 @@ targets.aarch64-unknown-linux-gnu = {{ platform = "linux-arm64", sha256 = "{sha2
             "zizmor",
             "pinact",
             "gitleaks",
+            "osv-scanner",
         ] {
             manifest.tool(name).unwrap();
         }
@@ -777,8 +790,10 @@ targets.aarch64-unknown-linux-gnu = {{ platform = "linux-arm64", sha256 = "{sha2
             "placeholders are filled in"
         );
         assert_eq!(
-            tool.render(&tool.binary, asset),
-            "fake-1.2.3/fake",
+            tool.binary
+                .as_deref()
+                .map(|binary| tool.render(binary, asset)),
+            Some("fake-1.2.3/fake".to_owned()),
             "the binary path is a template too"
         );
     }
@@ -821,6 +836,10 @@ targets.aarch64-unknown-linux-gnu = {{ platform = "linux-arm64", sha256 = "{sha2
                 "version",
             ),
             (valid.replace("name = \"fake\"", "name = \"a/b\""), "name"),
+            (
+                valid.replace("fake-{version}/fake", ""),
+                "binary must not be empty",
+            ),
             (
                 valid.replace("binary =", "mirror = \"x\"\nbinary ="),
                 "unknown field",
@@ -917,6 +936,34 @@ targets.aarch64-unknown-linux-gnu = {{ platform = "linux-arm64", sha256 = "{sha2
             "the executable lives under its version"
         );
         assert!(!stale.exists(), "other versions are removed");
+    }
+
+    #[test]
+    fn installs_an_asset_that_is_the_executable_itself() {
+        let root = tempfile::tempdir().unwrap();
+        let text = manifest_text(&sha256_hex(SCRIPT), &sha256_hex(SCRIPT))
+            .replace("binary = \"fake-{version}/fake\"\n", "")
+            .replace(".tar.gz", "");
+        let manifest = Manifest::parse(&text).unwrap();
+        assert_eq!(install_from(root.path(), &manifest, SCRIPT), 1, "installed");
+        let tool = only_tool(&manifest);
+        assert_eq!(
+            tool.status(root.path(), Target::MacArm64).unwrap(),
+            Status::Ready,
+            "the raw executable is installed as downloaded"
+        );
+        let mut fetch = |_: &str| Ok(SCRIPT.to_vec());
+        let pinned = pin_text(
+            &manifest_text(SHA_A, SHA_B).replace("binary = \"fake-{version}/fake\"\n", ""),
+            &mut Vec::new(),
+            &mut fetch,
+        )
+        .unwrap();
+        assert_eq!(
+            pinned.matches(&sha256_hex(SCRIPT)).count(),
+            6,
+            "pin records the same sha256 for the asset and the executable on every target"
+        );
     }
 
     #[test]
