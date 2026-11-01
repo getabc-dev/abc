@@ -231,8 +231,8 @@ Prompt injection crosses every boundary above, so it has its own rows.
    [Today](#today-abcs-own-development).
 2. **The App's workflows permission.** Does the agent need to write workflows, or should workflow
    changes be human-only, given that branch workflows run with repository secrets?
-3. **Plugins and skill packs.** How are adopted packs pinned and reviewed when their marketplaces
-   cannot be pinned to a commit?
+3. **Plugins and skill packs.** How are adopted packs pinned and reviewed, given that their
+   marketplaces are not pinned to a commit today?
 4. **Worker enrolment.** Is Tailscale node identity enough to admit a worker, or does the user also
    approve each worker with a one-time enrolment token? How is a worker revoked?
 5. **One App per install.** Each self-hosted install needs its own GitHub App and private key. How
