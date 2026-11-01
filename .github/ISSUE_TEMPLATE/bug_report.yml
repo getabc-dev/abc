@@ -1,0 +1,69 @@
+name: Bug report
+description: Something in abc does not work as it should.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for reporting a bug. abc is in development and has no releases yet, so tell us the commit you ran.
+
+        **Security issues do not belong here.** Report them privately as [SECURITY.md](https://github.com/getabc-dev/abc/blob/main/SECURITY.md) explains.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you saw, including any error messages.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: The smallest set of steps that shows the bug.
+      placeholder: |
+        1.
+        2.
+        3.
+    validations:
+      required: true
+  - type: input
+    id: commit
+    attributes:
+      label: Commit
+      description: The output of `git rev-parse HEAD` in your checkout.
+    validations:
+      required: true
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      options:
+        - Server
+        - Worker
+        - Web app
+        - Agents and sandbox
+        - GitHub integration
+        - Build tooling (cargo xtask, CI)
+        - Documentation
+        - Not sure
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Operating system and version, CPU architecture, and anything else that may matter.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Relevant output. Remove secrets, tokens and private paths first.
+      render: text
