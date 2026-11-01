@@ -8,6 +8,7 @@ mod guard;
 mod hook;
 mod integrity;
 mod mutants;
+mod review;
 mod shell;
 #[cfg(test)]
 mod testing;
@@ -72,6 +73,12 @@ enum Task {
         /// Arguments passed to gh.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<OsString>,
+    },
+    /// Have Gemini review the changes since the merge base against AGENTS.md (D8).
+    Review {
+        /// The revision whose merge base with HEAD the diff starts from.
+        #[arg(long)]
+        base: String,
     },
     /// Install the tools pinned in xtask/tools.toml into .tools/, verifying each download.
     Setup {
@@ -183,6 +190,14 @@ fn run(task: Task) -> anyhow::Result<ExitCode> {
         Task::Gh { args } => {
             let token = app::App::load(&app::config_dir()?)?.token(app::GITHUB_API)?;
             app::gh(Path::new("gh"), &args, &token)
+        }
+        Task::Review { base } => {
+            let passed = review::run_live(&root, &base, &mut io::stderr().lock())?;
+            Ok(if passed {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            })
         }
         Task::Setup { tools: only } => {
             tools::setup(&root, &only, &mut io::stdout().lock())?;
