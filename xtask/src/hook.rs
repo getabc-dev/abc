@@ -29,7 +29,7 @@ use std::process::{Child, Command, Stdio};
 use anyhow::{Context as _, bail, ensure};
 use serde::Deserialize;
 
-use crate::{check, guard, tools};
+use crate::{check, guard, tools, watchdog};
 
 /// The `PreToolUse` hook script. A checkout without it predates these hooks, so its xtask cannot
 /// take a hook over.
@@ -68,6 +68,10 @@ pub(crate) struct Context {
     delegated: bool,
     /// The cargo that runs another checkout's xtask.
     cargo: PathBuf,
+    /// The claude that runs the stop hook's watchdog.
+    claude: PathBuf,
+    /// Whether this hook runs inside the watchdog's own claude session, where it must do nothing.
+    inside_watchdog: bool,
 }
 
 impl Context {
@@ -77,6 +81,8 @@ impl Context {
             project_dir: std::env::var_os("CLAUDE_PROJECT_DIR").map(PathBuf::from),
             delegated: std::env::var_os(DELEGATED).is_some(),
             cargo: PathBuf::from("cargo"),
+            claude: PathBuf::from("claude"),
+            inside_watchdog: std::env::var_os(watchdog::GUARD).is_some(),
         }
     }
 }
@@ -111,6 +117,8 @@ pub(crate) fn run(
             Ok(code) => guard_unavailable(&format!("it exited {code}"), input, out),
             Err(error) => guard_unavailable(&format!("{error:#}"), input, out),
         },
+        // The watchdog's own session stops without a check, so it never starts another watchdog.
+        Event::Stop if context.inside_watchdog => Ok(0),
         Event::Stop => act(event, input, context, out),
     }
 }
@@ -161,7 +169,13 @@ fn act(event: Event, input: &str, context: &Context, out: &mut impl Write) -> an
         Location::Here => match event {
             Event::PreToolUse => guard(input, out),
             // Exit 1 when the check fails; the hook command turns any failure into a block.
-            Event::Stop => Ok(u8::from(!check::run(&context.own_root, true, out)?)),
+            Event::Stop => {
+                if check::run(&context.own_root, true, out)? {
+                    watchdog::check(&context.own_root, &context.claude, watchdog::TIMEOUT, out)
+                } else {
+                    Ok(1)
+                }
+            }
         },
         // GitHub is the gate, so a checkout that cannot take the hook is noted, never locked out.
         Location::Worktree(root) if !root.join(HOOK_SCRIPT).is_file() => {
@@ -335,6 +349,8 @@ mod tests {
             project_dir: project_dir.map(Path::to_path_buf),
             delegated: false,
             cargo: PathBuf::from("cargo"),
+            claude: PathBuf::from("claude"),
+            inside_watchdog: false,
         }
     }
 
@@ -736,7 +752,7 @@ mod tests {
             "the guard runs the hook script"
         );
         assert_eq!(guard["timeout"], 300, "the guard is time-boxed");
-        let stop_command = "if [ -f \"$CLAUDE_PROJECT_DIR/xtask/Cargo.toml\" ]; then cd \"$CLAUDE_PROJECT_DIR\" && cargo xtask hook stop 1>&2 || { echo 'cargo xtask check failed'; exit 2; }; else echo \"xtask hook: $CLAUDE_PROJECT_DIR has no xtask; no checks run\" >&2; fi";
+        let stop_command = "if [ -f \"$CLAUDE_PROJECT_DIR/xtask/Cargo.toml\" ]; then cd \"$CLAUDE_PROJECT_DIR\" && cargo xtask hook stop 1>&2 || { echo 'xtask stop hook: keep working; see stderr'; exit 2; }; else echo \"xtask hook: $CLAUDE_PROJECT_DIR has no xtask; no checks run\" >&2; fi";
         for event in ["Stop", "SubagentStop"] {
             let stop = &hooks[event][0]["hooks"][0];
             assert_eq!(stop["command"], stop_command, "{event} runs the check");
@@ -811,6 +827,21 @@ mod tests {
         let input = r#"{"tool_name":"Bash","tool_input":{"command":"git push -f"}}"#;
         assert_eq!(run_hook_script(2, input).0, Some(2), "a block");
         assert_eq!(run_hook_script(0, input).0, Some(0), "an allow");
+    }
+
+    #[test]
+    fn the_watchdogs_own_session_stops_without_checks() {
+        let (temp, main, _worktree) = repository_with_nested_worktree();
+        let mut inside = context(&main, Some(&main));
+        inside.inside_watchdog = true;
+        inside.cargo = fake_cargo(temp.path(), 101);
+        let mut out = Vec::new();
+        assert_eq!(
+            run(Event::Stop, "not json", &inside, &mut out).unwrap(),
+            0,
+            "no check, no watchdog, no recursion"
+        );
+        assert!(out.is_empty(), "and nothing to say");
     }
 
     #[test]

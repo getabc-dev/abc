@@ -10,9 +10,11 @@ mod integrity;
 mod mutants;
 mod review;
 mod shell;
+mod task;
 #[cfg(test)]
 mod testing;
 mod tools;
+mod watchdog;
 
 use std::ffi::OsString;
 use std::io::{self, Read, Write};
@@ -27,6 +29,20 @@ use clap::{Parser, Subcommand};
 struct Cli {
     #[command(subcommand)]
     command: Task,
+}
+
+/// What `cargo xtask task` does with the current task.
+#[derive(Debug, Subcommand)]
+enum TaskAction {
+    /// Record the task you are starting, for the stop hook's watchdog.
+    Set {
+        /// What the task is, in a sentence or two.
+        text: String,
+    },
+    /// Print the recorded task.
+    Show,
+    /// Forget the recorded task.
+    Clear,
 }
 
 #[derive(Debug, Subcommand)]
@@ -79,6 +95,12 @@ enum Task {
         /// The revision whose merge base with HEAD the diff starts from.
         #[arg(long)]
         base: String,
+    },
+    /// Record, show or clear the task this worktree's agent is working on.
+    #[command(name = "task")]
+    Work {
+        #[command(subcommand)]
+        action: TaskAction,
     },
     /// Install the tools pinned in xtask/tools.toml into .tools/, verifying each download.
     Setup {
@@ -198,6 +220,17 @@ fn run(task: Task) -> anyhow::Result<ExitCode> {
             } else {
                 ExitCode::FAILURE
             })
+        }
+        Task::Work { action } => {
+            match action {
+                TaskAction::Set { text } => task::set(&root, &text)?,
+                TaskAction::Show => match task::read(&root)? {
+                    Some(text) => writeln!(io::stdout().lock(), "{text}")?,
+                    None => writeln!(io::stderr().lock(), "no task recorded")?,
+                },
+                TaskAction::Clear => task::clear(&root)?,
+            }
+            Ok(ExitCode::SUCCESS)
         }
         Task::Setup { tools: only } => {
             tools::setup(&root, &only, &mut io::stdout().lock())?;

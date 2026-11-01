@@ -27,7 +27,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "if [ -f \"$CLAUDE_PROJECT_DIR/xtask/Cargo.toml\" ]; then cd \"$CLAUDE_PROJECT_DIR\" && cargo xtask hook stop 1>&2 || { echo 'cargo xtask check failed'; exit 2; }; else echo \"xtask hook: $CLAUDE_PROJECT_DIR has no xtask; no checks run\" >&2; fi",
+            "command": "if [ -f \"$CLAUDE_PROJECT_DIR/xtask/Cargo.toml\" ]; then cd \"$CLAUDE_PROJECT_DIR\" && cargo xtask hook stop 1>&2 || { echo 'xtask stop hook: keep working; see stderr'; exit 2; }; else echo \"xtask hook: $CLAUDE_PROJECT_DIR has no xtask; no checks run\" >&2; fi",
             "timeout": 900,
             "statusMessage": "cargo xtask check --changed"
           }
@@ -40,7 +40,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "if [ -f \"$CLAUDE_PROJECT_DIR/xtask/Cargo.toml\" ]; then cd \"$CLAUDE_PROJECT_DIR\" && cargo xtask hook stop 1>&2 || { echo 'cargo xtask check failed'; exit 2; }; else echo \"xtask hook: $CLAUDE_PROJECT_DIR has no xtask; no checks run\" >&2; fi",
+            "command": "if [ -f \"$CLAUDE_PROJECT_DIR/xtask/Cargo.toml\" ]; then cd \"$CLAUDE_PROJECT_DIR\" && cargo xtask hook stop 1>&2 || { echo 'xtask stop hook: keep working; see stderr'; exit 2; }; else echo \"xtask hook: $CLAUDE_PROJECT_DIR has no xtask; no checks run\" >&2; fi",
             "timeout": 900,
             "statusMessage": "cargo xtask check --changed"
           }
