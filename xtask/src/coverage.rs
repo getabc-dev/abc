@@ -40,6 +40,9 @@ pub(crate) fn run(
     if let Some(dir) = lcov.parent() {
         fs::create_dir_all(dir).with_context(|| format!("could not create {}", dir.display()))?;
     }
+    if crate::postgres::needed(root) {
+        crate::postgres::warm(out)?;
+    }
     writeln!(out, "xtask: running the tests under coverage")?;
     let status = Command::new(llvm_cov)
         .args(["llvm-cov", "nextest", "--workspace", "--locked", "--lcov"])
