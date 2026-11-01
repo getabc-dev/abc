@@ -1,6 +1,6 @@
 [package]
 name = "abc-protocol"
-description = "Wire formats spoken between abc workers and the abc server."
+description = "Wire contracts between the abc server and its clients: the worker link, enrolment, and API error codes."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,11 +8,16 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
+# abc-protocol depends on abc-core for Secret, ids and MachineInfo, so wire types carry domain
+# types (parsed at the boundary) instead of raw strings.
 [dependencies]
+abc-core = { path = "../abc-core" }
+schemars.workspace = true
 semver.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+ts-rs.workspace = true
 
 [dev-dependencies]
 insta.workspace = true

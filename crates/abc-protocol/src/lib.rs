@@ -10,6 +10,15 @@
 //! don't know, which lets a newer peer add a field without breaking an older one. Renaming or
 //! removing a field needs a new protocol version. Unknown message types and reject codes are
 //! decoding errors.
+//!
+//! Before the handshake, a worker enrols once over HTTP ([`enrol`]) and from then on opens each
+//! connection with its key in `Authorization: Bearer` ([`link`]), so no message here ever carries
+//! a credential. Every HTTP error any client sees carries one of the stable codes in
+//! [`api::ApiCode`].
+
+pub mod api;
+pub mod enrol;
+pub mod link;
 
 use std::fmt;
 

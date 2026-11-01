@@ -1,0 +1,32 @@
+[package]
+name = "abc-core"
+description = "abc's domain: identities, events, commands and the one permission policy. No IO."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# No tokio, no sqlx, no axum: abc-core cannot do IO, and the dependency list proves it (D9).
+[dependencies]
+data-encoding.workspace = true
+schemars.workspace = true
+semver.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+subtle.workspace = true
+thiserror.workspace = true
+time.workspace = true
+ts-rs.workspace = true
+uuid.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+insta.workspace = true
+proptest.workspace = true
+rand_chacha.workspace = true
+
+[lints]
+workspace = true

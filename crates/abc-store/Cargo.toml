@@ -1,0 +1,40 @@
+[package]
+name = "abc-store"
+description = "abc's system of record: the Postgres event log, its views, and the one write path."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# abc-store is the only crate in the workspace that depends on sqlx. abc-server and abc cannot
+# reach the database except through Store's API; cargo-shear keeps this list honest.
+[dependencies]
+abc-core = { path = "../abc-core" }
+futures.workspace = true
+rand.workspace = true
+semver.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+thiserror.workspace = true
+time.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+zeroize.workspace = true
+# `testing` feature only.
+rand_chacha = { workspace = true, optional = true }
+
+[features]
+# Test support for this crate's and abc-server's tests: ManualClock, SeededMint, Fixture,
+# assert_views_replay. Enabled only through dev-dependencies (resolver 3 keeps it out of builds).
+testing = ["dep:rand_chacha"]
+
+[dev-dependencies]
+abc-store = { path = ".", features = ["testing"] }
+insta.workspace = true
+proptest.workspace = true
+
+[lints]
+workspace = true

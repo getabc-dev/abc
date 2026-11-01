@@ -1,0 +1,25 @@
+[package]
+name = "abc"
+description = "The abc binary: `abc server` (and `abc server setup-code`), `abc worker`."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "abc"
+path = "src/main.rs"
+
+# No sqlx and no axum: the binary parses configuration and hands it over.
+[dependencies]
+abc-server = { path = "../abc-server" }
+abc-store = { path = "../abc-store" }
+clap = { workspace = true, features = ["env"] }
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true
