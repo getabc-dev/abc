@@ -1,0 +1,52 @@
+name: Base xtask
+description: >-
+  Checks out the base commit beside the pull request and builds its xtask there, so the gates that
+  judge a pull request are the base's, never the pull request's own.
+inputs:
+  base:
+    description: The base commit.
+    required: true
+  gate:
+    description: The `cargo xtask` subcommand the job runs with `--root`.
+    required: true
+  tools:
+    description: The base's pinned tools the gate runs, space-separated.
+    required: false
+    default: ""
+runs:
+  using: composite
+  steps:
+    - name: Check out the base commit beside the pull request
+      shell: bash
+      run: git worktree add --detach "$RUNNER_TEMP/base" "$BASE"
+      env:
+        BASE: ${{ inputs.base }}
+    - name: Install the base's Rust toolchain
+      shell: bash
+      working-directory: ${{ runner.temp }}/base
+      run: rustup toolchain install --no-self-update
+    # A pull request that adds a gate cannot be judged by it: the base has no such gate yet. That
+    # bootstrapping pull request fails here, closed, and merges under the rules already in force.
+    - name: The base has the gate
+      shell: bash
+      working-directory: ${{ runner.temp }}/base
+      run: |
+        if ! cargo xtask "$GATE" --root . --help >/dev/null 2>&1; then
+          echo "::error::base $BASE has no \`cargo xtask $GATE --root\`; bootstrapping PR: the gate this pull request adds cannot judge it, so it fails"
+          exit 1
+        fi
+      env:
+        BASE: ${{ inputs.base }}
+        GATE: ${{ inputs.gate }}
+    - name: Install the base's pinned tools
+      if: inputs.tools != ''
+      shell: bash
+      working-directory: ${{ runner.temp }}/base
+      # Word splitting is wanted: TOOLS is a space-separated list of tool names.
+      run: |
+        # shellcheck disable=SC2086
+        cargo xtask setup $TOOLS
+        # shellcheck disable=SC2086
+        cargo xtask doctor $TOOLS
+      env:
+        TOOLS: ${{ inputs.tools }}

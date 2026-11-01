@@ -24,16 +24,20 @@ jobs:
     timeout-minutes: 20
     permissions:
       contents: read
+    # GEMINI_API_KEY is in reach of this job alone, which builds and runs only the base commit's
+    # xtask and reads the pull request as a diff; nothing from the pull request's tree runs here.
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           fetch-depth: 0
-      - name: Install the pinned Rust toolchain
-        run: rustup toolchain install --no-self-update
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: $/.github/actions/base-xtask
+        with:
+          base: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+          gate: review
       - name: Gemini reviews the diff against AGENTS.md
-        run: cargo xtask review --base "$BASE"
+        working-directory: ${{ runner.temp }}/base
+        run: cargo xtask review --root "$GITHUB_WORKSPACE" --base "$BASE"
         env:
           BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}

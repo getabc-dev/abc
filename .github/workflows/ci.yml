@@ -91,12 +91,15 @@ jobs:
       - name: Secrets in the git history
         run: cargo xtask tool gitleaks git --redact --no-banner --verbose .
 
+  # The gates below run the base commit's xtask on the pull request's tree (--root), so a pull
+  # request cannot change the gates that judge it. Its tests still run, and use its own pinned
+  # cargo-nextest; no secret is in reach.
   coverage:
     name: Coverage
     # Required on pull requests and in the merge queue; a push to main was already gated.
     if: github.event_name != 'push'
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 60
     permissions:
       contents: read
     steps:
@@ -104,39 +107,68 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 0
-      - name: Install the pinned Rust toolchain
+      - uses: $/.github/actions/base-xtask
+        with:
+          base: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+          gate: coverage
+          tools: cargo-nextest cargo-llvm-cov
+      - name: Install the pull request's Rust toolchain
         run: rustup toolchain install --no-self-update
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-      - name: Install the pinned tools
-        run: cargo xtask setup cargo-nextest cargo-llvm-cov
-      - name: Check the installed tools against their pins
-        run: cargo xtask doctor cargo-nextest cargo-llvm-cov
+      - name: Install the pinned cargo-nextest the pull request's tests use
+        run: cargo xtask setup cargo-nextest
       - name: 90% of changed lines covered
-        run: cargo xtask coverage --base "$BASE"
+        working-directory: ${{ runner.temp }}/base
+        run: cargo xtask coverage --root "$GITHUB_WORKSPACE" --base "$BASE"
         env:
           BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
 
-  mutants:
-    name: Mutants
+  mutants-shard:
+    name: Mutants shard ${{ matrix.shard }}/8
     if: github.event_name != 'push'
     runs-on: ubuntu-24.04
-    # Every mutant runs the whole suite, so a large change takes hours; small ones take minutes.
-    timeout-minutes: 300
+    # Eight shards keep each well inside the merge queue's 150-minute check timeout.
+    timeout-minutes: 60
     permissions:
       contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           fetch-depth: 0
-      - name: Install the pinned Rust toolchain
+      - uses: $/.github/actions/base-xtask
+        with:
+          base: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+          gate: mutants
+          tools: cargo-nextest cargo-mutants
+      - name: Install the pull request's Rust toolchain
         run: rustup toolchain install --no-self-update
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-      - name: Install the pinned tools
-        run: cargo xtask setup cargo-nextest cargo-mutants
-      - name: Check the installed tools against their pins
-        run: cargo xtask doctor cargo-nextest cargo-mutants
-      - name: No missed mutants in the changed code
-        run: cargo xtask mutants --base "$BASE" --jobs 2
+      - name: Install the pinned cargo-nextest the pull request's tests use
+        run: cargo xtask setup cargo-nextest
+      - name: No missed mutants in this shard of the changed code
+        working-directory: ${{ runner.temp }}/base
+        run: cargo xtask mutants --root "$GITHUB_WORKSPACE" --base "$BASE" --jobs 2 --shard "$SHARD/8"
         env:
           BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+          SHARD: ${{ matrix.shard }}
+
+  mutants:
+    name: Mutants
+    # Reports for every shard, as the one required check; it fails unless all of them passed.
+    if: always() && github.event_name != 'push'
+    needs: mutants-shard
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Every shard caught every mutant
+        run: |
+          echo "mutant shards: $RESULT"
+          [ "$RESULT" = success ]
+        env:
+          RESULT: ${{ needs.mutants-shard.result }}

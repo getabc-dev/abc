@@ -35,14 +35,16 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 0
-      - name: Install the pinned Rust toolchain
+      # The base's xtask judges the pull request's tree, so a pull request cannot change the check.
+      - uses: $/.github/actions/base-xtask
         if: github.event_name == 'pull_request'
-        run: rustup toolchain install --no-self-update
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-        if: github.event_name == 'pull_request'
+        with:
+          base: ${{ github.event.pull_request.base.sha }}
+          gate: integrity
       - name: Deleted, skipped or weakened tests and gate changes
         if: github.event_name == 'pull_request'
-        run: cargo xtask integrity --base "$BASE" --pr "$PR"
+        working-directory: ${{ runner.temp }}/base
+        run: cargo xtask integrity --root "$GITHUB_WORKSPACE" --base "$BASE" --pr "$PR"
         env:
           BASE: ${{ github.event.pull_request.base.sha }}
           PR: ${{ github.event.pull_request.number }}
