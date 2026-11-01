@@ -5,9 +5,9 @@
 //!
 //! 1. **Identity routes can only be served on the sidecar socket.** [`SidecarApp`] wraps a private
 //!    `Router`, built only by `api::sidecar_app`, and the only function that serves it is
-//!    [`serve_sidecar`], which takes a [`SidecarSocket`]. No code path serves it over TCP. (Plain
-//!    axum would allow that: `Router::with_state` erases the state type, so the newtype is what
-//!    keeps the distinction.)
+//!    [`serve_sidecar`], which takes a [`SidecarSocket`]. (Plain axum would allow serving it over
+//!    TCP: `Router::with_state` erases the state type, so the newtype is what keeps the
+//!    distinction.)
 //! 2. **Only the sidecar can reach the socket.** [`SidecarSocket::bind`] refuses a parent directory
 //!    with any "other" permission bit, removes a stale socket file, binds, and sets the socket to
 //!    0660. In the compose file the directory is a volume mounted into exactly two containers: abc
@@ -15,30 +15,76 @@
 //!    `unix:/run/abc-sidecar/abc.sock`.
 //! 3. **There is no TCP listener with identity**, so a stray `ports:` mapping or a `0.0.0.0` bind
 //!    exposes health checks at most, never forgeable identity.
-//! 4. **Defence in depth against a shortcut.** `TailnetCaller` is `FromRequestParts<SidecarState>`
-//!    only, so identity handlers cannot be mounted on the ops router (state `Readiness`). The ops
-//!    router is built inside `ops::serve`, so no function serves a caller-supplied router over TCP.
-//!    `clippy.toml` gains `disallowed-methods = ["axum::serve"]`, so code cannot bypass both
-//!    newtypes by serving a router directly.
+//! 4. **Defence in depth.** `TailnetCaller` is `FromRequestParts<SidecarState>` only, so identity
+//!    handlers cannot be mounted on the ops router. The ops router is built inside `ops::serve`.
+//!    `clippy.toml` disallows `axum::serve`, so the two functions here are the only places that
+//!    serve a router.
 
+use std::fs;
+use std::future::Future;
+use std::io;
+use std::net::SocketAddr;
+use std::os::unix::fs::{FileTypeExt as _, PermissionsExt as _};
 use std::path::Path;
 
 use axum::Router;
+use tokio::net::{TcpListener, UnixListener};
 
 use crate::ServeError;
+
+/// The permission bits of the sidecar socket: the abc user and its group (the sidecar's).
+const SOCKET_MODE: u32 = 0o660;
 
 /// The bound sidecar Unix socket. Constructed only through [`SidecarSocket::bind`].
 #[derive(Debug)]
 pub(crate) struct SidecarSocket {
-    listener: tokio::net::UnixListener,
+    listener: UnixListener,
 }
 
 impl SidecarSocket {
-    /// Checks the directory (exists, owned by this uid, `mode & 0o007 == 0`), removes a stale socket
-    /// file, binds, and chmods the socket to 0660.
+    /// Checks that the directory exists and gives "other" users no access, removes a stale
+    /// socket, binds, and sets the socket's mode to 0660.
     pub(crate) fn bind(path: &Path) -> Result<Self, ServeError> {
-        let _ = path;
-        unimplemented!()
+        let refuse = |reason| ServeError::SocketPath {
+            path: path.to_owned(),
+            reason,
+        };
+        let dir = path
+            .parent()
+            .filter(|dir| !dir.as_os_str().is_empty())
+            .ok_or_else(|| refuse("the path has no directory"))?;
+        let dir_meta = fs::metadata(dir)
+            .ok()
+            .ok_or_else(|| refuse("its directory does not exist"))?;
+        if !dir_meta.is_dir() {
+            return Err(refuse("its parent is not a directory"));
+        }
+        let mode = dir_meta.permissions().mode() & 0o777;
+        if mode & 0o007 != 0 {
+            return Err(ServeError::SocketDirTooOpen {
+                path: dir.to_owned(),
+                mode,
+            });
+        }
+        match fs::symlink_metadata(path) {
+            Ok(existing) if existing.file_type().is_socket() => {
+                fs::remove_file(path).map_err(listener_error)?;
+            }
+            Ok(_) => return Err(refuse("a file that is not a socket is in the way")),
+            // Nothing there, or nothing this process may see: binding reports the real problem.
+            Err(_) => {}
+        }
+        let listener = UnixListener::bind(path).map_err(listener_error)?;
+        fs::set_permissions(path, fs::Permissions::from_mode(SOCKET_MODE))
+            .map_err(listener_error)?;
+        Ok(Self { listener })
+    }
+}
+
+fn listener_error(source: io::Error) -> ServeError {
+    ServeError::Listener {
+        what: "sidecar",
+        source,
     }
 }
 
@@ -53,32 +99,58 @@ impl SidecarApp {
     }
 }
 
-/// Serves the sidecar app on the sidecar socket with graceful shutdown (hyper-util auto builder
-/// over `UnixListener`, HTTP/1.1, WebSocket upgrades enabled).
+/// Serves the sidecar app on the sidecar socket until `shutdown` resolves and every connection
+/// it still tracks has finished.
 pub(crate) async fn serve_sidecar(
     socket: SidecarSocket,
     app: SidecarApp,
-    shutdown: impl std::future::Future<Output = ()> + Send,
+    shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<(), ServeError> {
-    let _ = (socket.listener, app.0, shutdown);
-    unimplemented!()
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the one place that serves the sidecar app, on the sidecar socket only"
+    )]
+    let serving = axum::serve(socket.listener, app.0).with_graceful_shutdown(shutdown);
+    serving.await.map_err(listener_error)
 }
 
 /// The ops listener: health and readiness only.
 #[derive(Debug)]
 pub(crate) struct OpsListener {
-    listener: tokio::net::TcpListener,
+    listener: TcpListener,
 }
 
 impl OpsListener {
-    /// Binds `addr` (loopback by default; a non-loopback address is allowed for orchestrator
-    /// probes because this router serves no data and reads no identity).
-    pub(crate) async fn bind(addr: std::net::SocketAddr) -> Result<Self, ServeError> {
-        let _ = addr;
-        unimplemented!()
+    /// Binds `addr`: loopback by default. A non-loopback address is allowed for orchestrator
+    /// probes, because this listener serves no data and reads no identity.
+    pub(crate) async fn bind(addr: SocketAddr) -> Result<Self, ServeError> {
+        let listener = TcpListener::bind(addr).await.map_err(ops_error)?;
+        Ok(Self { listener })
     }
 
-    pub(crate) fn into_inner(self) -> tokio::net::TcpListener {
-        self.listener
+    /// The address it is bound to (the actual port when `addr` asked for port 0).
+    pub(crate) fn local_addr(&self) -> Result<SocketAddr, ServeError> {
+        self.listener.local_addr().map_err(ops_error)
+    }
+
+    /// Serves the ops router, built by `ops::serve`, until `shutdown` resolves.
+    pub(crate) async fn serve(
+        self,
+        router: Router,
+        shutdown: impl Future<Output = ()> + Send + 'static,
+    ) -> Result<(), ServeError> {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the one place that serves the ops router, which reads no identity"
+        )]
+        let serving = axum::serve(self.listener, router).with_graceful_shutdown(shutdown);
+        serving.await.map_err(ops_error)
+    }
+}
+
+fn ops_error(source: io::Error) -> ServeError {
+    ServeError::Listener {
+        what: "ops",
+        source,
     }
 }

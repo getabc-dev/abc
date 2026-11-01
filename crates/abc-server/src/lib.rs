@@ -2,15 +2,16 @@
 //!
 //! | Listener | Transport | Routes | Identity |
 //! | --- | --- | --- | --- |
-//! | sidecar | Unix socket shared only with the Tailscale sidecar ([`listen::SidecarSocket`]) | the whole API, the worker WebSocket, SSE | `Tailscale-User-Login`, trusted |
+//! | sidecar | Unix socket shared only with the Tailscale sidecar | the whole API, the worker WebSocket, SSE | `Tailscale-User-Login`, trusted |
 //! | ops | TCP, loopback by default | `/healthz`, `/readyz` | none, and no data |
 //!
 //! The public webhook listener (later) will be a third, with its own router and no identity.
 //!
-//! [`run`] starts the ops listener first (so probes answer during migration), migrates, opens the
-//! store, ends the sessions a previous process left open (the boot sweep), logs a fixed hint if the
-//! server is unclaimed, binds the sidecar socket, and serves until `shutdown` resolves. Then it
-//! drains: SSE streams end, worker sessions close with 4503 and record `session_ended`.
+//! [`run`] starts the ops listener first (so probes answer during migration), connects to Postgres,
+//! migrates, opens the store, ends the sessions a previous process left open (the boot sweep),
+//! logs a fixed hint if the server is unclaimed, binds the sidecar socket, and serves until
+//! `shutdown` resolves. Then it drains: SSE streams end, and worker sessions close with 4503 and
+//! record their end.
 //!
 //! The owner setup code never passes through this process: `abc server setup-code` (the `abc`
 //! binary, run from a shell on the host) mints it through the store and prints it to that shell.
@@ -24,29 +25,46 @@ mod sidecar;
 pub mod telemetry;
 mod worker_link;
 
+use std::future::Future;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::time::Duration;
+
+use abc_core::command::EndSession;
+use abc_core::decision::Origin;
+use abc_core::event::SessionEndReason;
+use abc_core::id::{CorrelationId, FromUuid as _};
+use abc_core::query::OpenSessions;
+use abc_core::secret::Secret;
+use abc_store::{Caller, DatabaseUrl, Store, StoreOptions};
+use thiserror::Error;
+use tokio::sync::oneshot;
 
 pub use api::PublicUrl;
-
-use abc_core::secret::Secret;
-use abc_store::DatabaseUrl;
-use thiserror::Error;
+pub use worker_link::LinkTimings;
 
 /// Everything the server needs, parsed by the binary from flags and `ABC_*` environment variables.
 #[derive(Debug)]
 pub struct ServerConfig {
     /// `ABC_DATABASE_URL`.
     pub database_url: Secret<DatabaseUrl>,
+    /// How long to keep retrying while Postgres starts.
+    pub database_wait: Duration,
     /// `ABC_SIDECAR_SOCKET`, default `/run/abc-sidecar/abc.sock`. Its directory is the volume shared
     /// with the Tailscale container; the server refuses a directory others can reach.
     pub sidecar_socket: PathBuf,
     /// `ABC_OPS_ADDR`, default `127.0.0.1:7071`.
     pub ops_addr: SocketAddr,
-    /// `ABC_PUBLIC_URL`, such as `https://abc.tail1234.ts.net`: the URL Serve answers on. Used by
-    /// the identity extractor's Host and Origin checks and in the enrol command the web app shows.
+    /// `ABC_PUBLIC_URL`, such as `https://abc.tail1234.ts.net`: the URL Serve answers on. The
+    /// identity extractor's Host and Origin checks use it.
     pub public_url: PublicUrl,
+    /// The worker link's handshake, ping and idle timings: the protocol's own unless a test
+    /// shortens them.
+    pub link: LinkTimings,
 }
+
+/// How long a draining server waits for live worker sessions to record their end.
+const DRAIN_GRACE: Duration = Duration::from_secs(10);
 
 /// Runs the server until `shutdown` resolves.
 ///
@@ -56,26 +74,110 @@ pub struct ServerConfig {
 /// migration failure) or a listener dies.
 pub async fn run(
     config: ServerConfig,
-    shutdown: impl std::future::Future<Output = ()> + Send,
+    shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<(), ServeError> {
-    // let readiness = ops::Readiness::new();                        // Starting
-    // let ops = listen::OpsListener::bind(config.ops_addr).await?; spawn ops::serve(ops, readiness.clone())
-    // readiness.set(Migrating); let db = abc_store::connect(&config.database_url).await?;
-    // abc_store::migrate(&db).await?;
-    // let store = Store::open(db, StoreOptions::production()).await?;
-    // boot sweep, before the socket exists so no session can be live:
-    //   for open in store.query(&Caller::Server, OpenSessions).await? {
-    //       store.execute(&Caller::Server, &origin, EndSession { .., reason: ServerRestart }).await?;
-    //   }
-    // if !store.is_claimed().await? {
-    //     info!("server is unclaimed; run `abc server setup-code` on this host for a one-time code");
-    // }
-    // let socket = listen::SidecarSocket::bind(&config.sidecar_socket)?;   // permission checks
-    // let app = api::sidecar_app(SidecarState { store, sessions, public_url });
-    // readiness.set(Ready); listen::serve_sidecar(socket, app, shutdown).await?;
-    // readiness.set(Draining); sessions.shutdown_all(); (each session records its end)
-    let _ = (config, shutdown);
-    unimplemented!()
+    let readiness = ops::Readiness::new();
+    let ops_listener = listen::OpsListener::bind(config.ops_addr).await?;
+    tracing::info!(addr = %ops_listener.local_addr()?, "health and readiness listening");
+    let (stop_ops, ops_stopped) = oneshot::channel::<()>();
+    let ops = tokio::spawn(ops::serve(ops_listener, readiness.clone(), async move {
+        // A dropped sender also stops the listener.
+        let _stopped = ops_stopped.await;
+    }));
+    let served = serve(config, shutdown, &readiness).await;
+    drop(stop_ops);
+    let ops_result = ops
+        .await
+        .map_err(|error| ServeError::Task(error.to_string()))?;
+    served.and(ops_result)
+}
+
+/// Everything after the ops listener is up.
+async fn serve(
+    config: ServerConfig,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+    readiness: &ops::Readiness,
+) -> Result<(), ServeError> {
+    let db = abc_store::connect(&config.database_url, config.database_wait).await?;
+    readiness.set(ops::Phase::Migrating);
+    abc_store::migrate(&db).await?;
+    let store = Store::open(db, StoreOptions::production()).await?;
+    readiness.attach(store.clone());
+    boot_sweep(&store).await?;
+    if !store.is_claimed().await.map_err(ServeError::Installation)? {
+        tracing::info!(
+            "this server is unclaimed; run `abc server setup-code` on this host for a one-time code"
+        );
+    }
+    let socket = listen::SidecarSocket::bind(&config.sidecar_socket)?;
+    let sessions = sessions::Sessions::default();
+    let drain = api::Drain::new();
+    let app = api::sidecar_app(api::SidecarState {
+        store,
+        sessions: sessions.clone(),
+        public_url: config.public_url,
+        link: config.link,
+        drain: drain.clone(),
+    });
+    readiness.set(ops::Phase::Ready);
+    tracing::info!(socket = %config.sidecar_socket.display(), "serving the tailnet API");
+    let drain_readiness = readiness.clone();
+    let drain_sessions = sessions.clone();
+    listen::serve_sidecar(socket, app, async move {
+        shutdown.await;
+        drain_readiness.set(ops::Phase::Draining);
+        tracing::info!("draining: closing live streams and worker sessions");
+        drain.start();
+        drain_sessions.shutdown_all();
+    })
+    .await?;
+    if tokio::time::timeout(DRAIN_GRACE, sessions.idle())
+        .await
+        .is_err()
+    {
+        tracing::warn!(
+            "worker sessions did not record their end in time; the next start's boot sweep will"
+        );
+    }
+    Ok(())
+}
+
+/// Ends every session a previous process left open. It runs before the sidecar socket is bound, so
+/// no session can be live: every open one is stale.
+async fn boot_sweep(store: &Store) -> Result<(), ServeError> {
+    let open = store
+        .query(&Caller::Server, OpenSessions)
+        .await
+        .map_err(|error| ServeError::Sweep(Box::new(error)))?;
+    let origin = Origin {
+        correlation: CorrelationId::from_uuid(uuid::Uuid::now_v7()),
+        causation: None,
+    };
+    for session in open
+        .iter()
+        .filter_map(|open| open.session.map(|id| (open.worker, id)))
+    {
+        let (worker, session) = session;
+        store
+            .execute(
+                &Caller::Server,
+                &origin,
+                EndSession {
+                    worker,
+                    session,
+                    reason: SessionEndReason::ServerRestart,
+                },
+            )
+            .await
+            .map_err(|error| ServeError::Sweep(Box::new(error)))?;
+    }
+    if !open.is_empty() {
+        tracing::info!(
+            sessions = open.len(),
+            "ended the sessions the previous run left open"
+        );
+    }
+    Ok(())
 }
 
 /// Why the server could not start or keep serving. Each message tells a stranger what to fix (P4).
@@ -83,8 +185,8 @@ pub async fn run(
 pub enum ServeError {
     /// The sidecar socket's directory is reachable by others, so anyone could forge identity.
     #[error(
-        "{path} has mode {mode:o}; the sidecar socket directory must not be accessible to other users \
-         (expected 0750 or 0770, shared only with the Tailscale container)"
+        "{path} has mode {mode:o}; the sidecar socket directory must not be accessible to other \
+         users (use 0750 or 0770, shared only with the Tailscale container)"
     )]
     SocketDirTooOpen {
         /// The directory.
@@ -92,26 +194,41 @@ pub enum ServeError {
         /// Its mode.
         mode: u32,
     },
+    /// The sidecar socket path cannot be used.
+    #[error("cannot use {path} as the sidecar socket: {reason}")]
+    SocketPath {
+        /// The path.
+        path: PathBuf,
+        /// What is wrong.
+        reason: &'static str,
+    },
     /// `ABC_PUBLIC_URL` is not an https origin.
     #[error(
-        "ABC_PUBLIC_URL must be the https URL Tailscale Serve answers on, such as https://abc.tail1234.ts.net ({reason})"
+        "ABC_PUBLIC_URL must be the https URL Tailscale Serve answers on, such as \
+         https://abc.tail1234.ts.net ({reason})"
     )]
     PublicUrl {
         /// What is wrong with it.
         reason: &'static str,
     },
-    /// Binding a listener failed.
-    #[error("could not listen on {what}")]
-    Bind {
+    /// Binding or serving a listener failed.
+    #[error("the {what} listener failed")]
+    Listener {
         /// Which listener.
-        what: String,
+        what: &'static str,
         /// Why.
         #[source]
         source: std::io::Error,
     },
+    /// Reading whether the server is claimed failed.
+    #[error("could not read the installation's state")]
+    Installation(#[source] abc_store::StoreError),
     /// The boot sweep could not end stale sessions.
     #[error("could not close the sessions left open by the previous run")]
-    BootSweep(#[source] abc_store::StoreError),
+    Sweep(#[source] Box<dyn std::error::Error + Send + Sync>),
+    /// A server task ended abnormally.
+    #[error("a server task failed: {0}")]
+    Task(String),
     /// The store failed to open.
     #[error(transparent)]
     Store(#[from] abc_store::OpenError),

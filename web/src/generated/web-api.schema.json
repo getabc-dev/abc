@@ -1,0 +1,731 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "WebApi",
+  "description": "The generation root. Never constructed.",
+  "type": "object",
+  "properties": {
+    "claim_request": {
+      "$ref": "#/$defs/ClaimRequest"
+    },
+    "claim_response": {
+      "$ref": "#/$defs/ClaimResponse"
+    },
+    "error": {
+      "$ref": "#/$defs/ApiErrorBody"
+    },
+    "issue_token_request": {
+      "$ref": "#/$defs/IssueTokenRequest"
+    },
+    "live": {
+      "$ref": "#/$defs/LiveUpdate"
+    },
+    "session": {
+      "$ref": "#/$defs/SessionView"
+    },
+    "token_issued": {
+      "$ref": "#/$defs/TokenIssuedResponse"
+    },
+    "tokens": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/TokenSummary"
+      }
+    }
+  },
+  "required": [
+    "session",
+    "claim_request",
+    "claim_response",
+    "issue_token_request",
+    "token_issued",
+    "tokens",
+    "live",
+    "error"
+  ],
+  "$defs": {
+    "ApiCode": {
+      "description": "Every error code. Grouped by who has to act.",
+      "oneOf": [
+        {
+          "description": "The body or path did not parse. The message names the field, never its value.",
+          "type": "string",
+          "const": "malformed_request"
+        },
+        {
+          "description": "A state-changing request came from another site, or named a host other than the server's\npublic URL (CSRF and DNS-rebinding guard).",
+          "type": "string",
+          "const": "cross_site_request"
+        },
+        {
+          "description": "Nothing at this path.",
+          "type": "string",
+          "const": "not_found"
+        },
+        {
+          "description": "The path exists, but not for this method.",
+          "type": "string",
+          "const": "method_not_allowed"
+        },
+        {
+          "description": "The request needs a signed-in tailnet person and carried no identity (for example, a\ntagged device).",
+          "type": "string",
+          "const": "tailnet_identity_required"
+        },
+        {
+          "description": "The worker key is not known to this server.",
+          "type": "string",
+          "const": "invalid_worker_key"
+        },
+        {
+          "description": "The worker was revoked. Stop retrying and re-enrol.",
+          "type": "string",
+          "const": "worker_revoked"
+        },
+        {
+          "description": "Not a member of this workspace.",
+          "type": "string",
+          "const": "not_a_member"
+        },
+        {
+          "description": "Only a worker can do this.",
+          "type": "string",
+          "const": "worker_only"
+        },
+        {
+          "description": "The server already has an owner.",
+          "type": "string",
+          "const": "server_already_claimed"
+        },
+        {
+          "description": "A setup code is required.",
+          "type": "string",
+          "const": "setup_code_required"
+        },
+        {
+          "description": "The setup code does not match.",
+          "type": "string",
+          "const": "setup_code_mismatch"
+        },
+        {
+          "description": "The setup code expired. Run `abc server setup-code` on the server again.",
+          "type": "string",
+          "const": "setup_code_expired"
+        },
+        {
+          "description": "Only the server itself can do this. A client never causes it; seeing it is a bug.",
+          "type": "string",
+          "const": "server_only"
+        },
+        {
+          "description": "No such worker.",
+          "type": "string",
+          "const": "unknown_worker"
+        },
+        {
+          "description": "An enrolment token is required.",
+          "type": "string",
+          "const": "enrolment_token_required"
+        },
+        {
+          "description": "No such enrolment token.",
+          "type": "string",
+          "const": "enrolment_token_unknown"
+        },
+        {
+          "description": "The enrolment token expired. Ask the owner for a new one.",
+          "type": "string",
+          "const": "enrolment_token_expired"
+        },
+        {
+          "description": "The enrolment token was revoked.",
+          "type": "string",
+          "const": "enrolment_token_revoked"
+        },
+        {
+          "description": "The enrolment token was already used by another machine.",
+          "type": "string",
+          "const": "enrolment_token_used"
+        },
+        {
+          "description": "The token was already redeemed: revoke the worker instead.",
+          "type": "string",
+          "const": "enrolment_token_already_redeemed"
+        },
+        {
+          "description": "The server is starting, draining, or cannot reach its database. Retry.",
+          "type": "string",
+          "const": "unavailable"
+        },
+        {
+          "description": "A bug. The response carries a request id to quote.",
+          "type": "string",
+          "const": "internal"
+        }
+      ]
+    },
+    "ApiErrorBody": {
+      "description": "The JSON body of every non-2xx response: `{\"error\":{\"code\":\"…\",\"message\":\"…\"}}`.",
+      "type": "object",
+      "properties": {
+        "error": {
+          "description": "The error.",
+          "$ref": "#/$defs/ApiErrorDetail"
+        }
+      },
+      "required": [
+        "error"
+      ]
+    },
+    "ApiErrorDetail": {
+      "description": "An error's code and human message.",
+      "type": "object",
+      "properties": {
+        "code": {
+          "description": "Branch on this.",
+          "$ref": "#/$defs/ApiCode"
+        },
+        "message": {
+          "description": "Show this. It never contains a secret or echoes request input.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "code",
+        "message"
+      ]
+    },
+    "Arch": {
+      "description": "The CPU architectures abc ships for.",
+      "oneOf": [
+        {
+          "description": "64-bit ARM.",
+          "type": "string",
+          "const": "aarch64"
+        },
+        {
+          "description": "64-bit x86.",
+          "type": "string",
+          "const": "x86_64"
+        }
+      ]
+    },
+    "ClaimRequest": {
+      "description": "`POST /api/owner/claim`.",
+      "type": "object",
+      "properties": {
+        "code": {
+          "description": "The setup code as typed: case, spaces and dashes are forgiven.",
+          "$ref": "#/$defs/Secret"
+        },
+        "display_name": {
+          "description": "How the owner wants to be shown.",
+          "$ref": "#/$defs/DisplayName"
+        },
+        "workspace_name": {
+          "description": "The first workspace's name.",
+          "$ref": "#/$defs/WorkspaceName"
+        }
+      },
+      "required": [
+        "code",
+        "display_name",
+        "workspace_name"
+      ]
+    },
+    "ClaimResponse": {
+      "description": "The claim's answer.",
+      "type": "object",
+      "properties": {
+        "owner": {
+          "description": "The new owner.",
+          "$ref": "#/$defs/PersonId"
+        },
+        "workspace": {
+          "description": "The first workspace.",
+          "$ref": "#/$defs/WorkspaceId"
+        }
+      },
+      "required": [
+        "owner",
+        "workspace"
+      ]
+    },
+    "DisplayName": {
+      "description": "How a person or worker is shown: an actor's display name.",
+      "type": "string"
+    },
+    "EnrolmentTokenId": {
+      "description": "An enrolment token, and the stream of its lifecycle events.",
+      "type": "string",
+      "format": "uuid"
+    },
+    "IssueTokenRequest": {
+      "description": "`POST /api/workspaces/{ws}/enrolment-tokens`.",
+      "type": "object",
+      "properties": {
+        "label": {
+          "description": "An optional note, which also becomes the worker's name.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MachineLabel"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "ttl": {
+          "description": "Seconds, 300 to 86400. Defaults to 1800.",
+          "$ref": "#/$defs/TokenTtl"
+        }
+      }
+    },
+    "LiveUpdate": {
+      "description": "One message on `GET /api/workspaces/{ws}/live` (SSE `data:`, with `event:` set to the tag and\n`id:` set to `head`). Everything, online-ness included, comes from the log through views, so\none cursor (`head`) covers it all.",
+      "oneOf": [
+        {
+          "description": "The first message on a connection without `Last-Event-ID`: the full state. Replace, don't\nmerge.",
+          "type": "object",
+          "properties": {
+            "head": {
+              "description": "The log head the cards reflect.",
+              "$ref": "#/$defs/Position"
+            },
+            "machines": {
+              "description": "Every machine.",
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/MachineCard"
+              }
+            },
+            "type": {
+              "type": "string",
+              "const": "snapshot"
+            }
+          },
+          "required": [
+            "type",
+            "head",
+            "machines"
+          ]
+        },
+        {
+          "description": "Cards that changed in the log after the previous `head` (or after `Last-Event-ID` on a\nresumed connection). Upsert by `worker`.",
+          "type": "object",
+          "properties": {
+            "changed": {
+              "description": "The changed cards.",
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/MachineCard"
+              }
+            },
+            "head": {
+              "description": "The log head the cards reflect.",
+              "$ref": "#/$defs/Position"
+            },
+            "type": {
+              "type": "string",
+              "const": "machines"
+            }
+          },
+          "required": [
+            "type",
+            "head",
+            "changed"
+          ]
+        },
+        {
+          "description": "The viewer lost access. The stream ends.",
+          "type": "object",
+          "properties": {
+            "head": {
+              "description": "The last head the viewer saw.",
+              "$ref": "#/$defs/Position"
+            },
+            "type": {
+              "type": "string",
+              "const": "access_ended"
+            }
+          },
+          "required": [
+            "type",
+            "head"
+          ]
+        }
+      ]
+    },
+    "MachineCard": {
+      "description": "One worker as the Machines screen shows it. Everything here, online-ness included, is derived\nfrom the log through the `worker` view, so one SSE mechanism (a cursor over positions) keeps the\nscreen current.",
+      "type": "object",
+      "properties": {
+        "arch": {
+          "description": "Its architecture.",
+          "$ref": "#/$defs/Arch"
+        },
+        "build": {
+          "description": "The release it last connected with.",
+          "type": "string"
+        },
+        "changed_at": {
+          "description": "The position of the last event that changed this card.",
+          "$ref": "#/$defs/Position"
+        },
+        "enrolled_at": {
+          "description": "When it enrolled.",
+          "$ref": "#/$defs/Timestamp"
+        },
+        "hostname": {
+          "description": "Its hostname at enrolment.",
+          "$ref": "#/$defs/DisplayName"
+        },
+        "last_seen_at": {
+          "description": "The later of its last session start and its last session end, if it ever connected.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Timestamp"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "name": {
+          "description": "Its display name.",
+          "$ref": "#/$defs/DisplayName"
+        },
+        "online": {
+          "description": "Whether it has an open session: its last `session_started` has no matching `session_ended`.\nAfter a server crash the boot sweep ends stale sessions before any socket is accepted, so\nthis is never stale for longer than the server is down.",
+          "type": "boolean"
+        },
+        "os": {
+          "description": "Its OS.",
+          "$ref": "#/$defs/Os"
+        },
+        "revoked": {
+          "description": "Whether the owner revoked it. Revoked workers stay listed, greyed out.",
+          "type": "boolean"
+        },
+        "worker": {
+          "description": "The worker.",
+          "$ref": "#/$defs/WorkerId"
+        }
+      },
+      "required": [
+        "worker",
+        "name",
+        "hostname",
+        "os",
+        "arch",
+        "build",
+        "online",
+        "enrolled_at",
+        "revoked",
+        "changed_at"
+      ]
+    },
+    "MachineLabel": {
+      "description": "A note the owner attaches to an enrolment token, such as \"work laptop\". It becomes the\nenrolled worker's display name.",
+      "type": "string"
+    },
+    "Os": {
+      "description": "The operating systems abc ships for.",
+      "oneOf": [
+        {
+          "description": "macOS.",
+          "type": "string",
+          "const": "macos"
+        },
+        {
+          "description": "Linux.",
+          "type": "string",
+          "const": "linux"
+        }
+      ]
+    },
+    "PersonId": {
+      "description": "A person. Persons are actors and can belong to several workspaces.",
+      "type": "string",
+      "format": "uuid"
+    },
+    "Position": {
+      "description": "A place in the event log: the global sequence number. Positions are gapless and assigned in\ncommit order (the store serializes writers on the head row), so a consumer that has read every\nevent up to `N` has seen everything at or below `N`, forever. `Position::ORIGIN` (0) comes\nbefore the first event.",
+      "type": "integer",
+      "format": "int64"
+    },
+    "Role": {
+      "description": "A person's role in a workspace. v1 has one person per server (decision 20), so the only role is\n`Owner`. Membership is still stored per (workspace, person), so adding a role later is a local\nchange to this enum and the policy matrix.",
+      "oneOf": [
+        {
+          "description": "Full control of the workspace.",
+          "type": "string",
+          "const": "owner"
+        }
+      ]
+    },
+    "Secret": {
+      "type": "string",
+      "writeOnly": true
+    },
+    "SessionView": {
+      "description": "The answer to [`WhoAmI`].",
+      "oneOf": [
+        {
+          "description": "The request carried no tailnet identity (a tagged device, or a non-browser client).",
+          "type": "object",
+          "properties": {
+            "state": {
+              "type": "string",
+              "const": "no_identity"
+            }
+          },
+          "required": [
+            "state"
+          ]
+        },
+        {
+          "description": "The server has no owner yet. The web app shows the setup-code form.",
+          "type": "object",
+          "properties": {
+            "login": {
+              "description": "The login that will own the server.",
+              "$ref": "#/$defs/TailnetLogin"
+            },
+            "state": {
+              "type": "string",
+              "const": "unclaimed"
+            }
+          },
+          "required": [
+            "state",
+            "login"
+          ]
+        },
+        {
+          "description": "The server is claimed and this login is not a member.",
+          "type": "object",
+          "properties": {
+            "login": {
+              "description": "The visitor's login.",
+              "$ref": "#/$defs/TailnetLogin"
+            },
+            "state": {
+              "type": "string",
+              "const": "not_a_member"
+            }
+          },
+          "required": [
+            "state",
+            "login"
+          ]
+        },
+        {
+          "description": "A member.",
+          "type": "object",
+          "properties": {
+            "display_name": {
+              "description": "Their name.",
+              "$ref": "#/$defs/DisplayName"
+            },
+            "person": {
+              "description": "The person.",
+              "$ref": "#/$defs/PersonId"
+            },
+            "state": {
+              "type": "string",
+              "const": "member"
+            },
+            "workspaces": {
+              "description": "Every workspace they belong to.",
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/WorkspaceSummary"
+              }
+            }
+          },
+          "required": [
+            "state",
+            "person",
+            "display_name",
+            "workspaces"
+          ]
+        }
+      ]
+    },
+    "TailnetLogin": {
+      "description": "A person's Tailscale login, as Tailscale Serve asserts it in `Tailscale-User-Login`, for example\n`alice@example.com` or `alice@github`.\n\nHolding one proves nothing by itself. It means something only when abc-server's sidecar\nextractor built it from a request that arrived on the sidecar Unix socket. abc-store turns it\ninto a `Principal` inside the request's transaction.",
+      "type": "string"
+    },
+    "Timestamp": {
+      "description": "An instant in UTC, with microsecond precision to match Postgres `timestamptz`. On the wire it\nis an RFC 3339 string.",
+      "type": "string"
+    },
+    "TokenIssuedResponse": {
+      "description": "The only response that carries a secret: the token, shown once. The web app renders it as a\nready-to-paste `abc worker enrol <url> --token …` command and never stores it.",
+      "type": "object",
+      "properties": {
+        "expires_at": {
+          "description": "When it stops working.",
+          "$ref": "#/$defs/Timestamp"
+        },
+        "id": {
+          "description": "The token's id, for listing and revoking.",
+          "$ref": "#/$defs/EnrolmentTokenId"
+        },
+        "token": {
+          "description": "The token.",
+          "$ref": "#/$defs/Secret"
+        }
+      },
+      "required": [
+        "id",
+        "token",
+        "expires_at"
+      ]
+    },
+    "TokenStatus": {
+      "description": "A token's status. Derived when read from `revoked_at`, `redeemed_at` and `expires_at`, never\nstored, so it never goes stale.",
+      "oneOf": [
+        {
+          "description": "Redeemable.",
+          "type": "object",
+          "properties": {
+            "status": {
+              "type": "string",
+              "const": "open"
+            }
+          },
+          "required": [
+            "status"
+          ]
+        },
+        {
+          "description": "Past `expires_at`, unredeemed.",
+          "type": "object",
+          "properties": {
+            "status": {
+              "type": "string",
+              "const": "expired"
+            }
+          },
+          "required": [
+            "status"
+          ]
+        },
+        {
+          "description": "Revoked by the owner.",
+          "type": "object",
+          "properties": {
+            "status": {
+              "type": "string",
+              "const": "revoked"
+            }
+          },
+          "required": [
+            "status"
+          ]
+        },
+        {
+          "description": "Redeemed by a worker.",
+          "type": "object",
+          "properties": {
+            "status": {
+              "type": "string",
+              "const": "redeemed"
+            },
+            "worker": {
+              "description": "The worker it created.",
+              "$ref": "#/$defs/WorkerId"
+            }
+          },
+          "required": [
+            "status",
+            "worker"
+          ]
+        }
+      ]
+    },
+    "TokenSummary": {
+      "description": "A token as the owner sees it.",
+      "type": "object",
+      "properties": {
+        "expires_at": {
+          "description": "When it stops working.",
+          "$ref": "#/$defs/Timestamp"
+        },
+        "id": {
+          "description": "The token.",
+          "$ref": "#/$defs/EnrolmentTokenId"
+        },
+        "issued_at": {
+          "description": "When it was issued.",
+          "$ref": "#/$defs/Timestamp"
+        },
+        "label": {
+          "description": "The owner's note.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MachineLabel"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "status": {
+          "description": "Its status at the store's clock when read.",
+          "$ref": "#/$defs/TokenStatus"
+        }
+      },
+      "required": [
+        "id",
+        "issued_at",
+        "expires_at",
+        "status"
+      ]
+    },
+    "TokenTtl": {
+      "description": "How long a new token stays redeemable: 5 minutes to 24 hours, 30 minutes by default. On the\nwire, whole seconds.",
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    },
+    "WorkerId": {
+      "description": "An enrolled machine running `abc worker`. Workers are actors and belong to one workspace.",
+      "type": "string",
+      "format": "uuid"
+    },
+    "WorkspaceId": {
+      "description": "A workspace: the unit everything in abc belongs to (I4).",
+      "type": "string",
+      "format": "uuid"
+    },
+    "WorkspaceName": {
+      "description": "A workspace's name.",
+      "type": "string"
+    },
+    "WorkspaceSummary": {
+      "description": "One of a person's workspaces.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "description": "The workspace.",
+          "$ref": "#/$defs/WorkspaceId"
+        },
+        "name": {
+          "description": "Its name.",
+          "$ref": "#/$defs/WorkspaceName"
+        },
+        "role": {
+          "description": "The person's role in it.",
+          "$ref": "#/$defs/Role"
+        }
+      },
+      "required": [
+        "id",
+        "name",
+        "role"
+      ]
+    }
+  }
+}

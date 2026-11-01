@@ -17,10 +17,12 @@ publish = false
 anyhow = "1.0.104"
 axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "query", "tokio", "ws", "matched-path", "tracing"] }
 base64 = "0.23.1"
+bytes = "1.12.1"
 clap = { version = "4.6.7", features = ["derive"] }
 data-encoding = "2.11.1"
 flate2 = "1.1.10"
 futures = "0.3.34"
+http-body-util = "0.1.5"
 hyper = "1.12.0"
 hyper-util = { version = "0.1.21", features = ["tokio", "server-auto"] }
 insta = "1.49.0"
@@ -30,6 +32,7 @@ schemars = { version = "1.2.3", features = ["uuid1", "semver1"] }
 semver = { version = "1.0.28", features = ["serde"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
+serde_path_to_error = "0.1.20"
 proc-macro2 = { version = "1.0.107", features = ["span-locations"] }
 ring = "0.17.14"
 sha2 = "0.11.1"
@@ -45,8 +48,6 @@ tokio-stream = { version = "0.1.19", features = ["sync"] }
 tokio-tungstenite = "0.30.0"
 yaml-rust2 = "0.13.0"
 toml_edit = { version = "0.25.17", features = ["serde"] }
-tower = { version = "0.5.3", features = ["util"] }
-tower-http = { version = "0.7.1", features = ["trace", "request-id", "limit", "timeout"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["json", "env-filter", "fmt"] }
 ts-rs = { version = "12.0.1", features = ["uuid-impl", "semver-impl", "serde-compat", "no-serde-warnings"] }

@@ -3,3 +3,8 @@ allow-unwrap-in-tests = true
 allow-expect-in-tests = true
 allow-panic-in-tests = true
 allow-indexing-slicing-in-tests = true
+# Routers are served only through abc-server's listener newtypes, so the identity-carrying sidecar
+# router can never end up on a TCP listener (D4). The two sanctioned call sites expect this lint.
+disallowed-methods = [
+    { path = "axum::serve", reason = "serve routers through abc_server::listen, which ties each router to its listener" },
+]

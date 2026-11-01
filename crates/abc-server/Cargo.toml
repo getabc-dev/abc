@@ -14,18 +14,15 @@ abc-core = { path = "../abc-core" }
 abc-protocol = { path = "../abc-protocol" }
 abc-store = { path = "../abc-store" }
 axum.workspace = true
+bytes.workspace = true
 futures.workspace = true
-hyper.workspace = true
-hyper-util.workspace = true
 schemars.workspace = true
-semver.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+serde_path_to_error.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true
-tower.workspace = true
-tower-http.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 ts-rs.workspace = true
@@ -33,9 +30,12 @@ uuid.workspace = true
 
 [dev-dependencies]
 abc-store = { path = "../abc-store", features = ["testing"] }
-# Only for the #[sqlx::test] attribute (a fresh migrated database per test, D7).
+http-body-util.workspace = true
+hyper = { workspace = true, features = ["client", "http1"] }
+hyper-util.workspace = true
+semver.workspace = true
+# Only for the #[sqlx::test] attribute (a fresh migrated database per test, D7) and its pool.
 sqlx.workspace = true
-insta.workspace = true
 tempfile.workspace = true
 tokio-tungstenite.workspace = true
 
