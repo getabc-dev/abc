@@ -1,0 +1,43 @@
+name: Review
+
+on:
+  pull_request:
+    # An edited description re-reviews the reasons it gives for test changes.
+    types: [opened, synchronize, reopened, edited, ready_for_review]
+  merge_group:
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  gemini:
+    name: Gemini review
+    # Drafts are skipped; marking one ready for review runs it.
+    if: github.event_name == 'merge_group' || github.event.pull_request.draft == false
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    # GEMINI_API_KEY is in reach of this job alone, which builds and runs only the base commit's
+    # xtask and reads the pull request as a diff; nothing from the pull request's tree runs here.
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: $/.github/actions/base-xtask
+        with:
+          base: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+          gate: review
+      - name: Gemini reviews the diff against AGENTS.md
+        working-directory: ${{ runner.temp }}/base
+        run: cargo xtask review --root "$GITHUB_WORKSPACE" --base "$BASE"
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}

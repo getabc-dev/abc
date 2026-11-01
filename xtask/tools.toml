@@ -15,6 +15,12 @@
 # download. zizmor and cargo-shear publish no checksums but attest their release archives.
 # Renovate bumps `version` from the GitHub release named in the `url` line right after it, so
 # keep `version` and `url` adjacent and in that order.
+#
+# A tool with no verifiable release build is built from crates.io instead: `crate` names the
+# crate and `sha256` pins its .crate file, which `cargo xtask pin` checks against the crates.io
+# index. `cargo xtask setup` builds it with `cargo install --locked` and records the executable's
+# sha256 beside it, which xtask checks whenever it runs the tool. Renovate bumps `version` from
+# crates.io; keep `version` before `crate`, with only comments between them.
 
 [[tool]]
 name = "cargo-nextest"
@@ -84,3 +90,22 @@ checksums = "https://github.com/google/osv-scanner/releases/download/v{version}/
 targets.aarch64-apple-darwin = { platform = "darwin_arm64", sha256 = "d4926ef8da134332543be276dff157e4c170f99ad91fc48e89448a8816bdf70b", binary-sha256 = "d4926ef8da134332543be276dff157e4c170f99ad91fc48e89448a8816bdf70b" }
 targets.x86_64-unknown-linux-gnu = { platform = "linux_amd64", sha256 = "160c6253e2922e9e0a6a9771c5c4c40a4b3c6090b34a3cdd5e80c96cc2e4218b", binary-sha256 = "160c6253e2922e9e0a6a9771c5c4c40a4b3c6090b34a3cdd5e80c96cc2e4218b" }
 targets.aarch64-unknown-linux-gnu = { platform = "linux_arm64", sha256 = "4061ef4c021ed3c47f203b818f337e351336cc5cd67c0274fc36bd1dfc728dd7", binary-sha256 = "4061ef4c021ed3c47f203b818f337e351336cc5cd67c0274fc36bd1dfc728dd7" }
+
+[[tool]]
+name = "cargo-llvm-cov"
+version = "0.9.1"
+url = "https://github.com/taiki-e/cargo-llvm-cov/releases/download/v{version}/cargo-llvm-cov-{platform}.tar.gz"
+attestations = "taiki-e/cargo-llvm-cov"
+binary = "cargo-llvm-cov"
+version-args = ["llvm-cov", "--version"]
+targets.aarch64-apple-darwin = { platform = "aarch64-apple-darwin", sha256 = "7e821a6c90c0884f79f759f5d9be50799ade67bb82515186d922f26032ef43b8", binary-sha256 = "5ba9a1aa0a478acef5f3679564f0c21e3ede5eb53b6b622fd921c002458ae7cb" }
+targets.x86_64-unknown-linux-gnu = { platform = "x86_64-unknown-linux-gnu", sha256 = "b3f68e625481fed9b16444174f3fa5ebcdbde4a1878803a35eabe2dcefcdc41a", binary-sha256 = "d8334c0e109a983ea8ecc25b6146cfebbd295a9a71b4f8027e20a68fa2f1dcd4" }
+targets.aarch64-unknown-linux-gnu = { platform = "aarch64-unknown-linux-gnu", sha256 = "abf5f13c1520f8756d2192bfaaeadb0208f5b7eaa8cadc15bf847befa42b7360", binary-sha256 = "01db2607461e0f9e7fcc9039e8268faec0a045c2d91d766313df88f71edc79f3" }
+
+[[tool]]
+name = "cargo-mutants"
+version = "27.1.0"
+# Ships no verifiable build for every target, so it is built from crates.io with its lockfile.
+crate = "cargo-mutants"
+version-args = ["mutants", "--version"]
+sha256 = "07072e7bcdeb425d5e5fdbfd9f15a2c749e23cb2edf5ef40aee5876760ae1cf9"

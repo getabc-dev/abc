@@ -99,25 +99,72 @@ brief.
 Everything runs through `cargo xtask`, and agent hooks and CI call the same commands. The Rust
 toolchain is pinned in `rust-toolchain.toml`; rustup installs it on first use.
 
+Agents start every task with `cargo xtask task set "<the task>"`. When the agent stops, the
+watchdog compares the diff with that task and the rules above, and keeps it working if it drifted.
+
 | Command | What it does |
 | --- | --- |
-| `cargo xtask setup` | Installs the tools pinned in `xtask/tools.toml` into `.tools/`, checking the sha256 of each archive and of the executable in it. Run it in every new clone or worktree, and after the list changes. |
-| `cargo xtask doctor` | Fails unless every pinned tool is installed, matches its pinned sha256 and reports its pinned version. |
+| `cargo xtask setup [TOOLS]` | Installs the tools pinned in `xtask/tools.toml` into `.tools/`, checking the sha256 of each archive or crate and of the executable. Run it in every new clone or worktree, and after the list changes. It never touches git config. |
+| `cargo xtask doctor [TOOLS]` | Fails unless every pinned tool, or each one named, is installed, matches its pinned sha256 and reports its pinned version. |
 | `cargo xtask check` | Format check, clippy (`--all-targets --locked -D warnings`), nextest, doctests and rustdoc with warnings denied, on the whole workspace. Property tests run with a fixed seed. |
 | `cargo xtask check --changed` | The same, limited to the crates affected by changes since the merge base with the default branch (`upstream/HEAD`, else `origin/HEAD`). |
+| `cargo xtask integrity --base <rev> [--description <file>]` | Lists deleted test files and tests, newly skipped or `should_panic` tests, tests with fewer assertions, and changed gate files since the merge base. In CI it fails on any of them unless an approver listed in `.github/integrity-approvers` at the merge base labelled the PR `integrity-approved` after its last push and last description edit; a run for a description edit treats any earlier label as stale. Each flagged test change also needs a reason in the PR description, label or not (below). |
+| `cargo xtask coverage --base <rev>` | Runs the tests under cargo-llvm-cov and fails unless 90% of the changed, instrumented lines of shipped code are covered, listing the ones that are not. Test code (`#[cfg(test)]` items, test functions, test modules in their own files, `tests/`) does not count. |
+| `cargo xtask mutants --base <rev> [--jobs N] [--shard k/n]` | Runs cargo-mutants on the Rust lines changed since the merge base, or one shard of them, and fails on any missed mutant: a change to the code that no test notices. A mutant whose tests hang counts as caught. |
+| `cargo xtask review --base <rev>` | Gemini reviews the diff, the PR's title and description against this file as it stands at the merge base. Runs in CI; it blocks on a `block` verdict or any blocking finding, and fails closed on quota, size and missing-key errors. |
+| `cargo xtask task set "<text>"` / `show` / `clear` | Records, prints or forgets the current task in `.abc/task.md` (not committed), for the watchdog. |
+| `cargo xtask gh -- <args>` | Runs gh as the agent App with a token minted for this run and revoked when gh exits. Agents create, merge and change things on GitHub only through this; the guard blocks plain `gh pr create`, `gh pr merge` and `gh api` writes. |
+| `cargo xtask git-credential <op>` | git's credential helper for github.com in agent sessions, which `.claude/settings.json` sets through `GIT_CONFIG_*` variables: it answers with an agent App token. Never run it yourself. |
+| `cargo xtask rulesets check` | Checks `.github/rulesets/main.json` against the CI workflows: every job that runs on pull requests and in the merge queue is a required check. |
+| `cargo xtask rulesets apply` | For the maintainer only, with their own gh login: puts the ruleset on GitHub, replacing the ones it supersedes. Agents never run it. |
 | `cargo xtask tool <name> [args]` | Runs a pinned tool from `.tools/`, such as `cargo xtask tool cargo-deny check`. Never run these tools from `PATH`. |
-| `cargo xtask pin` | After a version changes in `xtask/tools.toml`, downloads each target's archive and records its sha256 and its executable's. To add a tool, write zeros for both and run it. |
+| `cargo xtask pin` | After a version changes in `xtask/tools.toml`, records each target's archive sha256 and its executable's, or a crate's sha256 from the crates.io index. To add a tool, write zeros and run it. |
 | `cargo fmt --all` | Fixes formatting. |
 
-CI also runs `cargo xtask doctor`, `cargo xtask tool cargo-deny check`, `cargo xtask tool
-cargo-shear --deny-warnings --locked`, `cargo xtask tool osv-scanner scan source --lockfile
-Cargo.lock`, `cargo xtask tool zizmor --pedantic .github`, `cargo xtask tool pinact run --check
---verify-comment` and `cargo xtask tool gitleaks git --redact --no-banner --verbose .`.
+The gates take `--root <path>` to check another tree with the pinned tools of the checkout xtask
+was built from.
 
-The git guard in the agent hooks catches accidents: force pushes, and git or gh commands it
-cannot read. It cannot stop a deliberate bypass, since no text check of a shell command can, and it
-does not try to. Enforcement is on GitHub: rulesets on `main` forbid force pushes and deletion and
-require the checks, and agents push as the abc-agent GitHub App with limited permissions.
+CI runs `check`, `integrity`, `coverage`, `mutants` (in eight shards, reported as one `Mutants`
+check) and `review` on every pull request, and `cargo xtask tool cargo-deny check`, `cargo xtask
+tool cargo-shear --deny-warnings --locked`, `cargo xtask tool osv-scanner scan source --lockfile
+Cargo.lock`, `cargo xtask tool zizmor --pedantic .github`, `cargo xtask tool pinact run --check
+--verify-comment` and `cargo xtask tool gitleaks git --redact --no-banner --verbose .`. Every job
+is a required check on `main`. Integrity, Coverage, Mutants and Gemini review run the base
+commit's xtask on the pull request's tree (`--root`), so a pull request cannot change the gates
+that judge it; a pull request that adds a gate fails that gate, which says it is bootstrapping.
+Only the review job has `GEMINI_API_KEY`, and it runs nothing from the pull request's tree.
+
+A PR that deletes, skips or weakens a test explains each one in its description, in a
+`## Test changes` section: one entry per test, naming the test in backticks as the integrity check
+reports it (`<file>::<test>`, or the file for a deleted test file), then the requirement or
+behaviour that changed. A test change that only makes the code pass is not a reason; the Gemini
+review blocks it. `.github/pull_request_template.md` has the section, with "None" for a PR that
+changes no tests.
+
+```markdown
+## Test changes
+
+- `xtask/src/a.rs::tests::accepts_tabs`: tabs are now rejected (plan step 3), so this test is gone.
+```
+
+The gate files are the files that decide what passes: CI and rulesets (`.github/`), cargo, lint,
+toolchain and tool configuration, `Cargo.toml` and `Cargo.lock`, the agent settings, this file
+and `CLAUDE.md`, and all of `xtask/`. `GATES` in `xtask/src/integrity/mod.rs` lists them, and a
+test keeps `.github/CODEOWNERS` identical. A change to one needs the integrity approval and a code
+owner's review.
+
+**Break glass.** The ruleset's one bypass lets a repository admin merge a pull request without
+its checks or reviews; GitHub logs every use. Use it only when a gate itself is broken and
+blocks every pull request, when Gemini is down for longer than the change can wait, or for the
+maintainer's own gate-file change, which no other approver can review. Say why in the pull
+request.
+
+The git guard in the agent hooks catches accidents: force pushes, git or gh commands it cannot
+read, and gh changes made as the user instead of through `cargo xtask gh`. It cannot stop a
+deliberate bypass, since no text check of a shell command can, and it does not try to. Enforcement
+is on GitHub: the ruleset on `main` forbids force pushes and deletion and requires a code owner's
+approval and every check, and agents act as the getabc-dev-agent GitHub App with limited
+permissions.
 
 Commit the `proptest-regressions/` files proptest writes when a property test fails: they replay
 the failing cases first on every run.

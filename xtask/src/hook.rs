@@ -29,7 +29,7 @@ use std::process::{Child, Command, Stdio};
 use anyhow::{Context as _, bail, ensure};
 use serde::Deserialize;
 
-use crate::{check, guard, tools};
+use crate::{check, guard, tools, watchdog};
 
 /// The `PreToolUse` hook script. A checkout without it predates these hooks, so its xtask cannot
 /// take a hook over.
@@ -68,6 +68,10 @@ pub(crate) struct Context {
     delegated: bool,
     /// The cargo that runs another checkout's xtask.
     cargo: PathBuf,
+    /// The claude that runs the stop hook's watchdog.
+    claude: PathBuf,
+    /// Whether this hook runs inside the watchdog's own claude session, where it must do nothing.
+    inside_watchdog: bool,
 }
 
 impl Context {
@@ -77,6 +81,8 @@ impl Context {
             project_dir: std::env::var_os("CLAUDE_PROJECT_DIR").map(PathBuf::from),
             delegated: std::env::var_os(DELEGATED).is_some(),
             cargo: PathBuf::from("cargo"),
+            claude: PathBuf::from("claude"),
+            inside_watchdog: std::env::var_os(watchdog::GUARD).is_some(),
         }
     }
 }
@@ -85,6 +91,19 @@ impl Context {
 #[derive(Deserialize)]
 struct HookInput {
     cwd: Option<PathBuf>,
+    /// `Stop` or `SubagentStop` for the stop hook.
+    hook_event_name: Option<String>,
+    /// Whether the agent is already working on because a stop hook blocked it.
+    #[serde(default)]
+    stop_hook_active: bool,
+}
+
+impl HookInput {
+    /// Whether the watchdog judges this stop: the main agent's own, and not one a stop hook has
+    /// already sent back to work, so the watchdog can never keep an agent going forever.
+    fn watched(&self) -> bool {
+        self.hook_event_name.as_deref() == Some("Stop") && !self.stop_hook_active
+    }
 }
 
 /// Where the agent is working, relative to this checkout.
@@ -111,6 +130,8 @@ pub(crate) fn run(
             Ok(code) => guard_unavailable(&format!("it exited {code}"), input, out),
             Err(error) => guard_unavailable(&format!("{error:#}"), input, out),
         },
+        // The watchdog's own session stops without a check, so it never starts another watchdog.
+        Event::Stop if context.inside_watchdog => Ok(0),
         Event::Stop => act(event, input, context, out),
     }
 }
@@ -144,8 +165,8 @@ fn guard_unavailable(reason: &str, input: &str, out: &mut impl Write) -> anyhow:
 
 /// Finds where the agent works and runs the hook there.
 fn act(event: Event, input: &str, context: &Context, out: &mut impl Write) -> anyhow::Result<u8> {
-    let cwd = match (event, serde_json::from_str::<HookInput>(input)) {
-        (_, Ok(fields)) => fields.cwd,
+    let fields = match (event, serde_json::from_str::<HookInput>(input)) {
+        (_, Ok(fields)) => fields,
         // The guard blocks input it cannot read and gives the parse error as the reason.
         (Event::PreToolUse, Err(_)) => return guard(input, out),
         (Event::Stop, Err(error)) => {
@@ -153,7 +174,7 @@ fn act(event: Event, input: &str, context: &Context, out: &mut impl Write) -> an
         }
     };
     let location = locate(
-        cwd.as_deref(),
+        fields.cwd.as_deref(),
         context.project_dir.as_deref(),
         &context.own_root,
     )?;
@@ -161,7 +182,23 @@ fn act(event: Event, input: &str, context: &Context, out: &mut impl Write) -> an
         Location::Here => match event {
             Event::PreToolUse => guard(input, out),
             // Exit 1 when the check fails; the hook command turns any failure into a block.
-            Event::Stop => Ok(u8::from(!check::run(&context.own_root, true, out)?)),
+            Event::Stop => {
+                if check::run(
+                    &context.own_root,
+                    true,
+                    &tools::pinned(&context.own_root, "cargo-nextest")?,
+                    None,
+                    out,
+                )? {
+                    if fields.watched() {
+                        watchdog::check(&context.own_root, &context.claude, watchdog::TIMEOUT, out)
+                    } else {
+                        Ok(0)
+                    }
+                } else {
+                    Ok(1)
+                }
+            }
         },
         // GitHub is the gate, so a checkout that cannot take the hook is noted, never locked out.
         Location::Worktree(root) if !root.join(HOOK_SCRIPT).is_file() => {
@@ -305,6 +342,7 @@ fn feed(child: &mut Child, input: &str) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::io::Write as _;
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
     use std::process::{Command, Stdio};
@@ -335,6 +373,8 @@ mod tests {
             project_dir: project_dir.map(Path::to_path_buf),
             delegated: false,
             cargo: PathBuf::from("cargo"),
+            claude: PathBuf::from("claude"),
+            inside_watchdog: false,
         }
     }
 
@@ -719,6 +759,71 @@ mod tests {
     }
 
     #[test]
+    fn only_the_agent_environment_asks_the_app_for_credentials() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = repository(&temp.path().join("repo"));
+        let home = temp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        fs::write(
+            home.join(".gitconfig"),
+            "[credential]\n\thelper = \"!f() { echo username=user; echo password=user-secret; }; f\"\n",
+        )
+        .unwrap();
+        let settings: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(crate::repo_root().unwrap().join(".claude/settings.json")).unwrap(),
+        )
+        .unwrap();
+        let fill = |agent: bool| {
+            let mut command = Command::new("git");
+            command
+                .args(["credential", "fill"])
+                .current_dir(&repo)
+                .env("HOME", &home)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .env_remove("GIT_CONFIG_GLOBAL")
+                .env_remove("GIT_CONFIG_COUNT")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped());
+            if agent {
+                for (name, value) in settings["env"].as_object().unwrap() {
+                    command.env(name, value.as_str().unwrap());
+                }
+                // The App's helper itself, which needs the App's files, stands in as a fake.
+                assert_eq!(
+                    settings["env"]["GIT_CONFIG_VALUE_1"], "!cargo xtask git-credential",
+                    "the real helper"
+                );
+                command.env(
+                    "GIT_CONFIG_VALUE_1",
+                    "!f() { echo username=x-access-token; echo password=app-token; }; f",
+                );
+            }
+            let mut child = command.spawn().unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(b"protocol=https\nhost=github.com\n\n")
+                .unwrap();
+            String::from_utf8(child.wait_with_output().unwrap().stdout).unwrap()
+        };
+        assert!(
+            fill(false).contains("password=user-secret"),
+            "the user's terminal keeps the user's credentials"
+        );
+        let agent = fill(true);
+        assert!(
+            agent.contains("password=app-token"),
+            "agents get the App's: {agent}"
+        );
+        assert!(
+            !agent.contains("user-secret"),
+            "and never the user's: {agent}"
+        );
+    }
+
+    #[test]
     fn settings_wire_the_hooks_to_xtask() {
         let settings: serde_json::Value = serde_json::from_str(
             &fs::read_to_string(crate::repo_root().unwrap().join(".claude/settings.json")).unwrap(),
@@ -736,12 +841,41 @@ mod tests {
             "the guard runs the hook script"
         );
         assert_eq!(guard["timeout"], 300, "the guard is time-boxed");
-        let stop_command = "if [ -f \"$CLAUDE_PROJECT_DIR/xtask/Cargo.toml\" ]; then cd \"$CLAUDE_PROJECT_DIR\" && cargo xtask hook stop 1>&2 || { echo 'cargo xtask check failed'; exit 2; }; else echo \"xtask hook: $CLAUDE_PROJECT_DIR has no xtask; no checks run\" >&2; fi";
+        let stop_command = "if [ -f \"$CLAUDE_PROJECT_DIR/xtask/Cargo.toml\" ]; then cd \"$CLAUDE_PROJECT_DIR\" && cargo xtask hook stop 1>&2 || { echo 'xtask stop hook: keep working; see stderr'; exit 2; }; else echo \"xtask hook: $CLAUDE_PROJECT_DIR has no xtask; no checks run\" >&2; fi";
         for event in ["Stop", "SubagentStop"] {
             let stop = &hooks[event][0]["hooks"][0];
             assert_eq!(stop["command"], stop_command, "{event} runs the check");
             assert_eq!(stop["timeout"], 900, "{event} is time-boxed");
         }
+        assert_eq!(
+            settings["permissions"]["deny"],
+            serde_json::json!([
+                "Bash(gh auth token)",
+                "Bash(gh auth token *)",
+                "Bash(gh auth status --show-token)",
+                "Bash(gh auth status --show-token *)",
+                "Bash(gh auth status * --show-token*)",
+                "Bash(gh auth status -t)",
+                "Bash(gh auth status -t *)",
+                "Bash(gh auth status * -t*)",
+                "Read(~/.config/gh/**)",
+                "Read(~/.config/abc/agent-app/**)",
+                "Bash(security find-generic-password *)",
+                "Bash(security find-internet-password *)"
+            ]),
+            "agents cannot read the user's GitHub credentials (D3)"
+        );
+        assert_eq!(
+            settings["env"],
+            serde_json::json!({
+                "GIT_CONFIG_COUNT": "2",
+                "GIT_CONFIG_KEY_0": "credential.https://github.com.helper",
+                "GIT_CONFIG_VALUE_0": "",
+                "GIT_CONFIG_KEY_1": "credential.https://github.com.helper",
+                "GIT_CONFIG_VALUE_1": "!cargo xtask git-credential"
+            }),
+            "agent sessions alone push as the App: the empty helper drops the user's (D3)"
+        );
         assert_eq!(
             hooks["SubagentStop"][0]["matcher"],
             "^(?!(?:Explore|Plan|claude-code-guide|statusline-setup|web-fetch)$).+",
@@ -799,6 +933,39 @@ mod tests {
         let input = r#"{"tool_name":"Bash","tool_input":{"command":"git push -f"}}"#;
         assert_eq!(run_hook_script(2, input).0, Some(2), "a block");
         assert_eq!(run_hook_script(0, input).0, Some(0), "an allow");
+    }
+
+    #[test]
+    fn the_watchdog_judges_only_the_main_agents_first_stop() {
+        let fields = |json: &str| serde_json::from_str::<super::HookInput>(json).unwrap();
+        assert!(
+            fields(r#"{"hook_event_name": "Stop", "stop_hook_active": false}"#).watched(),
+            "the main agent stopping"
+        );
+        assert!(
+            !fields(r#"{"hook_event_name": "Stop", "stop_hook_active": true}"#).watched(),
+            "an agent a stop hook already sent back is never blocked again"
+        );
+        assert!(
+            !fields(r#"{"hook_event_name": "SubagentStop"}"#).watched(),
+            "subagents have no task of their own"
+        );
+        assert!(!fields("{}").watched(), "an unnamed event is not watched");
+    }
+
+    #[test]
+    fn the_watchdogs_own_session_stops_without_checks() {
+        let (temp, main, _worktree) = repository_with_nested_worktree();
+        let mut inside = context(&main, Some(&main));
+        inside.inside_watchdog = true;
+        inside.cargo = fake_cargo(temp.path(), 101);
+        let mut out = Vec::new();
+        assert_eq!(
+            run(Event::Stop, "not json", &inside, &mut out).unwrap(),
+            0,
+            "no check, no watchdog, no recursion"
+        );
+        assert!(out.is_empty(), "and nothing to say");
     }
 
     #[test]

@@ -1,0 +1,17 @@
+# Gate files: whatever decides what passes. This list must match GATES in
+# xtask/src/integrity/mod.rs, which a test checks. Changing one needs the owner's review (D5),
+# and the Integrity check flags it.
+/.cargo/                  @snehilvj
+/.claude/settings.json    @snehilvj
+/.config/                 @snehilvj
+/.github/                 @snehilvj
+/.gitleaks.toml           @snehilvj
+/AGENTS.md                @snehilvj
+/CLAUDE.md                @snehilvj
+/Cargo.lock               @snehilvj
+/Cargo.toml               @snehilvj
+/clippy.toml              @snehilvj
+/deny.toml                @snehilvj
+/rust-toolchain.toml      @snehilvj
+/rustfmt.toml             @snehilvj
+/xtask/                   @snehilvj

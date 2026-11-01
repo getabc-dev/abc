@@ -1,0 +1,51 @@
+name: Integrity
+
+on:
+  pull_request:
+    # Labelling re-runs it, so an approver's integrity-approved label counts at once; editing the
+    # description re-reads its "## Test changes" reasons.
+    types: [opened, synchronize, reopened, edited, labeled, unlabeled]
+  merge_group:
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  integrity:
+    name: Integrity
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      pull-requests: read # the pull request's head commit and labels
+      issues: read # the timeline: who added integrity-approved, and when
+      actions: read # the head commit's workflow runs: when it was pushed
+    steps:
+      - name: The merge queue reruns a pull request that already passed
+        if: github.event_name == 'merge_group'
+        run: echo "Integrity was checked, and any findings approved, in the pull request."
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: github.event_name == 'pull_request'
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      # The base's xtask judges the pull request's tree, so a pull request cannot change the check.
+      - uses: $/.github/actions/base-xtask
+        if: github.event_name == 'pull_request'
+        with:
+          base: ${{ github.event.pull_request.base.sha }}
+          gate: integrity
+      - name: Deleted, skipped or weakened tests and gate changes
+        if: github.event_name == 'pull_request'
+        working-directory: ${{ runner.temp }}/base
+        run: cargo xtask integrity --root "$GITHUB_WORKSPACE" --base "$BASE" --pr "$PR"
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          PR: ${{ github.event.pull_request.number }}
+          GITHUB_TOKEN: ${{ github.token }}

@@ -1,0 +1,8 @@
+# gitleaks configuration: the default rules, plus the one path that holds a test-only key.
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "A throwaway RSA key the agent App tests sign with; it grants nothing."
+paths = ['''^xtask/testdata/agent-app-test-key\.pem$''']

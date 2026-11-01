@@ -1,0 +1,403 @@
+//! The reasons a pull request gives for its test changes.
+//!
+//! When the check flags a test change, the pull request description must say why in a
+//! `## Test changes` section, one list item per flagged test: the test in backticks, then the
+//! requirement or behaviour that changed.
+//!
+//! ```markdown
+//! ## Test changes
+//!
+//! - `xtask/src/a.rs::tests::parses_tabs`: tabs are now rejected, so the test that accepted them
+//!   is gone.
+//! - `xtask/src/old.rs`: the old parser was removed with its tests.
+//! ```
+//!
+//! A test is named `<file>::<test>`, or by its file alone when the whole file was deleted. HTML
+//! comments, such as the hints in `.github/pull_request_template.md`, are not read, and "None" (the
+//! template's default) names no test, so it passes only when no test change was flagged. The
+//! `integrity-approved` label approves a stated reason, so the reasons are required with or
+//! without it.
+
+use std::collections::BTreeMap;
+use std::fs;
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
+
+use anyhow::Context;
+use serde::Deserialize;
+
+/// The heading of the section, without its `## `.
+pub(super) const HEADING: &str = "Test changes";
+
+/// The reason given for each test the section names, keyed by the test; a reason may be empty.
+fn entries(description: &str) -> Option<BTreeMap<String, String>> {
+    let description = without_comments(description);
+    let mut lines = description.lines();
+    lines.find(|line| {
+        line.strip_prefix("## ")
+            .is_some_and(|title| title.trim().eq_ignore_ascii_case(HEADING))
+    })?;
+    let mut entries: BTreeMap<String, String> = BTreeMap::new();
+    let mut current: Option<String> = None;
+    for line in lines {
+        if line.starts_with("# ") || line.starts_with("## ") {
+            break;
+        }
+        let trimmed = line.trim_start();
+        if let Some(item) = trimmed
+            .strip_prefix("- ")
+            .or_else(|| trimmed.strip_prefix("* "))
+        {
+            current = None;
+            let Some((test, reason)) = item
+                .trim_start()
+                .strip_prefix('`')
+                .and_then(|rest| rest.split_once('`'))
+            else {
+                continue;
+            };
+            let reason = reason
+                .trim_start_matches(|c: char| {
+                    matches!(c, ':' | '-' | '—' | '–') || c.is_whitespace()
+                })
+                .trim();
+            let entry = entries.entry(test.trim().to_owned()).or_default();
+            append(entry, reason);
+            current = Some(test.trim().to_owned());
+        } else if let Some(test) = &current
+            && line.starts_with(char::is_whitespace)
+            && let Some(entry) = entries.get_mut(test)
+        {
+            // An indented line continues the item above.
+            append(entry, line.trim());
+        }
+    }
+    Some(entries)
+}
+
+/// `text` without its HTML comments; an unclosed comment runs to the end.
+fn without_comments(text: &str) -> String {
+    let mut kept = String::new();
+    let mut rest = text;
+    while let Some((before, comment)) = rest.split_once("<!--") {
+        kept.push_str(before);
+        rest = comment.split_once("-->").map_or("", |(_, after)| after);
+    }
+    kept.push_str(rest);
+    kept
+}
+
+fn append(reason: &mut String, more: &str) {
+    if more.is_empty() {
+        return;
+    }
+    if !reason.is_empty() {
+        reason.push(' ');
+    }
+    reason.push_str(more);
+}
+
+/// How well a description explains the flagged test changes.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct Explained {
+    /// Whether the description has the section at all.
+    pub(super) section: bool,
+    /// Flagged tests without an entry, or whose entry gives no reason.
+    pub(super) unexplained: Vec<String>,
+    /// Entries for tests the check did not flag.
+    pub(super) extra: Vec<String>,
+}
+
+impl Explained {
+    pub(super) const fn complete(&self) -> bool {
+        self.unexplained.is_empty()
+    }
+
+    /// Tells the author what is missing, and notes entries for tests that were not flagged.
+    pub(super) fn report(&self, out: &mut impl Write) -> io::Result<()> {
+        if !self.complete() {
+            let problem = if self.section {
+                format!("the \"## {HEADING}\" section gives no reason for")
+            } else {
+                format!("the pull request description has no \"## {HEADING}\" section for")
+            };
+            writeln!(
+                out,
+                "integrity: failed; {problem} these test changes. Add one entry per test, saying \
+                 which requirement or behaviour changed:\n\n## {HEADING}\n"
+            )?;
+            for test in &self.unexplained {
+                writeln!(out, "- `{test}`: <which requirement or behaviour changed>")?;
+            }
+        }
+        for test in &self.extra {
+            writeln!(
+                out,
+                "integrity: note: \"## {HEADING}\" names `{test}`, which has no flagged change"
+            )?;
+        }
+        Ok(())
+    }
+}
+
+/// Checks that `description` gives a reason for each of the `flagged` tests.
+pub(super) fn explained(flagged: &[String], description: &str) -> Explained {
+    let Some(entries) = entries(description) else {
+        return Explained {
+            section: false,
+            unexplained: flagged.to_vec(),
+            extra: Vec::new(),
+        };
+    };
+    Explained {
+        section: true,
+        unexplained: flagged
+            .iter()
+            .filter(|test| entries.get(*test).is_none_or(String::is_empty))
+            .cloned()
+            .collect(),
+        extra: entries
+            .keys()
+            .filter(|test| !flagged.contains(test))
+            .cloned()
+            .collect(),
+    }
+}
+
+#[derive(Deserialize)]
+struct Payload {
+    action: Option<String>,
+    changes: Option<Changes>,
+    pull_request: Option<PayloadPullRequest>,
+}
+
+#[derive(Deserialize)]
+struct Changes {
+    body: Option<serde_json::Value>,
+}
+
+#[derive(Deserialize)]
+struct PayloadPullRequest {
+    body: Option<String>,
+}
+
+/// What the check needs from the pull request event.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct Event {
+    /// The pull request description, when there is one to check.
+    pub(crate) description: Option<String>,
+    /// Whether this run is for an edit of the description, which no earlier approval covered.
+    pub(crate) body_edited: bool,
+}
+
+/// The event: the description from `file` when given, else from the GitHub Actions event payload
+/// at `payload_path` when this is a pull request; and whether the payload is a description edit.
+pub(crate) fn event(file: Option<&Path>, payload_path: Option<PathBuf>) -> anyhow::Result<Event> {
+    let from_file = file
+        .map(|file| {
+            fs::read_to_string(file)
+                .with_context(|| format!("could not read the description in {}", file.display()))
+        })
+        .transpose()?;
+    let Some(payload_path) = payload_path else {
+        return Ok(Event {
+            description: from_file,
+            body_edited: false,
+        });
+    };
+    let text = fs::read_to_string(&payload_path).with_context(|| {
+        format!(
+            "could not read the event payload {}",
+            payload_path.display()
+        )
+    })?;
+    let payload: Payload = serde_json::from_str(&text).context("the event payload is invalid")?;
+    let pull_request = payload
+        .pull_request
+        .context("the event is not about a pull request")?;
+    Ok(Event {
+        description: Some(from_file.unwrap_or_else(|| pull_request.body.unwrap_or_default())),
+        body_edited: payload.action.as_deref() == Some("edited")
+            && payload
+                .changes
+                .is_some_and(|changes| changes.body.is_some()),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use super::{Event, Explained, entries, event, explained};
+
+    fn report(result: &Explained) -> String {
+        let mut out = Vec::new();
+        result.report(&mut out).unwrap();
+        String::from_utf8(out).unwrap()
+    }
+
+    fn flagged() -> Vec<String> {
+        vec![
+            "src/a.rs::tests::one".to_owned(),
+            "src/a.rs::tests::two".to_owned(),
+            "src/gone.rs".to_owned(),
+        ]
+    }
+
+    #[test]
+    fn every_flagged_test_explained_passes() {
+        let description = "Adds x.\n\n## Test changes\n\n- `src/a.rs::tests::one`: tabs are now rejected.\n* `src/a.rs::tests::two` — the limit moved\n  from 10 to 20.\n- `src/gone.rs` - the old parser is gone.\n\n## Plan\n\n- `src/other.rs`: not in the section\n";
+        let result = explained(&flagged(), description);
+        assert_eq!(
+            result,
+            Explained {
+                section: true,
+                unexplained: Vec::new(),
+                extra: Vec::new()
+            },
+            "each test has a reason; the next section is not read"
+        );
+        assert!(result.complete(), "complete");
+        assert!(report(&result).is_empty(), "nothing to say");
+        assert_eq!(
+            entries(description).unwrap()["src/a.rs::tests::two"],
+            "the limit moved from 10 to 20.",
+            "an indented line continues its item"
+        );
+    }
+
+    #[test]
+    fn a_missing_section_lists_every_test() {
+        let result = explained(
+            &flagged(),
+            "Adds x.\n\n### Test changes\n- `src/gone.rs`: x\n",
+        );
+        assert!(!result.section, "only a level-2 heading counts");
+        assert_eq!(result.unexplained, flagged(), "all of them");
+        let report = report(&result);
+        assert!(
+            report.contains("has no \"## Test changes\" section"),
+            "{report}"
+        );
+        assert!(
+            report.contains("- `src/a.rs::tests::one`: <which requirement or behaviour changed>"),
+            "a template for each: {report}"
+        );
+    }
+
+    #[test]
+    fn a_partial_section_lists_the_tests_left_out() {
+        let description = "## test changes\n\n- `src/a.rs::tests::one`:\n- `src/a.rs::tests::two`: renamed.\n- src/gone.rs: no backticks\n";
+        let result = explained(&flagged(), description);
+        assert!(result.section, "the heading is matched without case");
+        assert_eq!(
+            result.unexplained,
+            ["src/a.rs::tests::one", "src/gone.rs"],
+            "an entry without a reason or without the test in backticks explains nothing"
+        );
+        assert!(!result.complete(), "incomplete");
+        let report = report(&result);
+        assert!(report.contains("gives no reason for"), "{report}");
+        assert!(!report.contains("tests::two`"), "{report}");
+    }
+
+    #[test]
+    fn extra_entries_are_noted_but_pass() {
+        let description = "## Test changes\n- `src/a.rs::tests::one`: a\n- `src/a.rs::tests::two`: b\n- `src/gone.rs`: c\n- `src/b.rs::tests::three`: d\n";
+        let result = explained(&flagged(), description);
+        assert!(result.complete(), "every flagged test is explained");
+        assert_eq!(result.extra, ["src/b.rs::tests::three"], "the extra entry");
+        assert!(
+            report(&result).contains("names `src/b.rs::tests::three`, which has no flagged change"),
+            "noted"
+        );
+        assert!(
+            explained(&[], "no section").complete(),
+            "nothing flagged needs no section"
+        );
+    }
+
+    #[test]
+    fn the_pull_request_template_agrees_with_the_parser() {
+        let template = include_str!("../../../.github/pull_request_template.md");
+        let untouched = explained(&[], template);
+        assert!(
+            untouched.section && untouched.complete() && untouched.extra.is_empty(),
+            "the template's \"None\" passes when nothing is flagged, and its hint is no entry"
+        );
+        assert_eq!(
+            explained(&flagged(), template).unexplained,
+            flagged(),
+            "\"None\" explains no flagged test"
+        );
+        let filled = template.replace(
+            "\nNone\n",
+            "\n- `src/a.rs::tests::one`: a\n- `src/a.rs::tests::two`: b\n- `src/gone.rs`: c\n",
+        );
+        assert!(
+            explained(&flagged(), &filled).complete(),
+            "filled in, it passes"
+        );
+        assert_eq!(
+            entries("## Test changes\n<!-- - `x`: hint\n-->\n- `y`: real <!-- aside --> reason\n<!-- open")
+                .unwrap()
+                .into_iter()
+                .collect::<Vec<_>>(),
+            [("y".to_owned(), "real  reason".to_owned())],
+            "comments are dropped, an unclosed one to the end"
+        );
+    }
+
+    #[test]
+    fn reads_the_description_from_a_file_or_the_event() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("description.md");
+        fs::write(&file, "## Test changes\n").unwrap();
+        let payload = dir.path().join("event.json");
+        fs::write(
+            &payload,
+            r#"{"action": "opened", "pull_request": {"body": "From the event."}}"#,
+        )
+        .unwrap();
+        let read = |given: Option<&std::path::Path>, sent: Option<&std::path::Path>| {
+            event(given, sent.map(std::path::Path::to_path_buf))
+        };
+        assert_eq!(
+            read(Some(&file), Some(&payload))
+                .unwrap()
+                .description
+                .as_deref(),
+            Some("## Test changes\n"),
+            "a file wins"
+        );
+        assert_eq!(
+            read(None, Some(&payload)).unwrap(),
+            Event {
+                description: Some("From the event.".to_owned()),
+                body_edited: false
+            },
+            "the pull request's body"
+        );
+        fs::write(&payload, r#"{"action": "edited", "changes": {"body": {"from": "Old."}}, "pull_request": {"body": null}}"#).unwrap();
+        assert_eq!(
+            read(None, Some(&payload)).unwrap(),
+            Event {
+                description: Some(String::new()),
+                body_edited: true
+            },
+            "an edited, now empty, description"
+        );
+        fs::write(&payload, r#"{"action": "edited", "changes": {"title": {"from": "Old"}}, "pull_request": {"body": "x"}}"#).unwrap();
+        assert!(
+            !read(None, Some(&payload)).unwrap().body_edited,
+            "a title edit is not one"
+        );
+        fs::write(&payload, r#"{"merge_group": {}}"#).unwrap();
+        assert!(read(None, Some(&payload)).is_err(), "not a pull request");
+        assert_eq!(read(None, None).unwrap(), Event::default(), "neither");
+        assert!(
+            read(Some(&dir.path().join("absent")), None).is_err(),
+            "an unreadable file"
+        );
+    }
+}
