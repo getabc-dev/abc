@@ -24,7 +24,7 @@
 use std::ffi::OsStr;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 
 use anyhow::{Context as _, bail, ensure};
 use serde::Deserialize;
@@ -282,22 +282,29 @@ fn delegate(cargo: &Path, root: &Path, event: Event, input: &str) -> anyhow::Res
         .stdin(Stdio::piped())
         .spawn()
         .with_context(|| format!("could not run cargo xtask in {}", root.display()))?;
-    child
-        .stdin
-        .take()
-        .context("the delegated hook has no stdin")?
-        .write_all(input.as_bytes())
-        .context("could not pass the hook input on")?;
+    feed(&mut child, input).context("could not pass the hook input on")?;
     let status = child
         .wait()
         .context("could not wait for the delegated hook")?;
     Ok(tools::status_code(status))
 }
 
+/// Writes `input` to `child`'s stdin and closes it. A child that exits without reading its input,
+/// such as a hook that only prints a note or a checkout whose xtask fails to build, closes the
+/// pipe first; its exit status then decides the outcome, so a broken pipe is not an error.
+fn feed(child: &mut Child, input: &str) -> std::io::Result<()> {
+    let Some(mut stdin) = child.stdin.take() else {
+        return Ok(());
+    };
+    match stdin.write_all(input.as_bytes()) {
+        Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+        written => written,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::io::Write as _;
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
     use std::process::{Command, Stdio};
@@ -568,6 +575,23 @@ mod tests {
         );
     }
 
+    #[test]
+    fn feeding_a_child_that_exits_without_reading_is_not_an_error() {
+        // A megabyte overflows any pipe buffer, so the write meets the closed pipe for certain.
+        let input = "x".repeat(1 << 20);
+        let mut child = Command::new("sh")
+            .args(["-c", "exit 3"])
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        super::feed(&mut child, &input).unwrap();
+        assert_eq!(
+            child.wait().unwrap().code(),
+            Some(3),
+            "the child's exit status decides, not the broken pipe"
+        );
+    }
+
     /// The shells hooks must work under: the system `sh` and dash, Debian's and Ubuntu's `sh`.
     const SHELLS: [&str; 2] = ["sh", "/bin/dash"];
 
@@ -590,12 +614,7 @@ mod tests {
             .stdout(Stdio::null())
             .spawn()
             .unwrap_or_else(|error| panic!("{shell} must be installed: {error}"));
-        child
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(input.as_bytes())
-            .unwrap();
+        super::feed(&mut child, input).unwrap();
         let output = child.wait_with_output().unwrap();
         (
             output.status.code(),
