@@ -2,11 +2,15 @@
 //!
 //! `cargo xtask rulesets check` keeps the ruleset in step with CI: its required status checks
 //! must be exactly the jobs of the workflows that run on both pull requests and the merge queue,
-//! since only those can report in both places, so renaming or adding a job fails the build.
+//! since only those can report in both places, so renaming or adding a job fails the build. A
+//! matrix job reports under a name per entry, so it is never required itself; a job that needs it
+//! reports for all of them. Every required job, with the jobs it waits for, must finish within the
+//! merge queue's check timeout. The only bypass is the break-glass one: repository admins, through
+//! a pull request, which GitHub logs.
 //! `cargo xtask rulesets apply`, run by the user with their own gh login, puts the file on
 //! GitHub in place of the rulesets it replaces.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -27,7 +31,19 @@ const REPLACED: [&str; 2] = ["Protect main", "main: checks must pass"];
 #[derive(Deserialize)]
 struct Ruleset {
     name: String,
+    #[serde(default)]
+    bypass_actors: serde_json::Value,
     rules: Vec<Rule>,
+}
+
+/// GitHub's own default for a job without `timeout-minutes`.
+const DEFAULT_JOB_MINUTES: u64 = 360;
+
+/// The break-glass bypass: repository admins (role 5), through a pull request only.
+fn break_glass() -> serde_json::Value {
+    serde_json::json!([
+        {"actor_type": "RepositoryRole", "actor_id": 5, "bypass_mode": "pull_request"}
+    ])
 }
 
 #[derive(Deserialize)]
@@ -38,10 +54,11 @@ struct Rule {
     parameters: serde_json::Value,
 }
 
-/// The status checks a ruleset must require: the job names of every workflow in `workflows`
-/// that runs on both `pull_request` and `merge_group`.
-fn required_checks(workflows: &[(String, String)]) -> anyhow::Result<BTreeSet<String>> {
-    let mut checks = BTreeSet::new();
+/// The status checks a ruleset must require, with the minutes each may take including the jobs
+/// it waits for: the jobs, other than matrix jobs, of every workflow in `workflows` that runs on
+/// both `pull_request` and `merge_group`.
+fn required_checks(workflows: &[(String, String)]) -> anyhow::Result<BTreeMap<String, u64>> {
+    let mut checks = BTreeMap::new();
     for (file, text) in workflows {
         let documents =
             YamlLoader::load_from_str(text).with_context(|| format!("{file} is not YAML"))?;
@@ -56,14 +73,46 @@ fn required_checks(workflows: &[(String, String)]) -> anyhow::Result<BTreeSet<St
             .as_hash()
             .with_context(|| format!("{file} has no jobs"))?;
         for (id, job) in jobs {
+            if !job["strategy"]["matrix"].is_badvalue() {
+                continue;
+            }
             let name = job["name"]
                 .as_str()
                 .or_else(|| id.as_str())
                 .with_context(|| format!("{file} has a job without a name"))?;
-            checks.insert(name.to_owned());
+            let id = id.as_str().context("a job id is not a string")?;
+            checks.insert(name.to_owned(), minutes(&workflow["jobs"], id, 0)?);
         }
     }
     Ok(checks)
+}
+
+/// The longest the job `id` in `jobs` can take: its own timeout plus that of the slowest job it
+/// needs, recursively; `depth` stops a cycle.
+fn minutes(jobs: &Yaml, id: &str, depth: usize) -> anyhow::Result<u64> {
+    ensure!(depth <= 32, "the needs of job {id} form a cycle");
+    let job = &jobs[id];
+    ensure!(!job.is_badvalue(), "no job {id}");
+    let own = job["timeout-minutes"]
+        .as_i64()
+        .map_or(Ok(DEFAULT_JOB_MINUTES), u64::try_from)
+        .with_context(|| format!("job {id} has a negative timeout"))?;
+    let needs: Vec<&str> = match &job["needs"] {
+        Yaml::String(need) => vec![need.as_str()],
+        Yaml::Array(needs) => needs.iter().filter_map(Yaml::as_str).collect(),
+        Yaml::Real(_)
+        | Yaml::Integer(_)
+        | Yaml::Boolean(_)
+        | Yaml::Hash(_)
+        | Yaml::Alias(_)
+        | Yaml::Null
+        | Yaml::BadValue => Vec::new(),
+    };
+    let mut slowest: u64 = 0;
+    for need in needs {
+        slowest = slowest.max(minutes(jobs, need, depth.saturating_add(1))?);
+    }
+    Ok(own.saturating_add(slowest))
 }
 
 /// The events in a workflow's `on`: a name, a list of names, or a map keyed by name.
@@ -132,7 +181,8 @@ fn check_text(ruleset: &str, workflows: &[(String, String)]) -> anyhow::Result<(
         .filter_map(|check| check.get("context").and_then(serde_json::Value::as_str))
         .map(str::to_owned)
         .collect();
-    let jobs = required_checks(workflows)?;
+    let checks = required_checks(workflows)?;
+    let jobs: BTreeSet<String> = checks.keys().cloned().collect();
     let missing: Vec<&String> = jobs.difference(&required).collect();
     let unknown: Vec<&String> = required.difference(&jobs).collect();
     ensure!(
@@ -140,6 +190,28 @@ fn check_text(ruleset: &str, workflows: &[(String, String)]) -> anyhow::Result<(
         "{RULESET} is out of step with CI: jobs not required: {missing:?}; required checks no job \
          reports: {unknown:?}. Required checks must be the jobs of workflows that run on both \
          pull_request and merge_group."
+    );
+    let queue_minutes = rule("merge_queue")
+        .context("checked above")?
+        .parameters
+        .get("check_response_timeout_minutes")
+        .and_then(serde_json::Value::as_u64)
+        .context("the merge queue needs check_response_timeout_minutes")?;
+    let slow: Vec<String> = checks
+        .iter()
+        .filter(|&(_, &minutes)| minutes > queue_minutes)
+        .map(|(name, minutes)| format!("{name} ({minutes} min)"))
+        .collect();
+    ensure!(
+        slow.is_empty(),
+        "required checks can outlast the merge queue's {queue_minutes}-minute timeout, so a \
+         queued run could never finish: {}",
+        slow.join(", ")
+    );
+    ensure!(
+        ruleset.bypass_actors == break_glass(),
+        "the ruleset's only bypass must be the break-glass one: {}",
+        break_glass()
     );
     ensure!(!ruleset.name.is_empty(), "the ruleset needs a name");
     Ok(())
@@ -305,8 +377,7 @@ mod tests {
     use super::{Action, Existing, apply, check, check_text, plan, repository, required_checks};
     use crate::testing::{git, repository as new_repository};
 
-    const CI: &str =
-        "on:\n  pull_request:\n  merge_group:\njobs:\n  check:\n    name: Checks\n  lint: {}\n";
+    const CI: &str = "on:\n  pull_request:\n  merge_group:\njobs:\n  check:\n    name: Checks\n    timeout-minutes: 30\n  shard:\n    timeout-minutes: 60\n    strategy:\n      matrix:\n        shard: [0, 1]\n  lint:\n    needs: [shard]\n    timeout-minutes: 5\n";
     const ONLY_PR: &str = "on: [pull_request]\njobs:\n  label:\n    name: Labels\n";
 
     fn ruleset(checks: &[&str]) -> String {
@@ -316,6 +387,9 @@ mod tests {
             .collect();
         serde_json::json!({
             "name": "main",
+            "bypass_actors": [
+                {"actor_type": "RepositoryRole", "actor_id": 5, "bypass_mode": "pull_request"}
+            ],
             "rules": [
                 {"type": "deletion"},
                 {"type": "non_fast_forward"},
@@ -323,7 +397,8 @@ mod tests {
                     "required_approving_review_count": 1, "require_code_owner_review": true,
                     "dismiss_stale_reviews_on_push": true, "require_last_push_approval": true}},
                 {"type": "required_status_checks", "parameters": {"required_status_checks": required}},
-                {"type": "merge_queue", "parameters": {"merge_method": "SQUASH"}}
+                {"type": "merge_queue", "parameters": {
+                    "merge_method": "SQUASH", "check_response_timeout_minutes": 150}}
             ]
         })
         .to_string()
@@ -343,8 +418,9 @@ mod tests {
                 .unwrap()
                 .into_iter()
                 .collect::<Vec<_>>(),
-            ["Checks", "lint"],
-            "a job without a name reports by its id; pull-request-only workflows are left out"
+            [("Checks".to_owned(), 30), ("lint".to_owned(), 65)],
+            "a job without a name reports by its id, with the jobs it needs; matrix jobs and \
+             pull-request-only workflows are left out"
         );
     }
 
@@ -384,6 +460,28 @@ mod tests {
                 .to_string()
                 .contains("squash"),
             "merge commits"
+        );
+        let slow = ruleset(&["Checks", "lint"]).replace(
+            r#""check_response_timeout_minutes":150"#,
+            r#""check_response_timeout_minutes":60"#,
+        );
+        assert!(
+            check_text(&slow, &workflows())
+                .unwrap_err()
+                .to_string()
+                .contains("lint (65 min)"),
+            "a check that outlasts the queue"
+        );
+        let open = ruleset(&["Checks", "lint"]).replace(
+            r#""bypass_mode":"pull_request""#,
+            r#""bypass_mode":"always""#,
+        );
+        assert!(
+            check_text(&open, &workflows())
+                .unwrap_err()
+                .to_string()
+                .contains("break-glass"),
+            "a bypass that skips pull requests"
         );
         let unprotected = ruleset(&["Checks", "lint"]).replace(r#"{"type":"deletion"},"#, "");
         assert!(
