@@ -324,6 +324,7 @@ fn feed(child: &mut Child, input: &str) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::io::Write as _;
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
     use std::process::{Command, Stdio};
@@ -736,6 +737,71 @@ mod tests {
         assert!(
             String::from_utf8(out).unwrap().starts_with("Blocked: "),
             "and the agent is told"
+        );
+    }
+
+    #[test]
+    fn only_the_agent_environment_asks_the_app_for_credentials() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = repository(&temp.path().join("repo"));
+        let home = temp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        fs::write(
+            home.join(".gitconfig"),
+            "[credential]\n\thelper = \"!f() { echo username=user; echo password=user-secret; }; f\"\n",
+        )
+        .unwrap();
+        let settings: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(crate::repo_root().unwrap().join(".claude/settings.json")).unwrap(),
+        )
+        .unwrap();
+        let fill = |agent: bool| {
+            let mut command = Command::new("git");
+            command
+                .args(["credential", "fill"])
+                .current_dir(&repo)
+                .env("HOME", &home)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .env_remove("GIT_CONFIG_GLOBAL")
+                .env_remove("GIT_CONFIG_COUNT")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped());
+            if agent {
+                for (name, value) in settings["env"].as_object().unwrap() {
+                    command.env(name, value.as_str().unwrap());
+                }
+                // The App's helper itself, which needs the App's files, stands in as a fake.
+                assert_eq!(
+                    settings["env"]["GIT_CONFIG_VALUE_1"], "!cargo xtask git-credential",
+                    "the real helper"
+                );
+                command.env(
+                    "GIT_CONFIG_VALUE_1",
+                    "!f() { echo username=x-access-token; echo password=app-token; }; f",
+                );
+            }
+            let mut child = command.spawn().unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(b"protocol=https\nhost=github.com\n\n")
+                .unwrap();
+            String::from_utf8(child.wait_with_output().unwrap().stdout).unwrap()
+        };
+        assert!(
+            fill(false).contains("password=user-secret"),
+            "the user's terminal keeps the user's credentials"
+        );
+        let agent = fill(true);
+        assert!(
+            agent.contains("password=app-token"),
+            "agents get the App's: {agent}"
+        );
+        assert!(
+            !agent.contains("user-secret"),
+            "and never the user's: {agent}"
         );
     }
 
