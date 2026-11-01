@@ -10,6 +10,8 @@ Report vulnerabilities privately through GitHub. Open the repository's **Securit
 **Report a vulnerability**, or go straight to
 <https://github.com/getabc-dev/abc/security/advisories/new>.
 
+If you cannot use GitHub's reporting, email <snehilvijay.productivity@protonmail.com> instead.
+
 Please do not open a public issue, pull request or discussion for a vulnerability.
 
 Include what you can of:
@@ -22,7 +24,7 @@ Include what you can of:
 
 ## What to expect
 
-- We acknowledge your report and keep you updated in the advisory.
+- We acknowledge your report and keep you updated, in the advisory or by email.
 - We confirm the issue, fix it on `main` and add a test that fails without the fix.
 - We publish the advisory once the fix has landed, at a time agreed with you, and credit you unless
   you ask us not to.
@@ -43,8 +45,9 @@ release is affected. Each maps to a rule in [AGENTS.md](AGENTS.md) and a section
 - A PR artifact entry whose author can be forged, or a finding closed by the agent that raised it
   (I6).
 - Anything that lets someone without access to your Tailscale network reach the server beyond its
-  public webhook path.
-- Weaknesses in the build and CI gates: unpinned tools or actions, skipped checks, leaked secrets.
+  public webhook path (I4).
+- Weaknesses in the build and CI gates: unpinned tools or actions, skipped checks, leaked
+  secrets (P3).
 
 Out of scope: vulnerabilities in Claude Code, Codex, Tailscale, GitHub or the operating system
 sandboxes themselves. Report those to their vendors. If abc uses one of them unsafely, that is in
