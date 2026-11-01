@@ -166,7 +166,7 @@ pub(crate) fn review(
 }
 
 /// Sends a request to Gemini, returning the status and body whatever the status.
-fn post_gemini(url: &str, body: &str, key: &str) -> anyhow::Result<(u16, String)> {
+pub(crate) fn post_gemini(url: &str, body: &str, key: &str) -> anyhow::Result<(u16, String)> {
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .http_status_as_error(false)
         .build()
@@ -347,20 +347,9 @@ fn review_changes(
     Ok((summary(&verdict), verdict.verdict == Decision::Pass))
 }
 
-/// [`run`] against the real Gemini API.
-pub(crate) fn run_live(root: &Path, base: &str, out: &mut impl Write) -> anyhow::Result<bool> {
-    run_from(
-        root,
-        base,
-        &|name| std::env::var_os(name),
-        out,
-        &mut post_gemini,
-    )
-}
-
 /// [`run`], with the event, the key and the job summary's path read from GitHub Actions'
-/// variables through `lookup`.
-fn run_from(
+/// variables through `lookup`, posting to Gemini with `post` ([`post_gemini`] for real).
+pub(crate) fn run_from(
     root: &Path,
     base: &str,
     lookup: &impl Fn(&str) -> Option<OsString>,

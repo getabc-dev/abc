@@ -84,12 +84,9 @@ fn run_with(
         .with_context(|| format!("could not create {}", output.display()))?;
     let results = output.join("mutants.out");
     // Results of an earlier run must not decide this one.
-    match fs::remove_dir_all(&results) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => {
-            return Err(error).with_context(|| format!("could not remove {}", results.display()));
-        }
+    if results.exists() {
+        fs::remove_dir_all(&results)
+            .with_context(|| format!("could not remove {}", results.display()))?;
     }
     let diff_file = output.join("changes.diff");
     fs::write(&diff_file, &diff).context("could not write the diff for cargo-mutants")?;

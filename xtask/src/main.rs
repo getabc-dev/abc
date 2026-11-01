@@ -210,7 +210,13 @@ fn run(task: Task) -> anyhow::Result<ExitCode> {
                 report,
             )?))
         }
-        Task::Review { base } => Ok(verdict(review::run_live(&root, &base, report)?)),
+        Task::Review { base } => Ok(verdict(review::run_from(
+            &root,
+            &base,
+            &|name| std::env::var_os(name),
+            report,
+            &mut review::post_gemini,
+        )?)),
         Task::GitCredential { operation } => {
             let mut request = String::new();
             io::stdin()
