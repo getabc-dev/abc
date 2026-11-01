@@ -41,7 +41,8 @@ const DELEGATED: &str = "XTASK_HOOK_DELEGATED";
 /// The Claude Code hook events xtask handles.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub(crate) enum Event {
-    /// `PreToolUse` on Bash: block git commands that skip hooks or force-push.
+    /// `PreToolUse` on Bash and Monitor: block force pushes and git or gh commands the guard
+    /// cannot read.
     PreToolUse,
     /// `Stop` and `SubagentStop`: run `cargo xtask check --changed`.
     Stop,

@@ -112,7 +112,7 @@ toolchain is pinned in `rust-toolchain.toml`; rustup installs it on first use.
 CI also runs `cargo xtask doctor`, `cargo xtask tool cargo-deny check`, `cargo xtask tool
 cargo-shear --deny-warnings --locked`, `cargo xtask tool osv-scanner scan source --lockfile
 Cargo.lock`, `cargo xtask tool zizmor --pedantic .github`, `cargo xtask tool pinact run --check
---verify-comment` and `cargo xtask tool gitleaks git --redact --no-banner .`.
+--verify-comment` and `cargo xtask tool gitleaks git --redact --no-banner --verbose .`.
 
 The git guard in the agent hooks catches accidents: force pushes, and git or gh commands it
 cannot read. It cannot stop a deliberate bypass, since no text check of a shell command can, and it

@@ -25,10 +25,11 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Task {
-    /// Check formatting, run clippy and run the tests: the gate stop hooks and CI share.
+    /// Check formatting, run clippy, the tests, the doctests and rustdoc: the gate stop hooks and
+    /// CI share.
     Check {
-        /// Lint and test only the crates affected by changes since the merge base with
-        /// origin/main, including uncommitted and untracked files.
+        /// Check only the crates affected by changes since the merge base with the default branch
+        /// (upstream/HEAD, else origin/HEAD), including uncommitted and untracked files.
         #[arg(long)]
         changed: bool,
     },
