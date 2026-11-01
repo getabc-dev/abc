@@ -443,3 +443,22 @@ Each has my recommended answer.
 Spike open question 10. Then write `0001_event_log.sql` and abc-store's `WriteTx::{begin, append}`
 with the head lock, plus `assert_views_replay`, and make the first `#[sqlx::test]` prove gapless,
 commit-ordered positions under concurrent writers.
+
+## Agreed (1 Nov 2026)
+
+The user chose these answers to the open questions:
+
+1. **Actors.** I4 is to be amended so that an actor is a person, an agent, a worker or the server. The amendment lands once s0/gates has merged, because AGENTS.md is a gate file.
+2. **Write order.** There is one global, gapless order: a single writer behind the head-row lock. Per-workspace sequences are not built.
+3. **Dev mode.** There is none. Identity only ever comes from the sidecar socket, and tests play the sidecar on that real socket.
+4. **First owner.** The only way to get a setup code is `abc server setup-code`. It prints the code to that terminal and stores only the code's digest. The code is never written to disk or to logs.
+
+The orchestrator settled the rest by default:
+
+- The server sides of the owner claim and of SSE land in PR 3.
+- `ABC_PUBLIC_URL` is required.
+- The generated TypeScript is committed under `web/src/generated/`, with a drift test.
+- `.sqlx/` is committed in PR 3. The `sqlx-cli` pin follows once s0/gates has merged.
+- Duplicate crate versions: our pins are aligned with sqlx's, and any remaining duplicates get skip entries in deny.toml, each with a date.
+- `axum::serve` is added to the disallowed methods. That change goes through the gate-file review.
+- The Tailscale `unix:` passthrough for WebSocket and SSE is checked before anything else in PR 3. If it fails, PR 3 stops for a decision; it does not fall back to loopback.
