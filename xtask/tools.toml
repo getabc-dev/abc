@@ -15,6 +15,12 @@
 # download. zizmor and cargo-shear publish no checksums but attest their release archives.
 # Renovate bumps `version` from the GitHub release named in the `url` line right after it, so
 # keep `version` and `url` adjacent and in that order.
+#
+# A tool with no verifiable release build is built from crates.io instead: `crate` names the
+# crate and `sha256` pins its .crate file, which `cargo xtask pin` checks against the crates.io
+# index. `cargo xtask setup` builds it with `cargo install --locked` and records the executable's
+# sha256 beside it, which xtask checks whenever it runs the tool. Renovate bumps `version` from
+# crates.io; keep `version` before `crate`, with only comments between them.
 
 [[tool]]
 name = "cargo-nextest"

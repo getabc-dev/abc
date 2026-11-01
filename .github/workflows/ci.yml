@@ -120,7 +120,8 @@ jobs:
     name: Mutants
     if: github.event_name != 'push'
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
+    # Every mutant runs the whole suite, so a large change takes hours; small ones take minutes.
+    timeout-minutes: 300
     permissions:
       contents: read
     steps:
