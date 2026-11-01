@@ -22,34 +22,29 @@ use std::path::Path;
 use anyhow::Context;
 
 pub(crate) use approval::PullRequest;
-pub(crate) use reasons::description;
+pub(crate) use reasons::{Event, event};
 
 use crate::git;
 
-/// Files that configure or run a gate.
-const GATE_FILES: [&str; 18] = [
-    "deny.toml",
-    "clippy.toml",
-    "rustfmt.toml",
-    "rust-toolchain.toml",
-    ".gitleaks.toml",
-    ".claude/settings.json",
-    ".config/nextest.toml",
-    "CODEOWNERS",
-    "xtask/tools.toml",
-    "xtask/hooks/pre-tool-use.sh",
-    "xtask/src/check.rs",
-    "xtask/src/coverage.rs",
-    "xtask/src/guard.rs",
-    "xtask/src/shell.rs",
-    "xtask/src/hook.rs",
-    "xtask/src/mutants.rs",
-    "xtask/src/review.rs",
-    "xtask/src/watchdog.rs",
+/// The gate files: whatever decides what passes. CODEOWNERS patterns, the single list both the
+/// check and `.github/CODEOWNERS` follow: a trailing `/` covers a directory, anything else is one
+/// file, both from the repository root.
+pub(crate) const GATES: [&str; 14] = [
+    "/.cargo/",
+    "/.claude/settings.json",
+    "/.config/",
+    "/.github/",
+    "/.gitleaks.toml",
+    "/AGENTS.md",
+    "/CLAUDE.md",
+    "/Cargo.lock",
+    "/Cargo.toml",
+    "/clippy.toml",
+    "/deny.toml",
+    "/rust-toolchain.toml",
+    "/rustfmt.toml",
+    "/xtask/",
 ];
-
-/// Directories whose every file configures or runs a gate.
-const GATE_DIRS: [&str; 2] = [".github/", "xtask/src/integrity/"];
 
 /// One test in a file.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -98,7 +93,6 @@ enum Finding {
     GateFile {
         file: String,
     },
-    WorkspaceLints,
 }
 
 impl fmt::Display for Finding {
@@ -122,7 +116,6 @@ impl fmt::Display for Finding {
                 "fewer assertions   {file}: {test} ({before} before, {after} now)"
             ),
             Self::GateFile { file } => write!(f, "gate file changed  {file}"),
-            Self::WorkspaceLints => write!(f, "gate file changed  Cargo.toml [workspace.lints]"),
         }
     }
 }
@@ -137,29 +130,24 @@ impl Finding {
             | Self::NewlyShouldPanic { file, test }
             | Self::FewerAssertions { file, test, .. } => Some(format!("{file}::{test}")),
             Self::DeletedTestFile { file, .. } => Some(file.clone()),
-            Self::GateFile { .. } | Self::WorkspaceLints => None,
+            Self::GateFile { .. } => None,
         }
     }
 }
 
 /// Runs the check against the merge base with `base`. Each flagged test change needs a reason in
-/// the pull request's `description`; with a pull request, findings then pass when an approver
-/// has approved them.
+/// the pull request's description; with a pull request, findings then pass when an approver
+/// listed at the merge base has approved them.
 pub(crate) fn run(
     root: &Path,
     base: &str,
     pull_request: Option<&PullRequest>,
-    description: Option<&str>,
+    event: &Event,
     out: &mut impl Write,
 ) -> anyhow::Result<bool> {
-    run_with(
-        root,
-        base,
-        pull_request,
-        description,
-        out,
-        &mut |url, token| approval::github_get(url, token),
-    )
+    run_with(root, base, pull_request, event, out, &mut |url, token| {
+        approval::github_get(url, token)
+    })
 }
 
 /// [`run`], reading GitHub's API through `fetch` (URL and token).
@@ -167,7 +155,7 @@ fn run_with(
     root: &Path,
     base: &str,
     pull_request: Option<&PullRequest>,
-    description: Option<&str>,
+    event: &Event,
     out: &mut impl Write,
     fetch: &mut impl FnMut(&str, &str) -> anyhow::Result<Vec<u8>>,
 ) -> anyhow::Result<bool> {
@@ -190,7 +178,7 @@ fn run_with(
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect();
-    let explained = reasons::explained(&flagged, description.unwrap_or_default());
+    let explained = reasons::explained(&flagged, event.description.as_deref().unwrap_or_default());
     explained.report(out)?;
     let Some(pull_request) = pull_request else {
         writeln!(
@@ -202,8 +190,15 @@ fn run_with(
         )?;
         return Ok(false);
     };
-    let approvers = approval::approvers(root)?;
-    let verdict = approval::approved(pull_request, &approvers, &mut |url| {
+    // The approvers come from the merge base, so a pull request cannot approve itself.
+    let listed = git::show(root, &commit, approval::APPROVERS)?.with_context(|| {
+        format!(
+            "the merge base has no {}, so nobody can approve these findings",
+            approval::APPROVERS
+        )
+    })?;
+    let approvers = approval::approvers(&listed)?;
+    let verdict = approval::approved(pull_request, &approvers, event.body_edited, &mut |url| {
         fetch(url, &pull_request.token)
     })?;
     writeln!(out, "integrity: {}", verdict.reason)?;
@@ -219,9 +214,6 @@ fn findings(root: &Path, commit: &str) -> anyhow::Result<Vec<Finding>> {
                 found.push(Finding::GateFile { file: path.clone() });
                 break;
             }
-        }
-        if change.new.as_deref() == Some("Cargo.toml") && lints_changed(root, commit)? {
-            found.push(Finding::WorkspaceLints);
         }
         let before = match &change.old {
             Some(path) => match git::show(root, commit, path)? {
@@ -255,26 +247,14 @@ fn tests_in(path: &str, source: &str) -> anyhow::Result<Option<Vec<Test>>> {
 }
 
 fn is_gate_file(path: &str) -> bool {
-    GATE_FILES.contains(&path)
-        || path.ends_with("/CODEOWNERS")
-        || GATE_DIRS.iter().any(|dir| path.starts_with(dir))
-}
-
-/// Whether the `[workspace.lints]` table of the root `Cargo.toml` differs from `commit`'s.
-fn lints_changed(root: &Path, commit: &str) -> anyhow::Result<bool> {
-    // Compared as data, so reformatting the table is not a change.
-    let lints = |text: &str| -> anyhow::Result<serde_json::Value> {
-        let manifest: serde_json::Value =
-            toml_edit::de::from_str(text).context("Cargo.toml is invalid")?;
-        Ok(manifest
-            .get("workspace")
-            .and_then(|workspace| workspace.get("lints"))
-            .cloned()
-            .unwrap_or_default())
-    };
-    let before = git::show(root, commit, "Cargo.toml")?.unwrap_or_default();
-    let after = fs::read_to_string(root.join("Cargo.toml")).context("could not read Cargo.toml")?;
-    Ok(lints(&before)? != lints(&after)?)
+    GATES.iter().any(|pattern| {
+        let pattern = pattern.trim_start_matches('/');
+        if pattern.ends_with('/') {
+            path.starts_with(pattern)
+        } else {
+            path == pattern
+        }
+    })
 }
 
 /// The findings between a file's tests before and after; `None` means the file did not exist or
@@ -337,9 +317,13 @@ fn compare(file: &str, before: Option<&[Test]>, after: Option<&[Test]>) -> Vec<F
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
     use std::fs;
+    use std::path::{Path, PathBuf};
 
-    use super::{Finding, PullRequest, Test, compare, findings, is_gate_file, run, run_with};
+    use super::{
+        Event, Finding, GATES, PullRequest, Test, compare, findings, is_gate_file, run, run_with,
+    };
     use crate::testing::{git, repository, repository_with_change};
 
     fn test(name: &str, ignored: bool, should_panic: bool, assertions: usize) -> Test {
@@ -416,21 +400,54 @@ mod tests {
         for path in [
             ".github/workflows/ci.yml",
             ".github/CODEOWNERS",
-            "docs/CODEOWNERS",
+            ".cargo/config.toml",
+            ".config/nextest.toml",
             "deny.toml",
-            "xtask/src/integrity/rust.rs",
-            "xtask/src/guard.rs",
+            "Cargo.lock",
+            "Cargo.toml",
+            "AGENTS.md",
+            "CLAUDE.md",
+            "rust-toolchain.toml",
+            "xtask/src/tools.rs",
+            "xtask/Cargo.toml",
             ".claude/settings.json",
         ] {
             assert!(is_gate_file(path), "{path} is a gate file");
         }
         for path in [
             "crates/abc-protocol/src/lib.rs",
-            "AGENTS.md",
-            "xtask/src/tools.rs",
+            "crates/abc-protocol/Cargo.toml",
+            "README.md",
+            ".claude/settings.local.json",
+            "docs/AGENTS.md",
+            "xtask",
         ] {
             assert!(!is_gate_file(path), "{path} is not a gate file");
         }
+    }
+
+    #[test]
+    fn codeowners_follow_the_gate_list() {
+        let owned: BTreeSet<&str> = include_str!("../../../.github/CODEOWNERS")
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .map(|line| {
+                let mut fields = line.split_whitespace();
+                let pattern = fields.next().unwrap();
+                assert_eq!(
+                    fields.collect::<Vec<_>>(),
+                    ["@snehilvj"],
+                    "{pattern}'s owner"
+                );
+                pattern
+            })
+            .collect();
+        assert_eq!(
+            owned,
+            GATES.into_iter().collect::<BTreeSet<_>>(),
+            "CODEOWNERS owns exactly the gate files"
+        );
     }
 
     #[test]
@@ -497,7 +514,9 @@ mod tests {
             Finding::GateFile {
                 file: "deny.toml".into(),
             },
-            Finding::WorkspaceLints,
+            Finding::GateFile {
+                file: "Cargo.toml".into(),
+            },
         ] {
             assert!(
                 found.contains(&expected),
@@ -505,24 +524,75 @@ mod tests {
             );
         }
         assert_eq!(found.len(), 6, "a renamed file keeps its tests: {found:?}");
-        assert_eq!(
-            Finding::WorkspaceLints.to_string(),
-            "gate file changed  Cargo.toml [workspace.lints]",
-            "the report names the table"
+    }
+
+    /// A repository whose base branch lists `snehilvj` as the integrity approver, with `files`
+    /// written and committed on top.
+    fn approved_repository(path: &Path, files: &[(&str, &str)]) -> PathBuf {
+        let repo = repository(path);
+        fs::create_dir_all(repo.join(".github")).unwrap();
+        fs::write(repo.join(".github/integrity-approvers"), "snehilvj\n").unwrap();
+        fs::create_dir_all(repo.join("src")).unwrap();
+        fs::write(repo.join("src/t.rs"), "#[test]\nfn kept() {}\n").unwrap();
+        git(&repo, &["add", "--all"]);
+        git(&repo, &["commit", "--quiet", "-m", "approvers"]);
+        git(&repo, &["branch", "base"]);
+        for (file, content) in files {
+            let target = repo.join(file);
+            fs::create_dir_all(target.parent().unwrap()).unwrap();
+            fs::write(target, content).unwrap();
+        }
+        git(&repo, &["add", "--all"]);
+        git(
+            &repo,
+            &["commit", "--quiet", "--allow-empty", "-m", "change"],
         );
+        repo
+    }
+
+    fn pull_request() -> PullRequest {
+        PullRequest {
+            api: "https://api.example".to_owned(),
+            repository: "o/r".to_owned(),
+            number: 7,
+            token: "token".to_owned(),
+        }
+    }
+
+    /// GitHub's API for pull request 7, whose `integrity-approved` label `login` added after
+    /// the push.
+    fn labelled_by(login: &'static str) -> impl FnMut(&str, &str) -> anyhow::Result<Vec<u8>> {
+        move |url: &str, token: &str| {
+            assert_eq!(token, "token", "the token CI gives");
+            Ok(if url.ends_with("/pulls/7") {
+                br#"{"head": {"sha": "abc"}, "labels": [{"name": "integrity-approved"}]}"#.to_vec()
+            } else if url.contains("/actions/runs") {
+                br#"{"workflow_runs": [{"created_at": "2026-11-01T09:00:00Z"}]}"#.to_vec()
+            } else if url.ends_with("page=1") {
+                format!(r#"[{{"event": "labeled", "created_at": "2026-11-01T10:00:00Z", "actor": {{"login": "{login}"}}, "label": {{"name": "integrity-approved"}}}}]"#).into_bytes()
+            } else {
+                b"[]".to_vec()
+            })
+        }
+    }
+
+    fn described(text: &str) -> Event {
+        Event {
+            description: Some(text.to_owned()),
+            body_edited: false,
+        }
     }
 
     #[test]
     fn runs_end_to_end_with_and_without_approval() {
         let temp = tempfile::tempdir().unwrap();
-        let clean =
-            repository_with_change(&temp.path().join("clean"), &[("src/a.rs", "fn a() {}\n")]);
+        let clean = approved_repository(&temp.path().join("clean"), &[("src/a.rs", "fn a() {}\n")]);
         let unused = &mut |_: &str, _: &str| -> anyhow::Result<Vec<u8>> {
             panic!("no findings, no API call")
         };
         let mut out = Vec::new();
         assert!(
-            run_with(&clean, "base", None, None, &mut out, unused).unwrap(),
+            run_with(&clean, "base", None, &Event::default(), &mut out, unused).unwrap(),
             "no findings pass"
         );
         assert!(
@@ -532,49 +602,36 @@ mod tests {
             "said so"
         );
 
-        let gated = repository_with_change(
-            &temp.path().join("gated"),
-            &[(".github/integrity-approvers", "snehilvj\n")],
-        );
+        let gated = approved_repository(&temp.path().join("gated"), &[("deny.toml", "[bans]\n")]);
         let mut refused = Vec::new();
         assert!(
-            !run_with(&gated, "base", None, None, &mut refused, unused).unwrap(),
-            "findings fail"
+            !run_with(
+                &gated,
+                "base",
+                None,
+                &Event::default(),
+                &mut refused,
+                unused
+            )
+            .unwrap(),
+            "findings fail outside a pull request"
         );
         assert!(
             String::from_utf8(refused)
                 .unwrap()
-                .contains("gate file changed  .github/integrity-approvers"),
+                .contains("gate file changed  deny.toml"),
             "listed"
         );
 
-        let pull_request = PullRequest {
-            api: "https://api.example".to_owned(),
-            repository: "o/r".to_owned(),
-            number: 7,
-            token: "token".to_owned(),
-        };
-        let mut approving = |url: &str, token: &str| -> anyhow::Result<Vec<u8>> {
-            assert_eq!(token, "token", "the token CI gives");
-            Ok(if url.ends_with("/pulls/7") {
-                br#"{"head": {"sha": "abc"}, "labels": [{"name": "integrity-approved"}]}"#.to_vec()
-            } else if url.contains("/actions/runs") {
-                br#"{"workflow_runs": [{"created_at": "2026-11-01T09:00:00Z"}]}"#.to_vec()
-            } else if url.ends_with("page=1") {
-                br#"[{"event": "labeled", "created_at": "2026-11-01T10:00:00Z", "actor": {"login": "snehilvj"}, "label": {"name": "integrity-approved"}}]"#.to_vec()
-            } else {
-                b"[]".to_vec()
-            })
-        };
         let mut accepted = Vec::new();
         assert!(
             run_with(
                 &gated,
                 "base",
-                Some(&pull_request),
-                None,
+                Some(&pull_request()),
+                &Event::default(),
                 &mut accepted,
-                &mut approving
+                &mut labelled_by("snehilvj")
             )
             .unwrap(),
             "approved"
@@ -585,88 +642,104 @@ mod tests {
                 .contains("accepted by snehilvj"),
             "who"
         );
+
+        let mut edited = Vec::new();
+        assert!(
+            !run_with(
+                &gated,
+                "base",
+                Some(&pull_request()),
+                &Event {
+                    description: None,
+                    body_edited: true
+                },
+                &mut edited,
+                &mut labelled_by("snehilvj")
+            )
+            .unwrap(),
+            "a description edit needs a new approval"
+        );
+        assert!(
+            String::from_utf8(edited).unwrap().contains("stale"),
+            "said so"
+        );
     }
 
     #[test]
-    fn runs_against_github() {
+    fn a_pull_request_cannot_name_its_own_approver() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = approved_repository(
+            &temp.path().join("repo"),
+            &[(".github/integrity-approvers", "agent\n")],
+        );
+        let mut out = Vec::new();
+        assert!(
+            !run_with(
+                &repo,
+                "base",
+                Some(&pull_request()),
+                &Event::default(),
+                &mut out,
+                &mut labelled_by("agent")
+            )
+            .unwrap(),
+            "the approvers come from the merge base"
+        );
+        assert!(
+            String::from_utf8(out)
+                .unwrap()
+                .contains("added by agent, who is not listed"),
+            "said so"
+        );
+
+        let bare = repository_with_change(&temp.path().join("bare"), &[("deny.toml", "\n")]);
+        let error = run_with(
+            &bare,
+            "base",
+            Some(&pull_request()),
+            &Event::default(),
+            &mut Vec::new(),
+            &mut labelled_by("snehilvj"),
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("the merge base has no .github/integrity-approvers"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn outside_a_pull_request_it_reads_no_api() {
         let temp = tempfile::tempdir().unwrap();
         let clean =
             repository_with_change(&temp.path().join("clean"), &[("src/a.rs", "fn a() {}\n")]);
         assert!(
-            run(&clean, "base", None, None, &mut Vec::new()).unwrap(),
+            run(&clean, "base", None, &Event::default(), &mut Vec::new()).unwrap(),
             "clean"
         );
         let gated = repository_with_change(&temp.path().join("gated"), &[("deny.toml", "\n")]);
         assert!(
-            !run(&gated, "base", None, None, &mut Vec::new()).unwrap(),
-            "a gate change outside a pull request"
-        );
-    }
-
-    #[test]
-    fn reformatting_the_lints_is_no_change() {
-        let temp = tempfile::tempdir().unwrap();
-        let repo = repository(&temp.path().join("repo"));
-        fs::write(
-            repo.join("Cargo.toml"),
-            "[workspace]\nmembers = []\n\n[workspace.lints.clippy]\nall = \"deny\"\n",
-        )
-        .unwrap();
-        git(&repo, &["add", "--all"]);
-        git(&repo, &["commit", "--quiet", "-m", "base"]);
-        let base = git(&repo, &["rev-parse", "HEAD"]).trim().to_owned();
-        fs::write(
-            repo.join("Cargo.toml"),
-            "[workspace]\nmembers = [\"a\"]\n\n[workspace.lints]\nclippy = { all = \"deny\" }\n",
-        )
-        .unwrap();
-        assert!(
-            findings(&repo, &base).unwrap().is_empty(),
-            "the same lints written another way, and another table changed"
+            !run(&gated, "base", None, &Event::default(), &mut Vec::new()).unwrap(),
+            "a gate change fails without asking GitHub"
         );
     }
 
     #[test]
     fn test_changes_need_a_reason_even_when_approved() {
         let temp = tempfile::tempdir().unwrap();
-        let repo = repository(&temp.path().join("repo"));
-        fs::create_dir_all(repo.join("src")).unwrap();
-        fs::write(repo.join("src/t.rs"), "#[test]\nfn kept() {}\n").unwrap();
-        git(&repo, &["add", "--all"]);
-        git(&repo, &["commit", "--quiet", "-m", "a test"]);
-        git(&repo, &["branch", "base"]);
+        let repo = approved_repository(&temp.path().join("repo"), &[]);
         fs::remove_file(repo.join("src/t.rs")).unwrap();
         git(&repo, &["commit", "--quiet", "--all", "-m", "drop it"]);
-
-        let pull_request = PullRequest {
-            api: "https://api.example".to_owned(),
-            repository: "o/r".to_owned(),
-            number: 7,
-            token: "token".to_owned(),
-        };
-        let mut approving = |url: &str, _: &str| -> anyhow::Result<Vec<u8>> {
-            Ok(if url.ends_with("/pulls/7") {
-                br#"{"head": {"sha": "abc"}, "labels": [{"name": "integrity-approved"}]}"#.to_vec()
-            } else if url.contains("/actions/runs") {
-                br#"{"workflow_runs": [{"created_at": "2026-11-01T09:00:00Z"}]}"#.to_vec()
-            } else if url.ends_with("page=1") {
-                br#"[{"event": "labeled", "created_at": "2026-11-01T10:00:00Z", "actor": {"login": "snehilvj"}, "label": {"name": "integrity-approved"}}]"#.to_vec()
-            } else {
-                b"[]".to_vec()
-            })
-        };
-        fs::create_dir_all(repo.join(".github")).unwrap();
-        fs::write(repo.join(".github/integrity-approvers"), "snehilvj\n").unwrap();
 
         let mut bare = Vec::new();
         assert!(
             !run_with(
                 &repo,
                 "base",
-                Some(&pull_request),
-                Some("Drops t."),
+                Some(&pull_request()),
+                &described("Drops t."),
                 &mut bare,
-                &mut approving
+                &mut labelled_by("snehilvj")
             )
             .unwrap(),
             "the label alone does not pass a test change"
@@ -682,29 +755,29 @@ mod tests {
             "approved all the same: {bare}"
         );
 
-        let reasoned =
-            "Drops t.\n\n## Test changes\n\n- `src/t.rs`: t covered the removed parser.\n";
+        let reasoned = described(
+            "Drops t.\n\n## Test changes\n\n- `src/t.rs`: t covered the removed parser.\n",
+        );
         assert!(
             run_with(
                 &repo,
                 "base",
-                Some(&pull_request),
-                Some(reasoned),
+                Some(&pull_request()),
+                &reasoned,
                 &mut Vec::new(),
-                &mut approving
+                &mut labelled_by("snehilvj")
             )
             .unwrap(),
             "a stated reason, approved, passes"
         );
-        let mut local = Vec::new();
         assert!(
             !run_with(
                 &repo,
                 "base",
                 None,
-                Some(reasoned),
-                &mut local,
-                &mut approving
+                &reasoned,
+                &mut Vec::new(),
+                &mut labelled_by("snehilvj")
             )
             .unwrap(),
             "a reason without approval still fails"
@@ -743,7 +816,6 @@ mod tests {
             None,
             "gate changes need approval, not a test reason"
         );
-        assert_eq!(Finding::WorkspaceLints.test(), None, "nor the lints");
     }
 
     #[test]

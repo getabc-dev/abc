@@ -170,7 +170,12 @@ fn act(event: Event, input: &str, context: &Context, out: &mut impl Write) -> an
             Event::PreToolUse => guard(input, out),
             // Exit 1 when the check fails; the hook command turns any failure into a block.
             Event::Stop => {
-                if check::run(&context.own_root, true, out)? {
+                if check::run(
+                    &context.own_root,
+                    true,
+                    &tools::pinned(&context.own_root, "cargo-nextest")?,
+                    out,
+                )? {
                     watchdog::check(&context.own_root, &context.claude, watchdog::TIMEOUT, out)
                 } else {
                     Ok(1)
@@ -770,10 +775,22 @@ mod tests {
                 "Bash(gh auth status -t *)",
                 "Bash(gh auth status * -t*)",
                 "Read(~/.config/gh/**)",
+                "Read(~/.config/abc/agent-app/**)",
                 "Bash(security find-generic-password *)",
                 "Bash(security find-internet-password *)"
             ]),
             "agents cannot read the user's GitHub credentials (D3)"
+        );
+        assert_eq!(
+            settings["env"],
+            serde_json::json!({
+                "GIT_CONFIG_COUNT": "2",
+                "GIT_CONFIG_KEY_0": "credential.https://github.com.helper",
+                "GIT_CONFIG_VALUE_0": "",
+                "GIT_CONFIG_KEY_1": "credential.https://github.com.helper",
+                "GIT_CONFIG_VALUE_1": "!cargo xtask git-credential"
+            }),
+            "agent sessions alone push as the App: the empty helper drops the user's (D3)"
         );
         assert_eq!(
             hooks["SubagentStop"][0]["matcher"],

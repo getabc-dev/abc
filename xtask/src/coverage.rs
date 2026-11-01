@@ -15,7 +15,7 @@ use anyhow::{Context, ensure};
 
 use crate::check::PROPTEST_RNG_SEED;
 use crate::git;
-use crate::tools::{self, Manifest};
+use crate::tools;
 
 /// The share of changed, instrumented lines the tests must run.
 pub(crate) const THRESHOLD_PERCENT: u64 = 90;
@@ -26,16 +26,9 @@ const LCOV: &str = "target/coverage/lcov.info";
 /// Hit counts by line, by file relative to the repository root.
 type Hits = BTreeMap<String, BTreeMap<u32, u64>>;
 
-/// Runs the tests under coverage and checks the lines changed since the merge base with `base`.
-pub(crate) fn run(root: &Path, base: &str, out: &mut impl Write) -> anyhow::Result<bool> {
-    let manifest = Manifest::load(root)?;
-    let llvm_cov = manifest.tool("cargo-llvm-cov")?.installed(root)?;
-    let nextest = manifest.tool("cargo-nextest")?.installed(root)?;
-    run_with(root, base, &llvm_cov, &nextest, out)
-}
-
-/// [`run`] with the cargo-llvm-cov and cargo-nextest executables given.
-fn run_with(
+/// Runs the tests under coverage, with the cargo-llvm-cov and cargo-nextest executables given,
+/// and checks the lines changed since the merge base with `base`.
+pub(crate) fn run(
     root: &Path,
     base: &str,
     llvm_cov: &Path,
@@ -196,7 +189,7 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
     use std::path::Path;
 
-    use super::{Measured, measure, parse_lcov, ranges, run, run_with};
+    use super::{Measured, measure, parse_lcov, ranges, run};
     use crate::testing::{repository_with_change, script};
 
     const LCOV: &str = "TN:\nSF:/repo/src/a.rs\nFN:1,a\nDA:1,3\nDA:2,0\nDA:3,0\nDA:4,1\nDA:4,0\nend_of_record\nSF:/elsewhere/dep.rs\nDA:1,0\nend_of_record\nSF:/repo/src/b.rs\nDA:7,0,abc\nend_of_record\n";
@@ -296,15 +289,6 @@ mod tests {
     }
 
     #[test]
-    fn needs_the_pinned_tools() {
-        let temp = tempfile::tempdir().unwrap();
-        let repo =
-            repository_with_change(&temp.path().join("repo"), &[("src/a.rs", "fn a() {}\n")]);
-        let error = run(&repo, "base", &mut Vec::new()).unwrap_err();
-        assert!(format!("{error:#}").contains("tools.toml"), "{error:#}");
-    }
-
-    #[test]
     fn gates_a_repository_end_to_end() {
         let temp = tempfile::tempdir().unwrap();
         let repo = repository_with_change(
@@ -313,7 +297,7 @@ mod tests {
         );
         let nextest = temp.path().join("cargo-nextest");
         let mut out = Vec::new();
-        let half = run_with(
+        let half = run(
             &repo,
             "base",
             &fake_llvm_cov(temp.path(), false),
@@ -324,7 +308,7 @@ mod tests {
         let text = String::from_utf8(out).unwrap();
         assert!(!half, "half the changed lines covered fails: {text}");
         assert!(text.contains("not covered: src/a.rs:2"), "{text}");
-        let full = run_with(
+        let full = run(
             &repo,
             "base",
             &fake_llvm_cov(temp.path(), true),
@@ -335,7 +319,7 @@ mod tests {
         assert!(full, "every changed line covered passes");
         let failing = temp.path().join("failing");
         script(&failing, "exit 1\n");
-        let error = run_with(&repo, "base", &failing, &nextest, &mut Vec::new()).unwrap_err();
+        let error = run(&repo, "base", &failing, &nextest, &mut Vec::new()).unwrap_err();
         assert!(
             error
                 .to_string()

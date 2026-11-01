@@ -1,13 +1,12 @@
 //! Whether a person accepted a pull request's integrity findings.
 //!
-//! An approver listed in `.github/integrity-approvers` accepts them by adding the label
-//! `integrity-approved` after the pull request's latest push. The push time is when the head
-//! commit first ran a pull request workflow; the label events come from the pull request's
-//! timeline. A label that predates the push, was removed, or was added by anyone else does not
-//! count. A separate CI job also removes the label on every push.
-
-use std::fs;
-use std::path::Path;
+//! An approver listed in `.github/integrity-approvers` at the merge base (so a pull request cannot
+//! name its own approvers) accepts them by adding the label `integrity-approved` after the pull
+//! request's latest push and latest description edit. The push time is when the head commit first
+//! ran a pull request workflow; the label events come from the pull request's timeline. A label
+//! that predates the push, was removed, or was added by anyone else does not count, and a run for
+//! a description edit treats any label as stale. A separate CI job also removes the label on every
+//! push and description edit.
 
 use anyhow::{Context, ensure};
 use serde::Deserialize;
@@ -29,13 +28,11 @@ pub(crate) struct PullRequest {
 
 impl PullRequest {
     /// The pull request `number` in the repository CI names in `GITHUB_REPOSITORY`, with
-    /// `GITHUB_TOKEN`.
-    pub(crate) fn from_env(number: u64) -> anyhow::Result<Self> {
-        Self::from_lookup(number, |name| std::env::var(name).ok())
-    }
-
-    /// The pull request `number`, with GitHub Actions' variables read through `lookup`.
-    fn from_lookup(number: u64, lookup: impl Fn(&str) -> Option<String>) -> anyhow::Result<Self> {
+    /// `GITHUB_TOKEN`, GitHub Actions' variables read through `lookup`.
+    pub(crate) fn from_lookup(
+        number: u64,
+        lookup: impl Fn(&str) -> Option<String>,
+    ) -> anyhow::Result<Self> {
         let variable = |name: &str| {
             lookup(name).with_context(|| format!("{name} is not set; is this GitHub Actions?"))
         };
@@ -48,10 +45,8 @@ impl PullRequest {
     }
 }
 
-/// The logins in the approvers file: one per line, `#` starting a comment.
-pub(super) fn approvers(root: &Path) -> anyhow::Result<Vec<String>> {
-    let text = fs::read_to_string(root.join(APPROVERS))
-        .with_context(|| format!("could not read {APPROVERS}"))?;
+/// The logins in the approvers file's `text`: one per line, `#` starting a comment.
+pub(super) fn approvers(text: &str) -> anyhow::Result<Vec<String>> {
     let logins: Vec<String> = text
         .lines()
         .map(|line| line.split('#').next().unwrap_or_default().trim())
@@ -113,6 +108,7 @@ struct Login {
 pub(super) fn approved(
     pull_request: &PullRequest,
     approvers: &[String],
+    body_edited: bool,
     fetch: &mut impl FnMut(&str) -> anyhow::Result<Vec<u8>>,
 ) -> anyhow::Result<Approval> {
     let base = format!("{}/repos/{}", pull_request.api, pull_request.repository);
@@ -146,16 +142,18 @@ pub(super) fn approved(
         .iter()
         .map(|label| label.name.as_str())
         .collect();
-    Ok(decide(&labels, &events, pushed, approvers))
+    Ok(decide(&labels, &events, pushed, approvers, body_edited))
 }
 
 /// The verdict from the pull request's labels, its timeline events, when its head was pushed,
-/// and who may approve. Timestamps are GitHub's UTC ISO 8601, which sort as text.
+/// and who may approve. With `body_edited`, this run is for a description edit, which an earlier
+/// label never approved. Timestamps are GitHub's UTC ISO 8601, which sort as text.
 fn decide(
     labels: &[&str],
     events: &[TimelineItem],
     pushed: Option<&str>,
     approvers: &[String],
+    body_edited: bool,
 ) -> Approval {
     let refuse = |reason: String| Approval {
         approved: false,
@@ -165,6 +163,12 @@ fn decide(
         return refuse(format!(
             "failed; an approver listed in {APPROVERS} can accept these findings by adding the \
              label {LABEL}"
+        ));
+    }
+    if body_edited {
+        return refuse(format!(
+            "failed; the description changed after {LABEL} was added, so it is stale; an \
+             approver must add it again"
         ));
     }
     let Some(pushed) = pushed else {
@@ -225,8 +229,6 @@ pub(super) fn github_get(url: &str, token: &str) -> anyhow::Result<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
-
     use super::{PullRequest, TimelineItem, approved, approvers, decide, github_get};
     use crate::testing::serve_once;
 
@@ -251,6 +253,7 @@ mod tests {
             &events(TIMELINE),
             Some("2026-11-01T09:00:00Z"),
             &logins(),
+            false,
         );
         assert!(verdict.approved, "{verdict:?}");
         assert_eq!(
@@ -295,7 +298,7 @@ mod tests {
             ),
         ];
         for (labels, timeline, pushed, expected) in cases {
-            let verdict = decide(&labels, &events(timeline), pushed, &logins());
+            let verdict = decide(&labels, &events(timeline), pushed, &logins(), false);
             assert!(!verdict.approved, "{expected}: {verdict:?}");
             assert!(verdict.reason.contains(expected), "{expected}: {verdict:?}");
         }
@@ -323,7 +326,7 @@ mod tests {
                 _ => b"[]".to_vec(),
             })
         };
-        let verdict = approved(&pull_request, &logins(), &mut fetch).unwrap();
+        let verdict = approved(&pull_request, &logins(), false, &mut fetch).unwrap();
         assert!(verdict.approved, "{verdict:?}");
         assert!(
             asked.last().is_some_and(|url| url.ends_with("page=2")),
@@ -377,20 +380,31 @@ mod tests {
     }
 
     #[test]
+    fn a_description_edit_makes_the_label_stale() {
+        let verdict = decide(
+            &["integrity-approved"],
+            &events(TIMELINE),
+            Some("2026-11-01T09:00:00Z"),
+            &logins(),
+            true,
+        );
+        assert!(!verdict.approved, "{verdict:?}");
+        assert!(
+            verdict.reason.contains("the description changed"),
+            "{verdict:?}"
+        );
+    }
+
+    #[test]
     fn reads_the_approvers_file() {
-        let dir = tempfile::tempdir().unwrap();
-        fs::create_dir(dir.path().join(".github")).unwrap();
-        fs::write(
-            dir.path().join(".github/integrity-approvers"),
-            "# who\nsnehilvj # owner\n\n",
-        )
-        .unwrap();
         assert_eq!(
-            approvers(dir.path()).unwrap(),
+            approvers("# who\nsnehilvj # owner\n\n").unwrap(),
             ["snehilvj"],
             "comments dropped"
         );
-        fs::write(dir.path().join(".github/integrity-approvers"), "# nobody\n").unwrap();
-        assert!(approvers(dir.path()).is_err(), "an empty list is an error");
+        assert!(
+            approvers("# nobody\n").is_err(),
+            "an empty list is an error"
+        );
     }
 }

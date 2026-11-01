@@ -10,7 +10,6 @@ use anyhow::{Context, ensure};
 use serde::Deserialize;
 
 use crate::git::{default_branch, git};
-use crate::tools::Manifest;
 
 /// Root files whose change can affect every crate.
 const WORKSPACE_FILES: [&str; 5] = [
@@ -91,16 +90,18 @@ struct Failure {
 
 /// Runs the check from `root` and reports whether it passed. With `changed`, clippy and the tests
 /// cover only the crates that the changes since the merge base with the default branch can affect.
-pub(crate) fn run(root: &Path, changed: bool, out: &mut impl Write) -> anyhow::Result<bool> {
-    let nextest = Manifest::load(root)?
-        .tool("cargo-nextest")?
-        .installed(root)?;
+pub(crate) fn run(
+    root: &Path,
+    changed: bool,
+    nextest: &Path,
+    out: &mut impl Write,
+) -> anyhow::Result<bool> {
     let scope = if changed {
         affected(&workspace_packages(root)?, &changed_files(root)?)
     } else {
         Scope::Workspace
     };
-    run_scope(root, &scope, &nextest, None, out)
+    run_scope(root, &scope, nextest, None, out)
 }
 
 /// Runs each step on `scope` from `root`, with the cargo-nextest executable at `nextest`, building

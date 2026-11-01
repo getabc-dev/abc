@@ -3,13 +3,19 @@
 //! Agents push, comment and open pull requests as the App, with installation tokens that expire
 //! in an hour, never with the user's own credentials. Signing a token request takes the App's
 //! client ID, its installation ID and its private key, kept outside the repository in
-//! `~/.config/abc/agent-app/` (`app.json` and `private-key.pem`). A token is minted for every use
-//! and goes only where it is needed: to git through the credential-helper protocol, or to `gh` in
-//! `GH_TOKEN`. It is never printed or logged.
+//! `~/.config/abc/agent-app/` (`app.json` and `private-key.pem`, which only its owner may read).
+//! A token is minted for every use, scoped to the one repository and the fewest permissions that
+//! use needs, and goes only where it is needed: to git through the credential-helper protocol, or
+//! to `gh` in `GH_TOKEN`, revoked once gh exits. It is never printed or logged.
+//!
+//! Only agent sessions use the App: the committed `.claude/settings.json` sets git's credential
+//! helper for github.com through `GIT_CONFIG_*` variables in their environment. The user's own
+//! terminal keeps the user's credentials.
 
 use std::ffi::OsString;
 use std::fs;
 use std::io::Write;
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -21,28 +27,52 @@ use ring::rand::SystemRandom;
 use ring::signature::{RSA_PKCS1_SHA256, RsaKeyPair};
 use serde::Deserialize;
 
-use crate::git;
-
 /// GitHub's REST API.
 pub(crate) const GITHUB_API: &str = "https://api.github.com";
-
-/// The git config key that names credential helpers for github.com.
-const HELPER_KEY: &str = "credential.https://github.com.helper";
-
-/// The helper git runs from inside the repository.
-const HELPER: &str = "!cargo xtask git-credential";
 
 /// The App's settings in `app.json`.
 #[derive(Deserialize)]
 struct Settings {
     client_id: String,
     installation_id: u64,
+    /// The one repository its tokens may reach, by name.
+    #[serde(default = "default_repository")]
+    repository: String,
+}
+
+fn default_repository() -> String {
+    "abc".to_owned()
+}
+
+/// What a token is for, which decides the permissions it gets (I5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Scope {
+    /// git fetching and pushing, workflow files included.
+    Git,
+    /// gh: pull requests and the branches behind them, and reading CI results.
+    Gh,
+}
+
+impl Scope {
+    fn permissions(self) -> serde_json::Value {
+        match self {
+            Self::Git => serde_json::json!({"contents": "write", "workflows": "write"}),
+            Self::Gh => serde_json::json!({
+                "contents": "write",
+                "pull_requests": "write",
+                "actions": "read",
+                "checks": "read",
+                "statuses": "read",
+            }),
+        }
+    }
 }
 
 /// The App, ready to sign token requests.
 pub(crate) struct App {
     client_id: String,
     installation_id: u64,
+    repository: String,
     key: RsaKeyPair,
 }
 
@@ -84,11 +114,23 @@ impl App {
             )
         })?;
         let key_path = dir.join("private-key.pem");
+        let mode = fs::metadata(&key_path)
+            .with_context(|| format!("could not read {}", key_path.display()))?
+            .permissions()
+            .mode();
+        // The low six bits are the group's and others' read, write and execute.
+        ensure!(
+            mode.trailing_zeros() >= 6,
+            "{} is readable by others (mode {:o}); run `chmod 600` on it",
+            key_path.display(),
+            mode & 0o777
+        );
         let pem = fs::read_to_string(&key_path)
             .with_context(|| format!("could not read {}", key_path.display()))?;
         Ok(Self {
             client_id: settings.client_id,
             installation_id: settings.installation_id,
+            repository: settings.repository,
             key: parse_key(&pem)
                 .with_context(|| format!("{} is not an RSA key", key_path.display()))?,
         })
@@ -117,8 +159,9 @@ impl App {
         Ok(format!("{message}.{}", URL_SAFE_NO_PAD.encode(signature)))
     }
 
-    /// A fresh installation token from the GitHub API at `api`, valid for an hour.
-    pub(crate) fn token(&self, api: &str) -> anyhow::Result<String> {
+    /// A fresh installation token from the GitHub API at `api`, valid for an hour, for the App's
+    /// one repository with the permissions `scope` needs.
+    pub(crate) fn token(&self, api: &str, scope: Scope) -> anyhow::Result<String> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .context("the clock is before 1970")?
@@ -131,7 +174,14 @@ impl App {
             .header("Authorization", &format!("Bearer {}", self.jwt(now)?))
             .header("Accept", "application/vnd.github+json")
             .header("X-GitHub-Api-Version", "2022-11-28")
-            .send_empty()
+            .header("Content-Type", "application/json")
+            .send(
+                serde_json::json!({
+                    "repositories": [self.repository],
+                    "permissions": scope.permissions(),
+                })
+                .to_string(),
+            )
             .context("GitHub refused the App's token request")?;
         let body: serde_json::Value = serde_json::from_slice(
             &response
@@ -200,9 +250,40 @@ pub(crate) fn credential(
     Ok(())
 }
 
+/// `cargo xtask gh`: runs `program` (gh) with `args` as `app`, with a token minted from `api` for
+/// this run and revoked when it ends.
+pub(crate) fn run_gh(
+    app: &App,
+    api: &str,
+    program: &Path,
+    args: &[OsString],
+    out: &mut impl Write,
+) -> anyhow::Result<ExitCode> {
+    let token = app.token(api, Scope::Gh)?;
+    let code = gh(program, args, &token);
+    if let Err(error) = revoke(api, &token) {
+        writeln!(
+            out,
+            "xtask gh: could not revoke the token; it expires within the hour: {error:#}"
+        )?;
+    }
+    code
+}
+
+/// Revokes the installation `token` at `api`.
+fn revoke(api: &str, token: &str) -> anyhow::Result<()> {
+    ureq::delete(&format!("{api}/installation/token"))
+        .header("Authorization", &format!("Bearer {token}"))
+        .header("Accept", "application/vnd.github+json")
+        .header("X-GitHub-Api-Version", "2022-11-28")
+        .call()
+        .context("GitHub refused to revoke the token")?;
+    Ok(())
+}
+
 /// Runs `gh` (the user's GitHub CLI, from `PATH`) with `args`, acting as the App through
 /// `GH_TOKEN`.
-pub(crate) fn gh(program: &Path, args: &[OsString], token: &str) -> anyhow::Result<ExitCode> {
+fn gh(program: &Path, args: &[OsString], token: &str) -> anyhow::Result<ExitCode> {
     let status = Command::new(program)
         .args(args)
         .env("GH_TOKEN", token)
@@ -210,38 +291,6 @@ pub(crate) fn gh(program: &Path, args: &[OsString], token: &str) -> anyhow::Resu
         .status()
         .with_context(|| format!("could not run {}", program.display()))?;
     Ok(ExitCode::from(crate::tools::status_code(status)))
-}
-
-/// Makes git in this repository ask the App for github.com credentials, ahead of and instead of
-/// the user's own helpers, once the App's files exist in `dir`. An empty helper entry first
-/// resets the helpers inherited from the user's and the system's git config.
-pub(crate) fn configure_git(root: &Path, dir: &Path, out: &mut impl Write) -> anyhow::Result<()> {
-    if !dir.join("app.json").is_file() {
-        writeln!(
-            out,
-            "note     no agent App in {}; git and gh keep your own credentials",
-            dir.display()
-        )?;
-        return Ok(());
-    }
-    let current =
-        git::git(root, &["config", "--local", "--get-all", HELPER_KEY]).unwrap_or_default();
-    if current.lines().eq(["", HELPER]) {
-        writeln!(out, "ok       git uses the agent App for github.com")?;
-        return Ok(());
-    }
-    git::git(
-        root,
-        &["config", "--local", "--replace-all", HELPER_KEY, ""],
-    )?;
-    git::git(root, &["config", "--local", "--add", HELPER_KEY, HELPER])?;
-    let written = git::git(root, &["config", "--local", "--get-all", HELPER_KEY])?;
-    ensure!(
-        written.lines().eq(["", HELPER]),
-        "git config did not take the agent App's credential helper"
-    );
-    writeln!(out, "set      git uses the agent App for github.com")?;
-    Ok(())
 }
 
 #[cfg(test)]
@@ -253,10 +302,8 @@ mod tests {
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use ring::signature::{RSA_PKCS1_2048_8192_SHA256, UnparsedPublicKey};
 
-    use super::{
-        App, HELPER, HELPER_KEY, config_dir_from, configure_git, credential, gh, parse_key,
-    };
-    use crate::testing::{git, repository, serve_once};
+    use super::{App, Scope, config_dir_from, credential, gh, parse_key, run_gh};
+    use crate::testing::{script, serve, serve_once};
 
     const KEY: &str = include_str!("../testdata/agent-app-test-key.pem");
 
@@ -303,8 +350,20 @@ mod tests {
             r#"{"client_id": "Iv23test", "installation_id": 42}"#,
         )
         .unwrap();
-        fs::write(dir.path().join("private-key.pem"), KEY).unwrap();
+        let key = dir.path().join("private-key.pem");
+        fs::write(&key, KEY).unwrap();
+        fs::set_permissions(&key, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
         dir
+    }
+
+    #[test]
+    fn refuses_a_key_others_can_read() {
+        let dir = app_dir();
+        let key = dir.path().join("private-key.pem");
+        fs::set_permissions(&key, std::os::unix::fs::PermissionsExt::from_mode(0o640)).unwrap();
+        let error = format!("{:#}", App::load(dir.path()).unwrap_err());
+        assert!(error.contains("readable by others (mode 640)"), "{error}");
+        assert!(error.contains("chmod 600"), "{error}");
     }
 
     #[test]
@@ -373,9 +432,22 @@ mod tests {
             r#"{"token": "ghs_test", "expires_at": "2026-11-01T11:00:00Z"}"#,
         );
         let dir = app_dir();
-        let token = App::load(dir.path()).unwrap().token(&url).unwrap();
+        let token = App::load(dir.path())
+            .unwrap()
+            .token(&url, Scope::Git)
+            .unwrap();
         assert_eq!(token, "ghs_test", "the token from the response");
         let request = server.join().unwrap();
+        let body: serde_json::Value =
+            serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "repositories": ["abc"],
+                "permissions": {"contents": "write", "workflows": "write"}
+            }),
+            "one repository, and only what git needs"
+        );
         assert!(
             request.starts_with("POST /app/installations/42/access_tokens HTTP/1.1"),
             "{request}"
@@ -440,29 +512,79 @@ mod tests {
     }
 
     #[test]
-    fn configures_git_only_when_the_app_is_set_up() {
-        let temp = tempfile::tempdir().unwrap();
-        let repo = repository(&temp.path().join("repo"));
-        let missing = temp.path().join("none");
-        let mut out = Vec::new();
-        configure_git(&repo, &missing, &mut out).unwrap();
+    fn scopes_each_use_to_what_it_needs() {
+        let gh_permissions = Scope::Gh.permissions();
+        assert_eq!(
+            gh_permissions["pull_requests"], "write",
+            "gh opens pull requests"
+        );
         assert!(
-            String::from_utf8(out).unwrap().starts_with("note "),
-            "no App, no change"
+            gh_permissions.get("workflows").is_none(),
+            "gh does not edit workflows"
+        );
+        assert!(
+            Scope::Git.permissions().get("pull_requests").is_none(),
+            "git does not touch pull requests"
+        );
+    }
+
+    #[test]
+    fn runs_gh_with_a_token_it_revokes_afterwards() {
+        let (url, server) = serve(vec![
+            ("201 Created", r#"{"token": "ghs_test"}"#),
+            ("204 No Content", ""),
+        ]);
+        let dir = app_dir();
+        let fake = dir.path().join("gh");
+        script(&fake, "[ \"$GH_TOKEN\" = ghs_test ] || exit 3\nexit 4\n");
+        let mut out = Vec::new();
+        let code = run_gh(
+            &App::load(dir.path()).unwrap(),
+            &url,
+            &fake,
+            &["pr".into(), "list".into()],
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(code, std::process::ExitCode::from(4), "gh's exit code");
+        assert!(out.is_empty(), "no warning");
+        let requests = server.join().unwrap();
+        assert!(
+            requests[0].starts_with("POST /app/installations/42/access_tokens"),
+            "{requests:?}"
+        );
+        assert!(
+            requests[0].contains("\"pull_requests\":\"write\""),
+            "{requests:?}"
+        );
+        assert!(
+            requests[1].starts_with("DELETE /installation/token HTTP/1.1"),
+            "{requests:?}"
+        );
+        assert!(
+            requests[1].contains("authorization: Bearer ghs_test"),
+            "revoked with itself: {requests:?}"
         );
 
-        let dir = app_dir();
-        for _ in 0..2 {
-            configure_git(&repo, dir.path(), &mut Vec::new()).unwrap();
-        }
-        assert_eq!(
-            git(&repo, &["config", "--local", "--get-all", HELPER_KEY]),
-            format!("\n{HELPER}\n"),
-            "the reset entry, then the App's helper, set once"
-        );
+        let (refusing, refusing_server) = serve(vec![
+            ("201 Created", r#"{"token": "ghs_test"}"#),
+            ("500 Internal Server Error", "{}"),
+        ]);
+        let mut warned = Vec::new();
+        run_gh(
+            &App::load(dir.path()).unwrap(),
+            &refusing,
+            &fake,
+            &[],
+            &mut warned,
+        )
+        .unwrap();
+        refusing_server.join().unwrap();
         assert!(
-            Path::new(&repo).exists(),
-            "the repository is untouched otherwise"
+            String::from_utf8(warned)
+                .unwrap()
+                .contains("could not revoke the token"),
+            "a failed revocation is reported"
         );
     }
 }

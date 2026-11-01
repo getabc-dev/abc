@@ -52,6 +52,18 @@ pub(crate) fn serve_once(
     status: &'static str,
     body: &'static str,
 ) -> (String, std::thread::JoinHandle<String>) {
+    let (url, server) = serve(vec![(status, body)]);
+    (
+        url,
+        std::thread::spawn(move || server.join().unwrap().remove(0)),
+    )
+}
+
+/// Serves one HTTP request per response in `responses`, in order, on a local port, and returns
+/// the server's base URL and a handle that yields the requests it received.
+pub(crate) fn serve(
+    responses: Vec<(&'static str, &'static str)>,
+) -> (String, std::thread::JoinHandle<Vec<String>>) {
     use std::io::{Read as _, Write as _};
 
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -60,49 +72,53 @@ pub(crate) fn serve_once(
         // A request that never comes fails the test instead of hanging it.
         listener.set_nonblocking(true).unwrap();
         let started = std::time::Instant::now();
-        let mut stream = loop {
-            match listener.accept() {
-                Ok((stream, _)) => break stream,
-                Err(error)
-                    if error.kind() == std::io::ErrorKind::WouldBlock
-                        && started.elapsed() < std::time::Duration::from_secs(10) =>
-                {
-                    std::thread::sleep(std::time::Duration::from_millis(10));
+        let mut requests = Vec::new();
+        for (status, body) in responses {
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::WouldBlock
+                            && started.elapsed() < std::time::Duration::from_secs(10) =>
+                    {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("no request arrived: {error}"),
                 }
-                Err(error) => panic!("no request arrived: {error}"),
-            }
-        };
-        stream.set_nonblocking(false).unwrap();
-        let mut request = Vec::new();
-        let mut buffer = [0_u8; 8192];
-        loop {
-            let read = stream.read(&mut buffer).unwrap();
-            request.extend_from_slice(&buffer[..read]);
-            let text = String::from_utf8_lossy(&request);
-            if let Some((head, rest)) = text.split_once("\r\n\r\n") {
-                let length = head
-                    .lines()
-                    .find_map(|line| {
-                        let (name, value) = line.split_once(':')?;
-                        name.eq_ignore_ascii_case("content-length")
-                            .then(|| value.trim().parse::<usize>().ok())?
-                    })
-                    .unwrap_or(0);
-                if rest.len() >= length {
+            };
+            stream.set_nonblocking(false).unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 8192];
+            loop {
+                let read = stream.read(&mut buffer).unwrap();
+                request.extend_from_slice(&buffer[..read]);
+                let text = String::from_utf8_lossy(&request);
+                if let Some((head, rest)) = text.split_once("\r\n\r\n") {
+                    let length = head
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().ok())?
+                        })
+                        .unwrap_or(0);
+                    if rest.len() >= length {
+                        break;
+                    }
+                }
+                if read == 0 {
                     break;
                 }
             }
-            if read == 0 {
-                break;
-            }
+            write!(
+                stream,
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+            requests.push(String::from_utf8(request).unwrap());
         }
-        write!(
-            stream,
-            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-            body.len()
-        )
-        .unwrap();
-        String::from_utf8(request).unwrap()
+        requests
     });
     (url, server)
 }

@@ -9,11 +9,11 @@ use std::io::Write;
 use std::path::Path;
 use std::process::Command;
 
-use anyhow::{Context, bail};
+use anyhow::{Context, bail, ensure};
 
 use crate::check::PROPTEST_RNG_SEED;
 use crate::git;
-use crate::tools::{self, Manifest};
+use crate::tools;
 
 /// Where cargo-mutants writes its results, relative to the repository root.
 const OUTPUT: &str = "target/mutants";
@@ -50,25 +50,48 @@ fn outcome(code: Option<i32>) -> anyhow::Result<Outcome> {
     }
 }
 
-/// Runs cargo-mutants on the Rust lines changed since the merge base with `base`, with `jobs`
-/// mutants built and tested in parallel.
+/// One of `count` equal shares of the mutants, numbered from 0.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Shard {
+    index: u32,
+    count: u32,
+}
+
+impl Shard {
+    /// A shard written `k/n`, as cargo-mutants takes it.
+    pub(crate) fn parse(text: &str) -> anyhow::Result<Self> {
+        let (index, count) = text
+            .split_once('/')
+            .with_context(|| format!("{text} is not a shard; write k/n, such as 0/4"))?;
+        let index: u32 = index
+            .parse()
+            .with_context(|| format!("{text}: {index} is not a number"))?;
+        let count: u32 = count
+            .parse()
+            .with_context(|| format!("{text}: {count} is not a number"))?;
+        ensure!(
+            index < count,
+            "{text}: the shard number must be below the count"
+        );
+        Ok(Self { index, count })
+    }
+}
+
+/// How to run cargo-mutants.
+#[derive(Debug)]
+pub(crate) struct Options {
+    /// How many mutants to build and test at once.
+    pub(crate) jobs: u32,
+    /// The share of the mutants to test; all of them when `None`.
+    pub(crate) shard: Option<Shard>,
+}
+
+/// Runs cargo-mutants, with the cargo-mutants and cargo-nextest executables given, on the Rust
+/// lines changed since the merge base with `base`.
 pub(crate) fn run(
     root: &Path,
     base: &str,
-    jobs: u32,
-    out: &mut impl Write,
-) -> anyhow::Result<bool> {
-    let manifest = Manifest::load(root)?;
-    let mutants = manifest.tool("cargo-mutants")?.installed(root)?;
-    let nextest = manifest.tool("cargo-nextest")?.installed(root)?;
-    run_with(root, base, jobs, &mutants, &nextest, out)
-}
-
-/// [`run`] with the cargo-mutants and cargo-nextest executables given.
-fn run_with(
-    root: &Path,
-    base: &str,
-    jobs: u32,
+    options: &Options,
     mutants: &Path,
     nextest: &Path,
     out: &mut impl Write,
@@ -105,10 +128,16 @@ fn run_with(
         // The tests run the pinned tools in .tools/, which .gitignore lists; copy them too.
         .args(["--gitignore", "false"])
         .arg("--timeout-multiplier")
-        .arg(timeout_multiplier(jobs).to_string())
+        .arg(timeout_multiplier(options.jobs).to_string())
         .args(["--minimum-test-timeout", MINIMUM_TEST_TIMEOUT])
         .arg("--jobs")
-        .arg(jobs.to_string())
+        .arg(options.jobs.to_string())
+        .args(
+            options
+                .shard
+                .map(|shard| vec!["--shard".to_owned(), format!("{}/{}", shard.index, shard.count)])
+                .unwrap_or_default(),
+        )
         .arg("--output")
         .arg(&output)
         .env("PATH", tools::path_with(nextest)?)
@@ -173,7 +202,7 @@ mod tests {
     use std::fs;
 
     use super::{
-        Outcome, changes_rust, describe, listed, outcome, run, run_with, timeout_multiplier,
+        Options, Outcome, Shard, changes_rust, describe, listed, outcome, run, timeout_multiplier,
     };
     use crate::testing::{repository_with_change, script};
 
@@ -199,13 +228,21 @@ mod tests {
         assert!(!changes_rust(""), "no change");
     }
 
+    const TWO: Options = Options {
+        jobs: 2,
+        shard: None,
+    };
+
     #[test]
-    fn needs_the_pinned_tools() {
-        let temp = tempfile::tempdir().unwrap();
-        let repo =
-            repository_with_change(&temp.path().join("repo"), &[("src/a.rs", "fn a() {}\n")]);
-        let error = run(&repo, "base", 2, &mut Vec::new()).unwrap_err();
-        assert!(format!("{error:#}").contains("tools.toml"), "{error:#}");
+    fn reads_shards() {
+        assert_eq!(
+            Shard::parse("1/4").unwrap(),
+            Shard { index: 1, count: 4 },
+            "k/n"
+        );
+        for bad in ["4/4", "1", "a/4", "1/b"] {
+            assert!(Shard::parse(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]
@@ -249,7 +286,7 @@ mod tests {
             "[ \"$1\" = mutants ] || exit 7\nwhile [ $# -gt 0 ]; do case \"$1\" in --output) out=$2 ;; --in-diff) diff=$2 ;; --timeout-multiplier) multiplier=$2 ;; esac; shift; done\ngrep -q 'src/a.rs' \"$diff\" || exit 8\n[ \"$multiplier\" = 6 ] || exit 9\nmkdir -p \"$out/mutants.out\"\necho 'src/a.rs:1:18: replace a -> bool with false' > \"$out/mutants.out/missed.txt\"\nexit 2\n",
         );
         let mut out = Vec::new();
-        let passed = run_with(&repo, "base", 2, &missing, &nextest, &mut out).unwrap();
+        let passed = run(&repo, "base", &TWO, &missing, &nextest, &mut out).unwrap();
         let text = String::from_utf8(out).unwrap();
         assert!(!passed, "a missed mutant fails: {text}");
         assert!(
@@ -264,7 +301,7 @@ mod tests {
         );
         let mut both = Vec::new();
         assert!(
-            !run_with(&repo, "base", 2, &mixed, &nextest, &mut both).unwrap(),
+            !run(&repo, "base", &TWO, &mixed, &nextest, &mut both).unwrap(),
             "a missed mutant fails even when another timed out"
         );
         assert!(
@@ -273,10 +310,17 @@ mod tests {
         );
 
         let caught = temp.path().join("caught");
-        script(&caught, "exit 0\n");
+        script(
+            &caught,
+            "while [ $# -gt 0 ]; do case \"$1\" in --shard) shard=$2 ;; esac; shift; done\n[ \"$shard\" = 1/4 ] || exit 9\n",
+        );
+        let sharded = Options {
+            jobs: 2,
+            shard: Some(Shard::parse("1/4").unwrap()),
+        };
         assert!(
-            run_with(&repo, "base", 2, &caught, &nextest, &mut Vec::new()).unwrap(),
-            "all caught"
+            run(&repo, "base", &sharded, &caught, &nextest, &mut Vec::new()).unwrap(),
+            "all caught, in the shard asked for"
         );
 
         let docs = repository_with_change(&temp.path().join("docs"), &[("README.md", "# x\n")]);
@@ -284,7 +328,7 @@ mod tests {
         script(&never, "exit 99\n");
         let mut skipped = Vec::new();
         assert!(
-            run_with(&docs, "base", 2, &never, &nextest, &mut skipped).unwrap(),
+            run(&docs, "base", &TWO, &never, &nextest, &mut skipped).unwrap(),
             "nothing to mutate"
         );
         assert!(

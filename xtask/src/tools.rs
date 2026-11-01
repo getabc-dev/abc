@@ -716,11 +716,14 @@ fn check_attested(
     Ok(())
 }
 
-/// `cargo xtask tool`: runs a pinned tool with the given arguments from the repository root.
-pub(crate) fn run(root: &Path, name: &str, args: &[OsString]) -> anyhow::Result<ExitCode> {
-    let manifest = Manifest::load(root)?;
-    let executable = manifest.tool(name)?.installed(root)?;
-    let status = Command::new(&executable)
+/// The executable of the tool `name` pinned in the repository at `home`, checked against its pin.
+pub(crate) fn pinned(home: &Path, name: &str) -> anyhow::Result<PathBuf> {
+    Manifest::load(home)?.tool(name)?.installed(home)
+}
+
+/// `cargo xtask tool`: runs a pinned tool's `executable` with the given arguments in `root`.
+pub(crate) fn run(executable: &Path, root: &Path, args: &[OsString]) -> anyhow::Result<ExitCode> {
+    let status = Command::new(executable)
         .args(args)
         .current_dir(root)
         .status()

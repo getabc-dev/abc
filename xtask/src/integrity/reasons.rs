@@ -165,43 +165,70 @@ pub(super) fn explained(flagged: &[String], description: &str) -> Explained {
 }
 
 #[derive(Deserialize)]
-struct Event {
-    pull_request: Option<EventPullRequest>,
+struct Payload {
+    action: Option<String>,
+    changes: Option<Changes>,
+    pull_request: Option<PayloadPullRequest>,
 }
 
 #[derive(Deserialize)]
-struct EventPullRequest {
+struct Changes {
+    body: Option<serde_json::Value>,
+}
+
+#[derive(Deserialize)]
+struct PayloadPullRequest {
     body: Option<String>,
 }
 
-/// The pull request description: from `file` when given, else from the GitHub Actions event
-/// payload at `event` when this is a pull request; `None` when there is neither.
-pub(crate) fn description(
-    file: Option<&Path>,
-    event: Option<PathBuf>,
-) -> anyhow::Result<Option<String>> {
-    if let Some(file) = file {
-        return fs::read_to_string(file)
-            .map(Some)
-            .with_context(|| format!("could not read the description in {}", file.display()));
-    }
-    let Some(event) = event else {
-        return Ok(None);
+/// What the check needs from the pull request event.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct Event {
+    /// The pull request description, when there is one to check.
+    pub(crate) description: Option<String>,
+    /// Whether this run is for an edit of the description, which no earlier approval covered.
+    pub(crate) body_edited: bool,
+}
+
+/// The event: the description from `file` when given, else from the GitHub Actions event payload
+/// at `payload_path` when this is a pull request; and whether the payload is a description edit.
+pub(crate) fn event(file: Option<&Path>, payload_path: Option<PathBuf>) -> anyhow::Result<Event> {
+    let from_file = file
+        .map(|file| {
+            fs::read_to_string(file)
+                .with_context(|| format!("could not read the description in {}", file.display()))
+        })
+        .transpose()?;
+    let Some(payload_path) = payload_path else {
+        return Ok(Event {
+            description: from_file,
+            body_edited: false,
+        });
     };
-    let text = fs::read_to_string(&event)
-        .with_context(|| format!("could not read the event payload {}", event.display()))?;
-    let payload: Event = serde_json::from_str(&text).context("the event payload is invalid")?;
+    let text = fs::read_to_string(&payload_path).with_context(|| {
+        format!(
+            "could not read the event payload {}",
+            payload_path.display()
+        )
+    })?;
+    let payload: Payload = serde_json::from_str(&text).context("the event payload is invalid")?;
     let pull_request = payload
         .pull_request
         .context("the event is not about a pull request")?;
-    Ok(Some(pull_request.body.unwrap_or_default()))
+    Ok(Event {
+        description: Some(from_file.unwrap_or_else(|| pull_request.body.unwrap_or_default())),
+        body_edited: payload.action.as_deref() == Some("edited")
+            && payload
+                .changes
+                .is_some_and(|changes| changes.body.is_some()),
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use std::fs;
 
-    use super::{Explained, description, entries, explained};
+    use super::{Event, Explained, entries, event, explained};
 
     fn report(result: &Explained) -> String {
         let mut out = Vec::new();
@@ -326,34 +353,50 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("description.md");
         fs::write(&file, "## Test changes\n").unwrap();
-        let event = dir.path().join("event.json");
-        fs::write(&event, r#"{"pull_request": {"body": "From the event."}}"#).unwrap();
+        let payload = dir.path().join("event.json");
+        fs::write(
+            &payload,
+            r#"{"action": "opened", "pull_request": {"body": "From the event."}}"#,
+        )
+        .unwrap();
+        let read = |given: Option<&std::path::Path>, sent: Option<&std::path::Path>| {
+            event(given, sent.map(std::path::Path::to_path_buf))
+        };
         assert_eq!(
-            description(Some(&file), Some(event.clone()))
+            read(Some(&file), Some(&payload))
                 .unwrap()
+                .description
                 .as_deref(),
             Some("## Test changes\n"),
             "a file wins"
         );
         assert_eq!(
-            description(None, Some(event.clone())).unwrap().as_deref(),
-            Some("From the event."),
+            read(None, Some(&payload)).unwrap(),
+            Event {
+                description: Some("From the event.".to_owned()),
+                body_edited: false
+            },
             "the pull request's body"
         );
-        fs::write(&event, r#"{"pull_request": {"body": null}}"#).unwrap();
+        fs::write(&payload, r#"{"action": "edited", "changes": {"body": {"from": "Old."}}, "pull_request": {"body": null}}"#).unwrap();
         assert_eq!(
-            description(None, Some(event.clone())).unwrap().as_deref(),
-            Some(""),
-            "an empty description"
+            read(None, Some(&payload)).unwrap(),
+            Event {
+                description: Some(String::new()),
+                body_edited: true
+            },
+            "an edited, now empty, description"
         );
-        fs::write(&event, r#"{"merge_group": {}}"#).unwrap();
+        fs::write(&payload, r#"{"action": "edited", "changes": {"title": {"from": "Old"}}, "pull_request": {"body": "x"}}"#).unwrap();
         assert!(
-            description(None, Some(event)).is_err(),
-            "not a pull request"
+            !read(None, Some(&payload)).unwrap().body_edited,
+            "a title edit is not one"
         );
-        assert_eq!(description(None, None).unwrap(), None, "neither");
+        fs::write(&payload, r#"{"merge_group": {}}"#).unwrap();
+        assert!(read(None, Some(&payload)).is_err(), "not a pull request");
+        assert_eq!(read(None, None).unwrap(), Event::default(), "neither");
         assert!(
-            description(Some(&dir.path().join("absent")), None).is_err(),
+            read(Some(&dir.path().join("absent")), None).is_err(),
             "an unreadable file"
         );
     }

@@ -1,4 +1,11 @@
 {
+  "env": {
+    "GIT_CONFIG_COUNT": "2",
+    "GIT_CONFIG_KEY_0": "credential.https://github.com.helper",
+    "GIT_CONFIG_VALUE_0": "",
+    "GIT_CONFIG_KEY_1": "credential.https://github.com.helper",
+    "GIT_CONFIG_VALUE_1": "!cargo xtask git-credential"
+  },
   "permissions": {
     "deny": [
       "Bash(gh auth token)",
@@ -10,6 +17,7 @@
       "Bash(gh auth status -t *)",
       "Bash(gh auth status * -t*)",
       "Read(~/.config/gh/**)",
+      "Read(~/.config/abc/agent-app/**)",
       "Bash(security find-generic-password *)",
       "Bash(security find-internet-password *)"
     ]
