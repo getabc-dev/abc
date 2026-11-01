@@ -27,6 +27,10 @@ use serde::Deserialize;
 
 use crate::{check, guard, tools};
 
+/// The `PreToolUse` hook script. A checkout without it predates these hooks, so its xtask cannot
+/// take a hook over.
+const HOOK_SCRIPT: &str = "xtask/hooks/pre-tool-use.sh";
+
 /// Marks a hook handed over by another checkout, which must not be handed on again.
 const DELEGATED: &str = "XTASK_HOOK_DELEGATED";
 
@@ -154,6 +158,15 @@ fn act(event: Event, input: &str, context: &Context, out: &mut impl Write) -> an
             // Exit 1 when the check fails; the hook command turns any failure into a block.
             Event::Stop => Ok(u8::from(!check::run(&context.own_root, true, out)?)),
         },
+        // GitHub is the gate, so a checkout that cannot take the hook is noted, never locked out.
+        Location::Worktree(root) if !root.join(HOOK_SCRIPT).is_file() => {
+            writeln!(
+                out,
+                "xtask hook: {} has no {HOOK_SCRIPT}; nothing is checked there",
+                root.display()
+            )?;
+            Ok(0)
+        }
         Location::Worktree(root) => {
             ensure!(
                 !context.delegated,
@@ -288,6 +301,8 @@ mod tests {
         );
         let worktree = main.join(".claude/worktrees/feature");
         fs::create_dir_all(worktree.join("crates/deep")).unwrap();
+        fs::create_dir_all(worktree.join("xtask/hooks")).unwrap();
+        fs::write(worktree.join(super::HOOK_SCRIPT), "").unwrap();
         (temp, main, worktree.canonicalize().unwrap())
     }
 
@@ -480,6 +495,32 @@ mod tests {
     }
 
     #[test]
+    fn a_worktree_without_xtask_hooks_is_noted_not_checked() {
+        let (_temp, main, worktree) = repository_with_nested_worktree();
+        fs::remove_file(worktree.join(super::HOOK_SCRIPT)).unwrap();
+        let context = context(&main, Some(&main));
+        let (code, out) = run_pre_tool_use(&context, Some(&worktree), "git push -f");
+        assert_eq!(code, 0, "an older checkout is not locked out: {out}");
+        assert_eq!(out.lines().count(), 1, "one line: {out}");
+        assert!(out.contains("nothing is checked there"), "{out}");
+        let mut stop_out = Vec::new();
+        let stop = run(
+            Event::Stop,
+            &input(Some(&worktree), ""),
+            &context,
+            &mut stop_out,
+        )
+        .unwrap();
+        assert_eq!(stop, 0, "the agent may stop");
+        assert!(
+            String::from_utf8(stop_out)
+                .unwrap()
+                .contains("nothing is checked there"),
+            "with a note"
+        );
+    }
+
+    #[test]
     fn a_worktree_whose_xtask_fails_blocks_git() {
         let (temp, main, worktree) = repository_with_nested_worktree();
         let mut broken = context(&main, Some(&main));
@@ -499,27 +540,28 @@ mod tests {
         );
     }
 
-    /// Runs the shell hook as Claude Code would, with `cargo` on `PATH` exiting `code`.
-    fn run_hook_script(code: u8, input: &str) -> (Option<i32>, String) {
-        let temp = tempfile::tempdir().unwrap();
-        fake_cargo(temp.path(), code);
-        let script = crate::repo_root()
-            .unwrap()
-            .join("xtask/hooks/pre-tool-use.sh");
-        let path = format!(
-            "{}:{}",
-            temp.path().display(),
-            std::env::var("PATH").unwrap()
-        );
-        let mut child = Command::new("sh")
-            .arg(&script)
+    /// The shells hooks must work under: the system `sh` and dash, Debian's and Ubuntu's `sh`.
+    const SHELLS: [&str; 2] = ["sh", "/bin/dash"];
+
+    /// Runs `args` under `shell` with `input` on stdin, the project directory `project` and
+    /// `cargo` from `bin` first on `PATH`; returns the exit code and stderr.
+    fn run_shell(
+        shell: &str,
+        args: &[&std::ffi::OsStr],
+        project: &Path,
+        bin: &Path,
+        input: &str,
+    ) -> (Option<i32>, String) {
+        let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+        let mut child = Command::new(shell)
+            .args(args)
             .env("PATH", path)
-            .env("CLAUDE_PROJECT_DIR", temp.path())
+            .env("CLAUDE_PROJECT_DIR", project)
             .stdin(Stdio::piped())
             .stderr(Stdio::piped())
             .stdout(Stdio::null())
             .spawn()
-            .unwrap();
+            .unwrap_or_else(|error| panic!("{shell} must be installed: {error}"));
         child
             .stdin
             .take()
@@ -531,6 +573,76 @@ mod tests {
             output.status.code(),
             String::from_utf8(output.stderr).unwrap(),
         )
+    }
+
+    /// Runs the hook script under each shell, with `cargo` on `PATH` exiting `code`, and checks
+    /// that every shell agrees; returns the exit code and the first shell's stderr.
+    fn run_hook_script(code: u8, input: &str) -> (Option<i32>, String) {
+        let temp = tempfile::tempdir().unwrap();
+        fake_cargo(temp.path(), code);
+        let script = crate::repo_root().unwrap().join(super::HOOK_SCRIPT);
+        let results: Vec<(Option<i32>, String)> = SHELLS
+            .iter()
+            .map(|shell| {
+                run_shell(
+                    shell,
+                    &[script.as_os_str()],
+                    temp.path(),
+                    temp.path(),
+                    input,
+                )
+            })
+            .collect();
+        assert!(
+            results.windows(2).all(|pair| pair[0].0 == pair[1].0),
+            "the shells disagree: {results:?}"
+        );
+        results.into_iter().next().unwrap()
+    }
+
+    /// The command of each hook in `.claude/settings.json`, by event.
+    fn hook_commands() -> Vec<(String, String)> {
+        let settings: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(crate::repo_root().unwrap().join(".claude/settings.json")).unwrap(),
+        )
+        .unwrap();
+        settings["hooks"]
+            .as_object()
+            .unwrap()
+            .iter()
+            .flat_map(|(event, groups)| {
+                groups.as_array().unwrap().iter().flat_map(move |group| {
+                    group["hooks"].as_array().unwrap().iter().map(move |hook| {
+                        (event.clone(), hook["command"].as_str().unwrap().to_owned())
+                    })
+                })
+            })
+            .collect()
+    }
+
+    #[test]
+    fn hook_commands_note_a_checkout_without_xtask_and_let_it_be() {
+        let empty = tempfile::tempdir().unwrap();
+        let commands = hook_commands();
+        assert_eq!(
+            commands.len(),
+            3,
+            "PreToolUse, Stop and SubagentStop: {commands:?}"
+        );
+        for (event, command) in commands {
+            for shell in SHELLS {
+                let (code, stderr) = run_shell(
+                    shell,
+                    &["-c".as_ref(), command.as_ref()],
+                    empty.path(),
+                    empty.path(),
+                    r#"{"tool_name":"Bash","tool_input":{"command":"git push -f"}}"#,
+                );
+                assert_eq!(code, Some(0), "{event} under {shell}: {stderr}");
+                assert_eq!(stderr.lines().count(), 1, "{event} under {shell}: {stderr}");
+                assert!(stderr.starts_with("xtask hook: "), "{event}: {stderr}");
+            }
+        }
     }
 
     #[test]
