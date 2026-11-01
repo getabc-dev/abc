@@ -743,6 +743,18 @@ mod tests {
             assert_eq!(stop["timeout"], 900, "{event} is time-boxed");
         }
         assert_eq!(
+            settings["permissions"]["deny"],
+            serde_json::json!([
+                "Bash(gh auth token *)",
+                "Bash(gh auth status --show-token *)",
+                "Bash(gh auth status -t *)",
+                "Read(~/.config/gh/**)",
+                "Bash(security find-generic-password *)",
+                "Bash(security find-internet-password *)"
+            ]),
+            "agents cannot read the user's GitHub credentials (D3)"
+        );
+        assert_eq!(
             hooks["SubagentStop"][0]["matcher"],
             "^(?!(?:Explore|Plan|claude-code-guide|statusline-setup|web-fetch)$).+",
             "read-only and internal subagents are exempt"

@@ -89,6 +89,8 @@ enum Violation {
     ForcePush(String),
     /// A command the guard cannot read, described.
     Unreadable(String),
+    /// A GitHub action run with the user's own gh login instead of as the agent App.
+    AsUser(String),
 }
 
 impl Violation {
@@ -101,6 +103,10 @@ impl Violation {
             Self::Unreadable(what) => format!(
                 "Blocked: {what} could hide a force push that the guard cannot see. Write the git \
                  or gh command out literally."
+            ),
+            Self::AsUser(action) => format!(
+                "Blocked: `{action}` would act as the user rather than as the abc agent App. Run it \
+                 through `cargo xtask gh -- ...`, which gives gh an App token."
             ),
         }
     }
@@ -337,6 +343,15 @@ fn push_violation(args: &[&Word], fed: bool) -> Option<Violation> {
 
 /// Checks one simple command for the GitHub CLI.
 fn gh_violation(words: &[Word]) -> Option<Violation> {
+    let start = words.iter().position(|word| basename(word) == "gh")?;
+    if start
+        .checked_sub(1)
+        .and_then(|previous| words.get(previous))
+        .is_some_and(|word| basename(word) == "xtask")
+    {
+        // `cargo xtask gh` runs gh as the App.
+        return None;
+    }
     let (gh, fed) = invocation(words, "gh")?;
     let mut args = gh.iter().skip(1);
     let subcommand = match args.next() {
@@ -349,6 +364,55 @@ fn gh_violation(words: &[Word]) -> Option<Violation> {
         Some(word) => word.text.as_str(),
     };
     let rest: Vec<&Word> = args.collect();
+    forced_through_gh(subcommand, &rest, fed).or_else(|| acting_as_user(subcommand, &rest))
+}
+
+/// A gh action that changes GitHub and so should run as the App: opening or merging a pull
+/// request, or an API call that writes.
+fn acting_as_user(subcommand: &str, rest: &[&Word]) -> Option<Violation> {
+    let action = match subcommand {
+        "pr" => rest
+            .first()
+            .map(|word| word.text.as_str())
+            .filter(|action| matches!(*action, "create" | "merge"))
+            .map(|action| format!("gh pr {action}")),
+        "api" => api_write(rest).map(|method| format!("gh api -X {method}")),
+        _ => None,
+    }?;
+    Some(Violation::AsUser(action))
+}
+
+/// The writing HTTP method of a `gh api` call: named with `-X` or `--method`, or POST, gh's
+/// default once fields or an input body are given.
+fn api_write(rest: &[&Word]) -> Option<String> {
+    let mut method = None;
+    let mut body = false;
+    let mut words = rest.iter().map(|word| word.text.as_str());
+    while let Some(word) = words.next() {
+        if word == "-X" || word == "--method" {
+            method = words.next().map(str::to_ascii_uppercase);
+        } else if let Some(value) = word
+            .strip_prefix("--method=")
+            .or_else(|| word.strip_prefix("-X"))
+            .filter(|value| !value.is_empty())
+        {
+            method = Some(value.to_ascii_uppercase());
+        } else if matches!(word, "-f" | "-F" | "--field" | "--raw-field" | "--input")
+            || ["-f", "-F", "--field=", "--raw-field=", "--input="]
+                .iter()
+                .any(|prefix| word.len() > prefix.len() && word.starts_with(prefix))
+        {
+            body = true;
+        }
+    }
+    let method = method.or_else(|| body.then(|| "POST".to_owned()))?;
+    ["POST", "PATCH", "PUT", "DELETE"]
+        .contains(&method.as_str())
+        .then_some(method)
+}
+
+/// A force update through gh, or a gh call the guard cannot read.
+fn forced_through_gh(subcommand: &str, rest: &[&Word], fed: bool) -> Option<Violation> {
     match subcommand {
         "api" if fed => Some(unreadable(
             "a gh api call run through xargs, which adds arguments from its input",
@@ -608,6 +672,34 @@ mod tests {
     }
 
     #[test]
+    fn blocks_gh_changes_made_as_the_user() {
+        for (command, action) in [
+            ("gh pr create --title x --body y", "gh pr create"),
+            ("gh pr merge 3 --squash", "gh pr merge"),
+            ("gh api -X POST repos/o/r/issues", "gh api -X POST"),
+            (
+                "gh api --method=patch repos/o/r/issues/1",
+                "gh api -X PATCH",
+            ),
+            ("gh api -XDELETE repos/o/r/labels/x", "gh api -X DELETE"),
+            ("gh api --method PUT repos/o/r/topics", "gh api -X PUT"),
+            ("gh api repos/o/r/issues -f title=x", "gh api -X POST"),
+            (
+                "gh api repos/o/r/issues --input body.json",
+                "gh api -X POST",
+            ),
+        ] {
+            assert_blocked(command, &Violation::AsUser(action.to_owned()));
+        }
+        assert!(
+            Violation::AsUser("gh pr create".to_owned())
+                .message()
+                .contains("cargo xtask gh -- ..."),
+            "the message says how to run it as the App"
+        );
+    }
+
+    #[test]
     fn blocks_forced_ref_updates_through_gh() {
         assert_blocked(
             "gh api repos/o/r/git/refs/heads/main -X PATCH -f sha=abc123 -F force=true",
@@ -651,7 +743,10 @@ mod tests {
             "git -C /tmp/git push origin main",
             "git config user.name agent",
             "find . -name '*.rs' | xargs git add",
-            "gh pr create --title x --body \"$(cat <<'EOF'\nbody\nEOF\n)\"",
+            "cargo xtask gh -- pr create --title x --body \"$(cat <<'EOF'\nbody\nEOF\n)\"",
+            "cargo xtask gh pr merge 3 --squash",
+            "gh pr view 3",
+            "gh api -X GET repos/o/r/pulls",
             "gh api repos/o/r/pulls",
             "gh repo sync",
             "echo $((1<<2))",

@@ -975,9 +975,11 @@ name = "xtask"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
  "clap",
  "flate2",
  "proc-macro2",
+ "ring",
  "serde",
  "serde_json",
  "sha2",

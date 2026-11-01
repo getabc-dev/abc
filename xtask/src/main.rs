@@ -1,5 +1,6 @@
 //! Repository automation for abc, run as `cargo xtask <command>`.
 
+mod app;
 mod check;
 mod coverage;
 mod git;
@@ -60,6 +61,17 @@ enum Task {
         /// In CI, the pull request whose `integrity-approved` label can accept the findings.
         #[arg(long)]
         pr: Option<u64>,
+    },
+    /// git's credential helper: answers `get` for github.com with an agent App token on stdout.
+    GitCredential {
+        /// The operation git asks for: get, store or erase.
+        operation: String,
+    },
+    /// Run gh as the agent App, with a fresh installation token in `GH_TOKEN`.
+    Gh {
+        /// Arguments passed to gh.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<OsString>,
     },
     /// Install the tools pinned in xtask/tools.toml into .tools/, verifying each download.
     Setup {
@@ -158,8 +170,23 @@ fn run(task: Task) -> anyhow::Result<ExitCode> {
                 ExitCode::FAILURE
             })
         }
+        Task::GitCredential { operation } => {
+            let mut request = String::new();
+            io::stdin()
+                .read_to_string(&mut request)
+                .context("could not read git's credential request")?;
+            app::credential(&operation, &request, &mut io::stdout().lock(), || {
+                app::App::load(&app::config_dir()?)?.token(app::GITHUB_API)
+            })?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Task::Gh { args } => {
+            let token = app::App::load(&app::config_dir()?)?.token(app::GITHUB_API)?;
+            app::gh(Path::new("gh"), &args, &token)
+        }
         Task::Setup { tools: only } => {
             tools::setup(&root, &only, &mut io::stdout().lock())?;
+            app::configure_git(&root, &app::config_dir()?, &mut io::stdout().lock())?;
             Ok(ExitCode::SUCCESS)
         }
         Task::Doctor { tools: only } => tools::doctor(&root, &only, &mut io::stdout().lock()),
