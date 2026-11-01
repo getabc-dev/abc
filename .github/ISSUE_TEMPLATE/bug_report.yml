@@ -5,7 +5,7 @@ body:
   - type: markdown
     attributes:
       value: |
-        Thank you for reporting a bug. abc is in development and has no releases yet, so tell us the commit you ran.
+        Thank you for reporting a bug. abc is in development and has no releases yet, so for a bug in the code, tell us the commit you ran.
 
         **Security issues do not belong here.** Report them privately as [SECURITY.md](https://github.com/getabc-dev/abc/blob/main/SECURITY.md) explains.
   - type: textarea
@@ -25,20 +25,20 @@ body:
     id: steps
     attributes:
       label: Steps to reproduce
-      description: The smallest set of steps that shows the bug.
+      description: The smallest set of steps that shows the bug. For a documentation bug, link the page instead.
       placeholder: |
         1.
         2.
         3.
     validations:
-      required: true
+      required: false
   - type: input
     id: commit
     attributes:
       label: Commit
-      description: The output of `git rev-parse HEAD` in your checkout.
+      description: The output of `git rev-parse HEAD` in your checkout, if the bug is in the code.
     validations:
-      required: true
+      required: false
   - type: dropdown
     id: component
     attributes:
@@ -58,9 +58,9 @@ body:
     id: environment
     attributes:
       label: Environment
-      description: Operating system and version, CPU architecture, and anything else that may matter.
+      description: Operating system and version, CPU architecture, and anything else that may matter. Not needed for documentation bugs.
     validations:
-      required: true
+      required: false
   - type: textarea
     id: logs
     attributes:
