@@ -1,23 +1,27 @@
 //! Properties of the event log, the write path and the feed. Each test gets a fresh migrated
-//! database (`#[sqlx::test]`); `Fixture` fixes the clock and the mints.
+//! database (`TestDatabase`); `Fixture` fixes the clock and the mints.
 
 #[cfg(test)]
 mod tests {
+    use abc_store::testing::TestDatabase;
     use std::time::Duration;
 
     use abc_core::command::{IssueEnrolmentToken, RevokeEnrolmentToken, TokenTtl};
     use abc_core::event::{Position, StreamKind};
     use abc_core::policy::DenialReason;
-    use abc_store::testing::{
-        Fixture, assert_views_replay, database, database_url, views_replay_diff,
-    };
+    use abc_store::testing::{Fixture, assert_views_replay, database_url, views_replay_diff};
     use abc_store::{DatabaseUrl, ExecuteError, OpenError, Store, StoreOptions};
     use rand::rngs::ChaCha20Rng;
     use rand::{RngExt as _, SeedableRng as _};
-    use sqlx::PgPool;
 
-    #[sqlx::test(migrator = "abc_store::MIGRATOR")]
-    async fn positions_stay_gapless_to_every_reader_under_concurrent_writers(pool: PgPool) {
+    #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "writers, a reader and a feed, checked together"
+    )]
+    async fn positions_stay_gapless_to_every_reader_under_concurrent_writers() {
+        let database = TestDatabase::migrated().await;
+        let pool = database.pool();
         let (fixture, claimed) = Fixture::claimed(pool.clone()).await;
         let fixture = std::sync::Arc::new(fixture);
         let start = fixture.event_count().await;
@@ -128,8 +132,10 @@ mod tests {
         assert_views_replay(&pool).await;
     }
 
-    #[sqlx::test(migrator = "abc_store::MIGRATOR")]
-    async fn a_refused_command_writes_nothing_and_leaves_no_gap(pool: PgPool) {
+    #[tokio::test]
+    async fn a_refused_command_writes_nothing_and_leaves_no_gap() {
+        let database = TestDatabase::migrated().await;
+        let pool = database.pool();
         let (fixture, claimed) = Fixture::claimed(pool.clone()).await;
         let before = fixture.event_count().await;
         let refused = fixture
@@ -162,8 +168,10 @@ mod tests {
         assert_views_replay(&pool).await;
     }
 
-    #[sqlx::test(migrator = "abc_store::MIGRATOR")]
-    async fn the_log_rejects_update_delete_and_truncate(pool: PgPool) {
+    #[tokio::test]
+    async fn the_log_rejects_update_delete_and_truncate() {
+        let database = TestDatabase::migrated().await;
+        let pool = database.pool();
         let (_fixture, _) = Fixture::claimed(pool.clone()).await;
         for statement in [
             "UPDATE event SET correlation_id = gen_random_uuid()",
@@ -178,8 +186,10 @@ mod tests {
         }
     }
 
-    #[sqlx::test(migrator = "abc_store::MIGRATOR")]
-    async fn the_head_moves_only_forward_and_only_onto_an_event(pool: PgPool) {
+    #[tokio::test]
+    async fn the_head_moves_only_forward_and_only_onto_an_event() {
+        let database = TestDatabase::migrated().await;
+        let pool = database.pool();
         let (fixture, _) = Fixture::claimed(pool.clone()).await;
         let head = fixture.event_count().await;
         let backwards = sqlx::query("UPDATE event_log_head SET position = 1")
@@ -219,8 +229,10 @@ mod tests {
         uuid::Uuid,
     );
 
-    #[sqlx::test(migrator = "abc_store::MIGRATOR")]
-    async fn every_event_records_its_actor_workspace_stream_and_cause(pool: PgPool) {
+    #[tokio::test]
+    async fn every_event_records_its_actor_workspace_stream_and_cause() {
+        let database = TestDatabase::migrated().await;
+        let pool = database.pool();
         let (fixture, claimed) = Fixture::claimed(pool.clone()).await;
         let issued = fixture.issue_token(claimed.workspace).await;
         let key = fixture.worker_key();
@@ -276,8 +288,10 @@ mod tests {
         assert_views_replay(&pool).await;
     }
 
-    #[sqlx::test(migrator = "abc_store::MIGRATOR")]
-    async fn the_stream_kind_constraint_matches_the_enum(pool: PgPool) {
+    #[tokio::test]
+    async fn the_stream_kind_constraint_matches_the_enum() {
+        let database = TestDatabase::migrated().await;
+        let pool = database.pool();
         let definition: String = sqlx::query_scalar(
             "SELECT pg_get_constraintdef(oid) FROM pg_constraint
              WHERE conrelid = 'event'::regclass AND pg_get_constraintdef(oid) LIKE '%stream_kind%'",
@@ -299,8 +313,10 @@ mod tests {
         }
     }
 
-    #[sqlx::test(migrator = "abc_store::MIGRATOR")]
-    async fn the_feed_wakes_on_commits_and_not_on_refusals(pool: PgPool) {
+    #[tokio::test]
+    async fn the_feed_wakes_on_commits_and_not_on_refusals() {
+        let database = TestDatabase::migrated().await;
+        let pool = database.pool();
         let (fixture, claimed) = Fixture::claimed(pool.clone()).await;
         let head = Position::from_stored(fixture.event_count().await).unwrap();
         let mut early = fixture.store.feed();
@@ -338,8 +354,10 @@ mod tests {
         assert_eq!(feed.head(), woke.unwrap(), "head() is the latest");
     }
 
-    #[sqlx::test(migrator = "abc_store::MIGRATOR")]
-    async fn a_lost_listener_connection_loses_no_wake_up(pool: PgPool) {
+    #[tokio::test]
+    async fn a_lost_listener_connection_loses_no_wake_up() {
+        let database = TestDatabase::migrated().await;
+        let pool = database.pool();
         let (fixture, claimed) = Fixture::claimed(pool.clone()).await;
         let mut feed = fixture.store.feed();
         let killed: i64 = sqlx::query_scalar(
@@ -379,8 +397,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "abc_store::MIGRATOR")]
-    async fn replay_catches_a_view_written_outside_the_event_path(pool: PgPool) {
+    #[tokio::test]
+    async fn replay_catches_a_view_written_outside_the_event_path() {
+        let database = TestDatabase::migrated().await;
+        let pool = database.pool();
         let (fixture, claimed) = Fixture::claimed(pool.clone()).await;
         fixture.issue_token(claimed.workspace).await;
         assert_eq!(
@@ -399,11 +419,13 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrations = false)]
-    async fn a_store_opens_only_on_this_builds_schema(pool: PgPool) {
+    #[tokio::test]
+    async fn a_store_opens_only_on_this_builds_schema() {
+        let database = TestDatabase::empty().await;
+        let pool = database.pool();
         let clock = abc_store::testing::ManualClock::new();
         let unmigrated = Store::open(
-            database(pool.clone()),
+            abc_store::testing::database(pool.clone()),
             abc_store::testing::options(&clock, 1),
         )
         .await;
@@ -411,11 +433,18 @@ mod tests {
             matches!(unmigrated, Err(OpenError::NotMigrated)),
             "never migrated"
         );
-        abc_store::migrate(&database(pool.clone())).await.unwrap();
-        abc_store::migrate(&database(pool.clone())).await.unwrap();
-        let store = Store::open(database(pool.clone()), StoreOptions::production())
+        abc_store::migrate(&abc_store::testing::database(pool.clone()))
             .await
             .unwrap();
+        abc_store::migrate(&abc_store::testing::database(pool.clone()))
+            .await
+            .unwrap();
+        let store = Store::open(
+            abc_store::testing::database(pool.clone()),
+            StoreOptions::production(),
+        )
+        .await
+        .unwrap();
         assert!(
             !store.is_claimed().await.unwrap(),
             "a new server is unclaimed"
@@ -426,15 +455,21 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
-        let newer = Store::open(database(pool), abc_store::testing::options(&clock, 1)).await;
+        let newer = Store::open(
+            abc_store::testing::database(pool),
+            abc_store::testing::options(&clock, 1),
+        )
+        .await;
         assert!(
             matches!(newer, Err(OpenError::NotMigrated)),
             "migrated by a newer build"
         );
     }
 
-    #[sqlx::test(migrator = "abc_store::MIGRATOR")]
-    async fn connect_reaches_a_database_and_never_echoes_the_url(pool: PgPool) {
+    #[tokio::test]
+    async fn connect_reaches_a_database_and_never_echoes_the_url() {
+        let database = TestDatabase::migrated().await;
+        let pool = database.pool();
         let db = abc_store::connect(&database_url(&pool), Duration::from_secs(5))
             .await
             .unwrap();
@@ -473,5 +508,51 @@ mod tests {
             "DatabaseUrl(<redacted>)",
             "nor does Debug"
         );
+    }
+
+    #[tokio::test]
+    async fn a_test_database_is_dropped_after_its_test_and_old_leftovers_are_swept() {
+        let database = TestDatabase::migrated().await;
+        let pool = database.pool();
+        let name: String = sqlx::query_scalar("SELECT current_database()")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(
+            name.starts_with("abc_test_"),
+            "named for abc's tests: {name}"
+        );
+        sqlx::query("CREATE DATABASE abc_test_1_leftover")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let fresh = TestDatabase::empty().await;
+        let exists = |wanted: &str| {
+            let pool = pool.clone();
+            let wanted = wanted.to_owned();
+            async move {
+                sqlx::query_scalar::<_, bool>(
+                    "SELECT EXISTS (SELECT 1 FROM pg_database WHERE datname = $1)",
+                )
+                .bind(wanted)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+            }
+        };
+        assert!(
+            !exists("abc_test_1_leftover").await,
+            "a day-old leftover is swept"
+        );
+        let fresh_name: String = sqlx::query_scalar("SELECT current_database()")
+            .fetch_one(&fresh.pool())
+            .await
+            .unwrap();
+        assert!(
+            exists(&fresh_name).await,
+            "the new database exists while held"
+        );
+        drop(fresh);
+        assert!(!exists(&fresh_name).await, "and is dropped with its value");
     }
 }

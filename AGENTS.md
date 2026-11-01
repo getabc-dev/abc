@@ -126,7 +126,8 @@ watchdog compares the diff with that task and the rules above, and keeps it work
 The gates take `--root <path>` to check another tree with the pinned tools of the checkout xtask
 was built from.
 
-Database tests (`#[sqlx::test]`) get a fresh database each on the server `DATABASE_URL` names,
+Database tests get a fresh, uniquely named database each (`abc_store::testing::TestDatabase`) on
+the server `DATABASE_URL` names,
 which `.cargo/config.toml` sets to one warm Postgres 18 container per machine
 (`127.0.0.1:55432`). `check`, `coverage` and `mutants` start it with Docker when it is not
 running; a `DATABASE_URL` in the environment points the tests elsewhere instead. sqlx's query

@@ -23,8 +23,10 @@ mod common;
 
 #[cfg(test)]
 mod tests {
+    use abc_store::testing::TestDatabase;
     use std::io::Write as _;
     use std::os::unix::fs::PermissionsExt as _;
+    use std::path::Path;
     use std::process::Command;
     use std::sync::Arc;
     use std::time::Duration;
@@ -144,8 +146,113 @@ mod tests {
         )
     }
 
-    #[sqlx::test(migrator = "abc_store::MIGRATOR")]
-    async fn serve_passes_identity_websockets_and_unbuffered_sse_to_the_unix_socket(pool: PgPool) {
+    /// The Serve node, proxying to the socket in `sockets` with the config in `serve_config`, and
+    /// the client node, whose HTTP proxy listens on `proxy`.
+    fn start_nodes(
+        key: &str,
+        node: &str,
+        sockets: &Path,
+        serve_config: &Path,
+        proxy: u16,
+    ) -> Containers {
+        let client = format!("{node}-client");
+        let containers = Containers(vec![node.to_owned(), client.clone()]);
+        let auth = format!("TS_AUTHKEY={key}");
+        let socket_volume = format!("{}:/run/abc-sidecar", sockets.display());
+        let config_volume = format!("{}:/config:ro", serve_config.display());
+        let server_name = format!("TS_HOSTNAME={node}");
+        docker(&[
+            "run",
+            "--detach",
+            "--name",
+            node,
+            "--env",
+            &auth,
+            "--env",
+            &server_name,
+            "--env",
+            "TS_USERSPACE=true",
+            "--env",
+            "TS_SERVE_CONFIG=/config/serve.json",
+            "--volume",
+            &socket_volume,
+            "--volume",
+            &config_volume,
+            IMAGE,
+        ]);
+        let client_name = format!("TS_HOSTNAME={client}");
+        let published = format!("127.0.0.1:{proxy}:1055");
+        docker(&[
+            "run",
+            "--detach",
+            "--name",
+            &client,
+            "--env",
+            &auth,
+            "--env",
+            &client_name,
+            "--env",
+            "TS_USERSPACE=true",
+            "--env",
+            "TS_OUTBOUND_HTTP_PROXY_LISTEN=0.0.0.0:1055",
+            "--publish",
+            &published,
+            IMAGE,
+        ]);
+        containers
+    }
+
+    /// `GET /api/session` through the tailnet, retried while the nodes join, DNS settles and the
+    /// first certificate is issued.
+    async fn first_session(proxy: u16, host: &str) -> (StatusCode, Value) {
+        let mut session = (StatusCode::BAD_GATEWAY, Value::Null);
+        for _ in 0..90 {
+            let host = host.to_owned();
+            let attempt = tokio::time::timeout(
+                Duration::from_secs(10),
+                tokio::spawn(async move { call(proxy, &host, "GET", "/api/session", None).await }),
+            )
+            .await;
+            if let Ok(Ok(answer)) = attempt {
+                session = answer;
+                if session.0 == StatusCode::OK {
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+        session
+    }
+
+    /// Claims the server and enrols a worker through the tailnet; returns the workspace and key.
+    async fn enrolled_worker(pool: &PgPool, proxy: u16, host: &str) -> (String, Secret<WorkerKey>) {
+        let cli = abc_store::Store::open(
+            abc_store::testing::database(pool.clone()),
+            abc_store::StoreOptions::production(),
+        )
+        .await
+        .unwrap();
+        let issued = cli.issue_setup_code().await.unwrap();
+        let code = issued.code.expose_secret().display_form().to_string();
+        let claim = Some(claim_body(&code));
+        let (status, claimed) = call(proxy, host, "POST", "/api/owner/claim", claim).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the claim passes through: {claimed}"
+        );
+        let workspace = claimed["workspace"].as_str().unwrap().to_owned();
+        let tokens = format!("/api/workspaces/{workspace}/enrolment-tokens");
+        let (_, token) = call(proxy, host, "POST", &tokens, Some(json!({}))).await;
+        let key = Fixture::new(pool.clone()).await.worker_key();
+        let enrol = Some(enrol_body(token["token"].as_str().unwrap(), &key));
+        let (enrol_status, enrolled) = call(proxy, host, "POST", "/api/enrol", enrol).await;
+        assert_eq!(enrol_status, StatusCode::OK, "{enrolled}");
+        (workspace, key)
+    }
+
+    #[tokio::test]
+    async fn serve_passes_identity_websockets_and_unbuffered_sse_to_the_unix_socket() {
         let (Ok(key), Ok(tailnet)) = (
             std::env::var("ABC_TAILSCALE_AUTHKEY"),
             std::env::var("ABC_TAILSCALE_TAILNET"),
@@ -157,8 +264,9 @@ mod tests {
             );
             return;
         };
-        let id = std::process::id();
-        let node = format!("abc-e2e-{id}");
+        let database = TestDatabase::migrated().await;
+        let pool = database.pool();
+        let node = format!("abc-e2e-{}", std::process::id());
         let host = format!("{node}.{tailnet}");
         let sockets = socket_dir();
         std::fs::set_permissions(sockets.path(), std::fs::Permissions::from_mode(0o770)).unwrap();
@@ -180,115 +288,26 @@ mod tests {
         let server = tokio::spawn(abc_server::run(settings, async move {
             let _stopped = stopped.await;
         }));
-        let containers = Containers(vec![node.clone(), format!("{node}-client")]);
         let proxy = std::net::TcpListener::bind("127.0.0.1:0")
             .unwrap()
             .local_addr()
             .unwrap()
             .port();
-        docker(&[
-            "run",
-            "--detach",
-            "--name",
-            &node,
-            "--env",
-            &format!("TS_AUTHKEY={key}"),
-            "--env",
-            &format!("TS_HOSTNAME={node}"),
-            "--env",
-            "TS_USERSPACE=true",
-            "--env",
-            "TS_SERVE_CONFIG=/config/serve.json",
-            "--volume",
-            &format!("{}:/run/abc-sidecar", sockets.path().display()),
-            "--volume",
-            &format!("{}:/config:ro", serve_config.path().display()),
-            IMAGE,
-        ]);
-        docker(&[
-            "run",
-            "--detach",
-            "--name",
-            &containers.0[1],
-            "--env",
-            &format!("TS_AUTHKEY={key}"),
-            "--env",
-            &format!("TS_HOSTNAME={node}-client"),
-            "--env",
-            "TS_USERSPACE=true",
-            "--env",
-            "TS_OUTBOUND_HTTP_PROXY_LISTEN=0.0.0.0:1055",
-            "--publish",
-            &format!("127.0.0.1:{proxy}:1055"),
-            IMAGE,
-        ]);
-        // Joining, DNS and the first certificate can take a while.
-        let mut session = (StatusCode::BAD_GATEWAY, Value::Null);
-        for _ in 0..90 {
-            let attempt = tokio::time::timeout(
-                Duration::from_secs(10),
-                tokio::spawn({
-                    let host = host.clone();
-                    async move { call(proxy, &host, "GET", "/api/session", None).await }
-                }),
-            )
-            .await;
-            if let Ok(Ok(answer)) = attempt {
-                session = answer;
-                if session.0 == StatusCode::OK {
-                    break;
-                }
-            }
-            tokio::time::sleep(Duration::from_secs(2)).await;
-        }
+        let containers = start_nodes(&key, &node, sockets.path(), serve_config.path(), proxy);
+
+        let session = first_session(proxy, &host).await;
         assert_eq!(
             session.0,
             StatusCode::OK,
-            "Serve reaches the socket and keeps the Host: {}",
+            "Serve reaches the socket, keeping Host: {}",
             session.1
         );
         assert_eq!(
             session.1["state"], "unclaimed",
-            "Serve asserted a tailnet login: {}",
+            "Serve asserted a login: {}",
             session.1
         );
-
-        let fixture_store = abc_store::Store::open(
-            abc_store::testing::database(pool.clone()),
-            abc_store::StoreOptions::production(),
-        )
-        .await
-        .unwrap();
-        let code = fixture_store.issue_setup_code().await.unwrap();
-        let code = code.code.expose_secret().display_form().to_string();
-        let (status, claimed) = call(
-            proxy,
-            &host,
-            "POST",
-            "/api/owner/claim",
-            Some(claim_body(&code)),
-        )
-        .await;
-        assert_eq!(
-            status,
-            StatusCode::OK,
-            "the claim passes through: {claimed}"
-        );
-        let workspace = claimed["workspace"].as_str().unwrap().to_owned();
-        let tokens = format!("/api/workspaces/{workspace}/enrolment-tokens");
-        let (_, issued) = call(proxy, &host, "POST", &tokens, Some(json!({}))).await;
-        let keys = Fixture::new(pool.clone()).await;
-        let worker_key: Secret<WorkerKey> = keys.worker_key();
-        let token = issued["token"].as_str().unwrap();
-        let (enrol_status, enrolled) = call(
-            proxy,
-            &host,
-            "POST",
-            "/api/enrol",
-            Some(enrol_body(token, &worker_key)),
-        )
-        .await;
-        assert_eq!(enrol_status, StatusCode::OK, "{enrolled}");
+        let (workspace, worker_key) = enrolled_worker(&pool, proxy, &host).await;
 
         let io = TokioIo::new(tunnel(proxy, &host).await);
         let (mut sender, connection) = hyper::client::conn::http1::handshake(io).await.unwrap();
@@ -307,12 +326,10 @@ mod tests {
         let mut request = format!("wss://{host}{}", abc_protocol::link::CONNECT_PATH)
             .into_client_request()
             .unwrap();
-        request.headers_mut().insert(
-            "authorization",
-            format!("Bearer {}", worker_key.expose_secret().as_str())
-                .parse()
-                .unwrap(),
-        );
+        let bearer = format!("Bearer {}", worker_key.expose_secret().as_str());
+        request
+            .headers_mut()
+            .insert("authorization", bearer.parse().unwrap());
         let (mut socket, _) = tokio_tungstenite::client_async(request, tunnel(proxy, &host).await)
             .await
             .expect("Serve upgrades the WebSocket");

@@ -3,6 +3,7 @@
 
 #[cfg(test)]
 mod tests {
+    use abc_store::testing::TestDatabase;
     use std::sync::Arc;
 
     use abc_core::command::{
@@ -22,7 +23,6 @@ mod tests {
     use abc_store::testing::{Fixture, assert_views_replay};
     use abc_store::{AuthError, Caller, ExecuteError, QueryError};
     use semver::Version;
-    use sqlx::PgPool;
 
     fn denial<R: std::error::Error>(
         result: Result<impl std::fmt::Debug, ExecuteError<R>>,
@@ -44,8 +44,10 @@ mod tests {
         SessionId::from_uuid(uuid::Uuid::from_u128(n))
     }
 
-    #[sqlx::test(migrator = "abc_store::MIGRATOR")]
-    async fn a_setup_code_claims_once_and_never_after(pool: PgPool) {
+    #[tokio::test]
+    async fn a_setup_code_claims_once_and_never_after() {
+        let database = TestDatabase::migrated().await;
+        let pool = database.pool();
         let fixture = Fixture::new(pool.clone()).await;
         assert!(
             !fixture.store.is_claimed().await.unwrap(),
@@ -111,8 +113,10 @@ mod tests {
         assert_views_replay(&pool).await;
     }
 
-    #[sqlx::test(migrator = "abc_store::MIGRATOR")]
-    async fn a_setup_code_expires_after_an_hour(pool: PgPool) {
+    #[tokio::test]
+    async fn a_setup_code_expires_after_an_hour() {
+        let database = TestDatabase::migrated().await;
+        let pool = database.pool();
         let fixture = Fixture::new(pool.clone()).await;
         let issued = fixture.store.issue_setup_code().await.unwrap();
         fixture.clock.advance(SETUP_CODE_TTL);
@@ -128,8 +132,10 @@ mod tests {
         assert_views_replay(&pool).await;
     }
 
-    #[sqlx::test(migrator = "abc_store::MIGRATOR")]
-    async fn two_concurrent_claims_make_one_owner(pool: PgPool) {
+    #[tokio::test]
+    async fn two_concurrent_claims_make_one_owner() {
+        let database = TestDatabase::migrated().await;
+        let pool = database.pool();
         let fixture = Arc::new(Fixture::new(pool.clone()).await);
         let issued = fixture.store.issue_setup_code().await.unwrap();
         let display = issued.code.expose_secret().display_form();
@@ -156,8 +162,10 @@ mod tests {
         assert_views_replay(&pool).await;
     }
 
-    #[sqlx::test(migrator = "abc_store::MIGRATOR")]
-    async fn a_lost_enrolment_response_is_retried_safely(pool: PgPool) {
+    #[tokio::test]
+    async fn a_lost_enrolment_response_is_retried_safely() {
+        let database = TestDatabase::migrated().await;
+        let pool = database.pool();
         let (fixture, claimed) = Fixture::claimed(pool.clone()).await;
         let issued = fixture.issue_token(claimed.workspace).await;
         let key = fixture.worker_key();
@@ -192,8 +200,10 @@ mod tests {
         assert_views_replay(&pool).await;
     }
 
-    #[sqlx::test(migrator = "abc_store::MIGRATOR")]
-    async fn two_concurrent_redemptions_make_one_worker(pool: PgPool) {
+    #[tokio::test]
+    async fn two_concurrent_redemptions_make_one_worker() {
+        let database = TestDatabase::migrated().await;
+        let pool = database.pool();
         let (fixture, claimed) = Fixture::claimed(pool.clone()).await;
         let fixture = Arc::new(fixture);
         let issued = fixture.issue_token(claimed.workspace).await;
@@ -219,8 +229,10 @@ mod tests {
         assert_views_replay(&pool).await;
     }
 
-    #[sqlx::test(migrator = "abc_store::MIGRATOR")]
-    async fn expired_revoked_and_unknown_tokens_are_refused(pool: PgPool) {
+    #[tokio::test]
+    async fn expired_revoked_and_unknown_tokens_are_refused() {
+        let database = TestDatabase::migrated().await;
+        let pool = database.pool();
         let (fixture, claimed) = Fixture::claimed(pool.clone()).await;
         let workspace = claimed.workspace;
         let revoked = fixture.issue_token(workspace).await;
@@ -267,8 +279,10 @@ mod tests {
         assert_views_replay(&pool).await;
     }
 
-    #[sqlx::test(migrator = "abc_store::MIGRATOR")]
-    async fn tokens_are_listed_with_their_status_and_revoked_only_while_open(pool: PgPool) {
+    #[tokio::test]
+    async fn tokens_are_listed_with_their_status_and_revoked_only_while_open() {
+        let database = TestDatabase::migrated().await;
+        let pool = database.pool();
         let (fixture, claimed) = Fixture::claimed(pool.clone()).await;
         let workspace = claimed.workspace;
         let labelled = fixture
@@ -355,8 +369,10 @@ mod tests {
         assert_views_replay(&pool).await;
     }
 
-    #[sqlx::test(migrator = "abc_store::MIGRATOR")]
-    async fn revocation_is_seen_by_the_very_next_request(pool: PgPool) {
+    #[tokio::test]
+    async fn revocation_is_seen_by_the_very_next_request() {
+        let database = TestDatabase::migrated().await;
+        let pool = database.pool();
         let (fixture, claimed) = Fixture::claimed(pool.clone()).await;
         let issued = fixture.issue_token(claimed.workspace).await;
         let key = fixture.worker_key();
@@ -447,8 +463,14 @@ mod tests {
         assert_views_replay(&pool).await;
     }
 
-    #[sqlx::test(migrator = "abc_store::MIGRATOR")]
-    async fn sessions_make_a_worker_online_and_a_superseded_end_changes_nothing(pool: PgPool) {
+    #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one session lifecycle, read top to bottom"
+    )]
+    async fn sessions_make_a_worker_online_and_a_superseded_end_changes_nothing() {
+        let database = TestDatabase::migrated().await;
+        let pool = database.pool();
         let (fixture, claimed) = Fixture::claimed(pool.clone()).await;
         let issued = fixture.issue_token(claimed.workspace).await;
         let key = fixture.worker_key();
@@ -558,8 +580,10 @@ mod tests {
         assert_views_replay(&pool).await;
     }
 
-    #[sqlx::test(migrator = "abc_store::MIGRATOR")]
-    async fn machines_since_returns_exactly_the_cards_changed_after_a_position(pool: PgPool) {
+    #[tokio::test]
+    async fn machines_since_returns_exactly_the_cards_changed_after_a_position() {
+        let database = TestDatabase::migrated().await;
+        let pool = database.pool();
         let (fixture, claimed) = Fixture::claimed(pool.clone()).await;
         let workspace = claimed.workspace;
         let first = fixture.issue_token(workspace).await;
@@ -630,8 +654,10 @@ mod tests {
         assert_views_replay(&pool).await;
     }
 
-    #[sqlx::test(migrator = "abc_store::MIGRATOR")]
-    async fn who_am_i_answers_every_kind_of_caller(pool: PgPool) {
+    #[tokio::test]
+    async fn who_am_i_answers_every_kind_of_caller() {
+        let database = TestDatabase::migrated().await;
+        let pool = database.pool();
         let fixture = Fixture::new(pool.clone()).await;
         let who = |caller: Caller| {
             let store = fixture.store.clone();
@@ -683,8 +709,10 @@ mod tests {
         assert_views_replay(&pool).await;
     }
 
-    #[sqlx::test(migrator = "abc_store::MIGRATOR")]
-    async fn the_server_caller_can_do_only_server_actions(pool: PgPool) {
+    #[tokio::test]
+    async fn the_server_caller_can_do_only_server_actions() {
+        let database = TestDatabase::migrated().await;
+        let pool = database.pool();
         let (fixture, claimed) = Fixture::claimed(pool.clone()).await;
         let workspace = claimed.workspace;
         let issue = |caller: Caller| {

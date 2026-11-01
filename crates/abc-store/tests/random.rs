@@ -4,6 +4,7 @@
 
 #[cfg(test)]
 mod tests {
+    use abc_store::testing::TestDatabase;
     use std::collections::BTreeMap;
 
     use abc_core::command::{
@@ -210,18 +211,24 @@ mod tests {
         assert_views_replay(&pool).await;
     }
 
-    #[sqlx::test(migrator = "abc_store::MIGRATOR")]
-    async fn random_commands_seed_1(pool: PgPool) {
+    #[tokio::test]
+    async fn random_commands_seed_1() {
+        let database = TestDatabase::migrated().await;
+        let pool = database.pool();
         run(pool, 1).await;
     }
 
-    #[sqlx::test(migrator = "abc_store::MIGRATOR")]
-    async fn random_commands_seed_2(pool: PgPool) {
+    #[tokio::test]
+    async fn random_commands_seed_2() {
+        let database = TestDatabase::migrated().await;
+        let pool = database.pool();
         run(pool, 2).await;
     }
 
-    #[sqlx::test(migrator = "abc_store::MIGRATOR")]
-    async fn random_commands_seed_3(pool: PgPool) {
+    #[tokio::test]
+    async fn random_commands_seed_3() {
+        let database = TestDatabase::migrated().await;
+        let pool = database.pool();
         run(pool, 3).await;
     }
 }

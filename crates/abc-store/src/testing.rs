@@ -1,7 +1,11 @@
 //! Test support (feature `testing`, dev-dependencies only). Every database test gets a fresh,
-//! migrated database from `#[sqlx::test(migrator = "abc_store::MIGRATOR")]`, which runs against the
-//! one warm Postgres container per machine (D7). Time and randomness are fixed, so tests are
-//! deterministic (P2).
+//! migrated database of its own from [`TestDatabase::migrated`], on the server `DATABASE_URL`
+//! names: the one warm Postgres container per machine (D7). Time and randomness are fixed, so
+//! tests are deterministic (P2).
+//!
+//! `#[sqlx::test]` would do the same, but it names each database after its test alone, so two runs
+//! of one test at the same time (cargo-mutants' parallel jobs, or two checkouts sharing the warm
+//! container) drop each other's database. These names are unique per run.
 #![expect(
     clippy::panic,
     reason = "test support: a failed setup step fails the calling test at that spot"
@@ -25,16 +29,132 @@ use abc_core::time::{Clock, Timestamp};
 use rand::rngs::ChaCha20Rng;
 use rand::{Rng as _, SeedableRng as _};
 use semver::Version;
-use sqlx::{Connection as _, PgPool};
+use std::str::FromStr as _;
+
+use sqlx::postgres::PgConnectOptions;
+use sqlx::{Connection as _, PgConnection, PgPool};
 use zeroize::Zeroizing;
 
 use crate::error::StoreError;
 use crate::{Caller, Database, DatabaseUrl, ExecuteError, Store, StoreOptions, projection};
 
-/// Wraps the pool `#[sqlx::test]` hands a test (already migrated by `MIGRATOR`).
+/// Wraps a test's pool.
 #[must_use]
 pub fn database(pool: PgPool) -> Database {
     Database(pool)
+}
+
+/// A database that exists for one test: created empty or migrated, and dropped when this value
+/// is, even when the test fails.
+#[derive(Debug)]
+pub struct TestDatabase {
+    pool: PgPool,
+    name: String,
+    server: PgConnectOptions,
+}
+
+/// How long a test database may outlive its test (a killed process cannot drop it) before a later
+/// test sweeps it away.
+const STALE_AFTER_SECONDS: u64 = 24 * 60 * 60;
+
+impl TestDatabase {
+    /// A fresh database with every migration applied.
+    ///
+    /// # Panics
+    ///
+    /// When the server is unreachable or the migrations fail (test code).
+    pub async fn migrated() -> Self {
+        let database = Self::empty().await;
+        crate::MIGRATOR
+            .run(&database.pool)
+            .await
+            .unwrap_or_else(|error| panic!("migrating the test database: {error}"));
+        database
+    }
+
+    /// A fresh database with no tables.
+    ///
+    /// # Panics
+    ///
+    /// When `DATABASE_URL` is unset or the server is unreachable (test code).
+    pub async fn empty() -> Self {
+        let url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
+            panic!("database tests need DATABASE_URL; `cargo xtask check` sets up Postgres")
+        });
+        let server = PgConnectOptions::from_str(&url)
+            .unwrap_or_else(|error| panic!("DATABASE_URL does not parse: {error}"));
+        let mut admin = PgConnection::connect_with(&server)
+            .await
+            .unwrap_or_else(|error| panic!("connecting to the test server: {error}"));
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| since.as_secs());
+        sweep(&mut admin, now).await;
+        let name = format!("abc_test_{now}_{}", uuid::Uuid::now_v7().simple());
+        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE {name:?}")))
+            .execute(&mut admin)
+            .await
+            .unwrap_or_else(|error| panic!("creating {name}: {error}"));
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(8)
+            .connect_with(server.clone().database(&name))
+            .await
+            .unwrap_or_else(|error| panic!("connecting to {name}: {error}"));
+        Self { pool, name, server }
+    }
+
+    /// The database's pool.
+    #[must_use]
+    pub fn pool(&self) -> PgPool {
+        self.pool.clone()
+    }
+}
+
+/// Drops the test databases older than [`STALE_AFTER_SECONDS`]: leftovers of killed runs.
+async fn sweep(admin: &mut PgConnection, now: u64) {
+    let names: Vec<String> =
+        sqlx::query_scalar(r"SELECT datname FROM pg_database WHERE datname LIKE 'abc\_test\_%'")
+            .fetch_all(&mut *admin)
+            .await
+            .unwrap_or_default();
+    for name in names {
+        let created = name
+            .split('_')
+            .nth(2)
+            .and_then(|seconds| seconds.parse::<u64>().ok());
+        if created.is_some_and(|created| now.saturating_sub(created) > STALE_AFTER_SECONDS) {
+            let _dropped = sqlx::query(sqlx::AssertSqlSafe(format!(
+                "DROP DATABASE IF EXISTS {name:?} WITH (FORCE)"
+            )))
+            .execute(&mut *admin)
+            .await;
+        }
+    }
+}
+
+impl Drop for TestDatabase {
+    fn drop(&mut self) {
+        let name = std::mem::take(&mut self.name);
+        let server = self.server.clone();
+        // Drop is synchronous and may run on the test's runtime; a thread with its own runtime
+        // drops the database, forcing out the connections the test left open.
+        let dropped = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .ok()?;
+            runtime.block_on(async {
+                let mut admin = PgConnection::connect_with(&server).await.ok()?;
+                sqlx::query(sqlx::AssertSqlSafe(format!(
+                    "DROP DATABASE IF EXISTS {name:?} WITH (FORCE)"
+                )))
+                .execute(&mut admin)
+                .await
+                .ok()
+            })
+        });
+        let _finished = dropped.join();
+    }
 }
 
 /// A URL for the database behind `pool`, for code under test that connects by itself (the
@@ -134,7 +254,7 @@ pub fn options(clock: &ManualClock, seed: u64) -> StoreOptions {
 }
 
 /// The view tables, found from the catalogue rather than from a list kept by hand.
-async fn view_tables(conn: &mut sqlx::PgConnection) -> Result<Vec<String>, StoreError> {
+async fn view_tables(conn: &mut PgConnection) -> Result<Vec<String>, StoreError> {
     Ok(sqlx::query_scalar!(
         r#"SELECT table_name AS "name!" FROM information_schema.tables
            WHERE table_schema = 'public' AND table_type = 'BASE TABLE'
@@ -147,7 +267,7 @@ async fn view_tables(conn: &mut sqlx::PgConnection) -> Result<Vec<String>, Store
 
 /// Every view table's rows as JSON, in a stable order.
 async fn dump(
-    conn: &mut sqlx::PgConnection,
+    conn: &mut PgConnection,
     tables: &[String],
 ) -> Result<Vec<(String, serde_json::Value)>, StoreError> {
     let mut dumps = Vec::with_capacity(tables.len());
@@ -164,7 +284,7 @@ async fn dump(
 }
 
 /// Every event in the log, in order.
-async fn log(conn: &mut sqlx::PgConnection) -> Result<Vec<Recorded>, StoreError> {
+async fn log(conn: &mut PgConnection) -> Result<Vec<Recorded>, StoreError> {
     let rows = sqlx::query!(
         "SELECT position, id, recorded_at, workspace_id, stream_kind, stream_id, stream_seq,
                 schema_version, actor_kind, actor_id, correlation_id, causation_id, payload

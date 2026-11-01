@@ -6,6 +6,7 @@ mod common;
 
 #[cfg(test)]
 mod tests {
+    use abc_store::testing::TestDatabase;
     use std::os::unix::fs::PermissionsExt as _;
     use std::time::Duration;
 
@@ -19,7 +20,6 @@ mod tests {
     use hyper::StatusCode;
     use semver::Version;
     use serde_json::json;
-    use sqlx::PgPool;
 
     use crate::common::{Call, HOST, Server, claim_body, config, enrol_body, socket_dir};
 
@@ -27,8 +27,10 @@ mod tests {
     const FORBIDDEN: StatusCode = StatusCode::FORBIDDEN;
     const OK: StatusCode = StatusCode::OK;
 
-    #[sqlx::test(migrator = "abc_store::MIGRATOR")]
-    async fn the_owner_claims_with_the_setup_code_once(pool: PgPool) {
+    #[tokio::test]
+    async fn the_owner_claims_with_the_setup_code_once() {
+        let database = TestDatabase::migrated().await;
+        let pool = database.pool();
         let server = Server::start(pool.clone()).await;
         let anonymous = server.expect(Call::get("/api/session"), OK, "anyone").await;
         assert_eq!(
@@ -90,8 +92,10 @@ mod tests {
         assert_views_replay(&pool).await;
     }
 
-    #[sqlx::test(migrator = "abc_store::MIGRATOR")]
-    async fn identity_is_refused_from_other_hosts_and_sites(pool: PgPool) {
+    #[tokio::test]
+    async fn identity_is_refused_from_other_hosts_and_sites() {
+        let database = TestDatabase::migrated().await;
+        let pool = database.pool();
         let server = Server::start(pool.clone()).await;
         let workspace = server.claimed().await;
         let tokens = format!("/api/workspaces/{workspace}/enrolment-tokens");
@@ -159,8 +163,10 @@ mod tests {
         server.stop().await.unwrap();
     }
 
-    #[sqlx::test(migrator = "abc_store::MIGRATOR")]
-    async fn malformed_requests_get_the_api_error_format(pool: PgPool) {
+    #[tokio::test]
+    async fn malformed_requests_get_the_api_error_format() {
+        let database = TestDatabase::migrated().await;
+        let pool = database.pool();
         let server = Server::start(pool.clone()).await;
         let workspace = server.claimed().await;
         let tokens = format!("/api/workspaces/{workspace}/enrolment-tokens");
@@ -208,6 +214,13 @@ mod tests {
         server
             .refused(path, BAD, "malformed_request", "a bad id in the path")
             .await;
+        let padded = format!("{{{}\"label\": null}}", " ".repeat(32 * 1024));
+        let roomy = Call::post(&tokens)
+            .alice()
+            .body_text("application/json", &padded);
+        server
+            .expect(roomy, OK, "a 32 KiB body is within the limit")
+            .await;
         let big = Call::post("/api/enrol").body_text("application/json", &"x".repeat(70 * 1024));
         server
             .refused(big, BAD, "malformed_request", "a body over 64 KiB")
@@ -228,8 +241,10 @@ mod tests {
         server.stop().await.unwrap();
     }
 
-    #[sqlx::test(migrator = "abc_store::MIGRATOR")]
-    async fn the_ops_listener_serves_probes_and_never_identity(pool: PgPool) {
+    #[tokio::test]
+    async fn the_ops_listener_serves_probes_and_never_identity() {
+        let database = TestDatabase::migrated().await;
+        let pool = database.pool();
         let server = Server::start(pool.clone()).await;
         assert_eq!(
             server.ops_get("/healthz").await,
@@ -254,8 +269,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "abc_store::MIGRATOR")]
-    async fn enrolment_over_http_survives_a_lost_response_and_refuses_replay(pool: PgPool) {
+    #[tokio::test]
+    async fn enrolment_over_http_survives_a_lost_response_and_refuses_replay() {
+        let database = TestDatabase::migrated().await;
+        let pool = database.pool();
         let server = Server::start(pool.clone()).await;
         let keys = Fixture::new(pool.clone()).await;
         let workspace = server.claimed().await;
@@ -318,10 +335,10 @@ mod tests {
         assert_views_replay(&pool).await;
     }
 
-    #[sqlx::test(migrator = "abc_store::MIGRATOR")]
-    async fn a_connected_worker_shows_online_over_sse_and_a_resume_sends_only_changes(
-        pool: PgPool,
-    ) {
+    #[tokio::test]
+    async fn a_connected_worker_shows_online_over_sse_and_a_resume_sends_only_changes() {
+        let database = TestDatabase::migrated().await;
+        let pool = database.pool();
         let server = Server::start(pool.clone()).await;
         let keys = Fixture::new(pool.clone()).await;
         let workspace = server.claimed().await;
@@ -384,8 +401,10 @@ mod tests {
         assert_views_replay(&pool).await;
     }
 
-    #[sqlx::test(migrator = "abc_store::MIGRATOR")]
-    async fn the_handshake_refuses_other_versions_silence_and_noise(pool: PgPool) {
+    #[tokio::test]
+    async fn the_handshake_refuses_other_versions_silence_and_noise() {
+        let database = TestDatabase::migrated().await;
+        let pool = database.pool();
         let timings = LinkTimings {
             handshake: Duration::from_millis(300),
             ..LinkTimings::default()
@@ -434,8 +453,10 @@ mod tests {
         assert_views_replay(&pool).await;
     }
 
-    #[sqlx::test(migrator = "abc_store::MIGRATOR")]
-    async fn a_reconnect_supersedes_the_old_session_and_stays_online(pool: PgPool) {
+    #[tokio::test]
+    async fn a_reconnect_supersedes_the_old_session_and_stays_online() {
+        let database = TestDatabase::migrated().await;
+        let pool = database.pool();
         let server = Server::start(pool.clone()).await;
         let keys = Fixture::new(pool.clone()).await;
         let workspace = server.claimed().await;
@@ -465,8 +486,10 @@ mod tests {
         assert_views_replay(&pool).await;
     }
 
-    #[sqlx::test(migrator = "abc_store::MIGRATOR")]
-    async fn simultaneous_reconnects_leave_exactly_the_attached_session_online(pool: PgPool) {
+    #[tokio::test]
+    async fn simultaneous_reconnects_leave_exactly_the_attached_session_online() {
+        let database = TestDatabase::migrated().await;
+        let pool = database.pool();
         let server = Server::start(pool.clone()).await;
         let keys = Fixture::new(pool.clone()).await;
         let workspace = server.claimed().await;
@@ -515,8 +538,10 @@ mod tests {
         assert_views_replay(&pool).await;
     }
 
-    #[sqlx::test(migrator = "abc_store::MIGRATOR")]
-    async fn a_viewer_who_loses_access_gets_access_ended(pool: PgPool) {
+    #[tokio::test]
+    async fn a_viewer_who_loses_access_gets_access_ended() {
+        let database = TestDatabase::migrated().await;
+        let pool = database.pool();
         let server = Server::start(pool.clone()).await;
         let keys = Fixture::new(pool.clone()).await;
         let workspace = server.claimed().await;
@@ -536,8 +561,10 @@ mod tests {
         server.stop().await.unwrap();
     }
 
-    #[sqlx::test(migrator = "abc_store::MIGRATOR")]
-    async fn revoking_a_worker_closes_its_session_and_blocks_reconnecting(pool: PgPool) {
+    #[tokio::test]
+    async fn revoking_a_worker_closes_its_session_and_blocks_reconnecting() {
+        let database = TestDatabase::migrated().await;
+        let pool = database.pool();
         let server = Server::start(pool.clone()).await;
         let keys = Fixture::new(pool.clone()).await;
         let workspace = server.claimed().await;
@@ -590,8 +617,10 @@ mod tests {
         assert_views_replay(&pool).await;
     }
 
-    #[sqlx::test(migrator = "abc_store::MIGRATOR")]
-    async fn the_connect_route_needs_an_upgrade(pool: PgPool) {
+    #[tokio::test]
+    async fn the_connect_route_needs_an_upgrade() {
+        let database = TestDatabase::migrated().await;
+        let pool = database.pool();
         let server = Server::start(pool.clone()).await;
         let keys = Fixture::new(pool.clone()).await;
         let workspace = server.claimed().await;
@@ -607,8 +636,10 @@ mod tests {
         server.stop().await.unwrap();
     }
 
-    #[sqlx::test(migrator = "abc_store::MIGRATOR")]
-    async fn a_silent_worker_times_out(pool: PgPool) {
+    #[tokio::test]
+    async fn a_silent_worker_times_out() {
+        let database = TestDatabase::migrated().await;
+        let pool = database.pool();
         let timings = LinkTimings {
             handshake: Duration::from_secs(5),
             ping: Duration::from_millis(100),
@@ -632,8 +663,10 @@ mod tests {
         assert_views_replay(&pool).await;
     }
 
-    #[sqlx::test(migrator = "abc_store::MIGRATOR")]
-    async fn a_worker_answering_pings_stays_connected(pool: PgPool) {
+    #[tokio::test]
+    async fn a_worker_answering_pings_stays_connected() {
+        let database = TestDatabase::migrated().await;
+        let pool = database.pool();
         let timings = LinkTimings {
             handshake: Duration::from_secs(5),
             ping: Duration::from_millis(50),
@@ -667,8 +700,10 @@ mod tests {
         server.stop().await.unwrap();
     }
 
-    #[sqlx::test(migrator = "abc_store::MIGRATOR")]
-    async fn a_restart_ends_the_sessions_the_previous_process_left_open(pool: PgPool) {
+    #[tokio::test]
+    async fn a_restart_ends_the_sessions_the_previous_process_left_open() {
+        let database = TestDatabase::migrated().await;
+        let pool = database.pool();
         let fixture = Fixture::new(pool.clone()).await;
         let claimed = fixture.claim(&Fixture::alice()).await.unwrap();
         let issued = fixture.issue_token(claimed.workspace).await;
@@ -700,8 +735,10 @@ mod tests {
         assert_views_replay(&pool).await;
     }
 
-    #[sqlx::test(migrator = "abc_store::MIGRATOR")]
-    async fn shutting_down_closes_sessions_and_streams_and_records_the_ends(pool: PgPool) {
+    #[tokio::test]
+    async fn shutting_down_closes_sessions_and_streams_and_records_the_ends() {
+        let database = TestDatabase::migrated().await;
+        let pool = database.pool();
         let server = Server::start(pool.clone()).await;
         let keys = Fixture::new(pool.clone()).await;
         let workspace = server.claimed().await;
@@ -734,8 +771,10 @@ mod tests {
         assert_views_replay(&pool).await;
     }
 
-    #[sqlx::test(migrator = "abc_store::MIGRATOR")]
-    async fn the_server_refuses_a_socket_others_could_reach(pool: PgPool) {
+    #[tokio::test]
+    async fn the_server_refuses_a_socket_others_could_reach() {
+        let database = TestDatabase::migrated().await;
+        let pool = database.pool();
         let open = socket_dir();
         std::fs::set_permissions(open.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
         let settings = config(&pool, open.path().join("abc.sock"), LinkTimings::default());
@@ -749,9 +788,9 @@ mod tests {
             "the message says what to do"
         );
         let dir = socket_dir();
-        let blocker = dir.path().join("abc.sock");
-        std::fs::write(&blocker, "not a socket").unwrap();
-        let blocked = abc_server::run(config(&pool, blocker, LinkTimings::default()), async {});
+        let in_the_way = dir.path().join("abc.sock");
+        std::fs::write(&in_the_way, "not a socket").unwrap();
+        let blocked = abc_server::run(config(&pool, in_the_way, LinkTimings::default()), async {});
         assert!(
             matches!(blocked.await, Err(ServeError::SocketPath { .. })),
             "a file in the way"
@@ -777,8 +816,10 @@ mod tests {
         );
     }
 
-    #[sqlx::test(migrator = "abc_store::MIGRATOR")]
-    async fn the_server_reports_an_unreachable_database(pool: PgPool) {
+    #[tokio::test]
+    async fn the_server_reports_an_unreachable_database() {
+        let database = TestDatabase::migrated().await;
+        let pool = database.pool();
         let dir = socket_dir();
         let mut settings = config(&pool, dir.path().join("abc.sock"), LinkTimings::default());
         settings.database_url =

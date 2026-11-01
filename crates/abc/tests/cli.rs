@@ -3,6 +3,7 @@
 
 #[cfg(test)]
 mod tests {
+    use abc_store::testing::TestDatabase;
     use std::os::unix::fs::PermissionsExt as _;
     use std::process::{Command, Output, Stdio};
     use std::time::Duration;
@@ -45,8 +46,10 @@ mod tests {
         String::from_utf8_lossy(bytes).into_owned()
     }
 
-    #[sqlx::test(migrator = "abc_store::MIGRATOR")]
-    async fn setup_code_prints_a_code_that_claims_the_server_once(pool: PgPool) {
+    #[tokio::test]
+    async fn setup_code_prints_a_code_that_claims_the_server_once() {
+        let database = TestDatabase::migrated().await;
+        let pool = database.pool();
         let output = run(&mut abc(&["server", "setup-code"], &url(&pool)));
         assert!(output.status.success(), "{}", text(&output.stderr));
         let stdout = text(&output.stdout);
@@ -69,15 +72,17 @@ mod tests {
         fixture.claim(&Fixture::alice()).await.unwrap();
         let again = run(&mut abc(&["server", "setup-code"], &url(&pool)));
         assert_eq!(again.status.code(), Some(1), "refused once claimed");
-        assert!(
-            text(&again.stderr).contains("already claimed"),
-            "{}",
-            text(&again.stderr)
+        assert_eq!(
+            text(&again.stderr),
+            "abc: no setup code: this server has already been claimed\n",
+            "the denial says why"
         );
     }
 
-    #[sqlx::test(migrations = false)]
-    async fn setup_code_refuses_an_unmigrated_database(pool: PgPool) {
+    #[tokio::test]
+    async fn setup_code_refuses_an_unmigrated_database() {
+        let database = TestDatabase::empty().await;
+        let pool = database.pool();
         let output = run(&mut abc(&["server", "setup-code"], &url(&pool)));
         assert_eq!(output.status.code(), Some(1), "a failure to run");
         assert!(
@@ -128,8 +133,10 @@ mod tests {
         }
     }
 
-    #[sqlx::test(migrator = "abc_store::MIGRATOR")]
-    async fn the_server_runs_until_sigterm_and_exits_cleanly(pool: PgPool) {
+    #[tokio::test]
+    async fn the_server_runs_until_sigterm_and_exits_cleanly() {
+        let database = TestDatabase::migrated().await;
+        let pool = database.pool();
         let dir = tempfile::tempdir().unwrap();
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let socket = dir.path().join("abc.sock");

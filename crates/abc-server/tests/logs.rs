@@ -11,6 +11,7 @@ mod common;
 
 #[cfg(test)]
 mod tests {
+    use abc_store::testing::TestDatabase;
     use std::io::Write;
     use std::sync::{Arc, Mutex, PoisonError};
 
@@ -18,7 +19,6 @@ mod tests {
     use abc_store::testing::Fixture;
     use hyper::StatusCode;
     use serde_json::json;
-    use sqlx::PgPool;
     use tracing_subscriber::EnvFilter;
 
     use crate::common::{Call, DATABASE_PASSWORD, Server, claim_body, enrol_body};
@@ -48,8 +48,10 @@ mod tests {
         }
     }
 
-    #[sqlx::test(migrator = "abc_store::MIGRATOR")]
-    async fn no_secret_reaches_the_log(pool: PgPool) {
+    #[tokio::test]
+    async fn no_secret_reaches_the_log() {
+        let database = TestDatabase::migrated().await;
+        let pool = database.pool();
         let capture = Capture::default();
         let writer = capture.clone();
         tracing::subscriber::set_global_default(abc_server::telemetry::subscriber(

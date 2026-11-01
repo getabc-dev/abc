@@ -489,6 +489,11 @@ Where the code differs from the sketch above, and why:
 - **Configuration.** `ServerConfig` also carries `database_wait` (`ABC_DATABASE_WAIT`, default
   60 seconds) and `link` (the worker link's handshake, ping and idle timings, the protocol's own
   unless a test shortens them).
+- **Test databases.** Tests take a fresh database from `abc_store::testing::TestDatabase`
+  instead of `#[sqlx::test]`, which names each database after its test alone: two runs of one
+  test at once (cargo-mutants' parallel jobs, or two checkouts sharing the machine's warm
+  container) dropped each other's database. `TestDatabase` names each one uniquely, drops it when
+  the test ends, and sweeps leftovers older than a day.
 - **Open question 8.** s0/gates had merged, so the `sqlx-cli` pin (`cargo-sqlx` in
   `xtask/tools.toml`) and the query cache check (`cargo xtask check` runs `sqlx prepare --check`
   for every crate with a `.sqlx/` against a fresh migrated database) land in this PR.
