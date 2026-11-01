@@ -51,6 +51,18 @@ pub(crate) fn run(
     let manifest = Manifest::load(root)?;
     let mutants = manifest.tool("cargo-mutants")?.installed(root)?;
     let nextest = manifest.tool("cargo-nextest")?.installed(root)?;
+    run_with(root, base, jobs, &mutants, &nextest, out)
+}
+
+/// [`run`] with the cargo-mutants and cargo-nextest executables given.
+fn run_with(
+    root: &Path,
+    base: &str,
+    jobs: u32,
+    mutants: &Path,
+    nextest: &Path,
+    out: &mut impl Write,
+) -> anyhow::Result<bool> {
     let commit = git::merge_base(root, base)?;
     let diff = git::diff(root, &commit, 3)?;
     if !changes_rust(&diff) {
@@ -74,12 +86,14 @@ pub(crate) fn run(
             "--colors",
             "never",
         ])
+        // The tests run the pinned tools in .tools/, which .gitignore lists; copy them too.
+        .args(["--gitignore", "false"])
         .args(["--timeout-multiplier", TIMEOUT_MULTIPLIER])
         .arg("--jobs")
         .arg(jobs.to_string())
         .arg("--output")
         .arg(&output)
-        .env("PATH", tools::path_with(&nextest)?)
+        .env("PATH", tools::path_with(nextest)?)
         .env("PROPTEST_RNG_SEED", PROPTEST_RNG_SEED)
         .current_dir(root)
         .status()
@@ -143,7 +157,8 @@ fn describe(result: &Outcome, missed: &[String], timed_out: &[String]) -> String
 mod tests {
     use std::fs;
 
-    use super::{Outcome, changes_rust, describe, listed, outcome};
+    use super::{Outcome, changes_rust, describe, listed, outcome, run_with};
+    use crate::testing::{repository_with_change, script};
 
     #[test]
     fn reads_cargo_mutants_exit_codes() {
@@ -184,6 +199,51 @@ mod tests {
         assert!(
             listed(dir.path()).is_err(),
             "a directory is not a result file"
+        );
+    }
+
+    #[test]
+    fn gates_a_repository_end_to_end() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = repository_with_change(
+            &temp.path().join("repo"),
+            &[("src/a.rs", "fn a() -> bool { true }\n")],
+        );
+        let nextest = temp.path().join("cargo-nextest");
+        let missing = temp.path().join("cargo-mutants");
+        script(
+            &missing,
+            "[ \"$1\" = mutants ] || exit 7\nwhile [ $# -gt 0 ]; do case \"$1\" in --output) out=$2 ;; --in-diff) diff=$2 ;; esac; shift; done\ngrep -q 'src/a.rs' \"$diff\" || exit 8\nmkdir -p \"$out/mutants.out\"\necho 'src/a.rs:1:18: replace a -> bool with false' > \"$out/mutants.out/missed.txt\"\nexit 2\n",
+        );
+        let mut out = Vec::new();
+        let passed = run_with(&repo, "base", 2, &missing, &nextest, &mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(!passed, "a missed mutant fails: {text}");
+        assert!(
+            text.contains("missed: src/a.rs:1:18: replace a -> bool with false"),
+            "{text}"
+        );
+
+        let caught = temp.path().join("caught");
+        script(&caught, "exit 0\n");
+        assert!(
+            run_with(&repo, "base", 2, &caught, &nextest, &mut Vec::new()).unwrap(),
+            "all caught"
+        );
+
+        let docs = repository_with_change(&temp.path().join("docs"), &[("README.md", "# x\n")]);
+        let never = temp.path().join("never");
+        script(&never, "exit 99\n");
+        let mut skipped = Vec::new();
+        assert!(
+            run_with(&docs, "base", 2, &never, &nextest, &mut skipped).unwrap(),
+            "nothing to mutate"
+        );
+        assert!(
+            String::from_utf8(skipped)
+                .unwrap()
+                .contains("no Rust lines changed"),
+            "said so"
         );
     }
 

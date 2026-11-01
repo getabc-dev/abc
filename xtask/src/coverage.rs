@@ -31,13 +31,27 @@ pub(crate) fn run(root: &Path, base: &str, out: &mut impl Write) -> anyhow::Resu
     let manifest = Manifest::load(root)?;
     let llvm_cov = manifest.tool("cargo-llvm-cov")?.installed(root)?;
     let nextest = manifest.tool("cargo-nextest")?.installed(root)?;
+    run_with(root, base, &llvm_cov, &nextest, out)
+}
+
+/// [`run`] with the cargo-llvm-cov and cargo-nextest executables given.
+fn run_with(
+    root: &Path,
+    base: &str,
+    llvm_cov: &Path,
+    nextest: &Path,
+    out: &mut impl Write,
+) -> anyhow::Result<bool> {
     let lcov = root.join(LCOV);
+    if let Some(dir) = lcov.parent() {
+        fs::create_dir_all(dir).with_context(|| format!("could not create {}", dir.display()))?;
+    }
     writeln!(out, "xtask: running the tests under coverage")?;
     let status = Command::new(llvm_cov)
         .args(["llvm-cov", "nextest", "--workspace", "--locked", "--lcov"])
         .arg("--output-path")
         .arg(&lcov)
-        .env("PATH", tools::path_with(&nextest)?)
+        .env("PATH", tools::path_with(nextest)?)
         .env("PROPTEST_RNG_SEED", PROPTEST_RNG_SEED)
         .current_dir(root)
         .status()
@@ -182,7 +196,8 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
     use std::path::Path;
 
-    use super::{Measured, measure, parse_lcov, ranges};
+    use super::{Measured, measure, parse_lcov, ranges, run_with};
+    use crate::testing::{repository_with_change, script};
 
     const LCOV: &str = "TN:\nSF:/repo/src/a.rs\nFN:1,a\nDA:1,3\nDA:2,0\nDA:3,0\nDA:4,1\nDA:4,0\nend_of_record\nSF:/elsewhere/dep.rs\nDA:1,0\nend_of_record\nSF:/repo/src/b.rs\nDA:7,0,abc\nend_of_record\n";
 
@@ -263,6 +278,60 @@ mod tests {
         assert!(
             measured(2, 2).describe().ends_with("coverage: passed\n"),
             "passing"
+        );
+    }
+
+    /// A fake cargo-llvm-cov that writes an lcov report covering line 1 of `src/a.rs` and, when
+    /// `both` is set, line 2 too.
+    fn fake_llvm_cov(dir: &Path, both: bool) -> std::path::PathBuf {
+        let path = dir.join("cargo-llvm-cov");
+        let second = u8::from(both);
+        script(
+            &path,
+            &format!(
+                "[ \"$1 $2\" = 'llvm-cov nextest' ] || exit 7\nwhile [ $# -gt 0 ]; do [ \"$1\" = --output-path ] && out=$2; shift; done\nprintf 'SF:%s/src/a.rs\\nDA:1,3\\nDA:2,{second}\\nend_of_record\\n' \"$PWD\" > \"$out\"\n"
+            ),
+        );
+        path
+    }
+
+    #[test]
+    fn gates_a_repository_end_to_end() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = repository_with_change(
+            &temp.path().join("repo"),
+            &[("src/a.rs", "fn a() {}\nfn b() {}\n")],
+        );
+        let nextest = temp.path().join("cargo-nextest");
+        let mut out = Vec::new();
+        let half = run_with(
+            &repo,
+            "base",
+            &fake_llvm_cov(temp.path(), false),
+            &nextest,
+            &mut out,
+        )
+        .unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(!half, "half the changed lines covered fails: {text}");
+        assert!(text.contains("not covered: src/a.rs:2"), "{text}");
+        let full = run_with(
+            &repo,
+            "base",
+            &fake_llvm_cov(temp.path(), true),
+            &nextest,
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert!(full, "every changed line covered passes");
+        let failing = temp.path().join("failing");
+        script(&failing, "exit 1\n");
+        let error = run_with(&repo, "base", &failing, &nextest, &mut Vec::new()).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("the tests failed under coverage"),
+            "{error}"
         );
     }
 

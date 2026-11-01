@@ -275,11 +275,33 @@ mod tests {
 
     use clap::Parser as _;
 
-    use super::{Cli, repo_root, usage_exit_code};
+    use super::{Cli, RulesetAction, Task, repo_root, run, usage_exit_code, verdict};
 
     #[test]
     fn cli_is_well_formed() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn dispatches_commands() {
+        assert_eq!(
+            run(Task::Rulesets {
+                action: RulesetAction::Check
+            })
+            .unwrap(),
+            std::process::ExitCode::SUCCESS,
+            "the checked-in ruleset is in step with CI"
+        );
+        assert_eq!(
+            verdict(true),
+            std::process::ExitCode::SUCCESS,
+            "a passing gate"
+        );
+        assert_eq!(
+            verdict(false),
+            std::process::ExitCode::FAILURE,
+            "a failing gate"
+        );
     }
 
     #[test]

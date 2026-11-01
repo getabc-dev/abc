@@ -45,3 +45,69 @@ pub(crate) fn repository(path: &Path) -> PathBuf {
     git(path, &["commit", "--quiet", "--allow-empty", "-m", "start"]);
     path.canonicalize().unwrap()
 }
+
+/// Serves one HTTP request on a local port with `status` (such as `201 Created`) and `body`, and
+/// returns the server's base URL and a handle that yields the request it received.
+pub(crate) fn serve_once(
+    status: &'static str,
+    body: &'static str,
+) -> (String, std::thread::JoinHandle<String>) {
+    use std::io::{Read as _, Write as _};
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 8192];
+        loop {
+            let read = stream.read(&mut buffer).unwrap();
+            request.extend_from_slice(&buffer[..read]);
+            let text = String::from_utf8_lossy(&request);
+            if let Some((head, rest)) = text.split_once("\r\n\r\n") {
+                let length = head
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())?
+                    })
+                    .unwrap_or(0);
+                if rest.len() >= length {
+                    break;
+                }
+            }
+            if read == 0 {
+                break;
+            }
+        }
+        write!(
+            stream,
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+        String::from_utf8(request).unwrap()
+    });
+    (url, server)
+}
+
+/// Writes an executable shell script at `path`.
+pub(crate) fn script(path: &Path, body: &str) {
+    fs::write(path, format!("#!/bin/sh\n{body}")).unwrap();
+    fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+}
+
+/// A repository with a `base` branch, then a commit that adds `files` (path and content).
+pub(crate) fn repository_with_change(path: &Path, files: &[(&str, &str)]) -> PathBuf {
+    let repo = repository(path);
+    git(&repo, &["branch", "base"]);
+    for (file, content) in files {
+        let target = repo.join(file);
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::write(target, content).unwrap();
+    }
+    git(&repo, &["add", "--all"]);
+    git(&repo, &["commit", "--quiet", "-m", "change"]);
+    repo
+}

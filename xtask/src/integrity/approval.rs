@@ -31,13 +31,16 @@ impl PullRequest {
     /// The pull request `number` in the repository CI names in `GITHUB_REPOSITORY`, with
     /// `GITHUB_TOKEN`.
     pub(crate) fn from_env(number: u64) -> anyhow::Result<Self> {
+        Self::from_lookup(number, |name| std::env::var(name).ok())
+    }
+
+    /// The pull request `number`, with GitHub Actions' variables read through `lookup`.
+    fn from_lookup(number: u64, lookup: impl Fn(&str) -> Option<String>) -> anyhow::Result<Self> {
         let variable = |name: &str| {
-            std::env::var(name)
-                .with_context(|| format!("{name} is not set; is this GitHub Actions?"))
+            lookup(name).with_context(|| format!("{name} is not set; is this GitHub Actions?"))
         };
         Ok(Self {
-            api: std::env::var("GITHUB_API_URL")
-                .unwrap_or_else(|_| "https://api.github.com".to_owned()),
+            api: lookup("GITHUB_API_URL").unwrap_or_else(|| "https://api.github.com".to_owned()),
             repository: variable("GITHUB_REPOSITORY")?,
             number,
             token: variable("GITHUB_TOKEN")?,
@@ -224,7 +227,8 @@ pub(super) fn github_get(url: &str, token: &str) -> anyhow::Result<Vec<u8>> {
 mod tests {
     use std::fs;
 
-    use super::{PullRequest, TimelineItem, approved, approvers, decide};
+    use super::{PullRequest, TimelineItem, approved, approvers, decide, github_get};
+    use crate::testing::serve_once;
 
     fn events(json: &str) -> Vec<TimelineItem> {
         serde_json::from_str(json).unwrap()
@@ -325,6 +329,51 @@ mod tests {
             asked.last().is_some_and(|url| url.ends_with("page=2")),
             "the timeline is read until an empty page: {asked:?}"
         );
+    }
+
+    #[test]
+    fn reads_github_actions_variables() {
+        let lookup = |name: &str| match name {
+            "GITHUB_REPOSITORY" => Some("o/r".to_owned()),
+            "GITHUB_TOKEN" => Some("t".to_owned()),
+            _ => None,
+        };
+        let pull_request = PullRequest::from_lookup(7, lookup).unwrap();
+        assert_eq!(
+            (
+                pull_request.api.as_str(),
+                pull_request.repository.as_str(),
+                pull_request.number
+            ),
+            ("https://api.github.com", "o/r", 7),
+            "the public API by default"
+        );
+        let error = PullRequest::from_lookup(7, |_| None)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("GITHUB_REPOSITORY is not set"), "{error}");
+    }
+
+    #[test]
+    fn calls_the_github_api_with_the_token() {
+        let (url, server) = serve_once("200 OK", r#"{"ok": true}"#);
+        assert_eq!(
+            github_get(&format!("{url}/x"), "secret").unwrap(),
+            br#"{"ok": true}"#,
+            "body"
+        );
+        let request = server.join().unwrap();
+        assert!(request.starts_with("GET /x HTTP/1.1"), "{request}");
+        assert!(
+            request.contains("authorization: Bearer secret"),
+            "{request}"
+        );
+        let (missing, refused) = serve_once("404 Not Found", "{}");
+        assert!(
+            github_get(&format!("{missing}/y"), "secret").is_err(),
+            "a 404 is an error"
+        );
+        refused.join().unwrap();
     }
 
     #[test]

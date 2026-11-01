@@ -361,9 +361,10 @@ mod tests {
     use std::fs;
 
     use super::{
-        Decision, Event, MAX_DIFF_BYTES, MODEL, Plan, Request, plan, review, run, summary,
+        Decision, Event, MAX_DIFF_BYTES, MODEL, Plan, Request, plan, post_gemini, review, run,
+        summary,
     };
-    use crate::testing::{git, repository};
+    use crate::testing::{git, repository, serve_once};
 
     fn request(diff: &str) -> Request {
         Request {
@@ -604,6 +605,29 @@ mod tests {
             },
             "a local run reviews the branch under its last commit's subject"
         );
+    }
+
+    #[test]
+    fn posts_to_gemini_with_the_key_in_a_header() {
+        let (url, server) = serve_once("429 Too Many Requests", r#"{"error": {"code": 429}}"#);
+        let (status, body) = post_gemini(
+            &format!("{url}/v1beta/models/m:generateContent"),
+            "{}",
+            "test-key",
+        )
+        .unwrap();
+        assert_eq!(
+            (status, body.as_str()),
+            (429, r#"{"error": {"code": 429}}"#),
+            "any status is read, not raised"
+        );
+        let request = server.join().unwrap();
+        assert!(
+            request.starts_with("POST /v1beta/models/m:generateContent HTTP/1.1"),
+            "{request}"
+        );
+        assert!(request.contains("x-goog-api-key: test-key"), "{request}");
+        assert!(!request.contains("key=test-key"), "never in the URL");
     }
 
     #[test]

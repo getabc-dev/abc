@@ -133,6 +133,19 @@ pub(crate) fn run(
     pull_request: Option<&PullRequest>,
     out: &mut impl Write,
 ) -> anyhow::Result<bool> {
+    run_with(root, base, pull_request, out, &mut |url, token| {
+        approval::github_get(url, token)
+    })
+}
+
+/// [`run`], reading GitHub's API through `fetch` (URL and token).
+fn run_with(
+    root: &Path,
+    base: &str,
+    pull_request: Option<&PullRequest>,
+    out: &mut impl Write,
+    fetch: &mut impl FnMut(&str, &str) -> anyhow::Result<Vec<u8>>,
+) -> anyhow::Result<bool> {
     let commit = git::merge_base(root, base)?;
     let found = findings(root, &commit)?;
     if found.is_empty() {
@@ -158,7 +171,7 @@ pub(crate) fn run(
     };
     let approvers = approval::approvers(root)?;
     let verdict = approval::approved(pull_request, &approvers, &mut |url| {
-        approval::github_get(url, &pull_request.token)
+        fetch(url, &pull_request.token)
     })?;
     writeln!(out, "integrity: {}", verdict.reason)?;
     Ok(verdict.approved)
@@ -293,8 +306,8 @@ fn compare(file: &str, before: Option<&[Test]>, after: Option<&[Test]>) -> Vec<F
 mod tests {
     use std::fs;
 
-    use super::{Finding, Test, compare, findings, is_gate_file};
-    use crate::testing::{git, repository};
+    use super::{Finding, PullRequest, Test, compare, findings, is_gate_file, run_with};
+    use crate::testing::{git, repository, repository_with_change};
 
     fn test(name: &str, ignored: bool, should_panic: bool, assertions: usize) -> Test {
         Test {
@@ -463,6 +476,80 @@ mod tests {
             Finding::WorkspaceLints.to_string(),
             "gate file changed  Cargo.toml [workspace.lints]",
             "the report names the table"
+        );
+    }
+
+    #[test]
+    fn runs_end_to_end_with_and_without_approval() {
+        let temp = tempfile::tempdir().unwrap();
+        let clean =
+            repository_with_change(&temp.path().join("clean"), &[("src/a.rs", "fn a() {}\n")]);
+        let unused = &mut |_: &str, _: &str| -> anyhow::Result<Vec<u8>> {
+            panic!("no findings, no API call")
+        };
+        let mut out = Vec::new();
+        assert!(
+            run_with(&clean, "base", None, &mut out, unused).unwrap(),
+            "no findings pass"
+        );
+        assert!(
+            String::from_utf8(out)
+                .unwrap()
+                .contains("no deleted, skipped"),
+            "said so"
+        );
+
+        let gated = repository_with_change(
+            &temp.path().join("gated"),
+            &[(".github/integrity-approvers", "snehilvj\n")],
+        );
+        let mut refused = Vec::new();
+        assert!(
+            !run_with(&gated, "base", None, &mut refused, unused).unwrap(),
+            "findings fail"
+        );
+        assert!(
+            String::from_utf8(refused)
+                .unwrap()
+                .contains("gate file changed  .github/integrity-approvers"),
+            "listed"
+        );
+
+        let pull_request = PullRequest {
+            api: "https://api.example".to_owned(),
+            repository: "o/r".to_owned(),
+            number: 7,
+            token: "token".to_owned(),
+        };
+        let mut approving = |url: &str, token: &str| -> anyhow::Result<Vec<u8>> {
+            assert_eq!(token, "token", "the token CI gives");
+            Ok(if url.ends_with("/pulls/7") {
+                br#"{"head": {"sha": "abc"}, "labels": [{"name": "integrity-approved"}]}"#.to_vec()
+            } else if url.contains("/actions/runs") {
+                br#"{"workflow_runs": [{"created_at": "2026-11-01T09:00:00Z"}]}"#.to_vec()
+            } else if url.ends_with("page=1") {
+                br#"[{"event": "labeled", "created_at": "2026-11-01T10:00:00Z", "actor": {"login": "snehilvj"}, "label": {"name": "integrity-approved"}}]"#.to_vec()
+            } else {
+                b"[]".to_vec()
+            })
+        };
+        let mut accepted = Vec::new();
+        assert!(
+            run_with(
+                &gated,
+                "base",
+                Some(&pull_request),
+                &mut accepted,
+                &mut approving
+            )
+            .unwrap(),
+            "approved"
+        );
+        assert!(
+            String::from_utf8(accepted)
+                .unwrap()
+                .contains("accepted by snehilvj"),
+            "who"
         );
     }
 
