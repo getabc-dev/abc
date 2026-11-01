@@ -86,6 +86,9 @@ pub(crate) struct Tool {
     binary: Option<String>,
     /// URL template of the checksums the project publishes for its assets, if it publishes any.
     checksums: Option<String>,
+    /// The GitHub repository whose build attestations must list each archive's sha256, as
+    /// `owner/repo`, for projects that attest their releases.
+    attestations: Option<String>,
     targets: BTreeMap<Target, Asset>,
 }
 
@@ -160,6 +163,18 @@ impl Tool {
             self.version
         );
         ensure!(self.url.starts_with("https://"), "the url must use https");
+        ensure!(
+            self.checksums.is_some() || self.attestations.is_some(),
+            "needs `checksums` or `attestations`: no tool's pin may rest on its first download"
+        );
+        if let Some(repository) = &self.attestations {
+            ensure!(
+                repository.split_once('/').is_some_and(
+                    |(owner, repo)| is_safe_name(owner) && repo.split('.').all(is_safe_name)
+                ),
+                "attestations {repository:?} must be an owner/repo GitHub repository"
+            );
+        }
         if let Some(checksums) = &self.checksums {
             ensure!(
                 checksums.starts_with("https://"),
@@ -436,32 +451,18 @@ fn pin_text(
             let url = tool.render(&tool.url, asset);
             let archive = fetch(&url)?;
             let sha256 = sha256_hex(&archive);
-            let source = match &tool.checksums {
-                Some(template) => {
-                    let checksums_url = tool.render(template, asset);
-                    if !published.contains_key(&checksums_url) {
-                        let listing = String::from_utf8(fetch(&checksums_url)?)
-                            .with_context(|| format!("{checksums_url} is not text"))?;
-                        published.insert(checksums_url.clone(), listing);
-                    }
-                    let listing = published
-                        .get(&checksums_url)
-                        .context("the checksums were fetched above")?;
-                    let file_name = url.rsplit('/').next().unwrap_or(&url);
-                    let expected = published_sha256(listing, file_name).with_context(|| {
-                        format!("{checksums_url} has no sha256 for {file_name}")
-                    })?;
-                    ensure!(
-                        expected == sha256,
-                        "{} {} on {target}: the download's sha256 is {sha256}, but {checksums_url} \
-                         publishes {expected}",
-                        tool.name,
-                        tool.version
-                    );
-                    "matches the published checksum"
-                }
-                None => "the project publishes no checksums; pinned as downloaded",
-            };
+            let mut sources = Vec::new();
+            if let Some(template) = &tool.checksums {
+                let checksums_url = tool.render(template, asset);
+                check_published(&checksums_url, &url, &sha256, &mut published, fetch)
+                    .with_context(|| format!("{} {} on {target}", tool.name, tool.version))?;
+                sources.push("matches the published checksum".to_owned());
+            }
+            if let Some(repository) = &tool.attestations {
+                check_attested(repository, &sha256, fetch)
+                    .with_context(|| format!("{} {} on {target}", tool.name, tool.version))?;
+                sources.push(format!("attested on GitHub by {repository}"));
+            }
             let binary_sha256 = sha256_hex(&tool.executable_in(&archive, asset)?);
             let state = if sha256 == asset.sha256 && binary_sha256 == asset.binary_sha256 {
                 "same"
@@ -470,8 +471,10 @@ fn pin_text(
             };
             writeln!(
                 out,
-                "{state:<8} {} {} {target}: {source}",
-                tool.name, tool.version
+                "{state:<8} {} {} {target}: {}",
+                tool.name,
+                tool.version,
+                sources.join("; ")
             )?;
             set_pin(&mut document, &tool.name, target, "sha256", &sha256)?;
             set_pin(
@@ -484,6 +487,58 @@ fn pin_text(
         }
     }
     Ok(document.to_string())
+}
+
+/// Requires the checksums file at `checksums_url`, fetched once into `published`, to list
+/// `sha256` for the asset at `url`.
+fn check_published(
+    checksums_url: &str,
+    url: &str,
+    sha256: &str,
+    published: &mut BTreeMap<String, String>,
+    fetch: &mut impl FnMut(&str) -> anyhow::Result<Vec<u8>>,
+) -> anyhow::Result<()> {
+    if !published.contains_key(checksums_url) {
+        let listing = String::from_utf8(fetch(checksums_url)?)
+            .with_context(|| format!("{checksums_url} is not text"))?;
+        published.insert(checksums_url.to_owned(), listing);
+    }
+    let listing = published
+        .get(checksums_url)
+        .context("the checksums were fetched above")?;
+    let file_name = url.rsplit('/').next().unwrap_or(url);
+    let expected = published_sha256(listing, file_name)
+        .with_context(|| format!("{checksums_url} has no sha256 for {file_name}"))?;
+    ensure!(
+        expected == sha256,
+        "the download's sha256 is {sha256}, but {checksums_url} publishes {expected}"
+    );
+    Ok(())
+}
+
+/// The attestations GitHub stores for one digest.
+#[derive(Deserialize)]
+struct Attestations {
+    attestations: Vec<serde_json::Value>,
+}
+
+/// Requires GitHub to hold a build attestation from `repository` for `sha256`. Only a workflow in
+/// that repository, or GitHub on its release, can create one.
+fn check_attested(
+    repository: &str,
+    sha256: &str,
+    fetch: &mut impl FnMut(&str) -> anyhow::Result<Vec<u8>>,
+) -> anyhow::Result<()> {
+    let url = format!("https://api.github.com/repos/{repository}/attestations/sha256:{sha256}");
+    let found: Attestations = serde_json::from_slice(
+        &fetch(&url).with_context(|| format!("{repository} has no attestation for {sha256}"))?,
+    )
+    .with_context(|| format!("{url} did not answer with attestations"))?;
+    ensure!(
+        !found.attestations.is_empty(),
+        "{repository} has no attestation for {sha256}"
+    );
+    Ok(())
 }
 
 /// `cargo xtask tool`: runs a pinned tool with the given arguments from the repository root.
@@ -710,6 +765,7 @@ mod tests {
 name = "fake"
 version = "1.2.3"
 url = "https://example.com/fake-{{version}}-{{platform}}.tar.gz"
+attestations = "example/fake"
 binary = "fake-{{version}}/fake"
 targets.aarch64-apple-darwin = {{ platform = "mac", sha256 = "{sha256}", binary-sha256 = "{binary_sha256}" }}
 targets.x86_64-unknown-linux-gnu = {{ platform = "linux-x64", sha256 = "{sha256}", binary-sha256 = "{binary_sha256}" }}
@@ -721,6 +777,21 @@ targets.aarch64-unknown-linux-gnu = {{ platform = "linux-arm64", sha256 = "{sha2
     /// The tool list pinning `archive`, whose executable is `binary`.
     fn pinned(archive: &[u8], binary: &[u8]) -> Manifest {
         Manifest::parse(&manifest_text(&sha256_hex(archive), &sha256_hex(binary))).unwrap()
+    }
+
+    /// What GitHub answers for a digest that `example/fake` attested.
+    const ATTESTED: &[u8] = br#"{"attestations":[{"repository_id":1}]}"#;
+
+    /// A fetch that serves `archive`, and attestations for any digest.
+    fn serving(archive: &[u8]) -> impl FnMut(&str) -> anyhow::Result<Vec<u8>> {
+        let archive = archive.to_vec();
+        move |url: &str| {
+            Ok(if url.contains("/attestations/") {
+                ATTESTED.to_vec()
+            } else {
+                archive.clone()
+            })
+        }
     }
 
     fn only_tool(manifest: &Manifest) -> &Tool {
@@ -952,7 +1023,7 @@ targets.aarch64-unknown-linux-gnu = {{ platform = "linux-arm64", sha256 = "{sha2
             Status::Ready,
             "the raw executable is installed as downloaded"
         );
-        let mut fetch = |_: &str| Ok(SCRIPT.to_vec());
+        let mut fetch = serving(SCRIPT);
         let pinned = pin_text(
             &manifest_text(SHA_A, SHA_B).replace("binary = \"fake-{version}/fake\"\n", ""),
             &mut Vec::new(),
@@ -1095,7 +1166,7 @@ targets.aarch64-unknown-linux-gnu = {{ platform = "linux-arm64", sha256 = "{sha2
     fn pin_records_the_archive_and_executable_checksums() {
         let archive = tarball(&[("fake-1.2.3/fake", SCRIPT, 0o755)]);
         let text = manifest_text(SHA_A, SHA_B);
-        let mut fetch = |_: &str| Ok(archive.clone());
+        let mut fetch = serving(&archive);
         let pinned = pin_text(&text, &mut Vec::new(), &mut fetch).unwrap();
         let expected = text
             .replace(SHA_A, &sha256_hex(&archive))
@@ -1107,8 +1178,8 @@ targets.aarch64-unknown-linux-gnu = {{ platform = "linux-arm64", sha256 = "{sha2
     fn pin_requires_a_match_with_published_checksums() {
         let archive = tarball(&[("fake-1.2.3/fake", SCRIPT, 0o755)]);
         let text = manifest_text(SHA_A, SHA_B).replace(
-            "binary =",
-            "checksums = \"https://example.com/fake-{version}-sums.txt\"\nbinary =",
+            "attestations = \"example/fake\"\n",
+            "checksums = \"https://example.com/fake-{version}-sums.txt\"\n",
         );
         let listing = |hash: &str| {
             ["mac", "linux-x64", "linux-arm64"]
@@ -1156,17 +1227,58 @@ targets.aarch64-unknown-linux-gnu = {{ platform = "linux-arm64", sha256 = "{sha2
     }
 
     #[test]
-    fn pin_says_when_nothing_is_published() {
+    fn pin_requires_a_github_attestation() {
         let archive = tarball(&[("fake-1.2.3/fake", SCRIPT, 0o755)]);
+        let text = manifest_text(SHA_A, SHA_B);
+        let attested_url = format!(
+            "https://api.github.com/repos/example/fake/attestations/sha256:{}",
+            sha256_hex(&archive)
+        );
+        let asked = std::cell::RefCell::new(Vec::new());
         let mut out = Vec::new();
-        let mut fetch = |_: &str| Ok(archive.clone());
-        pin_text(&manifest_text(SHA_A, SHA_B), &mut out, &mut fetch).unwrap();
+        let mut attested = |url: &str| {
+            asked.borrow_mut().push(url.to_owned());
+            serving(&archive)(url)
+        };
+        pin_text(&text, &mut out, &mut attested).unwrap();
+        assert!(
+            asked.borrow().contains(&attested_url),
+            "the archive's digest is looked up: {:?}",
+            asked.borrow()
+        );
         assert!(
             String::from_utf8(out)
                 .unwrap()
-                .contains("publishes no checksums"),
-            "an unverified pin is never silent"
+                .contains("attested on GitHub by example/fake"),
+            "and reported as verified"
         );
+
+        let mut unattested = |url: &str| {
+            Ok(if url.contains("/attestations/") {
+                br#"{"attestations":[]}"#.to_vec()
+            } else {
+                archive.clone()
+            })
+        };
+        let error = pin_text(&text, &mut Vec::new(), &mut unattested).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("example/fake has no attestation"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn every_tool_needs_a_way_to_verify_its_pin() {
+        let unverifiable =
+            manifest_text(SHA_A, SHA_B).replace("attestations = \"example/fake\"\n", "");
+        let missing = format!("{:#}", Manifest::parse(&unverifiable).unwrap_err());
+        assert!(
+            missing.contains("needs `checksums` or `attestations`"),
+            "{missing}"
+        );
+        let malformed = manifest_text(SHA_A, SHA_B).replace("\"example/fake\"", "\"example\"");
+        let invalid = format!("{:#}", Manifest::parse(&malformed).unwrap_err());
+        assert!(invalid.contains("owner/repo"), "{invalid}");
     }
 
     #[test]

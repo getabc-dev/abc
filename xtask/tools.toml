@@ -9,8 +9,10 @@
 # `url`, `binary` (the executable's path inside a .tar.gz archive; omitted when the asset is the
 # executable itself) and `checksums` are templates:
 # {version} is the tool's version and {platform} is the target's name in the project's asset file
-# names. `checksums` is where the project publishes its assets' sha256; when it is set,
-# `cargo xtask pin` refuses a download that does not match. zizmor and cargo-shear publish none.
+# names. `checksums` is where the project publishes its assets' sha256, and `attestations` the
+# GitHub repository whose build attestations list them; `cargo xtask pin` refuses a download that
+# either does not vouch for, and every tool needs at least one, so no pin rests on its first
+# download. zizmor and cargo-shear publish no checksums but attest their release archives.
 # Renovate bumps `version` from the GitHub release named in the `url` line right after it, so
 # keep `version` and `url` adjacent and in that order.
 
@@ -38,6 +40,7 @@ targets.aarch64-unknown-linux-gnu = { platform = "aarch64-unknown-linux-musl", s
 name = "cargo-shear"
 version = "1.14.0"
 url = "https://github.com/Boshen/cargo-shear/releases/download/v{version}/cargo-shear-{platform}.tar.gz"
+attestations = "Boshen/cargo-shear"
 binary = "cargo-shear"
 targets.aarch64-apple-darwin = { platform = "aarch64-apple-darwin", sha256 = "e50b9375b1e93d2293c803819c118337f1e8fce519e4188a93bb0f5e08041ca3", binary-sha256 = "34edccc283039ed8c2351c72c45c21a13ed65cf1fdde915f689ac97b060150c5" }
 targets.x86_64-unknown-linux-gnu = { platform = "x86_64-unknown-linux-gnu", sha256 = "1d7d860fdbd0d95857ff1f2643cc70d20c5d31236159ad51be7ce436eb3e5bf4", binary-sha256 = "37f2f573a53c786c12c4a935976267351a731010e464a179b29af78c3b53c216" }
@@ -47,6 +50,7 @@ targets.aarch64-unknown-linux-gnu = { platform = "aarch64-unknown-linux-gnu", sh
 name = "zizmor"
 version = "1.31.1"
 url = "https://github.com/zizmorcore/zizmor/releases/download/v{version}/zizmor-{platform}.tar.gz"
+attestations = "zizmorcore/zizmor"
 binary = "zizmor"
 targets.aarch64-apple-darwin = { platform = "aarch64-apple-darwin", sha256 = "ad5aa633cd56215b11e6c51d51f90c7e6b22904a75047d1215abbd422f61d698", binary-sha256 = "200733b2102e1bf5d53acfed2ab303fadf136532578a1ba9ec076c5bc543e70a" }
 targets.x86_64-unknown-linux-gnu = { platform = "x86_64-unknown-linux-gnu", sha256 = "d185f726bdaf92df78273217dfdd24ebcd6b0ef48cf3ce776ff5762b6e138c99", binary-sha256 = "dc3bb05237ddd11c62ac19cf5ac1c633acd228e386b7e18f9adb3498873d271f" }
