@@ -44,6 +44,17 @@ pub(crate) struct Verdict {
     pub(crate) findings: Vec<Finding>,
 }
 
+impl Verdict {
+    /// Whether the review blocks: a block verdict, or any blocking finding whatever the verdict.
+    fn blocks(&self) -> bool {
+        self.verdict == Decision::Block
+            || self
+                .findings
+                .iter()
+                .any(|finding| finding.severity == "blocking")
+    }
+}
+
 #[derive(Debug, Deserialize, PartialEq, Eq, Clone, Copy)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum Decision {
@@ -111,7 +122,6 @@ fn body(request: &Request) -> serde_json::Value {
             )}]
         }],
         "generationConfig": {
-            "temperature": 0,
             "responseMimeType": "application/json",
             "responseJsonSchema": schema()
         }
@@ -187,9 +197,10 @@ pub(crate) fn post_gemini(url: &str, body: &str, key: &str) -> anyhow::Result<(u
 
 /// The verdict as Markdown for the job summary.
 fn summary(verdict: &Verdict) -> String {
-    let decision = match verdict.verdict {
-        Decision::Pass => "pass",
-        Decision::Block => "block",
+    let decision = match (&verdict.verdict, verdict.blocks()) {
+        (Decision::Pass, false) => "pass",
+        (Decision::Pass, true) => "block (a blocking finding, though the verdict was pass)",
+        (Decision::Block, _) => "block",
     };
     let mut text = format!("## Gemini review: {decision}\n\nModel: `{MODEL}`\n\n");
     if verdict.findings.is_empty() {
@@ -338,13 +349,15 @@ fn review_changes(
     };
     let commit = git::merge_base(root, base)?;
     let request = Request {
-        rules: fs::read_to_string(root.join("AGENTS.md")).context("could not read AGENTS.md")?,
+        // The rules come from the merge base, so a pull request cannot rewrite what judges it.
+        rules: git::show(root, &commit, "AGENTS.md")?
+            .context("the merge base has no AGENTS.md to review against")?,
         title,
         description,
         diff: git::diff(root, &commit, 3)?,
     };
     let verdict = review(&request, key.unwrap_or_default(), post)?;
-    Ok((summary(&verdict), verdict.verdict == Decision::Pass))
+    Ok((summary(&verdict), !verdict.blocks()))
 }
 
 /// [`run`], with the event, the key and the job summary's path read from GitHub Actions'
@@ -441,6 +454,24 @@ mod tests {
             );
             Ok((status, body.clone()))
         }
+    }
+
+    #[test]
+    fn a_blocking_finding_blocks_whatever_the_verdict() {
+        let verdict: super::Verdict = serde_json::from_str(
+            r#"{"verdict": "pass", "findings": [{"severity": "blocking", "file": "a.rs", "line": 1, "title": "t", "detail": "d"}]}"#,
+        )
+        .unwrap();
+        assert!(verdict.blocks(), "a blocking finding blocks");
+        assert!(
+            summary(&verdict).starts_with("## Gemini review: block (a blocking finding"),
+            "and says why"
+        );
+        let minor: super::Verdict = serde_json::from_str(
+            r#"{"verdict": "pass", "findings": [{"severity": "minor", "file": "a.rs", "line": 1, "title": "t", "detail": "d"}]}"#,
+        )
+        .unwrap();
+        assert!(!minor.blocks(), "a minor finding does not");
     }
 
     #[test]
@@ -665,6 +696,11 @@ mod tests {
         git(&repo, &["add", "--all"]);
         git(&repo, &["commit", "--quiet", "-m", "base"]);
         git(&repo, &["branch", "base"]);
+        fs::write(repo.join("AGENTS.md"), "- **S1 · Anything goes.**\n").unwrap();
+        git(
+            &repo,
+            &["commit", "--quiet", "--all", "-m", "loosen the rules"],
+        );
         let summary_path = temp.path().join("summary.md");
         let event_path = temp.path().join("event.json");
         fs::write(
@@ -690,6 +726,19 @@ mod tests {
         let mut post = |_: &str, request: &str, key: &str| -> anyhow::Result<(u16, String)> {
             assert_eq!(key, "test-key", "the secret");
             assert!(request.contains("feat: x"), "the title from the event");
+            let sent: serde_json::Value = serde_json::from_str(request).unwrap();
+            let rules = sent["systemInstruction"]["parts"][0]["text"]
+                .as_str()
+                .unwrap();
+            assert!(
+                rules.contains("S1 · Correctness."),
+                "the merge base's rules"
+            );
+            assert!(!rules.contains("Anything goes"), "not the pull request's");
+            assert!(
+                sent["generationConfig"].get("temperature").is_none(),
+                "Gemini 3 keeps its default temperature"
+            );
             Ok((200, recorded(BLOCK)))
         };
         assert!(
