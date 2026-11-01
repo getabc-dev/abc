@@ -704,6 +704,17 @@ mod tests {
     }
 
     #[test]
+    fn a_clippy_warning_in_test_code_fails() {
+        let lib = CLEAN.replace(
+            "    #[test]\n    fn adds_one() {",
+            "    fn count(values: &Vec<u32>) -> usize {\n        values.len()\n    }\n\n    #[test]\n    fn counts() {\n        assert_eq!(count(&vec![1]), 1);\n    }\n\n    #[test]\n    fn adds_one() {",
+        );
+        let (passed, out) = check_fixture("clippy-test-warning", &lib);
+        assert!(!passed, "clippy covers test targets too: {out}");
+        assert!(out.contains("  clippy: "), "{out}");
+    }
+
+    #[test]
     fn a_failing_test_fails() {
         let (passed, out) = check_fixture(
             "failing-test",

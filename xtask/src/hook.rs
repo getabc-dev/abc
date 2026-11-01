@@ -239,13 +239,8 @@ fn locate(
 /// Runs git in `dir` and resolves the path it prints. `None` when git refuses, as it does outside a
 /// repository.
 fn git_path(dir: &Path, args: &[&str]) -> anyhow::Result<Option<PathBuf>> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(dir)
+    let output = git_in(dir)
         .args(args)
-        // Resolve from the directory alone, never from an inherited repository override.
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
         .output()
         .context("could not run git")?;
     if !output.status.success() {
@@ -256,6 +251,18 @@ fn git_path(dir: &Path, args: &[&str]) -> anyhow::Result<Option<PathBuf>> {
     path.canonicalize()
         .map(Some)
         .with_context(|| format!("could not resolve {}", path.display()))
+}
+
+/// Git run in `dir`, resolving the repository from the directory alone, never from an inherited
+/// `GIT_DIR` or `GIT_WORK_TREE`.
+fn git_in(dir: &Path) -> Command {
+    let mut command = Command::new("git");
+    command
+        .arg("-C")
+        .arg(dir)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE");
+    command
 }
 
 /// Hands the hook to the checkout at `root`, which runs it with its own xtask and toolchain.
@@ -296,7 +303,7 @@ mod tests {
 
     use tempfile::TempDir;
 
-    use super::{Context, Event, Location, locate, run};
+    use super::{Context, Event, Location, git_in, guard_unavailable, locate, run};
     use crate::testing::{git, repository};
 
     /// A repository with a worktree nested inside it, where Claude Code puts its worktrees.
@@ -666,11 +673,73 @@ mod tests {
     }
 
     #[test]
+    fn locating_ignores_an_inherited_repository_override() {
+        let git = git_in(Path::new("/"));
+        let removed: Vec<_> = git
+            .get_envs()
+            .filter(|(_, value)| value.is_none())
+            .map(|(name, _)| name.to_owned())
+            .collect();
+        assert_eq!(
+            removed,
+            ["GIT_DIR", "GIT_WORK_TREE"],
+            "a hook run inside another git command must not inherit its repository"
+        );
+    }
+
+    #[test]
+    fn unparseable_input_blocks_when_the_guard_cannot_run() {
+        let mut out = Vec::new();
+        let code = guard_unavailable("the build failed", "not json", &mut out).unwrap();
+        assert_eq!(code, 2, "no command can be read, so it may be git");
+        assert!(
+            String::from_utf8(out).unwrap().starts_with("Blocked: "),
+            "and the agent is told"
+        );
+    }
+
+    #[test]
+    fn settings_wire_the_hooks_to_xtask() {
+        let settings: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(crate::repo_root().unwrap().join(".claude/settings.json")).unwrap(),
+        )
+        .unwrap();
+        let hooks = &settings["hooks"];
+        assert_eq!(
+            hooks["PreToolUse"][0]["matcher"], "Bash|Monitor",
+            "both tools that run shell commands are guarded"
+        );
+        let guard = &hooks["PreToolUse"][0]["hooks"][0];
+        assert_eq!(
+            guard["command"],
+            "if [ -f \"$CLAUDE_PROJECT_DIR/xtask/hooks/pre-tool-use.sh\" ]; then sh \"$CLAUDE_PROJECT_DIR/xtask/hooks/pre-tool-use.sh\"; else echo \"xtask hook: $CLAUDE_PROJECT_DIR has no xtask/hooks/pre-tool-use.sh; the git guard is off\" >&2; fi",
+            "the guard runs the hook script"
+        );
+        assert_eq!(guard["timeout"], 300, "the guard is time-boxed");
+        let stop_command = "if [ -f \"$CLAUDE_PROJECT_DIR/xtask/Cargo.toml\" ]; then cd \"$CLAUDE_PROJECT_DIR\" && cargo xtask hook stop 1>&2 || { echo 'cargo xtask check failed'; exit 2; }; else echo \"xtask hook: $CLAUDE_PROJECT_DIR has no xtask; no checks run\" >&2; fi";
+        for event in ["Stop", "SubagentStop"] {
+            let stop = &hooks[event][0]["hooks"][0];
+            assert_eq!(stop["command"], stop_command, "{event} runs the check");
+            assert_eq!(stop["timeout"], 900, "{event} is time-boxed");
+        }
+        assert_eq!(
+            hooks["SubagentStop"][0]["matcher"],
+            "^(?!(?:Explore|Plan|claude-code-guide|statusline-setup|web-fetch)$).+",
+            "read-only and internal subagents are exempt"
+        );
+    }
+
+    #[test]
     fn the_hook_script_blocks_git_when_xtask_cannot_run() {
         let git_push = r#"{"cwd":"/home/me/git/abc","tool_name":"Bash","tool_input":{"command":"git push origin main"}}"#;
         let (code, stderr) = run_hook_script(101, git_push);
         assert_eq!(code, Some(2), "{stderr}");
         assert!(stderr.contains("could not run"), "{stderr}");
+        assert_eq!(
+            run_hook_script(1, git_push).0,
+            Some(2),
+            "exit 1 is a failure to run the guard, not its verdict"
+        );
 
         let quoted =
             r#"{"tool_name":"Bash","tool_input":{"command":"echo \"x\" && gh api repos/o/r"}}"#;
