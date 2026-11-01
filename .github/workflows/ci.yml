@@ -30,10 +30,10 @@ jobs:
         run: rustup toolchain install --no-self-update
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Install the pinned tools
-        run: cargo xtask setup
+        run: cargo xtask setup cargo-nextest
       - name: Check the installed tools against their pins
-        run: cargo xtask doctor
-      - name: Format, clippy and tests
+        run: cargo xtask doctor cargo-nextest
+      - name: Format, clippy, tests, doctests and docs
         run: cargo xtask check
 
   dependencies:
@@ -50,9 +50,9 @@ jobs:
         run: rustup toolchain install --no-self-update
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Install the pinned tools
-        run: cargo xtask setup
+        run: cargo xtask setup cargo-deny cargo-shear osv-scanner
       - name: Check the installed tools against their pins
-        run: cargo xtask doctor
+        run: cargo xtask doctor cargo-deny cargo-shear osv-scanner
       - name: Advisories, licences, bans and sources
         run: cargo xtask tool cargo-deny check
       - name: Unused dependencies
@@ -76,9 +76,9 @@ jobs:
         run: rustup toolchain install --no-self-update
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Install the pinned tools
-        run: cargo xtask setup
+        run: cargo xtask setup zizmor pinact gitleaks
       - name: Check the installed tools against their pins
-        run: cargo xtask doctor
+        run: cargo xtask doctor zizmor pinact gitleaks
       - name: Workflow security
         run: cargo xtask tool zizmor --pedantic .github
         env:
@@ -90,3 +90,52 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
       - name: Secrets in the git history
         run: cargo xtask tool gitleaks git --redact --no-banner --verbose .
+
+  coverage:
+    name: Coverage
+    # Required on pull requests and in the merge queue; a push to main was already gated.
+    if: github.event_name != 'push'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Install the pinned Rust toolchain
+        run: rustup toolchain install --no-self-update
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Install the pinned tools
+        run: cargo xtask setup cargo-nextest cargo-llvm-cov
+      - name: Check the installed tools against their pins
+        run: cargo xtask doctor cargo-nextest cargo-llvm-cov
+      - name: 90% of changed lines covered
+        run: cargo xtask coverage --base "$BASE"
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+
+  mutants:
+    name: Mutants
+    if: github.event_name != 'push'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Install the pinned Rust toolchain
+        run: rustup toolchain install --no-self-update
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Install the pinned tools
+        run: cargo xtask setup cargo-nextest cargo-mutants
+      - name: Check the installed tools against their pins
+        run: cargo xtask doctor cargo-nextest cargo-mutants
+      - name: No missed mutants in the changed code
+        run: cargo xtask mutants --base "$BASE" --jobs 2
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}

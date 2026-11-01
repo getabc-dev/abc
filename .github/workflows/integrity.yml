@@ -1,0 +1,48 @@
+name: Integrity
+
+on:
+  pull_request:
+    # Labelling re-runs it, so an approver's integrity-approved label counts at once.
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+  merge_group:
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  integrity:
+    name: Integrity
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      pull-requests: read # the pull request's head commit and labels
+      issues: read # the timeline: who added integrity-approved, and when
+      actions: read # the head commit's workflow runs: when it was pushed
+    steps:
+      - name: The merge queue reruns a pull request that already passed
+        if: github.event_name == 'merge_group'
+        run: echo "Integrity was checked, and any findings approved, in the pull request."
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: github.event_name == 'pull_request'
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Install the pinned Rust toolchain
+        if: github.event_name == 'pull_request'
+        run: rustup toolchain install --no-self-update
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        if: github.event_name == 'pull_request'
+      - name: Deleted, skipped or weakened tests and gate changes
+        if: github.event_name == 'pull_request'
+        run: cargo xtask integrity --base "$BASE" --pr "$PR"
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          PR: ${{ github.event.pull_request.number }}
+          GITHUB_TOKEN: ${{ github.token }}

@@ -9,6 +9,7 @@ mod hook;
 mod integrity;
 mod mutants;
 mod review;
+mod rulesets;
 mod shell;
 mod task;
 #[cfg(test)]
@@ -29,6 +30,15 @@ use clap::{Parser, Subcommand};
 struct Cli {
     #[command(subcommand)]
     command: Task,
+}
+
+/// What `cargo xtask rulesets` does.
+#[derive(Debug, Subcommand)]
+enum RulesetAction {
+    /// Check .github/rulesets/main.json against the CI workflows.
+    Check,
+    /// Put the ruleset on GitHub with your own gh login, replacing the rulesets it supersedes.
+    Apply,
 }
 
 /// What `cargo xtask task` does with the current task.
@@ -102,6 +112,11 @@ enum Task {
         #[command(subcommand)]
         action: TaskAction,
     },
+    /// Check or apply the branch rules for main in .github/rulesets/main.json.
+    Rulesets {
+        #[command(subcommand)]
+        action: RulesetAction,
+    },
     /// Install the tools pinned in xtask/tools.toml into .tools/, verifying each download.
     Setup {
         /// Install only these tools; all of them when none are named.
@@ -158,47 +173,32 @@ fn usage_exit_code(error: &clap::Error) -> u8 {
     u8::from(error.use_stderr())
 }
 
+/// Success when a gate passed, failure otherwise.
+fn verdict(passed: bool) -> ExitCode {
+    if passed {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
 fn run(task: Task) -> anyhow::Result<ExitCode> {
     let root = repo_root()?;
+    let report = &mut io::stderr().lock();
     match task {
-        Task::Check { changed } => {
-            let passed = check::run(&root, changed, &mut io::stderr().lock())?;
-            Ok(if passed {
-                ExitCode::SUCCESS
-            } else {
-                ExitCode::FAILURE
-            })
-        }
-        Task::Coverage { base } => {
-            let passed = coverage::run(&root, &base, &mut io::stderr().lock())?;
-            Ok(if passed {
-                ExitCode::SUCCESS
-            } else {
-                ExitCode::FAILURE
-            })
-        }
-        Task::Mutants { base, jobs } => {
-            let passed = mutants::run(&root, &base, jobs, &mut io::stderr().lock())?;
-            Ok(if passed {
-                ExitCode::SUCCESS
-            } else {
-                ExitCode::FAILURE
-            })
-        }
+        Task::Check { changed } => Ok(verdict(check::run(&root, changed, report)?)),
+        Task::Coverage { base } => Ok(verdict(coverage::run(&root, &base, report)?)),
+        Task::Mutants { base, jobs } => Ok(verdict(mutants::run(&root, &base, jobs, report)?)),
         Task::Integrity { base, pr } => {
             let pull_request = pr.map(integrity::PullRequest::from_env).transpose()?;
-            let passed = integrity::run(
+            Ok(verdict(integrity::run(
                 &root,
                 &base,
                 pull_request.as_ref(),
-                &mut io::stderr().lock(),
-            )?;
-            Ok(if passed {
-                ExitCode::SUCCESS
-            } else {
-                ExitCode::FAILURE
-            })
+                report,
+            )?))
         }
+        Task::Review { base } => Ok(verdict(review::run_live(&root, &base, report)?)),
         Task::GitCredential { operation } => {
             let mut request = String::new();
             io::stdin()
@@ -213,28 +213,33 @@ fn run(task: Task) -> anyhow::Result<ExitCode> {
             let token = app::App::load(&app::config_dir()?)?.token(app::GITHUB_API)?;
             app::gh(Path::new("gh"), &args, &token)
         }
-        Task::Review { base } => {
-            let passed = review::run_live(&root, &base, &mut io::stderr().lock())?;
-            Ok(if passed {
-                ExitCode::SUCCESS
-            } else {
-                ExitCode::FAILURE
-            })
+        Task::Rulesets { action } => {
+            match action {
+                RulesetAction::Check => {
+                    rulesets::check(&root)?;
+                    writeln!(report, "rulesets: {} matches CI", rulesets::RULESET)?;
+                }
+                RulesetAction::Apply => {
+                    rulesets::apply(&root, Path::new("gh"), &mut io::stdout().lock())?;
+                }
+            }
+            Ok(ExitCode::SUCCESS)
         }
         Task::Work { action } => {
             match action {
                 TaskAction::Set { text } => task::set(&root, &text)?,
                 TaskAction::Show => match task::read(&root)? {
                     Some(text) => writeln!(io::stdout().lock(), "{text}")?,
-                    None => writeln!(io::stderr().lock(), "no task recorded")?,
+                    None => writeln!(report, "no task recorded")?,
                 },
                 TaskAction::Clear => task::clear(&root)?,
             }
             Ok(ExitCode::SUCCESS)
         }
         Task::Setup { tools: only } => {
-            tools::setup(&root, &only, &mut io::stdout().lock())?;
-            app::configure_git(&root, &app::config_dir()?, &mut io::stdout().lock())?;
+            let out = &mut io::stdout().lock();
+            tools::setup(&root, &only, out)?;
+            app::configure_git(&root, &app::config_dir()?, out)?;
             Ok(ExitCode::SUCCESS)
         }
         Task::Doctor { tools: only } => tools::doctor(&root, &only, &mut io::stdout().lock()),
@@ -249,8 +254,7 @@ fn run(task: Task) -> anyhow::Result<ExitCode> {
                 .read_to_string(&mut input)
                 .context("could not read the hook input from stdin")?;
             let context = hook::Context::from_env(root);
-            let code = hook::run(event, &input, &context, &mut io::stderr().lock())?;
-            Ok(ExitCode::from(code))
+            Ok(ExitCode::from(hook::run(event, &input, &context, report)?))
         }
     }
 }
