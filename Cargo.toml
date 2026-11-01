@@ -1,0 +1,88 @@
+[workspace]
+resolver = "3"
+members = ["crates/*", "xtask"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+# Equal to the toolchain pinned in rust-toolchain.toml; an xtask test keeps them in step.
+rust-version = "1.99.1"
+license = "MIT"
+repository = "https://github.com/getabc-dev/abc"
+publish = false
+
+[workspace.dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.6.7", features = ["derive"] }
+flate2 = "1.1.10"
+insta = "1.49.0"
+proptest = { version = "1.12.0", default-features = false, features = ["std"] }
+semver = { version = "1.0.28", features = ["serde"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+sha2 = "0.11.1"
+tar = "0.4.46"
+tempfile = "3.27.0"
+thiserror = "2.0.21"
+toml_edit = { version = "0.25.17", features = ["serde"] }
+ureq = "3.5.0"
+
+# xtask hashes every pinned tool before running it; optimise sha2 so debug builds hash quickly.
+[profile.dev.package.sha2]
+opt-level = 3
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+unreachable_pub = "deny"
+unused_qualifications = "deny"
+elided_lifetimes_in_paths = "deny"
+let_underscore_drop = "deny"
+missing_debug_implementations = "deny"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+# Selected nursery lints.
+use_self = "deny"
+redundant_clone = "deny"
+significant_drop_in_scrutinee = "deny"
+needless_collect = "deny"
+or_fun_call = "deny"
+# Restriction lints: no panics, unchecked arithmetic, lossy casts, silent errors or catch-all matches.
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+unreachable = "deny"
+dbg_macro = "deny"
+print_stdout = "deny"
+print_stderr = "deny"
+indexing_slicing = "deny"
+string_slice = "deny"
+get_unwrap = "deny"
+arithmetic_side_effects = "deny"
+as_conversions = "deny"
+allow_attributes = "deny"
+allow_attributes_without_reason = "deny"
+unwrap_in_result = "deny"
+panic_in_result_fn = "deny"
+missing_assert_message = "deny"
+exit = "deny"
+mem_forget = "deny"
+wildcard_enum_match_arm = "deny"
+let_underscore_must_use = "deny"
+let_underscore_untyped = "deny"
+clone_on_ref_ptr = "deny"
+error_impl_error = "deny"
+map_err_ignore = "deny"
+unused_result_ok = "deny"
+assertions_on_result_states = "deny"
+tests_outside_test_module = "deny"
+cfg_not_test = "deny"
+iter_over_hash_type = "deny"
+shadow_unrelated = "deny"
+try_err = "deny"
+float_cmp_const = "deny"
+lossy_float_literal = "deny"
+self_named_module_files = "deny"

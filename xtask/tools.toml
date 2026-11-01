@@ -1,0 +1,86 @@
+# Tools that xtask installs into .tools/ and runs from there, never from PATH.
+#
+# `cargo xtask setup` downloads each tool's release archive for this machine, checks its sha256,
+# and installs the executable at .tools/<name>/<version>/<name> once its own sha256 matches
+# `binary-sha256`. xtask checks that sha256 again whenever it runs the tool, and
+# `cargo xtask doctor` fails when a tool is missing, modified or reports another version. After
+# changing a version, run `cargo xtask pin` to record the new checksums for every target.
+#
+# `url`, `binary` (the executable's path inside a .tar.gz archive; omitted when the asset is the
+# executable itself) and `checksums` are templates:
+# {version} is the tool's version and {platform} is the target's name in the project's asset file
+# names. `checksums` is where the project publishes its assets' sha256, and `attestations` the
+# GitHub repository whose build attestations list them; `cargo xtask pin` refuses a download that
+# either does not vouch for, and every tool needs at least one, so no pin rests on its first
+# download. zizmor and cargo-shear publish no checksums but attest their release archives.
+# Renovate bumps `version` from the GitHub release named in the `url` line right after it, so
+# keep `version` and `url` adjacent and in that order.
+
+[[tool]]
+name = "cargo-nextest"
+version = "0.9.150"
+url = "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-{version}/cargo-nextest-{version}-{platform}.tar.gz"
+binary = "cargo-nextest"
+checksums = "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-{version}/cargo-nextest-{version}-{platform}.sha256"
+targets.aarch64-apple-darwin = { platform = "universal-apple-darwin", sha256 = "82a759b4d218d38359424196ab244c470e8f7c7d149c814fbbeef4d67c3c301a", binary-sha256 = "aad9d409cd2f0a81fcaed49d7672a133254179458436c1e957505e4a11655329" }
+targets.x86_64-unknown-linux-gnu = { platform = "x86_64-unknown-linux-gnu", sha256 = "b0959bc64232974224cf9fb22c915845398c0e8668fa7831eb5b43fb1eef781f", binary-sha256 = "62dcc4348e189f5fbd5881f6b753c59d62f2e664b28c6357898644288d703c02" }
+targets.aarch64-unknown-linux-gnu = { platform = "aarch64-unknown-linux-gnu", sha256 = "9164568e9840c6509177086828ac7d3178c2d8feb0658b4d2bff62fa620e98c8", binary-sha256 = "5f9b5ea1599590cbbe1e3487746af3d707ab0c52a5aba784c0b139d39a7aa51b" }
+
+[[tool]]
+name = "cargo-deny"
+version = "0.20.2"
+url = "https://github.com/EmbarkStudios/cargo-deny/releases/download/{version}/cargo-deny-{version}-{platform}.tar.gz"
+binary = "cargo-deny-{version}-{platform}/cargo-deny"
+checksums = "https://github.com/EmbarkStudios/cargo-deny/releases/download/{version}/cargo-deny-{version}-{platform}.tar.gz.sha256"
+targets.aarch64-apple-darwin = { platform = "aarch64-apple-darwin", sha256 = "fe67d82a10d8597a3549364cb733a3f9cc1bfff9031b7ae46384a9f2a72090c3", binary-sha256 = "5f65c07c459c9514f0c97cc2e2fb6b120daef2d95aee31062cab4816cf027eb1" }
+targets.x86_64-unknown-linux-gnu = { platform = "x86_64-unknown-linux-musl", sha256 = "9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f", binary-sha256 = "b329e25933d01c36dd7c47d84ea5716694f9b7caf53a5003d45674703a8ed54a" }
+targets.aarch64-unknown-linux-gnu = { platform = "aarch64-unknown-linux-musl", sha256 = "995c82be0defc7a025cae49a2aa2644ce8245c9a3318fc4103907c6a285e8c7d", binary-sha256 = "21e797104e371854dde7f05f52d834e70312749d361c168429ced996f2194462" }
+
+[[tool]]
+name = "cargo-shear"
+version = "1.14.0"
+url = "https://github.com/Boshen/cargo-shear/releases/download/v{version}/cargo-shear-{platform}.tar.gz"
+attestations = "Boshen/cargo-shear"
+binary = "cargo-shear"
+targets.aarch64-apple-darwin = { platform = "aarch64-apple-darwin", sha256 = "e50b9375b1e93d2293c803819c118337f1e8fce519e4188a93bb0f5e08041ca3", binary-sha256 = "34edccc283039ed8c2351c72c45c21a13ed65cf1fdde915f689ac97b060150c5" }
+targets.x86_64-unknown-linux-gnu = { platform = "x86_64-unknown-linux-gnu", sha256 = "1d7d860fdbd0d95857ff1f2643cc70d20c5d31236159ad51be7ce436eb3e5bf4", binary-sha256 = "37f2f573a53c786c12c4a935976267351a731010e464a179b29af78c3b53c216" }
+targets.aarch64-unknown-linux-gnu = { platform = "aarch64-unknown-linux-gnu", sha256 = "947d69177d812048452866d90b05d1bf95550f487522b922ebf0c0677a5698f8", binary-sha256 = "f1d678f4b12d148a4b6cb4fa14cccfb85b24b8d5ebd27bddecce1e54d6447d08" }
+
+[[tool]]
+name = "zizmor"
+version = "1.31.1"
+url = "https://github.com/zizmorcore/zizmor/releases/download/v{version}/zizmor-{platform}.tar.gz"
+attestations = "zizmorcore/zizmor"
+binary = "zizmor"
+targets.aarch64-apple-darwin = { platform = "aarch64-apple-darwin", sha256 = "ad5aa633cd56215b11e6c51d51f90c7e6b22904a75047d1215abbd422f61d698", binary-sha256 = "200733b2102e1bf5d53acfed2ab303fadf136532578a1ba9ec076c5bc543e70a" }
+targets.x86_64-unknown-linux-gnu = { platform = "x86_64-unknown-linux-gnu", sha256 = "d185f726bdaf92df78273217dfdd24ebcd6b0ef48cf3ce776ff5762b6e138c99", binary-sha256 = "dc3bb05237ddd11c62ac19cf5ac1c633acd228e386b7e18f9adb3498873d271f" }
+targets.aarch64-unknown-linux-gnu = { platform = "aarch64-unknown-linux-gnu", sha256 = "37eebbd5762a44f262d94875431b14a6d2402991e90a685113ea97b8b41be833", binary-sha256 = "e2cf0a73958aed6646f7937dcf647dd86b52d49eb2b4190a81b17fa63123f8b0" }
+
+[[tool]]
+name = "pinact"
+version = "5.0.2"
+url = "https://github.com/suzuki-shunsuke/pinact/releases/download/v{version}/pinact_{platform}.tar.gz"
+binary = "pinact"
+checksums = "https://github.com/suzuki-shunsuke/pinact/releases/download/v{version}/pinact_{version}_checksums.txt"
+targets.aarch64-apple-darwin = { platform = "darwin_arm64", sha256 = "9b9545d53376654005daaee5ab736d579887205ca3df99925c8fe8358c6e7fdb", binary-sha256 = "23f3ee9407aa3358374072fc277e4a8983bfd11fba1c965578343c560fb84c2c" }
+targets.x86_64-unknown-linux-gnu = { platform = "linux_amd64", sha256 = "7f003d8f51e984c2264d2009d430e3e0e87ae404a0e2dc2a9a277b0f731bf5b7", binary-sha256 = "b6b45df78d71e9aff5ceb63f9cda6251b913d10aecd53a484136cf70653cb97d" }
+targets.aarch64-unknown-linux-gnu = { platform = "linux_arm64", sha256 = "326e27f5b3b5fca21e6a169b2785ba2023df3dd9ee82dd0f4e438cb1220b68d7", binary-sha256 = "6e46ac9ad37054dc622fcf2c841ad7c5d68a6adb38a155d0dac5afb5974321ec" }
+
+[[tool]]
+name = "gitleaks"
+version = "8.30.1"
+url = "https://github.com/gitleaks/gitleaks/releases/download/v{version}/gitleaks_{version}_{platform}.tar.gz"
+binary = "gitleaks"
+checksums = "https://github.com/gitleaks/gitleaks/releases/download/v{version}/gitleaks_{version}_checksums.txt"
+targets.aarch64-apple-darwin = { platform = "darwin_arm64", sha256 = "b40ab0ae55c505963e365f271a8d3846efbc170aa17f2607f13df610a9aeb6a5", binary-sha256 = "ba52fb1bfabbcde42f032afad3d6e0b19dff8ed105229a16e7caa338bbc0e84f" }
+targets.x86_64-unknown-linux-gnu = { platform = "linux_x64", sha256 = "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb", binary-sha256 = "88f91962aa2f93ac6ab281d553b9e125f5197bbbce38f9f2437f7299c32e5509" }
+targets.aarch64-unknown-linux-gnu = { platform = "linux_arm64", sha256 = "e4a487ee7ccd7d3a7f7ec08657610aa3606637dab924210b3aee62570fb4b080", binary-sha256 = "00e91bbe655bd7c47753e8cfe61cb76ea1a5d7e7702fe161ee40102b46b3823b" }
+
+[[tool]]
+name = "osv-scanner"
+version = "2.7.0"
+url = "https://github.com/google/osv-scanner/releases/download/v{version}/osv-scanner_{platform}"
+checksums = "https://github.com/google/osv-scanner/releases/download/v{version}/osv-scanner_SHA256SUMS"
+targets.aarch64-apple-darwin = { platform = "darwin_arm64", sha256 = "d4926ef8da134332543be276dff157e4c170f99ad91fc48e89448a8816bdf70b", binary-sha256 = "d4926ef8da134332543be276dff157e4c170f99ad91fc48e89448a8816bdf70b" }
+targets.x86_64-unknown-linux-gnu = { platform = "linux_amd64", sha256 = "160c6253e2922e9e0a6a9771c5c4c40a4b3c6090b34a3cdd5e80c96cc2e4218b", binary-sha256 = "160c6253e2922e9e0a6a9771c5c4c40a4b3c6090b34a3cdd5e80c96cc2e4218b" }
+targets.aarch64-unknown-linux-gnu = { platform = "linux_arm64", sha256 = "4061ef4c021ed3c47f203b818f337e351336cc5cd67c0274fc36bd1dfc728dd7", binary-sha256 = "4061ef4c021ed3c47f203b818f337e351336cc5cd67c0274fc36bd1dfc728dd7" }

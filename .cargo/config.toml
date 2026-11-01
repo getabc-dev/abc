@@ -1,0 +1,3 @@
+[alias]
+# --locked: never rewrite Cargo.lock as a side effect of running a check or a hook.
+xtask = "run --quiet --locked --package xtask --"

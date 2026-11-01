@@ -1,0 +1,59 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash|Monitor",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "if [ -f \"$CLAUDE_PROJECT_DIR/xtask/hooks/pre-tool-use.sh\" ]; then sh \"$CLAUDE_PROJECT_DIR/xtask/hooks/pre-tool-use.sh\"; else echo \"xtask hook: $CLAUDE_PROJECT_DIR has no xtask/hooks/pre-tool-use.sh; the git guard is off\" >&2; fi",
+            "timeout": 300
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "if [ -f \"$CLAUDE_PROJECT_DIR/xtask/Cargo.toml\" ]; then cd \"$CLAUDE_PROJECT_DIR\" && cargo xtask hook stop 1>&2 || { echo 'cargo xtask check failed'; exit 2; }; else echo \"xtask hook: $CLAUDE_PROJECT_DIR has no xtask; no checks run\" >&2; fi",
+            "timeout": 900,
+            "statusMessage": "cargo xtask check --changed"
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "matcher": "^(?!(?:Explore|Plan|claude-code-guide|statusline-setup|web-fetch)$).+",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "if [ -f \"$CLAUDE_PROJECT_DIR/xtask/Cargo.toml\" ]; then cd \"$CLAUDE_PROJECT_DIR\" && cargo xtask hook stop 1>&2 || { echo 'cargo xtask check failed'; exit 2; }; else echo \"xtask hook: $CLAUDE_PROJECT_DIR has no xtask; no checks run\" >&2; fi",
+            "timeout": 900,
+            "statusMessage": "cargo xtask check --changed"
+          }
+        ]
+      }
+    ]
+  },
+  "enabledPlugins": {
+    "pstack@cursor-plugins": true,
+    "egm@egm": true
+  },
+  "extraKnownMarketplaces": {
+    "cursor-plugins": {
+      "source": {
+        "source": "github",
+        "repo": "cursor/plugins"
+      }
+    },
+    "egm": {
+      "source": {
+        "source": "github",
+        "repo": "google/elephant-goldfish-model"
+      }
+    }
+  }
+}

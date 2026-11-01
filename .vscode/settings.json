@@ -1,0 +1,10 @@
+{
+  "files.autoSave": "off",
+  "editor.formatOnSave": true,
+  "editor.fontSize": 12,
+  "editor.fontLigatures": true,
+  "terminal.integrated.fontSize": 12,
+  "terminal.integrated.fontWeight": "450",
+  "terminal.integrated.fontFamily": "Menlo, 'Symbols Nerd Font Mono'",
+  "editor.fontFamily": "Menlo, Monaco, 'Courier New', monospace"
+}

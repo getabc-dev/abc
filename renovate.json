@@ -1,0 +1,50 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:best-practices"],
+  "minimumReleaseAge": "3 days",
+  "minimumReleaseAgeBehaviour": "timestamp-required",
+  "internalChecksFilter": "strict",
+  "internalChecksAsSuccess": true,
+  "prCreation": "not-pending",
+  "lockFileMaintenance": {
+    "description": "Off: refreshing Cargo.lock would pull transitive versions that never passed the 3-day minimum release age. Transitive updates arrive only with age-gated direct updates.",
+    "enabled": false
+  },
+  "packageRules": [
+    {
+      "description": "Bump the toolchain and the workspace rust-version together; an xtask test requires them equal.",
+      "matchDatasources": ["rust-version"],
+      "matchDepNames": ["rust"],
+      "groupName": "Rust toolchain"
+    },
+    {
+      "description": "Pinned tools need new checksums with every version.",
+      "matchFileNames": ["xtask/tools.toml"],
+      "prBodyNotes": [
+        "Run `cargo xtask pin` on this branch and commit `xtask/tools.toml`: `cargo xtask setup` refuses archives whose sha256 is not pinned."
+      ]
+    }
+  ],
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "The workspace rust-version in Cargo.toml.",
+      "managerFilePatterns": ["/^Cargo\\.toml$/"],
+      "matchStrings": ["\\nrust-version = \"(?<currentValue>[^\"]+)\""],
+      "depNameTemplate": "rust",
+      "datasourceTemplate": "rust-version",
+      "versioningTemplate": "rust-release-channel"
+    },
+    {
+      "customType": "regex",
+      "description": "Pinned tools in xtask/tools.toml, released on GitHub.",
+      "managerFilePatterns": ["/^xtask/tools\\.toml$/"],
+      "matchStrings": [
+        "version = \"(?<currentValue>[^\"]+)\"\\nurl = \"https://github\\.com/(?<depName>[^/\"]+/[^/\"]+)/releases/download/(?<tagPrefix>[^\"{/]*)\\{version\\}/"
+      ],
+      "datasourceTemplate": "github-releases",
+      "extractVersionTemplate": "^{{{tagPrefix}}}(?<version>.+)$",
+      "versioningTemplate": "semver"
+    }
+  ]
+}
