@@ -241,9 +241,9 @@ fn is_cfg_test(attribute: &syn::Attribute) -> bool {
         Ok(syn::Meta::List(list)) if list.path.is_ident("all") => list
             .parse_args_with(Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated)
             .is_ok_and(|predicates| {
-                predicates.iter().any(|predicate| {
-                    predicate.path().is_ident("test") && matches!(predicate, syn::Meta::Path(_))
-                })
+                predicates.iter().any(
+                    |predicate| matches!(predicate, syn::Meta::Path(path) if path.is_ident("test")),
+                )
             }),
         Ok(syn::Meta::List(_) | syn::Meta::NameValue(_)) | Err(_) => false,
     }
@@ -402,7 +402,7 @@ mod tests {
 
     #[test]
     fn finds_test_only_code() {
-        let source = r"fn shipped() {}
+        let source = r#"fn shipped() {}
 
 #[cfg(test)]
 mod tests {
@@ -422,17 +422,20 @@ fn unix_helper() {}
 #[cfg(any(test, unix))]
 fn sometimes() {}
 
+#[cfg(all(unix, target_os = "linux"))]
+fn linux() {}
+
 impl S {
     #[test]
     fn method_test() {}
 
     fn method() {}
 }
-";
+"#;
         let found = super::test_code(source).unwrap();
         assert_eq!(
             found.lines.into_iter().collect::<Vec<_>>(),
-            [3, 4, 5, 6, 7, 9, 10, 15, 16, 22, 23],
+            [3, 4, 5, 6, 7, 9, 10, 15, 16, 25, 26],
             "cfg(test) and cfg(all(test, ..)) items and test functions, attributes included"
         );
         assert_eq!(

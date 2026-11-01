@@ -187,6 +187,7 @@ fn act(event: Event, input: &str, context: &Context, out: &mut impl Write) -> an
                     &context.own_root,
                     true,
                     &tools::pinned(&context.own_root, "cargo-nextest")?,
+                    None,
                     out,
                 )? {
                     if fields.watched() {

@@ -259,6 +259,7 @@ fn run(
             root,
             changed,
             &tool("cargo-nextest")?,
+            None,
             report,
         )?)),
         Task::Coverage { base } => Ok(verdict(coverage::run(
@@ -583,6 +584,47 @@ mod tests {
         );
         assert_eq!(verdict(true), ExitCode::SUCCESS, "a passing gate");
         assert_eq!(verdict(false), ExitCode::FAILURE, "a failing gate");
+    }
+
+    #[test]
+    fn a_real_invocation_reads_this_checkout_and_the_environment() {
+        let here = Invocation::new(None).unwrap();
+        assert_eq!(
+            here.root,
+            repo_root().unwrap(),
+            "the tree defaults to xtask's own"
+        );
+        assert_eq!(here.home, here.root, "and so do the tools");
+        assert_eq!(
+            (here.env)("PATH"),
+            std::env::var_os("PATH"),
+            "the process environment"
+        );
+        assert!(
+            (here.tool)("no-such-tool").is_err(),
+            "only pinned tools resolve"
+        );
+        let temp = tempfile::tempdir().unwrap();
+        let elsewhere = Invocation::new(Some(temp.path().to_path_buf())).unwrap();
+        assert_eq!(
+            elsewhere.root,
+            temp.path().canonicalize().unwrap(),
+            "--root, canonical"
+        );
+        assert_eq!(
+            elsewhere.home,
+            repo_root().unwrap(),
+            "the tools stay xtask's own"
+        );
+        assert!(
+            Invocation::new(Some(temp.path().join("absent"))).is_err(),
+            "a --root that does not exist"
+        );
+        assert_eq!(
+            super::report_error(&anyhow::anyhow!("boom")),
+            ExitCode::FAILURE,
+            "an error fails the process"
+        );
     }
 
     #[test]

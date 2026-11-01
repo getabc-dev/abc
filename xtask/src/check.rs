@@ -90,10 +90,12 @@ struct Failure {
 
 /// Runs the check from `root` and reports whether it passed. With `changed`, clippy and the tests
 /// cover only the crates that the changes since the merge base with the default branch can affect.
+/// Builds go to `target_dir` when given, and wherever cargo is configured to otherwise.
 pub(crate) fn run(
     root: &Path,
     changed: bool,
     nextest: &Path,
+    target_dir: Option<&Path>,
     out: &mut impl Write,
 ) -> anyhow::Result<bool> {
     let scope = if changed {
@@ -101,7 +103,7 @@ pub(crate) fn run(
     } else {
         Scope::Workspace
     };
-    run_scope(root, &scope, nextest, None, out)
+    run_scope(root, &scope, nextest, target_dir, out)
 }
 
 /// Runs each step on `scope` from `root`, with the cargo-nextest executable at `nextest`, building
@@ -376,9 +378,7 @@ mod tests {
 
     use tempfile::TempDir;
 
-    use super::{
-        PROPTEST_RNG_SEED, Package, Scope, affected, changed_since, run_scope, test_command,
-    };
+    use super::{PROPTEST_RNG_SEED, Package, Scope, affected, changed_since, run, test_command};
     use crate::git::default_branch;
     use crate::testing::{git, repository};
     use crate::tools::Manifest;
@@ -628,14 +628,7 @@ mod tests {
         let fixture = fixture(name, lib);
         let target_dir = fixture.path().join("target");
         let mut out = Vec::new();
-        let passed = run_scope(
-            fixture.path(),
-            &Scope::Workspace,
-            &nextest,
-            Some(&target_dir),
-            &mut out,
-        )
-        .unwrap();
+        let passed = run(fixture.path(), false, &nextest, Some(&target_dir), &mut out).unwrap();
         (passed, String::from_utf8(out).unwrap())
     }
 

@@ -365,9 +365,10 @@ mod tests {
             ),
             ("src/testing.rs", "pub fn helper() {}\n"),
             ("src/inner/mod.rs", "pub fn nested() {}\n"),
+            ("src/a/deep.rs", "pub fn deep() {}\n"),
             (
                 "src/a.rs",
-                "pub fn a() {}\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn t() {}\n}\n",
+                "pub fn a() {}\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn t() {}\n}\n#[cfg(test)]\nmod deep;\n",
             ),
             ("tests/it.rs", "#[test]\nfn it() {}\n"),
             ("notes.txt", "x\n"),
@@ -390,7 +391,7 @@ mod tests {
         assert_eq!(
             kept["src/a.rs"].iter().copied().collect::<Vec<_>>(),
             [1, 2],
-            "the test module's lines are gone"
+            "the test modules' lines are gone"
         );
         assert_eq!(
             kept["src/main.rs"].iter().copied().collect::<Vec<_>>(),

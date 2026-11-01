@@ -461,6 +461,11 @@ mod tests {
                 .contains("squash"),
             "merge commits"
         );
+        let exact = ruleset(&["Checks", "lint"]).replace(
+            r#""check_response_timeout_minutes":150"#,
+            r#""check_response_timeout_minutes":65"#,
+        );
+        check_text(&exact, &workflows()).unwrap();
         let slow = ruleset(&["Checks", "lint"]).replace(
             r#""check_response_timeout_minutes":150"#,
             r#""check_response_timeout_minutes":60"#,
