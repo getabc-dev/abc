@@ -31,7 +31,6 @@ testing = ["dep:semver", "rand/chacha", "time/macros"]
 
 [dev-dependencies]
 abc-store = { path = ".", features = ["testing"] }
-proptest.workspace = true
 semver.workspace = true
 
 [lints]
