@@ -23,6 +23,7 @@ use anyhow::Context;
 
 pub(crate) use approval::PullRequest;
 pub(crate) use reasons::{Event, event};
+pub(crate) use rust::TestCode;
 
 use crate::git;
 
@@ -63,6 +64,13 @@ fn inventory(path: &str, source: &str) -> Option<anyhow::Result<Vec<Test>>> {
         .extension()
         .is_some_and(|extension| extension == "rs")
         .then(|| rust::tests(source))
+}
+
+/// The test-only code in a file, for the languages the check reads; `None` for any other file.
+pub(crate) fn test_code(path: &Path, source: &str) -> Option<anyhow::Result<TestCode>> {
+    path.extension()
+        .is_some_and(|extension| extension == "rs")
+        .then(|| rust::test_code(source))
 }
 
 /// Something the check reports.

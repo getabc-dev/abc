@@ -8,13 +8,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::fs;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, ensure};
 
 use crate::check::PROPTEST_RNG_SEED;
 use crate::git;
+use crate::integrity::{self, TestCode};
 use crate::tools;
 
 /// The share of changed, instrumented lines the tests must run.
@@ -56,10 +57,75 @@ pub(crate) fn run(
     let report =
         fs::read_to_string(&lcov).with_context(|| format!("could not read {}", lcov.display()))?;
     let commit = git::merge_base(root, base)?;
-    let changed = git::added_lines(&git::diff(root, &commit, 0)?);
+    let changed = without_tests(root, git::added_lines(&git::diff(root, &commit, 0)?))?;
     let measured = measure(&changed, &parse_lcov(&report, root));
     write!(out, "{}", measured.describe())?;
     Ok(measured.passes())
+}
+
+/// `changed` without test-only code: test items, test modules in files of their own, and files
+/// under a `tests` directory. The gate measures how well tests cover shipped code, not the tests.
+fn without_tests(
+    root: &Path,
+    changed: BTreeMap<String, BTreeSet<u32>>,
+) -> anyhow::Result<BTreeMap<String, BTreeSet<u32>>> {
+    let test_code = |path: &Path| -> anyhow::Result<Option<TestCode>> {
+        let Ok(source) = fs::read_to_string(root.join(path)) else {
+            return Ok(None);
+        };
+        integrity::test_code(path, &source)
+            .transpose()
+            .with_context(|| format!("could not read the tests in {}", path.display()))
+    };
+    let mut kept = BTreeMap::new();
+    for (file, mut lines) in changed {
+        let path = Path::new(&file);
+        if path.components().any(|part| part.as_os_str() == "tests") {
+            continue;
+        }
+        if let Some(code) = test_code(path)? {
+            lines.retain(|line| !code.lines.contains(line));
+        }
+        let mut declared_as_test = false;
+        for (name, declarer) in declarers(path) {
+            if test_code(&declarer)?.is_some_and(|code| code.modules.contains(&name)) {
+                declared_as_test = true;
+            }
+        }
+        if !declared_as_test && !lines.is_empty() {
+            kept.insert(file, lines);
+        }
+    }
+    Ok(kept)
+}
+
+/// The files that may declare the module in `path`, with the name they declare it by.
+fn declarers(path: &Path) -> Vec<(String, PathBuf)> {
+    let (Some(stem), Some(dir)) = (path.file_stem(), path.parent()) else {
+        return Vec::new();
+    };
+    let (name, home) = if stem == "mod" {
+        match (dir.file_name(), dir.parent()) {
+            (Some(name), Some(parent)) => (name, parent),
+            _ => return Vec::new(),
+        }
+    } else {
+        (stem, dir)
+    };
+    let name = name.to_string_lossy().into_owned();
+    let sibling = match (home.file_name(), home.parent()) {
+        (Some(module), Some(parent)) => {
+            Some(parent.join(format!("{}.rs", module.to_string_lossy())))
+        }
+        _ => None,
+    };
+    ["main.rs", "lib.rs", "mod.rs"]
+        .iter()
+        .map(|file| home.join(file))
+        .chain(sibling)
+        .filter(|file| file != path)
+        .map(|file| (name.clone(), file))
+        .collect()
 }
 
 /// Reads an lcov report into hit counts, with paths relative to `root`. Files outside it, such as
@@ -189,7 +255,7 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
     use std::path::Path;
 
-    use super::{Measured, measure, parse_lcov, ranges, run};
+    use super::{Measured, measure, parse_lcov, ranges, run, without_tests};
     use crate::testing::{repository_with_change, script};
 
     const LCOV: &str = "TN:\nSF:/repo/src/a.rs\nFN:1,a\nDA:1,3\nDA:2,0\nDA:3,0\nDA:4,1\nDA:4,0\nend_of_record\nSF:/elsewhere/dep.rs\nDA:1,0\nend_of_record\nSF:/repo/src/b.rs\nDA:7,0,abc\nend_of_record\n";
@@ -286,6 +352,60 @@ mod tests {
             ),
         );
         path
+    }
+
+    #[test]
+    fn leaves_test_code_out() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let files = [
+            (
+                "src/main.rs",
+                "mod a;\n#[cfg(test)]\nmod testing;\n#[cfg(test)]\nmod inner;\nfn main() {}\n",
+            ),
+            ("src/testing.rs", "pub fn helper() {}\n"),
+            ("src/inner/mod.rs", "pub fn nested() {}\n"),
+            (
+                "src/a.rs",
+                "pub fn a() {}\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn t() {}\n}\n",
+            ),
+            ("tests/it.rs", "#[test]\nfn it() {}\n"),
+            ("notes.txt", "x\n"),
+        ];
+        let mut changed = BTreeMap::new();
+        for (file, content) in files {
+            let path = root.join(file);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, content).unwrap();
+            let lines = u32::try_from(content.lines().count()).unwrap();
+            changed.insert(file.to_owned(), (1..=lines).collect::<BTreeSet<u32>>());
+        }
+        changed.insert("src/gone.rs".to_owned(), BTreeSet::from([1]));
+        let kept = without_tests(root, changed).unwrap();
+        assert_eq!(
+            kept.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["notes.txt", "src/a.rs", "src/gone.rs", "src/main.rs"],
+            "test modules in their own files and files under tests/ are gone"
+        );
+        assert_eq!(
+            kept["src/a.rs"].iter().copied().collect::<Vec<_>>(),
+            [1, 2],
+            "the test module's lines are gone"
+        );
+        assert_eq!(
+            kept["src/main.rs"].iter().copied().collect::<Vec<_>>(),
+            [1, 6],
+            "the test module declarations are test code too"
+        );
+        std::fs::write(root.join("src/broken.rs"), "fn (").unwrap();
+        assert!(
+            without_tests(
+                root,
+                BTreeMap::from([("src/broken.rs".to_owned(), BTreeSet::from([1]))])
+            )
+            .is_err(),
+            "a file the check cannot read fails the gate"
+        );
     }
 
     #[test]

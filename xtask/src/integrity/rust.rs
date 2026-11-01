@@ -1,9 +1,12 @@
 //! The test inventory of a Rust file: every `#[test]` function, including those inside
 //! `proptest!`, with its markers and how many assertion macros it calls.
 
+use std::collections::BTreeSet;
+
 use anyhow::{Context, anyhow};
 use proc_macro2::{TokenStream, TokenTree};
 use syn::parse::{Parse, ParseStream};
+use syn::punctuated::Punctuated;
 use syn::visit::{self, Visit};
 
 use super::Test;
@@ -194,6 +197,97 @@ fn count_assertions(tokens: TokenStream) -> usize {
     count
 }
 
+/// Test-only code in a Rust file: the lines of items under `#[cfg(test)]` and of test
+/// functions, and the modules it declares under `#[cfg(test)]` in other files.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct TestCode {
+    pub(crate) lines: BTreeSet<u32>,
+    pub(crate) modules: BTreeSet<String>,
+}
+
+/// The test-only code in a Rust source file.
+pub(crate) fn test_code(source: &str) -> anyhow::Result<TestCode> {
+    let file = syn::parse_file(source).context("the file is not valid Rust")?;
+    let mut finder = TestCodeFinder(TestCode::default());
+    finder.visit_file(&file);
+    Ok(finder.0)
+}
+
+struct TestCodeFinder(TestCode);
+
+impl TestCodeFinder {
+    /// Records `item` as test code when `attrs` mark it so, and says whether they did.
+    fn mark(&mut self, attrs: &[syn::Attribute], item: &impl syn::spanned::Spanned) -> bool {
+        let is_test = attrs.iter().any(|attribute| {
+            is_cfg_test(attribute) || attribute_name(attribute).as_deref() == Some("test")
+        });
+        if is_test {
+            let span = item.span();
+            let first = u32::try_from(span.start().line).unwrap_or(u32::MAX);
+            let last = u32::try_from(span.end().line).unwrap_or(u32::MAX);
+            self.0.lines.extend(first..=last);
+        }
+        is_test
+    }
+}
+
+/// Whether `attribute` is `#[cfg(test)]` or a `#[cfg(all(..))]` that requires `test`.
+fn is_cfg_test(attribute: &syn::Attribute) -> bool {
+    if !attribute.path().is_ident("cfg") {
+        return false;
+    }
+    match attribute.parse_args::<syn::Meta>() {
+        Ok(syn::Meta::Path(path)) => path.is_ident("test"),
+        Ok(syn::Meta::List(list)) if list.path.is_ident("all") => list
+            .parse_args_with(Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated)
+            .is_ok_and(|predicates| {
+                predicates.iter().any(|predicate| {
+                    predicate.path().is_ident("test") && matches!(predicate, syn::Meta::Path(_))
+                })
+            }),
+        Ok(syn::Meta::List(_) | syn::Meta::NameValue(_)) | Err(_) => false,
+    }
+}
+
+/// A visit method that skips, after recording, an item its attributes mark as test code.
+macro_rules! skip_test_items {
+    ($($method:ident, $walk:ident, $item:ty;)*) => {
+        $(
+            fn $method(&mut self, item: &'ast $item) {
+                if !self.mark(&item.attrs, item) {
+                    visit::$walk(self, item);
+                }
+            }
+        )*
+    };
+}
+
+impl<'ast> Visit<'ast> for TestCodeFinder {
+    skip_test_items! {
+        visit_item_fn, visit_item_fn, syn::ItemFn;
+        visit_item_impl, visit_item_impl, syn::ItemImpl;
+        visit_item_struct, visit_item_struct, syn::ItemStruct;
+        visit_item_enum, visit_item_enum, syn::ItemEnum;
+        visit_item_use, visit_item_use, syn::ItemUse;
+        visit_item_const, visit_item_const, syn::ItemConst;
+        visit_item_static, visit_item_static, syn::ItemStatic;
+        visit_item_trait, visit_item_trait, syn::ItemTrait;
+        visit_item_type, visit_item_type, syn::ItemType;
+        visit_item_macro, visit_item_macro, syn::ItemMacro;
+        visit_impl_item_fn, visit_impl_item_fn, syn::ImplItemFn;
+    }
+
+    fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
+        if self.mark(&item.attrs, item) {
+            if item.content.is_none() {
+                self.0.modules.insert(item.ident.to_string());
+            }
+        } else {
+            visit::visit_item_mod(self, item);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::tests;
@@ -304,6 +398,49 @@ mod tests {
             [test("t", false, false, 2)],
             "a name containing assert, or a ! after another word, is no assertion"
         );
+    }
+
+    #[test]
+    fn finds_test_only_code() {
+        let source = r"fn shipped() {}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn t() {}
+}
+
+#[cfg(test)]
+mod testing;
+
+#[cfg(not(test))]
+fn not_in_tests() {}
+
+#[cfg(all(test, unix))]
+fn unix_helper() {}
+
+#[cfg(any(test, unix))]
+fn sometimes() {}
+
+impl S {
+    #[test]
+    fn method_test() {}
+
+    fn method() {}
+}
+";
+        let found = super::test_code(source).unwrap();
+        assert_eq!(
+            found.lines.into_iter().collect::<Vec<_>>(),
+            [3, 4, 5, 6, 7, 9, 10, 15, 16, 22, 23],
+            "cfg(test) and cfg(all(test, ..)) items and test functions, attributes included"
+        );
+        assert_eq!(
+            found.modules.into_iter().collect::<Vec<_>>(),
+            ["testing"],
+            "a test module in its own file"
+        );
+        assert!(super::test_code("fn (").is_err(), "not Rust");
     }
 
     #[test]
