@@ -133,6 +133,20 @@ mod tests {
         }
     }
 
+    /// The ops listener's answer to `GET /readyz`, or nothing when it does not answer.
+    async fn readyz(ops: std::net::SocketAddr) -> String {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let Ok(mut stream) = tokio::net::TcpStream::connect(ops).await else {
+            return String::new();
+        };
+        let _sent = stream
+            .write_all(b"GET /readyz HTTP/1.0\r\nHost: localhost\r\n\r\n")
+            .await;
+        let mut answer = String::new();
+        let _read = stream.read_to_string(&mut answer).await;
+        answer
+    }
+
     #[tokio::test]
     async fn the_server_runs_until_sigterm_and_exits_cleanly() {
         let database = TestDatabase::migrated().await;
@@ -154,13 +168,18 @@ mod tests {
             .unwrap();
         let mut ready = false;
         for _ in 0..200 {
-            if socket.exists() {
+            if socket.exists() && readyz(ops).await.starts_with("HTTP/1.0 200") {
                 ready = true;
                 break;
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
-        assert!(ready, "the server binds its socket");
+        assert!(ready, "the server binds its socket and reports ready");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            server.try_wait().unwrap().is_none(),
+            "and keeps running until told to stop"
+        );
         let killed = Command::new("kill")
             .args(["-TERM", &server.id().to_string()])
             .status()

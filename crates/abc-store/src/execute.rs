@@ -302,3 +302,39 @@ pub(crate) fn uuid_v7(now: Timestamp, random: &[u8; 10]) -> uuid::Uuid {
     uuid::Builder::from_unix_timestamp_millis(u64::try_from(millis).unwrap_or(0), random)
         .into_uuid()
 }
+
+#[cfg(test)]
+mod tests {
+    use time::macros::datetime;
+
+    use super::*;
+
+    #[test]
+    fn the_os_mint_makes_fresh_secrets_and_time_ordered_ids() {
+        let now = Timestamp::from_utc(datetime!(2026-01-01 00:00:01.5 UTC));
+        let first = OsMint.uuid(now);
+        let second = OsMint.uuid(now);
+        assert_ne!(first, second, "every id is fresh");
+        assert_eq!(first.get_version_num(), 7, "a UUIDv7");
+        let (seconds, nanos) = first.get_timestamp().unwrap().to_unix();
+        assert_eq!(
+            (seconds, nanos),
+            (1_767_225_601, 500_000_000),
+            "its time is now, to the ms"
+        );
+        let secret = OsMint.secret();
+        assert_ne!(*secret, *OsMint.secret(), "every secret is fresh");
+        assert_ne!(*secret, [0; 32], "and not zero");
+    }
+
+    #[test]
+    fn the_system_clock_reads_the_present() {
+        let before = time::OffsetDateTime::now_utc();
+        let now = SystemClock.now().as_offset();
+        assert!(
+            now >= before.replace_nanosecond(0).unwrap(),
+            "not in the past"
+        );
+        assert!(now <= time::OffsetDateTime::now_utc(), "not in the future");
+    }
+}

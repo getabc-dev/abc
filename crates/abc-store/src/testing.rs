@@ -110,6 +110,12 @@ impl TestDatabase {
     }
 }
 
+/// Whether a test database created at `created` is a leftover at `now`, both in seconds since the
+/// Unix epoch.
+const fn stale(created: u64, now: u64) -> bool {
+    now.saturating_sub(created) > STALE_AFTER_SECONDS
+}
+
 /// Drops the test databases older than [`STALE_AFTER_SECONDS`]: leftovers of killed runs.
 async fn sweep(admin: &mut PgConnection, now: u64) {
     let names: Vec<String> =
@@ -122,7 +128,7 @@ async fn sweep(admin: &mut PgConnection, now: u64) {
             .split('_')
             .nth(2)
             .and_then(|seconds| seconds.parse::<u64>().ok());
-        if created.is_some_and(|created| now.saturating_sub(created) > STALE_AFTER_SECONDS) {
+        if created.is_some_and(|created| stale(created, now)) {
             let _dropped = sqlx::query(sqlx::AssertSqlSafe(format!(
                 "DROP DATABASE IF EXISTS {name:?} WITH (FORCE)"
             )))
@@ -591,5 +597,57 @@ pub fn machine() -> MachineInfo {
         hostname: DisplayName::parse("mbp").unwrap_or_else(|error| panic!("{error}")),
         os: Os::Macos,
         arch: Arch::Aarch64,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_test_database_is_a_leftover_after_a_day() {
+        let now = 1_000_000;
+        assert!(!stale(now, now), "a database made now is not");
+        assert!(!stale(now - 86_400, now), "nor one exactly a day old");
+        assert!(stale(now - 86_401, now), "one a day and a second old is");
+        assert!(
+            !stale(now + 5, now),
+            "a clock that went back is not a reason"
+        );
+    }
+
+    #[test]
+    fn the_manual_clock_starts_at_new_year_and_moves_on_demand() {
+        let clock = ManualClock::default();
+        let start = clock.now();
+        assert_eq!(
+            start.as_offset(),
+            time::macros::datetime!(2026-01-01 00:00:00 UTC),
+            "the fixed start"
+        );
+        clock.advance(time::Duration::minutes(5));
+        assert_eq!(
+            clock.now(),
+            start.checked_add(time::Duration::minutes(5)).unwrap(),
+            "five minutes later"
+        );
+    }
+
+    #[test]
+    fn seeded_mints_repeat_their_sequence() {
+        let now = ManualClock::new().now();
+        let (first, second) = (SeededMint::new(7), SeededMint::new(7));
+        assert_eq!(
+            first.uuid(now),
+            second.uuid(now),
+            "the same seed, the same id"
+        );
+        assert_eq!(*first.secret(), *second.secret(), "and the same secret");
+        assert_ne!(
+            *first.secret(),
+            *SeededMint::new(8).secret(),
+            "another seed differs"
+        );
+        assert_ne!(first.uuid(now), first.uuid(now), "each draw is new");
     }
 }

@@ -118,6 +118,10 @@ mod tests {
         let log = capture.text();
         assert!(log.contains("request finished"), "requests were logged");
         assert!(log.contains("worker connected"), "sessions were logged");
+        assert!(
+            log.contains("this server is unclaimed; run `abc server setup-code`"),
+            "an unclaimed server says how to claim it"
+        );
         let normalized = code.replace('-', "");
         for (secret, what) in [
             (code.as_str(), "the setup code"),

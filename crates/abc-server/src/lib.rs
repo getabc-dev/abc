@@ -170,12 +170,7 @@ async fn boot_sweep(store: &Store) -> Result<(), ServeError> {
             )
             .await
             .map_err(|error| ServeError::Sweep(Box::new(error)))?;
-    }
-    if !open.is_empty() {
-        tracing::info!(
-            sessions = open.len(),
-            "ended the sessions the previous run left open"
-        );
+        tracing::info!(%worker, %session, "ended a session the previous run left open");
     }
     Ok(())
 }

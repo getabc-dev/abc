@@ -413,6 +413,12 @@ mod tests {
             .await
             .unwrap();
         let difference = views_replay_diff(&pool).await.unwrap().unwrap();
+        let tampered = pool.clone();
+        let check = tokio::spawn(async move { assert_views_replay(&tampered).await }).await;
+        assert!(
+            check.is_err_and(|error| error.is_panic()),
+            "assert_views_replay fails the test"
+        );
         assert!(
             difference.starts_with("view workspace differs from its replay"),
             "the divergent view is named: {difference}"
@@ -433,6 +439,23 @@ mod tests {
             matches!(unmigrated, Err(OpenError::NotMigrated)),
             "never migrated"
         );
+        sqlx::query("CREATE TABLE _sqlx_migrations (version bigint)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let broken = Store::open(
+            abc_store::testing::database(pool.clone()),
+            abc_store::testing::options(&clock, 1),
+        )
+        .await;
+        assert!(
+            matches!(broken, Err(OpenError::Database(_))),
+            "a migration table this build cannot read is a database error, not a fresh database"
+        );
+        sqlx::query("DROP TABLE _sqlx_migrations")
+            .execute(&pool)
+            .await
+            .unwrap();
         abc_store::migrate(&abc_store::testing::database(pool.clone()))
             .await
             .unwrap();
@@ -450,6 +473,11 @@ mod tests {
             "a new server is unclaimed"
         );
         assert_eq!(store.ready().await, Ok(()), "and ready");
+        assert_eq!(
+            format!("{store:?}"),
+            "Store { .. }",
+            "Debug shows no internals"
+        );
         drop(store);
         sqlx::query("INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time) VALUES (99990101000000, 'from the future', true, '\\x00', 0)")
             .execute(&pool)
@@ -554,5 +582,40 @@ mod tests {
         );
         drop(fresh);
         assert!(!exists(&fresh_name).await, "and is dropped with its value");
+    }
+
+    #[tokio::test]
+    async fn a_store_whose_database_turns_away_connections_is_not_ready() {
+        let database = TestDatabase::migrated().await;
+        let pool = database.pool();
+        let admin = TestDatabase::empty().await;
+        let fixture = Fixture::new(pool.clone()).await;
+        assert_eq!(fixture.store.ready().await, Ok(()), "ready at first");
+        let name: String = sqlx::query_scalar("SELECT current_database()")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "ALTER DATABASE {name:?} ALLOW_CONNECTIONS false"
+        )))
+        .execute(&admin.pool())
+        .await
+        .unwrap();
+        sqlx::query("SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = $1")
+            .bind(&name)
+            .execute(&admin.pool())
+            .await
+            .unwrap();
+        assert_eq!(
+            fixture.store.ready().await,
+            Err(abc_store::NotReady::Database),
+            "a database that refuses connections is not ready"
+        );
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "ALTER DATABASE {name:?} ALLOW_CONNECTIONS true"
+        )))
+        .execute(&admin.pool())
+        .await
+        .unwrap();
     }
 }

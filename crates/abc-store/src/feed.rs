@@ -175,3 +175,73 @@ async fn resume(pool: &PgPool) -> (PgListener, Position) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A handle around `task`, with the listener's connection state `connected`.
+    fn handle(connected: bool, task: tokio::task::JoinHandle<()>) -> FeedHandle {
+        let (_heads, head) = watch::channel(Position::ORIGIN);
+        let (_state, connected) = watch::channel(connected);
+        FeedHandle {
+            head,
+            connected,
+            task,
+        }
+    }
+
+    #[tokio::test]
+    async fn the_handle_reports_the_listeners_connection() {
+        assert!(
+            handle(true, tokio::spawn(async {})).connected(),
+            "connected"
+        );
+        assert!(
+            !handle(false, tokio::spawn(async {})).connected(),
+            "reconnecting"
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_the_handle_stops_the_listener_task() {
+        let (alive, stopped) = tokio::sync::oneshot::channel::<()>();
+        let task = tokio::spawn(async move {
+            let _alive = alive;
+            std::future::pending::<()>().await;
+        });
+        drop(handle(true, task));
+        assert!(
+            stopped.await.is_err(),
+            "the task was aborted, dropping what it held"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_new_feed_wakes_only_for_heads_published_after_it() {
+        let (heads, head) = watch::channel(Position::ORIGIN);
+        let (_state, connected) = watch::channel(true);
+        let feed = FeedHandle {
+            head,
+            connected,
+            task: tokio::spawn(async {}),
+        };
+        publish(&heads, Position::from_stored(3).unwrap());
+        let mut subscriber = feed.subscribe();
+        assert_eq!(subscriber.head().get(), 3, "it starts at the head");
+        publish(&heads, Position::from_stored(3).unwrap());
+        assert!(
+            !subscriber.head.has_changed().unwrap(),
+            "the same head wakes no one"
+        );
+        publish(&heads, Position::from_stored(2).unwrap());
+        publish(&heads, Position::from_stored(4).unwrap());
+        assert_eq!(
+            subscriber.changed().await.map(Position::get),
+            Some(4),
+            "an older head is ignored; a newer one wakes it"
+        );
+        drop(heads);
+        assert_eq!(subscriber.changed().await, None, "a closed feed ends");
+    }
+}
