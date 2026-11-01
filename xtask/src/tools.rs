@@ -73,14 +73,15 @@ struct RawManifest {
     tool: Vec<Tool>,
 }
 
-/// One pinned tool.
+/// One pinned tool: a GitHub release asset per target, or a crate built from crates.io where a
+/// project publishes no verifiable build for every target.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Tool {
     name: String,
     version: String,
     /// Download URL template; `{version}` and `{platform}` are filled in.
-    url: String,
+    url: Option<String>,
     /// Path of the executable inside the `.tar.gz` archive, with the same placeholders; absent
     /// when the downloaded asset is the executable itself.
     binary: Option<String>,
@@ -89,7 +90,43 @@ pub(crate) struct Tool {
     /// The GitHub repository whose build attestations must list each archive's sha256, as
     /// `owner/repo`, for projects that attest their releases.
     attestations: Option<String>,
+    #[serde(default)]
     targets: BTreeMap<Target, Asset>,
+    /// The crates.io crate to build the tool from, instead of release assets.
+    #[serde(rename = "crate")]
+    crate_name: Option<String>,
+    /// Lowercase hex sha256 of the `.crate` file, as the crates.io index records it.
+    sha256: Option<String>,
+    /// The arguments that make the executable print its version, for cargo subcommands that
+    /// expect their own name first. `--version` when absent.
+    #[serde(rename = "version-args")]
+    version_args: Option<Vec<String>>,
+}
+
+/// Where a tool comes from.
+enum Source<'a> {
+    Release { url: &'a str },
+    Crate { name: &'a str, sha256: &'a str },
+}
+
+/// The crates.io index file listing every version of `name`.
+fn index_url(name: &str) -> String {
+    let name = name.to_ascii_lowercase();
+    let prefix = match (name.len(), name.get(..1), name.get(..2), name.get(2..4)) {
+        (1, _, _, _) => "1".to_owned(),
+        (2, _, _, _) => "2".to_owned(),
+        (3, Some(first), _, _) => format!("3/{first}"),
+        (_, _, Some(first), Some(second)) => format!("{first}/{second}"),
+        _ => String::new(),
+    };
+    format!("https://index.crates.io/{prefix}/{name}")
+}
+
+/// One version's entry in the crates.io index.
+#[derive(Deserialize)]
+struct IndexEntry {
+    vers: String,
+    cksum: String,
 }
 
 /// A tool's release asset for one target.
@@ -133,6 +170,23 @@ impl Manifest {
         Ok(Self { tools: raw.tool })
     }
 
+    /// The tools named in `only`, or all of them when it is empty.
+    fn select(self, only: &[String]) -> anyhow::Result<Self> {
+        if only.is_empty() {
+            return Ok(self);
+        }
+        for name in only {
+            self.tool(name)?;
+        }
+        Ok(Self {
+            tools: self
+                .tools
+                .into_iter()
+                .filter(|tool| only.contains(&tool.name))
+                .collect(),
+        })
+    }
+
     pub(crate) fn tool(&self, name: &str) -> anyhow::Result<&Tool> {
         self.tools
             .iter()
@@ -162,7 +216,23 @@ impl Tool {
             "version {:?} must be ASCII letters, digits, '.', '+' or '-'",
             self.version
         );
-        ensure!(self.url.starts_with("https://"), "the url must use https");
+        if let Source::Crate { name, sha256 } = self.source()? {
+            ensure!(
+                name.split('-').all(is_safe_name),
+                "crate {name:?} must be a crates.io crate name"
+            );
+            ensure!(
+                is_sha256_hex(sha256),
+                "sha256 must be 64 lowercase hex digits"
+            );
+            return Ok(());
+        }
+        ensure!(
+            self.url
+                .as_deref()
+                .is_some_and(|url| url.starts_with("https://")),
+            "the url must use https"
+        );
         ensure!(
             self.checksums.is_some() || self.attestations.is_some(),
             "needs `checksums` or `attestations`: no tool's pin may rest on its first download"
@@ -197,7 +267,7 @@ impl Tool {
                     "{target}: {field} must be 64 lowercase hex digits"
                 );
             }
-            let url = self.render(&self.url, asset);
+            let url = self.render(self.url.as_deref().unwrap_or_default(), asset);
             let binary = self
                 .binary
                 .as_ref()
@@ -230,6 +300,55 @@ impl Tool {
             );
         }
         Ok(())
+    }
+
+    fn source(&self) -> anyhow::Result<Source<'_>> {
+        match (&self.url, &self.crate_name, &self.sha256) {
+            (Some(url), None, None) => Ok(Source::Release { url }),
+            (None, Some(name), Some(sha256))
+                if self.targets.is_empty()
+                    && self.binary.is_none()
+                    && self.checksums.is_none()
+                    && self.attestations.is_none() =>
+            {
+                Ok(Source::Crate { name, sha256 })
+            }
+            _ => bail!(
+                "set either `url` with `targets` for release assets, or `crate` with `sha256` \
+                 alone for a crate built from crates.io"
+            ),
+        }
+    }
+
+    /// Where to download the tool for `target`: its release asset or its `.crate` file.
+    fn download_url(&self, target: Target) -> anyhow::Result<String> {
+        Ok(match self.source()? {
+            Source::Release { url } => self.render(url, self.asset(target)?),
+            Source::Crate { name, .. } => format!(
+                "https://static.crates.io/crates/{name}/{name}-{}.crate",
+                self.version
+            ),
+        })
+    }
+
+    /// The sha256 the installed executable must have: pinned for a release, recorded at
+    /// install for a crate, whose build is local. `None` when nothing was recorded.
+    fn executable_pin(&self, root: &Path, target: Target) -> anyhow::Result<Option<String>> {
+        match self.source()? {
+            Source::Release { .. } => Ok(Some(self.asset(target)?.binary_sha256.clone())),
+            Source::Crate { .. } => {
+                let record = self.recorded_sha256(root);
+                Ok(fs::read_to_string(&record)
+                    .ok()
+                    .map(|text| text.trim().to_owned()))
+            }
+        }
+    }
+
+    fn recorded_sha256(&self, root: &Path) -> PathBuf {
+        let mut record = self.executable(root).into_os_string();
+        record.push(".sha256");
+        PathBuf::from(record)
     }
 
     fn asset(&self, target: Target) -> anyhow::Result<&Asset> {
@@ -269,11 +388,18 @@ impl Tool {
             self.name,
             self.version
         );
-        let pinned = &self.asset(Target::host()?)?.binary_sha256;
+        let pinned = self
+            .executable_pin(root, Target::host()?)?
+            .with_context(|| {
+                format!(
+                    "{} has no recorded sha256: run `cargo xtask setup`",
+                    self.name
+                )
+            })?;
         let actual = file_sha256(&executable)?;
         ensure!(
-            actual == *pinned,
-            "{} has sha256 {actual}, but {MANIFEST} pins {pinned}: run `cargo xtask setup`",
+            actual == pinned,
+            "{} has sha256 {actual}, but its pin is {pinned}: run `cargo xtask setup`",
             executable.display()
         );
         Ok(executable)
@@ -285,11 +411,15 @@ impl Tool {
             return Ok(Status::Missing);
         }
         let sha256 = file_sha256(&executable)?;
-        if sha256 != self.asset(target)?.binary_sha256 {
+        if self.executable_pin(root, target)?.as_deref() != Some(sha256.as_str()) {
             return Ok(Status::Modified { sha256 });
         }
+        let version_args = self
+            .version_args
+            .clone()
+            .unwrap_or_else(|| vec!["--version".to_owned()]);
         let output = Command::new(&executable)
-            .arg("--version")
+            .args(version_args)
             .output()
             .with_context(|| format!("could not run {} --version", executable.display()))?;
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -346,9 +476,9 @@ enum Status {
     },
 }
 
-/// `cargo xtask setup`: installs every pinned tool that is missing or drifted.
-pub(crate) fn setup(root: &Path, out: &mut impl Write) -> anyhow::Result<()> {
-    let manifest = Manifest::load(root)?;
+/// `cargo xtask setup`: installs every pinned tool, or the `only` ones, that is missing or drifted.
+pub(crate) fn setup(root: &Path, only: &[String], out: &mut impl Write) -> anyhow::Result<()> {
+    let manifest = Manifest::load(root)?.select(only)?;
     install_unready(root, &manifest, Target::host()?, out, &mut download)
 }
 
@@ -365,7 +495,7 @@ fn install_unready(
         if tool.status(root, target)? == Status::Ready {
             writeln!(out, "ok       {} {}", tool.name, tool.version)?;
         } else {
-            let url = tool.render(&tool.url, tool.asset(target)?);
+            let url = tool.download_url(target)?;
             writeln!(out, "install  {} {} from {url}", tool.name, tool.version)?;
             install(root, tool, target, &fetch(&url)?)?;
         }
@@ -374,9 +504,14 @@ fn install_unready(
     Ok(())
 }
 
-/// `cargo xtask doctor`: reports each tool's state and fails unless all are ready.
-pub(crate) fn doctor(root: &Path, out: &mut impl Write) -> anyhow::Result<ExitCode> {
-    let manifest = Manifest::load(root)?;
+/// `cargo xtask doctor`: reports the state of each tool, or the `only` ones, and fails unless all
+/// are ready.
+pub(crate) fn doctor(
+    root: &Path,
+    only: &[String],
+    out: &mut impl Write,
+) -> anyhow::Result<ExitCode> {
+    let manifest = Manifest::load(root)?.select(only)?;
     report(root, &manifest, Target::host()?, out)
 }
 
@@ -398,10 +533,11 @@ fn report(
                 ready = false;
                 writeln!(
                     out,
-                    "modified {} {}: the installed binary has sha256 {sha256}, {MANIFEST} pins {}",
+                    "modified {} {}: the installed binary has sha256 {sha256}, its pin is {}",
                     tool.name,
                     tool.version,
-                    tool.asset(target)?.binary_sha256
+                    tool.executable_pin(root, target)?
+                        .unwrap_or_else(|| "missing".to_owned())
                 )?;
             }
             Status::Drift { reported } => {
@@ -446,9 +582,26 @@ fn pin_text(
     let mut document: DocumentMut = text.parse()?;
     let mut published: BTreeMap<String, String> = BTreeMap::new();
     for tool in &manifest.tools {
+        if let Source::Crate {
+            name,
+            sha256: pinned,
+        } = tool.source()?
+        {
+            let sha256 = sha256_hex(&fetch(&tool.download_url(Target::MacArm64)?)?);
+            check_indexed(name, &tool.version, &sha256, fetch)
+                .with_context(|| format!("{} {}", tool.name, tool.version))?;
+            let state = if sha256 == pinned { "same" } else { "changed" };
+            writeln!(
+                out,
+                "{state:<8} {} {}: matches the crates.io index",
+                tool.name, tool.version
+            )?;
+            set_crate_pin(&mut document, &tool.name, &sha256)?;
+            continue;
+        }
         for target in Target::ALL {
             let asset = tool.asset(target)?;
-            let url = tool.render(&tool.url, asset);
+            let url = tool.download_url(target)?;
             let archive = fetch(&url)?;
             let sha256 = sha256_hex(&archive);
             let mut sources = Vec::new();
@@ -512,6 +665,28 @@ fn check_published(
     ensure!(
         expected == sha256,
         "the download's sha256 is {sha256}, but {checksums_url} publishes {expected}"
+    );
+    Ok(())
+}
+
+/// Requires the crates.io index to record `sha256` for version `version` of crate `name`.
+fn check_indexed(
+    name: &str,
+    version: &str,
+    sha256: &str,
+    fetch: &mut impl FnMut(&str) -> anyhow::Result<Vec<u8>>,
+) -> anyhow::Result<()> {
+    let url = index_url(name);
+    let listing = String::from_utf8(fetch(&url)?).with_context(|| format!("{url} is not text"))?;
+    let entry = listing
+        .lines()
+        .filter_map(|line| serde_json::from_str::<IndexEntry>(line).ok())
+        .find(|entry| entry.vers == version)
+        .with_context(|| format!("the crates.io index has no {name} {version}"))?;
+    ensure!(
+        entry.cksum == sha256,
+        "the download's sha256 is {sha256}, but the crates.io index records {}",
+        entry.cksum
     );
     Ok(())
 }
@@ -608,8 +783,27 @@ fn sha256_hex(bytes: &[u8]) -> String {
     hex
 }
 
-/// Verifies `archive` and installs the tool's executable from it.
-fn install(root: &Path, tool: &Tool, target: Target, archive: &[u8]) -> anyhow::Result<()> {
+/// Verifies a downloaded release asset or `.crate` file and installs the tool's executable from
+/// it.
+fn install(root: &Path, tool: &Tool, target: Target, download: &[u8]) -> anyhow::Result<()> {
+    let binary = match tool.source()? {
+        Source::Release { .. } => verified_release(tool, target, download)?,
+        Source::Crate { name, sha256 } => {
+            let actual = sha256_hex(download);
+            ensure!(
+                actual == sha256,
+                "sha256 mismatch for the {name} {} crate: {MANIFEST} pins {sha256}, the download is \
+                 {actual}. If the version changed, run `cargo xtask pin`.",
+                tool.version
+            );
+            build_crate(root, tool, name, download)?
+        }
+    };
+    place(root, tool, target, &binary)
+}
+
+/// The executable in a verified release asset.
+fn verified_release(tool: &Tool, target: Target, archive: &[u8]) -> anyhow::Result<Vec<u8>> {
     let asset = tool.asset(target)?;
     let actual = sha256_hex(archive);
     ensure!(
@@ -630,7 +824,46 @@ fn install(root: &Path, tool: &Tool, target: Target, archive: &[u8]) -> anyhow::
         tool.version,
         asset.binary_sha256
     );
+    Ok(binary)
+}
 
+/// Builds the executable of `tool` from the verified `.crate` file of crate `name`, with the
+/// crate's own lockfile.
+fn build_crate(root: &Path, tool: &Tool, name: &str, archive: &[u8]) -> anyhow::Result<Vec<u8>> {
+    let work = root
+        .join(TOOLS_DIR)
+        .join(&tool.name)
+        .join(format!("{}.build", tool.version));
+    remove_dir_if_present(&work)?;
+    let sources = work.join("src");
+    fs::create_dir_all(&sources)
+        .with_context(|| format!("could not create {}", sources.display()))?;
+    tar::Archive::new(GzDecoder::new(archive))
+        .unpack(&sources)
+        .context("the crate is not a gzipped tarball")?;
+    let status = Command::new(crate::check::cargo())
+        .args(["install", "--locked", "--quiet", "--path"])
+        .arg(sources.join(format!("{name}-{}", tool.version)))
+        .arg("--root")
+        .arg(work.join("root"))
+        .arg("--target-dir")
+        .arg(work.join("target"))
+        .current_dir(&work)
+        .status()
+        .context("could not run cargo install")?;
+    ensure!(
+        status.success(),
+        "cargo install of {name} {} failed",
+        tool.version
+    );
+    let built = work.join("root/bin").join(&tool.name);
+    let binary = fs::read(&built).with_context(|| format!("could not read {}", built.display()))?;
+    remove_dir_if_present(&work)?;
+    Ok(binary)
+}
+
+/// Installs `binary` as the tool's executable and checks it.
+fn place(root: &Path, tool: &Tool, target: Target, binary: &[u8]) -> anyhow::Result<()> {
     let tool_dir = root.join(TOOLS_DIR).join(&tool.name);
     let staging = tool_dir.join(format!("{}.partial", tool.version));
     let destination = tool_dir.join(&tool.version);
@@ -642,6 +875,12 @@ fn install(root: &Path, tool: &Tool, target: Target, archive: &[u8]) -> anyhow::
         .with_context(|| format!("could not write {}", executable.display()))?;
     fs::set_permissions(&executable, Permissions::from_mode(0o755))
         .with_context(|| format!("could not make {} executable", executable.display()))?;
+    if let Source::Crate { .. } = tool.source()? {
+        let mut record = executable.into_os_string();
+        record.push(".sha256");
+        fs::write(PathBuf::from(record), sha256_hex(binary))
+            .context("could not record the executable's sha256")?;
+    }
     remove_dir_if_present(&destination)?;
     fs::rename(&staging, &destination)
         .with_context(|| format!("could not move {} into place", staging.display()))?;
@@ -705,6 +944,23 @@ fn remove_dir_if_present(path: &Path) -> anyhow::Result<()> {
     if path.exists() {
         fs::remove_dir_all(path).with_context(|| format!("could not remove {}", path.display()))?;
     }
+    Ok(())
+}
+
+/// Sets a crate tool's `sha256` pin in the tool list document.
+fn set_crate_pin(document: &mut DocumentMut, name: &str, sha256: &str) -> anyhow::Result<()> {
+    let value = document
+        .get_mut("tool")
+        .and_then(toml_edit::Item::as_array_of_tables_mut)
+        .context("the tool list has no [[tool]] tables")?
+        .iter_mut()
+        .find(|tool| tool.get("name").and_then(toml_edit::Item::as_str) == Some(name))
+        .and_then(|tool| tool.get_mut("sha256"))
+        .and_then(toml_edit::Item::as_value_mut)
+        .with_context(|| format!("the tool list has no sha256 for {name}"))?;
+    let decor = value.decor().clone();
+    *value = sha256.into();
+    *value.decor_mut() = decor;
     Ok(())
 }
 
@@ -845,6 +1101,8 @@ targets.aarch64-unknown-linux-gnu = {{ platform = "linux-arm64", sha256 = "{sha2
             "pinact",
             "gitleaks",
             "osv-scanner",
+            "cargo-llvm-cov",
+            "cargo-mutants",
         ] {
             manifest.tool(name).unwrap();
         }
@@ -856,7 +1114,7 @@ targets.aarch64-unknown-linux-gnu = {{ platform = "linux-arm64", sha256 = "{sha2
         let tool = only_tool(&manifest);
         let asset = tool.asset(Target::LinuxX64).unwrap();
         assert_eq!(
-            tool.render(&tool.url, asset),
+            tool.download_url(Target::LinuxX64).unwrap(),
             "https://example.com/fake-1.2.3-linux-x64.tar.gz",
             "placeholders are filled in"
         );
@@ -1279,6 +1537,172 @@ targets.aarch64-unknown-linux-gnu = {{ platform = "linux-arm64", sha256 = "{sha2
         let malformed = manifest_text(SHA_A, SHA_B).replace("\"example/fake\"", "\"example\"");
         let invalid = format!("{:#}", Manifest::parse(&malformed).unwrap_err());
         assert!(invalid.contains("owner/repo"), "{invalid}");
+    }
+
+    fn crate_manifest(sha256: &str) -> String {
+        format!(
+            "[[tool]]\nname = \"fake\"\nversion = \"1.2.3\"\ncrate = \"fake\"\nsha256 = \"{sha256}\"\n"
+        )
+    }
+
+    /// The `.crate` file of a binary crate `fake` 1.2.3 that prints its version.
+    fn fake_crate() -> Vec<u8> {
+        tarball(&[
+            (
+                "fake-1.2.3/Cargo.toml",
+                b"[package]\nname = \"fake\"\nversion = \"1.2.3\"\nedition = \"2021\"\n",
+                0o644,
+            ),
+            (
+                "fake-1.2.3/Cargo.lock",
+                b"version = 3\n\n[[package]]\nname = \"fake\"\nversion = \"1.2.3\"\n",
+                0o644,
+            ),
+            (
+                "fake-1.2.3/src/main.rs",
+                b"fn main() {\n    println!(\"fake 1.2.3\");\n}\n",
+                0o644,
+            ),
+        ])
+    }
+
+    #[test]
+    fn crate_tools_are_validated() {
+        Manifest::parse(&crate_manifest(SHA_A)).unwrap();
+        let mixed = crate_manifest(SHA_A).replace("crate =", "url = \"https://x\"\ncrate =");
+        assert!(
+            format!("{:#}", Manifest::parse(&mixed).unwrap_err()).contains("set either `url`"),
+            "a tool is a release or a crate, not both"
+        );
+        assert!(
+            format!("{:#}", Manifest::parse(&crate_manifest("abc")).unwrap_err())
+                .contains("sha256 must be"),
+            "the crate's sha256 is checked"
+        );
+    }
+
+    #[test]
+    fn index_urls_follow_the_crates_io_layout() {
+        assert_eq!(
+            super::index_url("a"),
+            "https://index.crates.io/1/a",
+            "one letter"
+        );
+        assert_eq!(
+            super::index_url("ab"),
+            "https://index.crates.io/2/ab",
+            "two"
+        );
+        assert_eq!(
+            super::index_url("abc"),
+            "https://index.crates.io/3/a/abc",
+            "three"
+        );
+        assert_eq!(
+            super::index_url("Cargo-Mutants"),
+            "https://index.crates.io/ca/rg/cargo-mutants",
+            "four or more, lowercased"
+        );
+    }
+
+    #[test]
+    fn pin_checks_a_crate_against_the_crates_io_index() {
+        let archive = fake_crate();
+        let sha256 = sha256_hex(&archive);
+        let serve = |cksum: String| {
+            let archive = archive.clone();
+            move |url: &str| {
+                Ok(if url.starts_with("https://index.crates.io/") {
+                    format!("{{\"vers\":\"1.0.0\",\"cksum\":\"{SHA_B}\"}}\n{{\"vers\":\"1.2.3\",\"cksum\":\"{cksum}\"}}\n")
+                        .into_bytes()
+                } else {
+                    assert_eq!(
+                        url, "https://static.crates.io/crates/fake/fake-1.2.3.crate",
+                        "the crate is downloaded from crates.io"
+                    );
+                    archive.clone()
+                })
+            }
+        };
+        let mut out = Vec::new();
+        let pinned =
+            pin_text(&crate_manifest(SHA_A), &mut out, &mut serve(sha256.clone())).unwrap();
+        assert_eq!(
+            pinned,
+            crate_manifest(&sha256),
+            "the crate's sha256 is pinned"
+        );
+        assert!(
+            String::from_utf8(out)
+                .unwrap()
+                .contains("matches the crates.io index"),
+            "and reported as verified"
+        );
+        let error = pin_text(
+            &crate_manifest(SHA_A),
+            &mut Vec::new(),
+            &mut serve(SHA_B.to_owned()),
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("the crates.io index records"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn installs_a_crate_tool_by_building_it() {
+        let root = tempfile::tempdir().unwrap();
+        let archive = fake_crate();
+        let manifest = Manifest::parse(&crate_manifest(&sha256_hex(&archive))).unwrap();
+        assert_eq!(install_from(root.path(), &manifest, &archive), 1, "built");
+        let tool = only_tool(&manifest);
+        assert_eq!(
+            tool.status(root.path(), Target::MacArm64).unwrap(),
+            Status::Ready,
+            "the built executable reports its version and matches its recorded sha256"
+        );
+        assert!(
+            !root.path().join(".tools/fake/1.2.3.build").exists(),
+            "the build directory is removed"
+        );
+        write_executable(
+            &root.path().join(".tools/fake/1.2.3/fake"),
+            b"#!/bin/sh\necho 'fake 1.2.3'\n",
+        );
+        assert!(
+            matches!(
+                tool.status(root.path(), Target::MacArm64).unwrap(),
+                Status::Modified { .. }
+            ),
+            "a swapped build is caught by its recorded sha256"
+        );
+        let tampered = Manifest::parse(&crate_manifest(SHA_A)).unwrap();
+        let error = install(
+            root.path(),
+            only_tool(&tampered),
+            Target::MacArm64,
+            &archive,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("sha256 mismatch for the fake 1.2.3 crate"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn setup_and_doctor_can_select_tools() {
+        let manifest = Manifest::parse(&manifest_text(SHA_A, SHA_B)).unwrap();
+        let only = vec!["fake".to_owned()];
+        assert_eq!(manifest.select(&only).unwrap().tools.len(), 1, "selected");
+        let error = Manifest::parse(&manifest_text(SHA_A, SHA_B))
+            .unwrap()
+            .select(&["other".to_owned()])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("other is not a pinned tool"), "{error}");
     }
 
     #[test]

@@ -206,7 +206,7 @@ fn test_command(nextest: &Path, scope: &Scope) -> Command {
 }
 
 /// Cargo as chosen by `cargo xtask`, so every step uses the pinned toolchain.
-fn cargo() -> OsString {
+pub(crate) fn cargo() -> OsString {
     std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into())
 }
 

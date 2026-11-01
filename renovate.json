@@ -45,6 +45,16 @@
       "datasourceTemplate": "github-releases",
       "extractVersionTemplate": "^{{{tagPrefix}}}(?<version>.+)$",
       "versioningTemplate": "semver"
+    },
+    {
+      "customType": "regex",
+      "description": "Pinned tools in xtask/tools.toml built from crates.io.",
+      "managerFilePatterns": ["/^xtask/tools\\.toml$/"],
+      "matchStrings": [
+        "version = \"(?<currentValue>[^\"]+)\"\\n(?:#[^\\n]*\\n)*crate = \"(?<depName>[^\"]+)\""
+      ],
+      "datasourceTemplate": "crate",
+      "versioningTemplate": "semver"
     }
   ]
 }

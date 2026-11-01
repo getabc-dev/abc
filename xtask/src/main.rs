@@ -34,9 +34,15 @@ enum Task {
         changed: bool,
     },
     /// Install the tools pinned in xtask/tools.toml into .tools/, verifying each download.
-    Setup,
-    /// Check that every pinned tool is installed at its pinned version.
-    Doctor,
+    Setup {
+        /// Install only these tools; all of them when none are named.
+        tools: Vec<String>,
+    },
+    /// Check that every pinned tool, or each one named, is installed at its pinned version.
+    Doctor {
+        /// Check only these tools; all of them when none are named.
+        tools: Vec<String>,
+    },
     /// Record the sha256 of every pinned tool's archive for every target in xtask/tools.toml.
     Pin,
     /// Run a pinned tool from .tools/ in the repository root.
@@ -94,11 +100,11 @@ fn run(task: Task) -> anyhow::Result<ExitCode> {
                 ExitCode::FAILURE
             })
         }
-        Task::Setup => {
-            tools::setup(&root, &mut io::stdout().lock())?;
+        Task::Setup { tools: only } => {
+            tools::setup(&root, &only, &mut io::stdout().lock())?;
             Ok(ExitCode::SUCCESS)
         }
-        Task::Doctor => tools::doctor(&root, &mut io::stdout().lock()),
+        Task::Doctor { tools: only } => tools::doctor(&root, &only, &mut io::stdout().lock()),
         Task::Pin => {
             tools::pin(&root, &mut io::stdout().lock())?;
             Ok(ExitCode::SUCCESS)
