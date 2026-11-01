@@ -91,6 +91,19 @@ impl Context {
 #[derive(Deserialize)]
 struct HookInput {
     cwd: Option<PathBuf>,
+    /// `Stop` or `SubagentStop` for the stop hook.
+    hook_event_name: Option<String>,
+    /// Whether the agent is already working on because a stop hook blocked it.
+    #[serde(default)]
+    stop_hook_active: bool,
+}
+
+impl HookInput {
+    /// Whether the watchdog judges this stop: the main agent's own, and not one a stop hook has
+    /// already sent back to work, so the watchdog can never keep an agent going forever.
+    fn watched(&self) -> bool {
+        self.hook_event_name.as_deref() == Some("Stop") && !self.stop_hook_active
+    }
 }
 
 /// Where the agent is working, relative to this checkout.
@@ -152,8 +165,8 @@ fn guard_unavailable(reason: &str, input: &str, out: &mut impl Write) -> anyhow:
 
 /// Finds where the agent works and runs the hook there.
 fn act(event: Event, input: &str, context: &Context, out: &mut impl Write) -> anyhow::Result<u8> {
-    let cwd = match (event, serde_json::from_str::<HookInput>(input)) {
-        (_, Ok(fields)) => fields.cwd,
+    let fields = match (event, serde_json::from_str::<HookInput>(input)) {
+        (_, Ok(fields)) => fields,
         // The guard blocks input it cannot read and gives the parse error as the reason.
         (Event::PreToolUse, Err(_)) => return guard(input, out),
         (Event::Stop, Err(error)) => {
@@ -161,7 +174,7 @@ fn act(event: Event, input: &str, context: &Context, out: &mut impl Write) -> an
         }
     };
     let location = locate(
-        cwd.as_deref(),
+        fields.cwd.as_deref(),
         context.project_dir.as_deref(),
         &context.own_root,
     )?;
@@ -176,7 +189,11 @@ fn act(event: Event, input: &str, context: &Context, out: &mut impl Write) -> an
                     &tools::pinned(&context.own_root, "cargo-nextest")?,
                     out,
                 )? {
-                    watchdog::check(&context.own_root, &context.claude, watchdog::TIMEOUT, out)
+                    if fields.watched() {
+                        watchdog::check(&context.own_root, &context.claude, watchdog::TIMEOUT, out)
+                    } else {
+                        Ok(0)
+                    }
                 } else {
                     Ok(1)
                 }
@@ -915,6 +932,24 @@ mod tests {
         let input = r#"{"tool_name":"Bash","tool_input":{"command":"git push -f"}}"#;
         assert_eq!(run_hook_script(2, input).0, Some(2), "a block");
         assert_eq!(run_hook_script(0, input).0, Some(0), "an allow");
+    }
+
+    #[test]
+    fn the_watchdog_judges_only_the_main_agents_first_stop() {
+        let fields = |json: &str| serde_json::from_str::<super::HookInput>(json).unwrap();
+        assert!(
+            fields(r#"{"hook_event_name": "Stop", "stop_hook_active": false}"#).watched(),
+            "the main agent stopping"
+        );
+        assert!(
+            !fields(r#"{"hook_event_name": "Stop", "stop_hook_active": true}"#).watched(),
+            "an agent a stop hook already sent back is never blocked again"
+        );
+        assert!(
+            !fields(r#"{"hook_event_name": "SubagentStop"}"#).watched(),
+            "subagents have no task of their own"
+        );
+        assert!(!fields("{}").watched(), "an unnamed event is not watched");
     }
 
     #[test]

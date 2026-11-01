@@ -127,11 +127,13 @@ fn prompt(root: &Path, task: &str) -> anyhow::Result<String> {
     ))
 }
 
-/// Runs `claude -p` with `prompt` on stdin, hooks off, and returns what it prints.
+/// Runs `claude -p` with `prompt` on stdin, hooks and tools off, and returns what it prints.
 fn ask(claude: &Path, root: &Path, prompt: &str, timeout: Duration) -> anyhow::Result<String> {
     let mut child = Command::new(claude)
         .args(["-p", "--model", MODEL, "--output-format", "json"])
         .args(["--settings", r#"{"disableAllHooks": true}"#])
+        // The diff is untrusted, so the watchdog's claude gets no tools to act on it with.
+        .args(["--tools", ""])
         .env(GUARD, "1")
         .current_dir(root)
         .stdin(Stdio::piped())
@@ -197,7 +199,7 @@ mod tests {
     fn fake_claude(dir: &Path, envelope: &str) -> PathBuf {
         let path = dir.join("claude");
         fs::write(&path, format!(
-            "#!/bin/sh\ncase \"$*\" in *disableAllHooks*) ;; *) exit 9 ;; esac\n[ \"$ABC_WATCHDOG\" = 1 ] || exit 8\ncat > \"$(dirname \"$0\")/prompt.txt\"\ncat <<'JSON'\n{envelope}\nJSON\n"
+            "#!/bin/sh\ncase \"$*\" in *disableAllHooks*) ;; *) exit 9 ;; esac\n[ \"$ABC_WATCHDOG\" = 1 ] || exit 8\nprevious=\nfor argument; do [ \"$previous\" = --tools ] && [ -z \"$argument\" ] && toolless=1; previous=$argument; done\n[ \"$toolless\" = 1 ] || exit 10\ncat > \"$(dirname \"$0\")/prompt.txt\"\ncat <<'JSON'\n{envelope}\nJSON\n"
         ))
         .unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
