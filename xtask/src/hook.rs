@@ -10,6 +10,9 @@
 //!   repository, so the checkout is held to its own toolchain, tools and gate;
 //! - does nothing when the directory is in no repository, or in a different one.
 //!
+//! The `PreToolUse` guard catches accidents; it is not the enforcement. GitHub rulesets on `main`
+//! (no force push, no deletion, required checks) and the abc-agent App's limited permissions are.
+//!
 //! When the `PreToolUse` guard cannot run, it blocks commands that mention git or gh and lets the
 //! rest through, so a broken build never locks the agent out of the shell. When xtask cannot even
 //! start, `xtask/hooks/pre-tool-use.sh` applies the same rule.

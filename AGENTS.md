@@ -114,8 +114,10 @@ cargo-shear --deny-warnings --locked`, `cargo xtask tool osv-scanner scan source
 Cargo.lock`, `cargo xtask tool zizmor --pedantic .github`, `cargo xtask tool pinact run --check
 --verify-comment` and `cargo xtask tool gitleaks git --redact --no-banner .`.
 
-The git guard in the agent hooks blocks force pushes and git or gh commands it cannot read, but
-it is best effort: branch protection on GitHub is the real gate.
+The git guard in the agent hooks catches accidents: force pushes, and git or gh commands it
+cannot read. It cannot stop a deliberate bypass, since no text check of a shell command can, and it
+does not try to. Enforcement is on GitHub: rulesets on `main` forbid force pushes and deletion and
+require the checks, and agents push as the abc-agent GitHub App with limited permissions.
 
 Commit the `proptest-regressions/` files proptest writes when a property test fails: they replay
 the failing cases first on every run.

@@ -1,11 +1,16 @@
 //! The Claude Code `PreToolUse` hook for Bash and Monitor: blocks force pushes, and git and gh
 //! commands it cannot check.
 //!
-//! The guard is best effort; branch protection on GitHub is the real gate. It lexes the command
+//! The guard catches accidents, not attacks: no text check of a shell command can be complete,
+//! because the shell can build any command at run time. Enforcement is on GitHub, where rulesets
+//! on `main` forbid force pushes and deletion and require the checks, and agents push as the
+//! abc-agent App with limited permissions. So the guard keeps to rules a confused agent could
+//! plausibly trip, and does not chase every bypass. It lexes the command
 //! with [`crate::shell`] and looks at every git and gh invocation, including ones nested in
 //! substitutions, `sh -c` scripts and `eval`. It blocks:
 //!
-//! - force pushes: `git push` with `--force` or a variant, `-f`, `--mirror` or a `+refspec`;
+//! - force pushes: `git push` or `git send-pack` with `--force` or a variant, `-f`, `--mirror`
+//!   or a `+refspec`, long options written as any prefix git accepts;
 //!   `gh api` calls that force a ref; `gh repo sync --force`;
 //! - commands that could hide one: a `git push` or `gh api` whose arguments come from variables,
 //!   command output or xargs; a git subcommand or global option built at run time; aliases and
@@ -284,7 +289,7 @@ fn git_violation(words: &[Word]) -> Option<Violation> {
     };
     let rest: Vec<&Word> = args.collect();
     match subcommand.text.as_str() {
-        "push" => push_violation(&rest, fed),
+        "push" | "send-pack" => push_violation(&rest, fed),
         "config" if rest.iter().any(|word| word.dynamic) => Some(unreadable(
             "a git config whose arguments come from variables or command output",
         )),
@@ -386,14 +391,16 @@ fn sets_force(arg: &str) -> bool {
         || compact.contains("\"force\":true")
 }
 
-/// `--force`, `--force-with-lease`, `--force-if-includes`, their prefixes, and `--mirror`, which
-/// force-updates every remote ref. Git accepts any unambiguous prefix of a long option.
+/// `--force`, `--force-with-lease`, `--force-if-includes` and `--mirror`, which force-updates every
+/// remote ref, written as any prefix git accepts: git takes an unambiguous prefix of a long option.
+/// `--for` is the shortest force prefix (`--fo` could be `--follow-tags`); any prefix of
+/// `--mirror` is unambiguous, down to `--m`.
 fn is_force(name: &str) -> bool {
     let force = name.starts_with("for")
         && ["force", "force-with-lease", "force-if-includes"]
             .iter()
             .any(|option| option.starts_with(name));
-    let mirror = name.len() >= "mir".len() && "mirror".starts_with(name);
+    let mirror = !name.is_empty() && "mirror".starts_with(name);
     force || mirror
 }
 
@@ -508,6 +515,11 @@ mod tests {
             &force("--force-if-includes"),
         );
         assert_blocked("git push --mirror backup", &force("--mirror"));
+        assert_blocked("git push --m backup", &force("--m"));
+        assert_blocked("git push --mi backup", &force("--mi"));
+        assert_blocked("git send-pack --force remote main", &force("--force"));
+        assert_blocked("git send-pack --mirr remote", &force("--mirr"));
+        assert_blocked("git send-pack remote +main", &force("+main"));
         assert_blocked("git push origin +main", &force("+main"));
         assert_blocked(
             "git push origin +HEAD:refs/heads/main",
@@ -630,6 +642,8 @@ mod tests {
             "git push -o ci.skip origin main",
             "git push -of origin main",
             "git push --no-force-with-lease",
+            "git push --follow-tags origin main",
+            "git send-pack remote main",
             "git push origin :stale-branch",
             "git log -n 3",
             "git fetch -f",
