@@ -33,11 +33,15 @@ abc-store = { path = "../abc-store", features = ["testing"] }
 http-body-util.workspace = true
 hyper = { workspace = true, features = ["client", "http1"] }
 hyper-util.workspace = true
+# Only for the opt-in Tailscale passthrough test (tests/tailscale.rs), which speaks TLS to Serve.
+rustls.workspace = true
 semver.workspace = true
 # Only for the #[sqlx::test] attribute (a fresh migrated database per test, D7) and its pool.
 sqlx.workspace = true
 tempfile.workspace = true
+tokio-rustls.workspace = true
 tokio-tungstenite.workspace = true
+webpki-roots.workspace = true
 
 [lints]
 workspace = true

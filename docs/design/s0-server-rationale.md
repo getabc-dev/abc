@@ -1,7 +1,7 @@
 # S0 PR 3 "Server": design rationale
 
-Status: sketch for agreement (architect phases A and B). Types and signatures are in `crates/`;
-bodies are `unimplemented!()` or pseudocode. Nothing here is implemented.
+Status: agreed on 1 Nov 2026 and implemented in PR 3. The sections below are the design as agreed;
+"Implementation notes" at the end records where the code differs and why.
 
 ## Problem
 
@@ -462,3 +462,36 @@ The orchestrator settled the rest by default:
 - Duplicate crate versions: our pins are aligned with sqlx's, and any remaining duplicates get skip entries in deny.toml, each with a date.
 - `axum::serve` is added to the disallowed methods. That change goes through the gate-file review.
 - The Tailscale `unix:` passthrough for WebSocket and SSE is checked before anything else in PR 3. If it fails, PR 3 stops for a decision; it does not fall back to loopback.
+
+## Implementation notes (PR 3)
+
+Where the code differs from the sketch above, and why:
+
+- **No `OwnerOnly`.** With `Owner` as the only role, the matrix could never produce it, so the
+  denial and its `ApiCode` are gone (S4). They return with the second role.
+- **`method_not_allowed`.** A route hit with the wrong method answers 405 with this code, in the
+  API's error format.
+- **Session admission.** A session records `StartSession` first and attaches second, and starts
+  are admitted one at a time in the process. Attaching first, as sketched, let the kicked older
+  session's `EndSession` commit before the newer start, and two simultaneous reconnects could
+  leave the view naming a closed session. Now the session recorded last is always the one
+  attached, and a kicked session's end always records nothing.
+- **`AccessEnded { head }`.** The message carries the head so its SSE `id:` is a position like
+  every other message's.
+- **Socket directory check.** `SidecarSocket::bind` refuses a directory with any "other"
+  permission bit, a missing directory and a non-socket file in the way. It does not compare the
+  directory's owner with the process's uid: the standard library has no `getuid`, and the mode
+  check is the boundary that matters.
+- **`Tailscale-User-Name` is not read.** The claim form sends the display name the owner typed.
+- **Middleware.** The request id (a `UUIDv7`, the events' correlation id), the request span and
+  the 30-second timeout on non-streaming routes are small axum middleware in `api`, so every
+  refusal keeps the API's error format; tower-http is not used.
+- **Configuration.** `ServerConfig` also carries `database_wait` (`ABC_DATABASE_WAIT`, default
+  60 seconds) and `link` (the worker link's handshake, ping and idle timings, the protocol's own
+  unless a test shortens them).
+- **Open question 8.** s0/gates had merged, so the `sqlx-cli` pin (`cargo-sqlx` in
+  `xtask/tools.toml`) and the query cache check (`cargo xtask check` runs `sqlx prepare --check`
+  for every crate with a `.sqlx/` against a fresh migrated database) land in this PR.
+- **Open question 10.** The Tailscale `unix:` passthrough check needs a tailnet auth key. Its
+  harness is opt-in (see `crates/abc-server/tests/tailscale.rs`); until it has run, the
+  passthrough of WebSocket upgrades and unbuffered SSE through the pinned image is unverified.
