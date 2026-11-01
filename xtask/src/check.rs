@@ -6,9 +6,10 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use anyhow::{Context, bail, ensure};
+use anyhow::{Context, ensure};
 use serde::Deserialize;
 
+use crate::git::{default_branch, git};
 use crate::tools::Manifest;
 
 /// Root files whose change can affect every crate.
@@ -25,11 +26,7 @@ const WORKSPACE_DIRS: [&str; 2] = [".cargo", ".config"];
 
 /// The seed for property tests run by the check, so a run can be repeated exactly. Plain
 /// `cargo test` keeps proptest's random seed and explores new cases.
-const PROPTEST_RNG_SEED: &str = "20261031";
-
-/// Remotes whose `HEAD` names the default branch `--changed` diffs against, in order of
-/// preference: a fork's `upstream`, then `origin`.
-const DEFAULT_BRANCH_REMOTES: [&str; 2] = ["upstream", "origin"];
+pub(crate) const PROPTEST_RNG_SEED: &str = "20261031";
 
 /// Which crates the lint, test and documentation steps cover.
 #[derive(Debug, PartialEq, Eq)]
@@ -315,26 +312,6 @@ fn changed_files(root: &Path) -> anyhow::Result<Vec<PathBuf>> {
     changed_since(root, merge_base.trim())
 }
 
-/// The remote-tracking ref of the repository's default branch, such as `refs/remotes/origin/main`.
-fn default_branch(root: &Path) -> anyhow::Result<String> {
-    for remote in DEFAULT_BRANCH_REMOTES {
-        let output = Command::new("git")
-            .args(["symbolic-ref", "--quiet"])
-            .arg(format!("refs/remotes/{remote}/HEAD"))
-            .current_dir(root)
-            .output()
-            .context("could not run git")?;
-        if output.status.success() {
-            let target = String::from_utf8(output.stdout).context("git printed a non-UTF-8 ref")?;
-            return Ok(target.trim().to_owned());
-        }
-    }
-    bail!(
-        "cannot tell this repository's default branch: neither upstream/HEAD nor origin/HEAD is \
-         set; run `git remote set-head origin --auto`"
-    )
-}
-
 /// Files changed since commit `base`: committed, staged, unstaged and untracked, including deleted
 /// ones but not ignored ones.
 fn changed_since(root: &Path, base: &str) -> anyhow::Result<Vec<PathBuf>> {
@@ -346,21 +323,6 @@ fn changed_since(root: &Path, base: &str) -> anyhow::Result<Vec<PathBuf>> {
         .filter(|path| !path.is_empty())
         .map(PathBuf::from)
         .collect())
-}
-
-fn git(root: &Path, args: &[&str]) -> anyhow::Result<String> {
-    let output = Command::new("git")
-        .args(args)
-        .current_dir(root)
-        .output()
-        .context("could not run git")?;
-    ensure!(
-        output.status.success(),
-        "git {} failed: {}",
-        args.join(" "),
-        String::from_utf8_lossy(&output.stderr).trim()
-    );
-    String::from_utf8(output.stdout).context("git printed paths that are not UTF-8")
 }
 
 /// The crates whose lints or tests the changed files can affect: the crates containing them and
@@ -414,9 +376,9 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        PROPTEST_RNG_SEED, Package, Scope, affected, changed_since, default_branch, run_scope,
-        test_command,
+        PROPTEST_RNG_SEED, Package, Scope, affected, changed_since, run_scope, test_command,
     };
+    use crate::git::default_branch;
     use crate::testing::{git, repository};
     use crate::tools::Manifest;
 

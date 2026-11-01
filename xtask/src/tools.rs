@@ -728,6 +728,19 @@ pub(crate) fn run(root: &Path, name: &str, args: &[OsString]) -> anyhow::Result<
     Ok(ExitCode::from(status_code(status)))
 }
 
+/// `PATH` with the directory of the installed tool `executable` first, for tools that run another
+/// as a cargo subcommand, such as cargo-llvm-cov running cargo-nextest.
+pub(crate) fn path_with(executable: &Path) -> anyhow::Result<OsString> {
+    let directory = executable
+        .parent()
+        .with_context(|| format!("{} has no directory", executable.display()))?;
+    let inherited = std::env::var_os("PATH").unwrap_or_default();
+    std::env::join_paths(
+        std::iter::once(directory.to_path_buf()).chain(std::env::split_paths(&inherited)),
+    )
+    .context("PATH holds a directory that cannot be joined")
+}
+
 /// The exit code that passes a child's status on; 1 when it has none, as after a signal.
 pub(crate) fn status_code(status: ExitStatus) -> u8 {
     status

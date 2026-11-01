@@ -1,8 +1,12 @@
 //! Repository automation for abc, run as `cargo xtask <command>`.
 
 mod check;
+mod coverage;
+mod git;
 mod guard;
 mod hook;
+mod integrity;
+mod mutants;
 mod shell;
 #[cfg(test)]
 mod testing;
@@ -32,6 +36,30 @@ enum Task {
         /// (upstream/HEAD, else origin/HEAD), including uncommitted and untracked files.
         #[arg(long)]
         changed: bool,
+    },
+    /// Run the tests under coverage and require 90% of the changed, instrumented lines covered.
+    Coverage {
+        /// The revision whose merge base with HEAD the diff starts from.
+        #[arg(long)]
+        base: String,
+    },
+    /// Run cargo-mutants on the Rust lines changed since the merge base and fail on missed mutants.
+    Mutants {
+        /// The revision whose merge base with HEAD the diff starts from.
+        #[arg(long)]
+        base: String,
+        /// How many mutants to build and test at once.
+        #[arg(long, default_value_t = 2)]
+        jobs: u32,
+    },
+    /// Report deleted, skipped or weakened tests and changed gate files since the merge base.
+    Integrity {
+        /// The revision whose merge base with HEAD the diff starts from.
+        #[arg(long)]
+        base: String,
+        /// In CI, the pull request whose `integrity-approved` label can accept the findings.
+        #[arg(long)]
+        pr: Option<u64>,
     },
     /// Install the tools pinned in xtask/tools.toml into .tools/, verifying each download.
     Setup {
@@ -94,6 +122,36 @@ fn run(task: Task) -> anyhow::Result<ExitCode> {
     match task {
         Task::Check { changed } => {
             let passed = check::run(&root, changed, &mut io::stderr().lock())?;
+            Ok(if passed {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            })
+        }
+        Task::Coverage { base } => {
+            let passed = coverage::run(&root, &base, &mut io::stderr().lock())?;
+            Ok(if passed {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            })
+        }
+        Task::Mutants { base, jobs } => {
+            let passed = mutants::run(&root, &base, jobs, &mut io::stderr().lock())?;
+            Ok(if passed {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            })
+        }
+        Task::Integrity { base, pr } => {
+            let pull_request = pr.map(integrity::PullRequest::from_env).transpose()?;
+            let passed = integrity::run(
+                &root,
+                &base,
+                pull_request.as_ref(),
+                &mut io::stderr().lock(),
+            )?;
             Ok(if passed {
                 ExitCode::SUCCESS
             } else {
