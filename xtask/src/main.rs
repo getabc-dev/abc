@@ -77,7 +77,7 @@ enum Task {
         #[arg(long)]
         base: String,
         /// How many mutants to build and test at once.
-        #[arg(long, default_value_t = 2)]
+        #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u32).range(1..))]
         jobs: u32,
     },
     /// Report deleted, skipped or weakened tests and changed gate files since the merge base.

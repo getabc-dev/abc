@@ -7,6 +7,7 @@
 //! and goes only where it is needed: to git through the credential-helper protocol, or to `gh` in
 //! `GH_TOKEN`. It is never printed or logged.
 
+use std::ffi::OsString;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -56,9 +57,14 @@ impl std::fmt::Debug for App {
 
 /// Where the App's files live: `$XDG_CONFIG_HOME/abc/agent-app`, else `~/.config/abc/agent-app`.
 pub(crate) fn config_dir() -> anyhow::Result<PathBuf> {
-    let base = match std::env::var_os("XDG_CONFIG_HOME") {
+    config_dir_from(|name| std::env::var_os(name))
+}
+
+/// [`config_dir`], with the environment read through `lookup`.
+fn config_dir_from(lookup: impl Fn(&str) -> Option<OsString>) -> anyhow::Result<PathBuf> {
+    let base = match lookup("XDG_CONFIG_HOME") {
         Some(dir) if !dir.is_empty() => PathBuf::from(dir),
-        _ => PathBuf::from(std::env::var_os("HOME").context("HOME is not set")?).join(".config"),
+        _ => PathBuf::from(lookup("HOME").context("HOME is not set")?).join(".config"),
     };
     Ok(base.join("abc/agent-app"))
 }
@@ -198,7 +204,7 @@ pub(crate) fn credential(
 /// `GH_TOKEN`.
 pub(crate) fn gh(
     program: &Path,
-    args: &[std::ffi::OsString],
+    args: &[OsString],
     token: &str,
 ) -> anyhow::Result<ExitCode> {
     let status = Command::new(program)
@@ -253,10 +259,39 @@ mod tests {
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use ring::signature::{RSA_PKCS1_2048_8192_SHA256, UnparsedPublicKey};
 
-    use super::{App, HELPER, HELPER_KEY, configure_git, credential, gh, parse_key};
+    use super::{
+        App, HELPER, HELPER_KEY, config_dir_from, configure_git, credential, gh, parse_key,
+    };
     use crate::testing::{git, repository};
 
     const KEY: &str = include_str!("../testdata/agent-app-test-key.pem");
+
+    #[test]
+    fn finds_the_config_under_xdg_or_home() {
+        let lookup = |xdg: Option<&'static str>| {
+            move |name: &str| match name {
+                "XDG_CONFIG_HOME" => xdg.map(Into::into),
+                "HOME" => Some("/home/a".into()),
+                _ => None,
+            }
+        };
+        assert_eq!(
+            config_dir_from(lookup(Some("/xdg"))).unwrap(),
+            Path::new("/xdg/abc/agent-app"),
+            "XDG_CONFIG_HOME first"
+        );
+        assert_eq!(
+            config_dir_from(lookup(Some(""))).unwrap(),
+            Path::new("/home/a/.config/abc/agent-app"),
+            "an empty XDG_CONFIG_HOME is unset"
+        );
+        assert_eq!(
+            config_dir_from(lookup(None)).unwrap(),
+            Path::new("/home/a/.config/abc/agent-app"),
+            "else ~/.config"
+        );
+        assert!(config_dir_from(|_| None).is_err(), "no HOME");
+    }
 
     /// An App configuration in a temporary directory, with the test key.
     fn app_dir() -> tempfile::TempDir {

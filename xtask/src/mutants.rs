@@ -18,8 +18,17 @@ use crate::tools::{self, Manifest};
 /// Where cargo-mutants writes its results, relative to the repository root.
 const OUTPUT: &str = "target/mutants";
 
-/// How much longer than the clean test run a mutant's tests may take before they count as hung.
-const TIMEOUT_MULTIPLIER: &str = "3";
+/// How much longer than the clean test run a mutant's tests may take before they count as hung,
+/// for each job: parallel jobs share the CPUs, so each test run slows by up to the number of jobs.
+const TIMEOUT_MULTIPLIER_PER_JOB: u32 = 3;
+
+/// The least time, in seconds, a mutant's tests get before they count as hung.
+const MINIMUM_TEST_TIMEOUT: &str = "60";
+
+/// The test timeout multiplier for `jobs` mutants tested at once.
+const fn timeout_multiplier(jobs: u32) -> u32 {
+    TIMEOUT_MULTIPLIER_PER_JOB.saturating_mul(jobs)
+}
 
 /// How cargo-mutants ended, from its exit code.
 #[derive(Debug, PartialEq, Eq)]
@@ -88,7 +97,9 @@ fn run_with(
         ])
         // The tests run the pinned tools in .tools/, which .gitignore lists; copy them too.
         .args(["--gitignore", "false"])
-        .args(["--timeout-multiplier", TIMEOUT_MULTIPLIER])
+        .arg("--timeout-multiplier")
+        .arg(timeout_multiplier(jobs).to_string())
+        .args(["--minimum-test-timeout", MINIMUM_TEST_TIMEOUT])
         .arg("--jobs")
         .arg(jobs.to_string())
         .arg("--output")
@@ -157,7 +168,7 @@ fn describe(result: &Outcome, missed: &[String], timed_out: &[String]) -> String
 mod tests {
     use std::fs;
 
-    use super::{Outcome, changes_rust, describe, listed, outcome, run_with};
+    use super::{Outcome, changes_rust, describe, listed, outcome, run_with, timeout_multiplier};
     use crate::testing::{repository_with_change, script};
 
     #[test]
@@ -180,6 +191,13 @@ mod tests {
             "documentation only"
         );
         assert!(!changes_rust(""), "no change");
+    }
+
+    #[test]
+    fn the_timeout_grows_with_the_jobs() {
+        assert_eq!(timeout_multiplier(1), 3, "one job");
+        assert_eq!(timeout_multiplier(4), 12, "four jobs share the CPUs");
+        assert_eq!(timeout_multiplier(u32::MAX), u32::MAX, "never overflows");
     }
 
     #[test]
@@ -213,7 +231,7 @@ mod tests {
         let missing = temp.path().join("cargo-mutants");
         script(
             &missing,
-            "[ \"$1\" = mutants ] || exit 7\nwhile [ $# -gt 0 ]; do case \"$1\" in --output) out=$2 ;; --in-diff) diff=$2 ;; esac; shift; done\ngrep -q 'src/a.rs' \"$diff\" || exit 8\nmkdir -p \"$out/mutants.out\"\necho 'src/a.rs:1:18: replace a -> bool with false' > \"$out/mutants.out/missed.txt\"\nexit 2\n",
+            "[ \"$1\" = mutants ] || exit 7\nwhile [ $# -gt 0 ]; do case \"$1\" in --output) out=$2 ;; --in-diff) diff=$2 ;; --timeout-multiplier) multiplier=$2 ;; esac; shift; done\ngrep -q 'src/a.rs' \"$diff\" || exit 8\n[ \"$multiplier\" = 6 ] || exit 9\nmkdir -p \"$out/mutants.out\"\necho 'src/a.rs:1:18: replace a -> bool with false' > \"$out/mutants.out/missed.txt\"\nexit 2\n",
         );
         let mut out = Vec::new();
         let passed = run_with(&repo, "base", 2, &missing, &nextest, &mut out).unwrap();
