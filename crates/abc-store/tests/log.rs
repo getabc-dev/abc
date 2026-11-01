@@ -1,82 +1,477 @@
-//! Store-level properties of the event log and the write path. Each test gets a fresh migrated
-//! database; ManualClock + SeededMint make them deterministic.
+//! Properties of the event log, the write path and the feed. Each test gets a fresh migrated
+//! database (`#[sqlx::test]`); `Fixture` fixes the clock and the mints.
 
-use sqlx::PgPool;
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
 
-#[sqlx::test(migrator = "abc_store::MIGRATOR")]
-async fn positions_are_gapless_and_commit_ordered_under_concurrent_writers(pool: PgPool) {
-    // 32 concurrent executes (mix of issue and revoke, some rejected or denied) on a multi-thread
-    // runtime; then SELECT position ORDER BY position == 1..=n, and for every pair a < b, a's
-    // transaction committed first (observed via a LogFeed subscriber that saw heads in order).
-    let _ = pool;
-}
+    use abc_core::command::{IssueEnrolmentToken, RevokeEnrolmentToken, TokenTtl};
+    use abc_core::event::{Position, StreamKind};
+    use abc_core::policy::DenialReason;
+    use abc_store::testing::{
+        Fixture, assert_views_replay, database, database_url, views_replay_diff,
+    };
+    use abc_store::{DatabaseUrl, ExecuteError, OpenError, Store, StoreOptions};
+    use rand::rngs::ChaCha20Rng;
+    use rand::{RngExt as _, SeedableRng as _};
+    use sqlx::PgPool;
 
-#[sqlx::test(migrator = "abc_store::MIGRATOR")]
-async fn a_failed_command_writes_nothing_and_leaves_no_gap(pool: PgPool) {
-    let _ = pool;
-}
+    #[sqlx::test(migrator = "abc_store::MIGRATOR")]
+    async fn positions_stay_gapless_to_every_reader_under_concurrent_writers(pool: PgPool) {
+        let (fixture, claimed) = Fixture::claimed(pool.clone()).await;
+        let fixture = std::sync::Arc::new(fixture);
+        let start = fixture.event_count().await;
+        let mut feed = fixture.store.feed();
+        let heads = tokio::spawn(async move {
+            let mut seen = Vec::new();
+            while let Ok(Some(head)) =
+                tokio::time::timeout(Duration::from_secs(2), feed.changed()).await
+            {
+                seen.push(head);
+            }
+            seen
+        });
+        // A reader that, at every instant, must see exactly the positions 1..=max: never a hole that a
+        // later commit fills.
+        let reader_pool = pool.clone();
+        let reader = tokio::spawn(async move {
+            let mut checks = 0_u32;
+            for _ in 0..200 {
+                let (max, count): (Option<i64>, i64) =
+                    sqlx::query_as("SELECT MAX(position), COUNT(*) FROM event")
+                        .fetch_one(&reader_pool)
+                        .await
+                        .unwrap();
+                assert_eq!(max.unwrap_or(0), count, "a reader never sees a gap");
+                checks = checks.saturating_add(1);
+                tokio::task::yield_now().await;
+            }
+            checks
+        });
+        let mut rng = ChaCha20Rng::seed_from_u64(abc_store::testing::SEED);
+        let mut writers = Vec::new();
+        for n in 0..32_u32 {
+            let fixture = std::sync::Arc::clone(&fixture);
+            let workspace = claimed.workspace;
+            let as_stranger = rng.random_bool(0.25);
+            writers.push(tokio::spawn(async move {
+                let caller = if as_stranger {
+                    Fixture::tailnet("mallory@example.com")
+                } else {
+                    Fixture::alice()
+                };
+                let issued = fixture
+                    .store
+                    .execute(
+                        &caller,
+                        &fixture.origin(),
+                        IssueEnrolmentToken {
+                            workspace,
+                            label: None,
+                            ttl: TokenTtl::default(),
+                        },
+                    )
+                    .await;
+                if let Ok(issued) = &issued
+                    && n % 2 == 0
+                {
+                    fixture
+                        .store
+                        .execute(
+                            &Fixture::alice(),
+                            &fixture.origin(),
+                            RevokeEnrolmentToken {
+                                workspace,
+                                token: issued.id,
+                            },
+                        )
+                        .await
+                        .unwrap();
+                }
+                issued.is_ok()
+            }));
+        }
+        let mut succeeded = 0_i64;
+        let mut issued_and_revoked = 0_i64;
+        for (n, writer) in writers.into_iter().enumerate() {
+            if writer.await.unwrap() {
+                succeeded = succeeded.saturating_add(1);
+                if n % 2 == 0 {
+                    issued_and_revoked = issued_and_revoked.saturating_add(1);
+                }
+            }
+        }
+        assert!(reader.await.unwrap() > 0, "the reader ran");
+        let positions: Vec<i64> =
+            sqlx::query_scalar("SELECT position FROM event ORDER BY position")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        let total = start
+            .saturating_add(succeeded)
+            .saturating_add(issued_and_revoked);
+        assert_eq!(
+            positions,
+            (1..=total).collect::<Vec<_>>(),
+            "1..=n, no gaps from denials"
+        );
+        let heads = heads.await.unwrap();
+        assert!(
+            heads.windows(2).all(|pair| pair[0] < pair[1]),
+            "the feed only moves forward: {heads:?}"
+        );
+        assert_eq!(
+            heads.last().map(|head| head.get()),
+            Some(total),
+            "the feed reaches the head"
+        );
+        assert_views_replay(&pool).await;
+    }
 
-#[sqlx::test(migrator = "abc_store::MIGRATOR")]
-async fn the_log_rejects_update_delete_and_truncate(pool: PgPool) {
-    let _ = pool;
-}
+    #[sqlx::test(migrator = "abc_store::MIGRATOR")]
+    async fn a_refused_command_writes_nothing_and_leaves_no_gap(pool: PgPool) {
+        let (fixture, claimed) = Fixture::claimed(pool.clone()).await;
+        let before = fixture.event_count().await;
+        let refused = fixture
+            .store
+            .execute(
+                &Fixture::tailnet("mallory@example.com"),
+                &fixture.origin(),
+                IssueEnrolmentToken {
+                    workspace: claimed.workspace,
+                    label: None,
+                    ttl: TokenTtl::default(),
+                },
+            )
+            .await;
+        assert!(
+            matches!(refused, Err(ExecuteError::Denied(denied)) if denied.reason == DenialReason::NotAMember),
+            "a stranger is not a member"
+        );
+        assert_eq!(fixture.event_count().await, before, "nothing was written");
+        fixture.issue_token(claimed.workspace).await;
+        let last: i64 = sqlx::query_scalar("SELECT MAX(position) FROM event")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            last,
+            before.saturating_add(1),
+            "the next event takes the next position"
+        );
+        assert_views_replay(&pool).await;
+    }
 
-#[sqlx::test(migrator = "abc_store::MIGRATOR")]
-async fn every_event_records_actor_workspace_and_correlation(pool: PgPool) {
-    // after a claim + issue + enrol flow: no NULLs (schema), actor ids all exist in `actor`,
-    // enrolment events carry causation = the token's issued event.
-    let _ = pool;
-}
+    #[sqlx::test(migrator = "abc_store::MIGRATOR")]
+    async fn the_log_rejects_update_delete_and_truncate(pool: PgPool) {
+        let (_fixture, _) = Fixture::claimed(pool.clone()).await;
+        for statement in [
+            "UPDATE event SET correlation_id = gen_random_uuid()",
+            "DELETE FROM event",
+            "TRUNCATE event CASCADE",
+        ] {
+            let error = sqlx::query(statement).execute(&pool).await.unwrap_err();
+            assert!(
+                error.to_string().contains("the event log is append-only"),
+                "{statement}: {error}"
+            );
+        }
+    }
 
-#[sqlx::test(migrator = "abc_store::MIGRATOR")]
-async fn stream_kind_constraint_matches_the_enum(pool: PgPool) {
-    // read the CHECK from pg_constraint; compare with StreamKind::ALL.
-    let _ = pool;
-}
+    #[sqlx::test(migrator = "abc_store::MIGRATOR")]
+    async fn the_head_moves_only_forward_and_only_onto_an_event(pool: PgPool) {
+        let (fixture, _) = Fixture::claimed(pool.clone()).await;
+        let head = fixture.event_count().await;
+        let backwards = sqlx::query("UPDATE event_log_head SET position = 1")
+            .execute(&pool)
+            .await
+            .unwrap_err();
+        assert!(
+            backwards.to_string().contains("moved backwards"),
+            "{backwards}"
+        );
+        let beyond = sqlx::query("UPDATE event_log_head SET position = $1")
+            .bind(head.saturating_add(1))
+            .execute(&pool)
+            .await
+            .unwrap_err();
+        assert!(
+            beyond.to_string().contains("with no event there"),
+            "{beyond}"
+        );
+        sqlx::query("UPDATE event_log_head SET position = $1")
+            .bind(head)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
 
-#[sqlx::test(migrator = "abc_store::MIGRATOR")]
-async fn revocation_is_seen_by_the_very_next_request(pool: PgPool) {
-    // revoke worker; the next StartSession with its key -> AuthError::WorkerRevoked.
-    let _ = pool;
-}
+    /// position, type, actor kind, actor id, workspace, stream seq, correlation, causation, id.
+    type EventRow = (
+        i64,
+        String,
+        String,
+        Option<uuid::Uuid>,
+        uuid::Uuid,
+        i32,
+        uuid::Uuid,
+        Option<uuid::Uuid>,
+        uuid::Uuid,
+    );
 
-#[sqlx::test(migrator = "abc_store::MIGRATOR")]
-async fn two_concurrent_claims_produce_one_owner(pool: PgPool) {
-    let _ = pool;
-}
+    #[sqlx::test(migrator = "abc_store::MIGRATOR")]
+    async fn every_event_records_its_actor_workspace_stream_and_cause(pool: PgPool) {
+        let (fixture, claimed) = Fixture::claimed(pool.clone()).await;
+        let issued = fixture.issue_token(claimed.workspace).await;
+        let key = fixture.worker_key();
+        let enrolled = fixture.enrol(&issued.token, &key).await.unwrap();
+        let rows: Vec<EventRow> = sqlx::query_as(
+            "SELECT position, event_type, actor_kind, actor_id, workspace_id, stream_seq, correlation_id,
+                    causation_id, id
+             FROM event ORDER BY position",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        let summary: Vec<(String, String, i32)> = rows
+            .iter()
+            .map(|row| (row.1.clone(), row.2.clone(), row.5))
+            .collect();
+        let s = |kind: &str, actor: &str, seq: i32| (kind.to_owned(), actor.to_owned(), seq);
+        assert_eq!(
+            summary,
+            [
+                s("installation.setup_code_issued", "server", 1),
+                s("person.registered", "person", 1),
+                s("workspace.created", "person", 1),
+                s("workspace.member_added", "person", 2),
+                s("installation.claimed", "person", 2),
+                s("enrolment_token.issued", "person", 1),
+                s("enrolment_token.redeemed", "worker", 2),
+                s("worker.enrolled", "worker", 1),
+            ],
+            "who did what, numbered within each stream"
+        );
+        assert!(
+            rows.iter().all(|row| row.4 == claimed.workspace.as_uuid()),
+            "everything belongs to the workspace (I4)"
+        );
+        let owner = Some(claimed.owner.as_uuid());
+        assert!(
+            rows[1..6].iter().all(|row| row.3 == owner),
+            "the owner acted"
+        );
+        let worker = Some(enrolled.worker.as_uuid());
+        assert!(
+            rows[6..].iter().all(|row| row.3 == worker),
+            "the worker enrolled itself"
+        );
+        let issued_event = rows[5].8;
+        assert!(
+            rows[6..].iter().all(|row| row.7 == Some(issued_event)),
+            "enrolment is caused by the token's issue"
+        );
+        assert_eq!(rows[1].6, rows[4].6, "one request, one correlation id");
+        assert_ne!(rows[5].6, rows[6].6, "two requests, two correlation ids");
+        assert_views_replay(&pool).await;
+    }
 
-#[sqlx::test(migrator = "abc_store::MIGRATOR")]
-async fn two_concurrent_redemptions_of_one_token_produce_one_worker(pool: PgPool) {
-    let _ = pool;
-}
+    #[sqlx::test(migrator = "abc_store::MIGRATOR")]
+    async fn the_stream_kind_constraint_matches_the_enum(pool: PgPool) {
+        let definition: String = sqlx::query_scalar(
+            "SELECT pg_get_constraintdef(oid) FROM pg_constraint
+             WHERE conrelid = 'event'::regclass AND pg_get_constraintdef(oid) LIKE '%stream_kind%'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let quoted = definition.matches("::text").count();
+        assert_eq!(
+            quoted,
+            StreamKind::ALL.len(),
+            "one name per kind: {definition}"
+        );
+        for kind in StreamKind::ALL {
+            assert!(
+                definition.contains(&format!("'{}'", kind.as_str())),
+                "{kind:?} is allowed: {definition}"
+            );
+        }
+    }
 
-#[sqlx::test(migrator = "abc_store::MIGRATOR")]
-async fn the_feed_wakes_subscribers_after_commit_only(pool: PgPool) {
-    let _ = pool;
-}
+    #[sqlx::test(migrator = "abc_store::MIGRATOR")]
+    async fn the_feed_wakes_on_commits_and_not_on_refusals(pool: PgPool) {
+        let (fixture, claimed) = Fixture::claimed(pool.clone()).await;
+        let head = Position::from_stored(fixture.event_count().await).unwrap();
+        let mut early = fixture.store.feed();
+        while early.head() < head {
+            tokio::time::timeout(Duration::from_secs(5), early.changed())
+                .await
+                .unwrap();
+        }
+        let mut feed = fixture.store.feed();
+        assert_eq!(feed.head(), head, "a new feed starts at the head");
+        let refused = fixture
+            .store
+            .execute(
+                &Fixture::tailnet("mallory@example.com"),
+                &fixture.origin(),
+                IssueEnrolmentToken {
+                    workspace: claimed.workspace,
+                    label: None,
+                    ttl: TokenTtl::default(),
+                },
+            )
+            .await;
+        assert!(refused.is_err(), "mallory is refused");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), feed.changed())
+                .await
+                .is_err(),
+            "a refusal wakes no one"
+        );
+        fixture.issue_token(claimed.workspace).await;
+        let woke = tokio::time::timeout(Duration::from_secs(5), feed.changed())
+            .await
+            .unwrap();
+        assert_eq!(woke, head.next(), "one commit, one step");
+        assert_eq!(feed.head(), woke.unwrap(), "head() is the latest");
+    }
 
-// proptest (fixed seed via xtask): random sequences of commands from random callers, then
-// assert_views_replay(&pool) and "every denied or rejected command appended nothing".
+    #[sqlx::test(migrator = "abc_store::MIGRATOR")]
+    async fn a_lost_listener_connection_loses_no_wake_up(pool: PgPool) {
+        let (fixture, claimed) = Fixture::claimed(pool.clone()).await;
+        let mut feed = fixture.store.feed();
+        let killed: i64 = sqlx::query_scalar(
+            "SELECT COUNT(pg_terminate_backend(pid)) FROM pg_stat_activity
+             WHERE datname = current_database() AND query ILIKE 'LISTEN%'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(killed, 1, "the store's listener was found and cut");
+        fixture.issue_token(claimed.workspace).await;
+        let expected = Position::from_stored(fixture.event_count().await).unwrap();
+        let mut seen = feed.head();
+        let deadline = tokio::time::Instant::now()
+            .checked_add(Duration::from_secs(20))
+            .unwrap();
+        while seen < expected {
+            seen = tokio::time::timeout_at(deadline, feed.changed())
+                .await
+                .expect("the feed catches up after reconnecting")
+                .unwrap();
+        }
+        assert_eq!(
+            seen, expected,
+            "the head written while disconnected is published"
+        );
+        for _ in 0..100 {
+            if fixture.store.ready().await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(
+            fixture.store.ready().await,
+            Ok(()),
+            "ready again once reconnected"
+        );
+    }
 
-#[sqlx::test(migrator = "abc_store::MIGRATOR")]
-async fn a_setup_code_claims_once_and_never_after(pool: PgPool) {
-    // issue_setup_code -> claim with it -> Claimed; a second claim (same or new code) ->
-    // ServerAlreadyClaimed; issue_setup_code after the claim -> ServerAlreadyClaimed.
-    // A newer code supersedes an older one (the older -> SetupCodeMismatch); both reserve the
-    // same owner and workspace ids. After SETUP_CODE_TTL -> SetupCodeExpired.
-    let _ = pool;
-}
+    #[sqlx::test(migrator = "abc_store::MIGRATOR")]
+    async fn replay_catches_a_view_written_outside_the_event_path(pool: PgPool) {
+        let (fixture, claimed) = Fixture::claimed(pool.clone()).await;
+        fixture.issue_token(claimed.workspace).await;
+        assert_eq!(
+            views_replay_diff(&pool).await.unwrap(),
+            None,
+            "the views match the log"
+        );
+        sqlx::query("UPDATE workspace SET name = 'Renamed behind the log'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let difference = views_replay_diff(&pool).await.unwrap().unwrap();
+        assert!(
+            difference.starts_with("view workspace differs from its replay"),
+            "the divergent view is named: {difference}"
+        );
+    }
 
-#[sqlx::test(migrator = "abc_store::MIGRATOR")]
-async fn a_superseded_session_end_leaves_the_worker_online(pool: PgPool) {
-    // StartSession(s1), StartSession(s2), EndSession(s1) -> open_session == s2, zero events for
-    // the s1 end; EndSession(s2) -> offline; EndSession(s2) again -> zero events.
-    let _ = pool;
-}
+    #[sqlx::test(migrations = false)]
+    async fn a_store_opens_only_on_this_builds_schema(pool: PgPool) {
+        let clock = abc_store::testing::ManualClock::new();
+        let unmigrated = Store::open(
+            database(pool.clone()),
+            abc_store::testing::options(&clock, 1),
+        )
+        .await;
+        assert!(
+            matches!(unmigrated, Err(OpenError::NotMigrated)),
+            "never migrated"
+        );
+        abc_store::migrate(&database(pool.clone())).await.unwrap();
+        abc_store::migrate(&database(pool.clone())).await.unwrap();
+        let store = Store::open(database(pool.clone()), StoreOptions::production())
+            .await
+            .unwrap();
+        assert!(
+            !store.is_claimed().await.unwrap(),
+            "a new server is unclaimed"
+        );
+        assert_eq!(store.ready().await, Ok(()), "and ready");
+        drop(store);
+        sqlx::query("INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time) VALUES (99990101000000, 'from the future', true, '\\x00', 0)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let newer = Store::open(database(pool), abc_store::testing::options(&clock, 1)).await;
+        assert!(
+            matches!(newer, Err(OpenError::NotMigrated)),
+            "migrated by a newer build"
+        );
+    }
 
-#[sqlx::test(migrator = "abc_store::MIGRATOR")]
-async fn the_server_caller_can_do_only_server_actions(pool: PgPool) {
-    // Caller::Server: IssueEnrolmentToken, RevokeWorker, ListMachines -> Denied(ServerOnly or
-    // TailnetIdentityRequired); a tailnet person: EndSession, OpenSessions -> Denied(ServerOnly).
-    let _ = pool;
+    #[sqlx::test(migrator = "abc_store::MIGRATOR")]
+    async fn connect_reaches_a_database_and_never_echoes_the_url(pool: PgPool) {
+        let db = abc_store::connect(&database_url(&pool), Duration::from_secs(5))
+            .await
+            .unwrap();
+        let store = Store::open(db, StoreOptions::production()).await.unwrap();
+        assert_eq!(store.ready().await, Ok(()), "connected");
+        let invalid = abc_store::connect(
+            &DatabaseUrl::new("not a url:hunter2".to_owned()),
+            Duration::ZERO,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(invalid, OpenError::InvalidUrl), "a malformed URL");
+        assert!(
+            !invalid.to_string().contains("hunter2"),
+            "the message never echoes the URL"
+        );
+        let unreachable = abc_store::connect(
+            &DatabaseUrl::new("postgres://abc:hunter2@127.0.0.1:1/abc".to_owned()),
+            Duration::from_millis(300),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(unreachable, OpenError::Connect(_)),
+            "nothing listens on port 1"
+        );
+        assert!(
+            !unreachable.to_string().contains("hunter2"),
+            "never echoes the URL"
+        );
+        assert_eq!(
+            format!(
+                "{:?}",
+                DatabaseUrl::new("postgres://x:hunter2@h/d".to_owned()).expose_secret()
+            ),
+            "DatabaseUrl(<redacted>)",
+            "nor does Debug"
+        );
+    }
 }

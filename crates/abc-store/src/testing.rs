@@ -2,19 +2,53 @@
 //! migrated database from `#[sqlx::test(migrator = "abc_store::MIGRATOR")]`, which runs against the
 //! one warm Postgres container per machine (D7). Time and randomness are fixed, so tests are
 //! deterministic (P2).
+#![expect(
+    clippy::panic,
+    reason = "test support: a failed setup step fails the calling test at that spot"
+)]
 
-use std::sync::{Arc, Mutex};
+use std::convert::Infallible;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 
-use abc_core::decision::Mint;
+use abc_core::actor::Actor;
+use abc_core::command::{
+    ClaimServer, Claimed, EnrolWorker, Enrolled, IssueEnrolmentToken, TokenIssued, TokenTtl,
+};
+use abc_core::credential::{EnrolmentToken, SetupCode, WorkerKey};
+use abc_core::decision::{Mint, Origin};
+use abc_core::event::{Event, Position, Recorded, StreamKind, StreamRef};
+use abc_core::id::{CorrelationId, EventId, FromUuid as _, WorkspaceId};
+use abc_core::identity::{Arch, DisplayName, MachineInfo, Os, TailnetLogin, WorkspaceName};
+use abc_core::secret::Secret;
 use abc_core::time::{Clock, Timestamp};
-use sqlx::PgPool;
+use rand::rngs::ChaCha20Rng;
+use rand::{Rng as _, SeedableRng as _};
+use semver::Version;
+use sqlx::{Connection as _, PgPool};
+use zeroize::Zeroizing;
 
-use crate::{Database, StoreOptions};
+use crate::error::StoreError;
+use crate::{Caller, Database, DatabaseUrl, ExecuteError, Store, StoreOptions, projection};
 
 /// Wraps the pool `#[sqlx::test]` hands a test (already migrated by `MIGRATOR`).
 #[must_use]
 pub fn database(pool: PgPool) -> Database {
     Database(pool)
+}
+
+/// A URL for the database behind `pool`, for code under test that connects by itself (the
+/// server's `run`). The test container trusts local connections, so it carries no password.
+#[must_use]
+pub fn database_url(pool: &PgPool) -> Secret<DatabaseUrl> {
+    let options = pool.connect_options();
+    DatabaseUrl::new(format!(
+        "postgres://{}@{}:{}/{}",
+        options.get_username(),
+        options.get_host(),
+        options.get_port(),
+        options.get_database().unwrap_or("postgres"),
+    ))
 }
 
 /// A clock tests move by hand, for expiry.
@@ -27,44 +61,66 @@ impl ManualClock {
     /// Starts at a fixed instant (2026-01-01T00:00:00Z).
     #[must_use]
     pub fn new() -> Self {
-        unimplemented!()
+        Self {
+            now: Arc::new(Mutex::new(Timestamp::from_utc(
+                time::macros::datetime!(2026-01-01 00:00:00 UTC),
+            ))),
+        }
     }
 
     /// Moves time forward.
     pub fn advance(&self, by: time::Duration) {
-        let _ = by;
-        unimplemented!()
+        let mut now = self.now.lock().unwrap_or_else(PoisonError::into_inner);
+        *now = now.checked_add(by).unwrap_or(*now);
+    }
+}
+
+impl Default for ManualClock {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
 impl Clock for ManualClock {
     fn now(&self) -> Timestamp {
-        unimplemented!()
+        *self.now.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
-/// A ChaCha-seeded mint: the same seed gives the same ids and secrets.
+/// A `ChaCha20`-seeded mint: the same seed gives the same ids and secrets.
 #[derive(Debug)]
 pub struct SeededMint {
-    rng: Mutex<rand_chacha::ChaCha20Rng>,
+    rng: Mutex<ChaCha20Rng>,
 }
 
 impl SeededMint {
     /// A mint seeded with `seed`.
     #[must_use]
     pub fn new(seed: u64) -> Self {
-        let _ = seed;
-        unimplemented!()
+        Self {
+            rng: Mutex::new(ChaCha20Rng::seed_from_u64(seed)),
+        }
+    }
+
+    fn fill(&self, bytes: &mut [u8]) {
+        self.rng
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .fill_bytes(bytes);
     }
 }
 
 impl Mint for SeededMint {
     fn uuid(&self, now: Timestamp) -> uuid::Uuid {
-        let _ = now;
-        unimplemented!("UUIDv7 with `now` as the time part and seeded random bits")
+        let mut random = [0; 10];
+        self.fill(&mut random);
+        crate::execute::uuid_v7(now, &random)
     }
-    fn secret(&self) -> zeroize::Zeroizing<[u8; 32]> {
-        unimplemented!()
+
+    fn secret(&self) -> Zeroizing<[u8; 32]> {
+        let mut bytes = Zeroizing::new([0; 32]);
+        self.fill(bytes.as_mut_slice());
+        bytes
     }
 }
 
@@ -77,21 +133,343 @@ pub fn options(clock: &ManualClock, seed: u64) -> StoreOptions {
     }
 }
 
-/// Asserts that the views are exactly what replaying the log produces.
+/// The view tables, found from the catalogue rather than from a list kept by hand.
+async fn view_tables(conn: &mut sqlx::PgConnection) -> Result<Vec<String>, StoreError> {
+    Ok(sqlx::query_scalar!(
+        r#"SELECT table_name AS "name!" FROM information_schema.tables
+           WHERE table_schema = 'public' AND table_type = 'BASE TABLE'
+             AND table_name NOT IN ('event', 'event_log_head', '_sqlx_migrations')
+           ORDER BY table_name"#
+    )
+    .fetch_all(conn)
+    .await?)
+}
+
+/// Every view table's rows as JSON, in a stable order.
+async fn dump(
+    conn: &mut sqlx::PgConnection,
+    tables: &[String],
+) -> Result<Vec<(String, serde_json::Value)>, StoreError> {
+    let mut dumps = Vec::with_capacity(tables.len());
+    for table in tables {
+        let rows: serde_json::Value = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT COALESCE(jsonb_agg(to_jsonb(t) ORDER BY to_jsonb(t)::text), '[]'::jsonb)
+             FROM {table:?} t"
+        )))
+        .fetch_one(&mut *conn)
+        .await?;
+        dumps.push((table.clone(), rows));
+    }
+    Ok(dumps)
+}
+
+/// Every event in the log, in order.
+async fn log(conn: &mut sqlx::PgConnection) -> Result<Vec<Recorded>, StoreError> {
+    let rows = sqlx::query!(
+        "SELECT position, id, recorded_at, workspace_id, stream_kind, stream_id, stream_seq,
+                schema_version, actor_kind, actor_id, correlation_id, causation_id, payload
+         FROM event ORDER BY position"
+    )
+    .fetch_all(conn)
+    .await?;
+    rows.into_iter()
+        .map(|row| {
+            let kind = StreamKind::parse(&row.stream_kind)
+                .ok_or(StoreError::Corrupt("event.stream_kind"))?;
+            Ok(Recorded {
+                position: Position::from_stored(row.position)
+                    .ok()
+                    .ok_or(StoreError::Corrupt("event.position"))?,
+                id: EventId::from_uuid(row.id),
+                recorded_at: Timestamp::from_utc(row.recorded_at),
+                workspace: WorkspaceId::from_uuid(row.workspace_id),
+                stream: StreamRef {
+                    kind,
+                    id: row.stream_id,
+                },
+                stream_seq: row.stream_seq,
+                actor: Actor::from_stored(&row.actor_kind, row.actor_id)
+                    .ok()
+                    .ok_or(StoreError::Corrupt("event.actor"))?,
+                correlation: CorrelationId::from_uuid(row.correlation_id),
+                causation: row.causation_id.map(EventId::from_uuid),
+                event: Event::decode(kind, row.schema_version, row.payload).map_err(|source| {
+                    StoreError::CorruptEvent {
+                        position: row.position,
+                        source,
+                    }
+                })?,
+            })
+        })
+        .collect()
+}
+
+/// Rebuilds every view from the log inside a transaction that is rolled back, and returns the
+/// first view table whose rows differ from the live ones, with both versions. `None` means the
+/// views are exactly what replaying the log produces.
 ///
-/// 1. Lists view tables from `information_schema.tables` (schema `public`, excluding `event`,
-///    `event_log_head` and `_sqlx_migrations`), so a new view is covered without editing a list.
-/// 2. Dumps each as `jsonb_agg(to_jsonb(t) ORDER BY <primary key>)`.
-/// 3. In one transaction: `TRUNCATE` every view table, replay `SELECT * FROM event ORDER BY
-///    position` through `projection::apply`, dump again, and roll back.
-/// 4. Asserts the two dumps are equal, naming the first table that differs.
+/// # Errors
 ///
-/// A write that bypasses the event path, or a projection that reads `now()`, fails here.
+/// Returns [`StoreError`] when the database fails or the log cannot be decoded.
+pub async fn views_replay_diff(pool: &PgPool) -> Result<Option<String>, StoreError> {
+    let mut conn = pool.acquire().await?;
+    let tables = view_tables(&mut conn).await?;
+    let live = dump(&mut conn, &tables).await?;
+    let mut tx = conn.begin().await?;
+    let list = tables
+        .iter()
+        .map(|table| format!("{table:?}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    sqlx::query(sqlx::AssertSqlSafe(format!("TRUNCATE {list}")))
+        .execute(&mut *tx)
+        .await?;
+    for recorded in log(&mut tx).await? {
+        projection::apply(&mut tx, &recorded).await?;
+    }
+    let replayed = dump(&mut tx, &tables).await?;
+    tx.rollback().await?;
+    Ok(live
+        .into_iter()
+        .zip(replayed)
+        .find(|(live, replayed)| live != replayed)
+        .map(|((table, live), (_, replayed))| {
+            format!(
+                "view {table} differs from its replay:\n  live:     {live}\n  replayed: {replayed}"
+            )
+        }))
+}
+
+/// Asserts that the views are exactly what replaying the log produces. A write that bypasses the
+/// event path, or a projection that reads `now()`, fails here.
 ///
 /// # Panics
 ///
-/// On mismatch or database error (test code).
+/// On a mismatch or a database error (test code).
 pub async fn assert_views_replay(pool: &PgPool) {
-    let _ = pool;
-    unimplemented!()
+    match views_replay_diff(pool).await {
+        Ok(None) => {}
+        Ok(Some(difference)) => panic!("{difference}"),
+        Err(error) => panic!("could not replay the log: {error}"),
+    }
+}
+
+/// The seed every fixture's store uses.
+pub const SEED: u64 = 20_261_031;
+
+/// A store on a test database with a manual clock and seeded mints, and the steps most tests
+/// start from.
+#[derive(Debug)]
+pub struct Fixture {
+    /// The store under test.
+    pub store: Store,
+    /// Its clock.
+    pub clock: ManualClock,
+    /// The test's pool, for direct inspection.
+    pub pool: PgPool,
+    /// Generates worker keys, as a worker would, separately from the store's mint.
+    keys: SeededMint,
+    /// Numbers each request's correlation id.
+    requests: AtomicU64,
+}
+
+impl Fixture {
+    /// A fresh store on `pool`.
+    ///
+    /// # Panics
+    ///
+    /// When the store cannot open (test code).
+    pub async fn new(pool: PgPool) -> Self {
+        let clock = ManualClock::new();
+        let store = Store::open(database(pool.clone()), options(&clock, SEED))
+            .await
+            .unwrap_or_else(|error| panic!("the test store opens: {error}"));
+        Self {
+            store,
+            clock,
+            pool,
+            keys: SeededMint::new(SEED.wrapping_add(1)),
+            requests: AtomicU64::new(0),
+        }
+    }
+
+    /// A fresh store whose server `alice@example.com` has claimed, with the first workspace.
+    ///
+    /// # Panics
+    ///
+    /// When the claim fails (test code).
+    pub async fn claimed(pool: PgPool) -> (Self, Claimed) {
+        let fixture = Self::new(pool).await;
+        let claimed = fixture
+            .claim(&Self::alice())
+            .await
+            .unwrap_or_else(|error| panic!("alice claims the server: {error}"));
+        (fixture, claimed)
+    }
+
+    /// The tailnet caller who claims the server in [`Fixture::claimed`].
+    ///
+    /// # Panics
+    ///
+    /// Never: the login is valid.
+    #[must_use]
+    pub fn alice() -> Caller {
+        Self::tailnet("alice@example.com")
+    }
+
+    /// A tailnet caller with `login`.
+    ///
+    /// # Panics
+    ///
+    /// When `login` is not a valid login (test code).
+    #[must_use]
+    pub fn tailnet(login: &str) -> Caller {
+        Caller::Tailnet(
+            TailnetLogin::parse(login).unwrap_or_else(|error| panic!("{login}: {error}")),
+        )
+    }
+
+    /// A fresh origin: correlation ids 1, 2, 3… for this fixture's requests.
+    pub fn origin(&self) -> Origin {
+        let n = self
+            .requests
+            .fetch_add(1, Ordering::SeqCst)
+            .saturating_add(1);
+        Origin {
+            correlation: CorrelationId::from_uuid(uuid::Uuid::from_u128(u128::from(n))),
+            causation: None,
+        }
+    }
+
+    /// Issues a setup code and claims the server with it as `caller`.
+    ///
+    /// # Errors
+    ///
+    /// The claim's error.
+    ///
+    /// # Panics
+    ///
+    /// When no setup code can be issued (test code).
+    pub async fn claim(&self, caller: &Caller) -> Result<Claimed, ExecuteError<Infallible>> {
+        let issued = self
+            .store
+            .issue_setup_code()
+            .await
+            .unwrap_or_else(|error| panic!("a setup code is issued: {error}"));
+        self.claim_with(caller, &issued.code).await
+    }
+
+    /// Claims the server as `caller` with `code`.
+    ///
+    /// # Errors
+    ///
+    /// The claim's error.
+    ///
+    /// # Panics
+    ///
+    /// Never: the names are valid.
+    pub async fn claim_with(
+        &self,
+        caller: &Caller,
+        code: &Secret<SetupCode>,
+    ) -> Result<Claimed, ExecuteError<Infallible>> {
+        let command = ClaimServer {
+            code: SetupCode::parse(&code.expose_secret().display_form())
+                .unwrap_or_else(|error| panic!("{error}")),
+            display_name: DisplayName::parse("Alice").unwrap_or_else(|error| panic!("{error}")),
+            workspace_name: WorkspaceName::parse("Home").unwrap_or_else(|error| panic!("{error}")),
+        };
+        self.store.execute(caller, &self.origin(), command).await
+    }
+
+    /// Issues an enrolment token in `workspace` as alice, with the default lifetime.
+    ///
+    /// # Panics
+    ///
+    /// When issuing fails (test code).
+    pub async fn issue_token(&self, workspace: WorkspaceId) -> TokenIssued {
+        self.store
+            .execute(
+                &Self::alice(),
+                &self.origin(),
+                IssueEnrolmentToken {
+                    workspace,
+                    label: None,
+                    ttl: TokenTtl::default(),
+                },
+            )
+            .await
+            .unwrap_or_else(|error| panic!("alice issues a token: {error}"))
+    }
+
+    /// A fresh worker key, as `abc worker enrol` generates one.
+    #[must_use]
+    pub fn worker_key(&self) -> Secret<WorkerKey> {
+        WorkerKey::generate(&self.keys)
+    }
+
+    /// Redeems `token` with `key` from a machine called `mbp`.
+    ///
+    /// # Errors
+    ///
+    /// The enrolment's error.
+    ///
+    /// # Panics
+    ///
+    /// Never: the inputs are valid.
+    pub async fn enrol(
+        &self,
+        token: &Secret<EnrolmentToken>,
+        key: &Secret<WorkerKey>,
+    ) -> Result<Enrolled, ExecuteError<Infallible>> {
+        let command = EnrolWorker {
+            token: EnrolmentToken::parse(token.expose_secret().as_str())
+                .unwrap_or_else(|error| panic!("{error}")),
+            key: key.expose_secret().digest(),
+            machine: machine(),
+            build: Version::new(0, 1, 0),
+        };
+        self.store
+            .execute(&Caller::Anonymous, &self.origin(), command)
+            .await
+    }
+
+    /// A caller presenting `key`.
+    ///
+    /// # Panics
+    ///
+    /// Never: the key is well formed.
+    #[must_use]
+    pub fn worker(key: &Secret<WorkerKey>) -> Caller {
+        Caller::Worker(
+            WorkerKey::parse(key.expose_secret().as_str())
+                .unwrap_or_else(|error| panic!("{error}")),
+        )
+    }
+
+    /// How many events the log holds.
+    ///
+    /// # Panics
+    ///
+    /// On a database error (test code).
+    pub async fn event_count(&self) -> i64 {
+        sqlx::query_scalar!(r#"SELECT COUNT(*) AS "count!" FROM event"#)
+            .fetch_one(&self.pool)
+            .await
+            .unwrap_or_else(|error| panic!("counting events: {error}"))
+    }
+}
+
+/// The machine the fixture enrols.
+///
+/// # Panics
+///
+/// Never: the hostname is valid.
+#[must_use]
+pub fn machine() -> MachineInfo {
+    MachineInfo {
+        hostname: DisplayName::parse("mbp").unwrap_or_else(|error| panic!("{error}")),
+        os: Os::Macos,
+        arch: Arch::Aarch64,
+    }
 }

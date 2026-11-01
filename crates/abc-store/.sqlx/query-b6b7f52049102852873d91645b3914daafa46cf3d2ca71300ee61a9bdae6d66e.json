@@ -1,0 +1,12 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM setup_code",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": []
+  },
+  "hash": "b6b7f52049102852873d91645b3914daafa46cf3d2ca71300ee61a9bdae6d66e"
+}

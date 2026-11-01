@@ -8,15 +8,20 @@ use thiserror::Error;
 /// Opening the store failed.
 #[derive(Debug, Error)]
 pub enum OpenError {
-    /// Postgres did not accept a connection within the retry budget. The message never contains
-    /// the URL.
+    /// The database URL does not parse. The message never contains the URL.
+    #[error(
+        "ABC_DATABASE_URL is not a valid Postgres URL, such as postgres://user:password@host/abc"
+    )]
+    InvalidUrl,
+    /// Postgres did not accept a connection in time. The message never contains the URL.
     #[error("could not connect to Postgres (check ABC_DATABASE_URL and that the database is up)")]
     Connect(#[source] sqlx::Error),
     /// A migration failed.
     #[error("database migration failed")]
     Migrate(#[source] sqlx::migrate::MigrateError),
-    /// `Store::open` found migrations not yet applied.
-    #[error("the database is not migrated to this build's schema")]
+    /// The applied migrations are not exactly this build's: not migrated yet, or migrated by a
+    /// newer build.
+    #[error("the database schema does not match this build; start `abc server`, which migrates it")]
     NotMigrated,
     /// Another database error while opening.
     #[error(transparent)]
@@ -38,9 +43,22 @@ pub enum StoreError {
         #[source]
         source: UndecodableEvent,
     },
+    /// A stored view value cannot be read by this build, or the store found itself in a state it
+    /// never creates.
+    #[error("stored state is inconsistent: {0}")]
+    Corrupt(&'static str),
+    /// An event payload could not be encoded.
+    #[error("an event payload could not be encoded")]
+    Encode(#[source] serde_json::Error),
     /// The log reached `i64::MAX` positions.
     #[error("the event log is full")]
     LogFull,
+}
+
+impl From<sqlx::Error> for StoreError {
+    fn from(error: sqlx::Error) -> Self {
+        Self::Database(error)
+    }
 }
 
 /// The caller's credential did not resolve to a principal.
@@ -88,7 +106,7 @@ pub enum QueryError {
 /// What makes the store not ready.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum NotReady {
-    /// Postgres did not answer `SELECT 1` within a second.
+    /// Postgres did not answer within a second.
     #[error("database unreachable")]
     Database,
     /// The log listener is reconnecting.

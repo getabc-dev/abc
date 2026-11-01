@@ -1,0 +1,107 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT id, workspace_id, reserved_worker, label, expires_at,\n                      revoked_at IS NOT NULL AS \"revoked!\", redeemed_key, issued_event\n               FROM enrolment_token WHERE id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "enrolment_token",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "workspace_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "enrolment_token",
+            "name": "workspace_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "reserved_worker",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "enrolment_token",
+            "name": "reserved_worker"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "label",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "enrolment_token",
+            "name": "label"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "expires_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "enrolment_token",
+            "name": "expires_at"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "revoked!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 6,
+        "name": "redeemed_key",
+        "type_info": "Bytea",
+        "origin": {
+          "Table": {
+            "table": "enrolment_token",
+            "name": "redeemed_key"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "issued_event",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "enrolment_token",
+            "name": "issued_event"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true,
+      false,
+      null,
+      true,
+      false
+    ]
+  },
+  "hash": "b013d4946911d5d7a669984f64529c06a388fff968497215363fe7457dea9a3b"
+}

@@ -7,23 +7,58 @@ use std::future::Future;
 use abc_core::actor::Principal;
 use abc_core::command::{
     ClaimServer, EndSession, EnrolFacts, EnrolWorker, InstallationFacts, IssueEnrolmentToken,
-    IssueSetupCode, OpenSession, RevokeEnrolmentToken, RevokeWorker, SelfFacts, StartSession,
-    TokenRecord, WorkerRecord,
+    IssueSetupCode, OpenSession, RevokeEnrolmentToken, RevokeWorker, SelfFacts, SetupCodeRecord,
+    StartSession, TokenRecord, WorkerRecord,
 };
+use abc_core::credential::Digest;
+use abc_core::id::{
+    EnrolmentTokenId, EventId, FromUuid as _, PersonId, SessionId, WorkerId, WorkspaceId,
+};
+use abc_core::identity::MachineLabel;
+use abc_core::time::Timestamp;
 use sqlx::PgConnection;
+use uuid::Uuid;
 
 use crate::error::StoreError;
 use crate::execute::{Executable, Sealed};
 
-/// Shared by the two installation commands: `claimed = EXISTS (SELECT 1 FROM installation)`,
-/// `setup_code = SELECT … FROM setup_code` (one row at most), and `login` from a `Visitor`
-/// principal.
+/// Shared by the two installation commands: whether the server is claimed, the newest setup code,
+/// and the claimant's login from a `Visitor` principal.
 async fn installation_facts(
     conn: &mut PgConnection,
     principal: &Principal,
 ) -> Result<InstallationFacts, StoreError> {
-    let _ = (conn, principal);
-    unimplemented!()
+    let claimed =
+        sqlx::query_scalar!(r#"SELECT EXISTS (SELECT 1 FROM installation) AS "claimed!""#)
+            .fetch_one(&mut *conn)
+            .await?;
+    let row = sqlx::query!("SELECT digest, owner_id, workspace_id, expires_at FROM setup_code")
+        .fetch_optional(&mut *conn)
+        .await?;
+    let setup_code = row
+        .map(|row| {
+            Ok::<_, StoreError>(SetupCodeRecord {
+                digest: Digest::from_slice(&row.digest)
+                    .ok()
+                    .ok_or(StoreError::Corrupt("setup_code.digest"))?,
+                owner: PersonId::from_uuid(row.owner_id),
+                workspace: WorkspaceId::from_uuid(row.workspace_id),
+                expires_at: Timestamp::from_utc(row.expires_at),
+            })
+        })
+        .transpose()?;
+    let login = match principal {
+        Principal::Visitor { login } => Some(login.clone()),
+        Principal::Person { .. }
+        | Principal::Worker { .. }
+        | Principal::Anonymous
+        | Principal::Server => None,
+    };
+    Ok(InstallationFacts {
+        claimed,
+        setup_code,
+        login,
+    })
 }
 
 impl Sealed for IssueSetupCode {}
@@ -48,96 +83,162 @@ impl Executable for ClaimServer {
     }
 }
 
+/// One `enrolment_token` row as abc-core sees it.
+struct TokenRow {
+    id: Uuid,
+    workspace_id: Uuid,
+    reserved_worker: Uuid,
+    label: Option<String>,
+    expires_at: time::OffsetDateTime,
+    revoked: bool,
+    redeemed_key: Option<Vec<u8>>,
+    issued_event: Uuid,
+}
+
+impl TryFrom<TokenRow> for TokenRecord {
+    type Error = StoreError;
+
+    fn try_from(row: TokenRow) -> Result<Self, StoreError> {
+        Ok(Self {
+            id: EnrolmentTokenId::from_uuid(row.id),
+            workspace: WorkspaceId::from_uuid(row.workspace_id),
+            worker: WorkerId::from_uuid(row.reserved_worker),
+            label: row
+                .label
+                .map(|label| MachineLabel::parse(&label))
+                .transpose()
+                .ok()
+                .ok_or(StoreError::Corrupt("enrolment_token.label"))?,
+            expires_at: Timestamp::from_utc(row.expires_at),
+            revoked: row.revoked,
+            redeemed_by: row
+                .redeemed_key
+                .map(|key| Digest::from_slice(&key))
+                .transpose()
+                .ok()
+                .ok_or(StoreError::Corrupt("enrolment_token.redeemed_key"))?,
+            issued_event: EventId::from_uuid(row.issued_event),
+        })
+    }
+}
+
 impl Sealed for EnrolWorker {}
 impl Executable for EnrolWorker {
-    /// `SELECT … FROM enrolment_token WHERE digest = $1` with the digest of the presented token.
-    fn load<'c>(
-        &'c self,
-        conn: &'c mut PgConnection,
-        _principal: &'c Principal,
-    ) -> impl Future<Output = Result<EnrolFacts, StoreError>> + Send + 'c {
-        async move {
-            let _ = (conn, TokenRecord::clone);
-            unimplemented!()
-        }
+    /// The token whose digest is the presented token's.
+    async fn load(
+        &self,
+        conn: &mut PgConnection,
+        _principal: &Principal,
+    ) -> Result<EnrolFacts, StoreError> {
+        let digest = self.token.expose_secret().digest();
+        let row = sqlx::query_as!(
+            TokenRow,
+            r#"SELECT id, workspace_id, reserved_worker, label, expires_at,
+                      revoked_at IS NOT NULL AS "revoked!", redeemed_key, issued_event
+               FROM enrolment_token WHERE digest = $1"#,
+            digest.as_bytes().as_slice()
+        )
+        .fetch_optional(&mut *conn)
+        .await?;
+        Ok(EnrolFacts {
+            token: row.map(TokenRecord::try_from).transpose()?,
+        })
     }
 }
 
 impl Sealed for IssueEnrolmentToken {}
 impl Executable for IssueEnrolmentToken {
-    /// No facts: the policy's membership check (from the principal) is all it needs.
+    /// No facts: the policy's membership check, from the principal, is all it needs.
     fn load<'c>(
         &'c self,
         _conn: &'c mut PgConnection,
         _principal: &'c Principal,
     ) -> impl Future<Output = Result<(), StoreError>> + Send + 'c {
-        async { Ok(()) }
+        std::future::ready(Ok(()))
     }
 }
 
 impl Sealed for RevokeEnrolmentToken {}
 impl Executable for RevokeEnrolmentToken {
-    /// `SELECT … FROM enrolment_token WHERE id = $1`.
-    fn load<'c>(
-        &'c self,
-        conn: &'c mut PgConnection,
-        _principal: &'c Principal,
-    ) -> impl Future<Output = Result<Option<TokenRecord>, StoreError>> + Send + 'c {
-        async move {
-            let _ = conn;
-            unimplemented!()
-        }
+    /// The token with this id.
+    async fn load(
+        &self,
+        conn: &mut PgConnection,
+        _principal: &Principal,
+    ) -> Result<Option<TokenRecord>, StoreError> {
+        let row = sqlx::query_as!(
+            TokenRow,
+            r#"SELECT id, workspace_id, reserved_worker, label, expires_at,
+                      revoked_at IS NOT NULL AS "revoked!", redeemed_key, issued_event
+               FROM enrolment_token WHERE id = $1"#,
+            self.token.as_uuid()
+        )
+        .fetch_optional(&mut *conn)
+        .await?;
+        row.map(TokenRecord::try_from).transpose()
     }
 }
 
 impl Sealed for RevokeWorker {}
 impl Executable for RevokeWorker {
-    /// `SELECT id, workspace_id, revoked_at IS NOT NULL FROM worker WHERE id = $1`.
-    fn load<'c>(
-        &'c self,
-        conn: &'c mut PgConnection,
-        _principal: &'c Principal,
-    ) -> impl Future<Output = Result<Option<WorkerRecord>, StoreError>> + Send + 'c {
-        async move {
-            let _ = conn;
-            unimplemented!()
-        }
-    }
-}
-
-/// `StartSession`'s facts: the authenticated worker, copied from the principal.
-fn self_facts(principal: &Principal) -> SelfFacts {
-    match principal {
-        Principal::Worker { id, .. } => SelfFacts { worker: Some(*id) },
-        Principal::Person { .. }
-        | Principal::Visitor { .. }
-        | Principal::Anonymous
-        | Principal::Server => SelfFacts { worker: None },
+    /// The worker with this id.
+    async fn load(
+        &self,
+        conn: &mut PgConnection,
+        _principal: &Principal,
+    ) -> Result<Option<WorkerRecord>, StoreError> {
+        let row = sqlx::query!(
+            r#"SELECT id, workspace_id, revoked_at IS NOT NULL AS "revoked!"
+               FROM worker WHERE id = $1"#,
+            self.worker.as_uuid()
+        )
+        .fetch_optional(&mut *conn)
+        .await?;
+        Ok(row.map(|row| WorkerRecord {
+            id: WorkerId::from_uuid(row.id),
+            workspace: WorkspaceId::from_uuid(row.workspace_id),
+            revoked: row.revoked,
+        }))
     }
 }
 
 impl Sealed for StartSession {}
 impl Executable for StartSession {
+    /// The authenticated worker, copied from the principal.
     fn load<'c>(
         &'c self,
         _conn: &'c mut PgConnection,
         principal: &'c Principal,
     ) -> impl Future<Output = Result<SelfFacts, StoreError>> + Send + 'c {
-        async move { Ok(self_facts(principal)) }
+        let worker = match principal {
+            Principal::Worker { id, .. } => Some(*id),
+            Principal::Person { .. }
+            | Principal::Visitor { .. }
+            | Principal::Anonymous
+            | Principal::Server => None,
+        };
+        std::future::ready(Ok(SelfFacts { worker }))
     }
 }
 
 impl Sealed for EndSession {}
 impl Executable for EndSession {
-    /// `SELECT id, workspace_id, open_session FROM worker WHERE id = $1`.
-    fn load<'c>(
-        &'c self,
-        conn: &'c mut PgConnection,
-        _principal: &'c Principal,
-    ) -> impl Future<Output = Result<Option<OpenSession>, StoreError>> + Send + 'c {
-        async move {
-            let _ = conn;
-            unimplemented!()
-        }
+    /// The worker and its open session, if any.
+    async fn load(
+        &self,
+        conn: &mut PgConnection,
+        _principal: &Principal,
+    ) -> Result<Option<OpenSession>, StoreError> {
+        let row = sqlx::query!(
+            "SELECT id, workspace_id, open_session FROM worker WHERE id = $1",
+            self.worker.as_uuid()
+        )
+        .fetch_optional(&mut *conn)
+        .await?;
+        Ok(row.map(|row| OpenSession {
+            worker: WorkerId::from_uuid(row.id),
+            workspace: WorkspaceId::from_uuid(row.workspace_id),
+            session: row.open_session.map(SessionId::from_uuid),
+        }))
     }
 }

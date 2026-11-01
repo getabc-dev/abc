@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO installation (singleton, owner_id, workspace_id, claimed_at, changed_at)\n                 VALUES (true, $1, $2, $3, $4)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Timestamptz",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "3a7ad5b46472c9763730c820848c53c7a831c3cfc8f3131faed058d0dabc4d83"
+}

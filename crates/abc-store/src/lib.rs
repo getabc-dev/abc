@@ -6,7 +6,7 @@
 //! way to write: the transaction type, the projections and the pool are private.
 //!
 //! ```ignore
-//! let db = abc_store::connect(&database_url).await?;
+//! let db = abc_store::connect(&database_url, Duration::from_secs(60)).await?;
 //! abc_store::migrate(&db).await?;
 //! let store = Store::open(db, StoreOptions::production()).await?;
 //! let issued = store.execute(&Caller::Tailnet(login), &origin, IssueEnrolmentToken { .. }).await?;
@@ -23,25 +23,28 @@ mod read;
 #[cfg(feature = "testing")]
 pub mod testing;
 
-use std::sync::Arc;
-
+use std::collections::BTreeSet;
 use std::convert::Infallible;
+use std::str::FromStr as _;
+use std::sync::Arc;
+use std::time::Duration;
 
-use abc_core::command::SetupCodeIssued;
+use abc_core::command::{IssueSetupCode, Reservation, SetupCodeIssued};
 use abc_core::credential::WorkerKey;
-use abc_core::decision::Mint;
+use abc_core::decision::{DecideCtx, Mint, Origin};
 use abc_core::identity::TailnetLogin;
 use abc_core::secret::Secret;
 use abc_core::time::Clock;
 use sqlx::PgPool;
 use sqlx::migrate::Migrator;
+use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 
 pub use error::{AuthError, ExecuteError, NotReady, OpenError, QueryError, StoreError};
 pub use execute::Executable;
 pub use feed::LogFeed;
 pub use read::Fetchable;
 
-/// The migrations, for `#[sqlx::test(migrator = "abc_store::MIGRATOR")]` and for [`migrate`].
+/// The migrations, which [`migrate`] applies.
 pub static MIGRATOR: Migrator = sqlx::migrate!();
 
 /// Who is calling, as transport proved it. **Not trusted**: the store resolves it into an
@@ -49,7 +52,7 @@ pub static MIGRATOR: Migrator = sqlx::migrate!();
 #[derive(Debug)]
 pub enum Caller {
     /// A tailnet person, as the Tailscale sidecar asserted. Only abc-server's sidecar listener
-    /// builds this (see `abc_server::sidecar`).
+    /// builds this.
     Tailnet(TailnetLogin),
     /// An enrolled worker presenting its key (`Authorization: Bearer abc_wk_…`).
     Worker(Secret<WorkerKey>),
@@ -64,27 +67,76 @@ pub enum Caller {
 }
 
 /// A connection pool to abc's database. Opaque, so no sqlx type appears in this crate's public API
-/// and abc-server never names one (tests reach the pool `#[sqlx::test]` provides through
-/// `testing::database`).
+/// and abc-server never names one.
 #[derive(Debug, Clone)]
 pub struct Database(PgPool);
 
-/// Connects to Postgres, retrying with capped backoff while the database starts (compose start
-/// order, P4). Logs each attempt without the URL.
+/// Postgres's SQLSTATE for a missing table.
+const UNDEFINED_TABLE: &str = "42P01";
+
+/// The most connections the store opens. Writes queue on the log head one at a time, so more would
+/// only wait; reads and the SSE streams share the rest.
+const MAX_CONNECTIONS: u32 = 16;
+
+/// How long a request waits for a free connection before failing as unavailable.
+const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The first pause between connection attempts; it doubles up to [`MAX_RETRY_PAUSE`].
+const FIRST_RETRY_PAUSE: Duration = Duration::from_millis(250);
+
+/// The longest pause between connection attempts.
+const MAX_RETRY_PAUSE: Duration = Duration::from_secs(5);
+
+/// Connects to Postgres, retrying with capped backoff for up to `patience` while the database
+/// starts (compose start order, P4). Logs each failed attempt without the URL.
 ///
 /// # Errors
 ///
-/// Returns [`OpenError::Connect`] after the retry budget.
-pub async fn connect(url: &Secret<DatabaseUrl>) -> Result<Database, OpenError> {
-    let _ = url;
-    unimplemented!(
-        "PgPoolOptions with acquire_timeout; backoff 0.25 s doubling to 5 s, 60 s budget"
-    )
+/// Returns [`OpenError::InvalidUrl`] for a URL that does not parse and [`OpenError::Connect`]
+/// once `patience` runs out.
+pub async fn connect(url: &Secret<DatabaseUrl>, patience: Duration) -> Result<Database, OpenError> {
+    let options = PgConnectOptions::from_str(&url.expose_secret().0)
+        .ok()
+        .ok_or(OpenError::InvalidUrl)?;
+    let mut last = None;
+    let attempts = async {
+        let mut pause = FIRST_RETRY_PAUSE;
+        let mut attempt = 1_u32;
+        loop {
+            let result = PgPoolOptions::new()
+                .max_connections(MAX_CONNECTIONS)
+                .acquire_timeout(ACQUIRE_TIMEOUT)
+                .connect_with(options.clone())
+                .await;
+            match result {
+                Ok(pool) => return pool,
+                Err(error) => {
+                    tracing::warn!(attempt, "Postgres is not reachable yet; retrying");
+                    last = Some(error);
+                    tokio::time::sleep(pause).await;
+                    pause = pause.saturating_mul(2).min(MAX_RETRY_PAUSE);
+                    attempt = attempt.saturating_add(1);
+                }
+            }
+        }
+    };
+    match tokio::time::timeout(patience, attempts).await {
+        Ok(pool) => Ok(Database(pool)),
+        Err(_) => Err(OpenError::Connect(
+            last.unwrap_or(sqlx::Error::PoolTimedOut),
+        )),
+    }
 }
 
 /// The Postgres URL. A secret: it usually holds a password.
-#[derive(Clone, zeroize::Zeroize)]
+#[derive(zeroize::Zeroize)]
 pub struct DatabaseUrl(String);
+
+impl std::fmt::Debug for DatabaseUrl {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("DatabaseUrl(<redacted>)")
+    }
+}
 
 impl DatabaseUrl {
     /// Wraps the raw URL. Validation happens when connecting, and its errors never echo the URL.
@@ -107,9 +159,9 @@ pub async fn migrate(db: &Database) -> Result<(), OpenError> {
 /// How a store reads time and makes fresh ids and secrets.
 #[derive(Debug, Clone)]
 pub struct StoreOptions {
-    /// The clock: `SystemClock` in production, `testing::ManualClock` in tests.
+    /// The clock: the system clock in production, `testing::ManualClock` in tests.
     pub clock: Arc<dyn Clock>,
-    /// The mint: `OsMint` in production, `testing::SeededMint` in tests.
+    /// The mint: OS entropy in production, `testing::SeededMint` in tests.
     pub mint: Arc<dyn Mint>,
 }
 
@@ -117,7 +169,10 @@ impl StoreOptions {
     /// The system clock and OS entropy.
     #[must_use]
     pub fn production() -> Self {
-        unimplemented!("SystemClock + OsMint (private types in execute.rs)")
+        Self {
+            clock: Arc::new(execute::SystemClock),
+            mint: Arc::new(execute::OsMint),
+        }
     }
 }
 
@@ -142,21 +197,50 @@ impl std::fmt::Debug for Store {
 }
 
 impl Store {
-    /// Opens the store on a migrated database: it checks that every migration is applied and
-    /// starts the log listener. Tests call this with `testing::database(pool)` on the pool
-    /// `#[sqlx::test]` gives them.
+    /// Opens the store on a migrated database: it checks that exactly this build's migrations are
+    /// applied and starts the log listener.
     ///
     /// `connect`, `migrate` and `open` are separate on purpose: the server reports each phase on
     /// `/readyz` (starting, migrating, ready).
     ///
     /// # Errors
     ///
-    /// Returns [`OpenError::NotMigrated`] if migrations are missing, or [`OpenError::Database`].
+    /// Returns [`OpenError::NotMigrated`] if the applied migrations differ from this build's, or
+    /// [`OpenError::Database`].
     pub async fn open(db: Database, options: StoreOptions) -> Result<Self, OpenError> {
-        // 1. compare MIGRATOR.iter() with _sqlx_migrations; any missing -> NotMigrated.
-        // 2. feed = feed::FeedHandle::start(&pool).await? (PgListener on 'abc_log').
-        let _ = (db.0, options);
-        unimplemented!()
+        let pool = db.0;
+        let applied = sqlx::query_scalar!(
+            "SELECT version FROM _sqlx_migrations WHERE success ORDER BY version"
+        )
+        .fetch_all(&pool)
+        .await;
+        let applied: BTreeSet<i64> = match applied {
+            Ok(versions) => versions.into_iter().collect(),
+            // No migration table: never migrated.
+            Err(sqlx::Error::Database(error))
+                if error.code().as_deref() == Some(UNDEFINED_TABLE) =>
+            {
+                return Err(OpenError::NotMigrated);
+            }
+            Err(error) => return Err(StoreError::Database(error).into()),
+        };
+        let expected: BTreeSet<i64> = MIGRATOR
+            .iter()
+            .filter(|migration| migration.migration_type.is_up_migration())
+            .map(|migration| migration.version)
+            .collect();
+        if applied != expected {
+            return Err(OpenError::NotMigrated);
+        }
+        let feed = feed::FeedHandle::start(&pool).await?;
+        Ok(Self {
+            inner: Arc::new(Inner {
+                pool,
+                clock: options.clock,
+                mint: options.mint,
+                feed,
+            }),
+        })
     }
 
     /// Runs `command` for `caller`: the only way to change anything. See `execute.rs` for the
@@ -170,12 +254,9 @@ impl Store {
     pub async fn execute<C: Executable>(
         &self,
         caller: &Caller,
-        origin: &abc_core::decision::Origin,
+        origin: &Origin,
         command: C,
-    ) -> Result<C::Outcome, ExecuteError<C::Rejection>>
-    where
-        C::Facts: Send,
-    {
+    ) -> Result<C::Outcome, ExecuteError<C::Rejection>> {
         execute::run(&self.inner, caller, origin, command).await
     }
 
@@ -203,7 +284,17 @@ impl Store {
     ///
     /// [`ExecuteError::Denied`] with `ServerAlreadyClaimed` once claimed; [`ExecuteError::Store`].
     pub async fn issue_setup_code(&self) -> Result<SetupCodeIssued, ExecuteError<Infallible>> {
-        unimplemented!("mint a Reservation; execute IssueSetupCode with it as Caller::Server")
+        let fresh = DecideCtx::new(self.inner.clock.now(), self.inner.mint.as_ref());
+        let candidate = Reservation {
+            owner: fresh.id(),
+            workspace: fresh.id(),
+        };
+        let origin = Origin {
+            correlation: fresh.id(),
+            causation: None,
+        };
+        self.execute(&Caller::Server, &origin, IssueSetupCode { candidate })
+            .await
     }
 
     /// Whether the server has been claimed. Installation state, not tenant data: the server logs
@@ -214,7 +305,10 @@ impl Store {
     ///
     /// [`StoreError::Database`].
     pub async fn is_claimed(&self) -> Result<bool, StoreError> {
-        unimplemented!("SELECT EXISTS (SELECT 1 FROM installation)")
+        sqlx::query_scalar!(r#"SELECT EXISTS (SELECT 1 FROM installation) AS "claimed!""#)
+            .fetch_one(&self.inner.pool)
+            .await
+            .map_err(StoreError::Database)
     }
 
     /// A handle that wakes whenever the log head advances. See [`LogFeed`].
@@ -229,6 +323,15 @@ impl Store {
     ///
     /// Returns [`NotReady`] naming what is down.
     pub async fn ready(&self) -> Result<(), NotReady> {
-        unimplemented!()
+        let ping = sqlx::query_scalar!(r#"SELECT 1 AS "one!""#).fetch_one(&self.inner.pool);
+        match tokio::time::timeout(Duration::from_secs(1), ping).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(_)) | Err(_) => return Err(NotReady::Database),
+        }
+        if self.inner.feed.connected() {
+            Ok(())
+        } else {
+            Err(NotReady::Listener)
+        }
     }
 }
