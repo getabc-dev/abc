@@ -22,6 +22,8 @@ ts-rs.workspace = true
 [dev-dependencies]
 insta.workspace = true
 proptest.workspace = true
+uuid.workspace = true
+zeroize.workspace = true
 
 [lints]
 workspace = true

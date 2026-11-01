@@ -54,6 +54,15 @@ impl CloseCode {
         }
     }
 
+    /// Every close code.
+    pub const ALL: [Self; 5] = [
+        Self::HandshakeTimeout,
+        Self::ProtocolViolation,
+        Self::Revoked,
+        Self::Superseded,
+        Self::ServerShutdown,
+    ];
+
     /// Parses a received close code. Unknown codes are `None` (treat as retryable).
     #[must_use]
     pub const fn from_code(code: u16) -> Option<Self> {
@@ -65,5 +74,48 @@ impl CloseCode {
             4503 => Some(Self::ServerShutdown),
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn close_codes_round_trip_and_are_application_codes() {
+        for code in CloseCode::ALL {
+            assert_eq!(CloseCode::from_code(code.code()), Some(code), "{code:?}");
+            assert!(
+                (4000..5000).contains(&code.code()),
+                "{code:?} is an application code"
+            );
+        }
+        assert_eq!(
+            CloseCode::ALL.map(CloseCode::code),
+            [4408, 4400, 4403, 4409, 4503],
+            "the wire values the worker branches on"
+        );
+        assert_eq!(
+            CloseCode::from_code(1000),
+            None,
+            "a normal close is not ours"
+        );
+        assert_eq!(
+            CloseCode::from_code(4999),
+            None,
+            "unknown codes are retryable"
+        );
+    }
+
+    #[test]
+    fn the_timings_fit_together() {
+        assert!(
+            PING_INTERVAL < IDLE_TIMEOUT,
+            "several pings fit in the idle window"
+        );
+        assert!(
+            HANDSHAKE_TIMEOUT < IDLE_TIMEOUT,
+            "the handshake is shorter still"
+        );
     }
 }

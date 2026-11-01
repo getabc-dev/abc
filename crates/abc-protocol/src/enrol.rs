@@ -21,7 +21,8 @@ use abc_core::secret::{Secret, serialize_exposed};
 use semver::Version;
 use serde::{Deserialize, Serialize};
 
-/// The enrolment endpoint, relative to the server's tailnet URL.
+/// The enrolment endpoint, relative to the server's tailnet URL. Requests carry
+/// `Content-Type: application/json`.
 pub const ENROL_PATH: &str = "/api/enrol";
 
 /// The worker's enrolment request.
@@ -47,4 +48,85 @@ pub struct EnrolResponse {
     pub workspace: WorkspaceId,
     /// Its display name.
     pub name: DisplayName,
+}
+
+#[cfg(test)]
+mod tests {
+    use abc_core::credential::WorkerKey;
+    use abc_core::decision::Mint;
+    use abc_core::identity::{Arch, Os};
+    use abc_core::time::Timestamp;
+    use zeroize::Zeroizing;
+
+    use super::*;
+
+    #[derive(Debug)]
+    struct Fixed;
+
+    impl Mint for Fixed {
+        fn uuid(&self, _now: Timestamp) -> uuid::Uuid {
+            uuid::Uuid::nil()
+        }
+
+        fn secret(&self) -> Zeroizing<[u8; 32]> {
+            Zeroizing::new([0; 32])
+        }
+    }
+
+    #[test]
+    fn the_request_carries_the_token_and_only_the_keys_digest() {
+        let key = WorkerKey::generate(&Fixed);
+        let token = format!("abc_enr_{}", "0".repeat(52));
+        let request = EnrolRequest {
+            token: EnrolmentToken::parse(&token).unwrap(),
+            key: key.expose_secret().digest(),
+            machine: MachineInfo {
+                hostname: DisplayName::parse("mbp").unwrap(),
+                os: Os::Macos,
+                arch: Arch::Aarch64,
+            },
+            build: Version::new(0, 1, 0),
+        };
+        let json = serde_json::to_string(&request).unwrap();
+        let digest = serde_json::to_string(&key.expose_secret().digest()).unwrap();
+        assert_eq!(
+            digest.len(),
+            66,
+            "the key travels as 64 hex characters of its digest"
+        );
+        insta::assert_snapshot!(
+            json.replace(&digest, "\"<digest of the key>\""),
+            @r#"{"token":"abc_enr_0000000000000000000000000000000000000000000000000000","key":"<digest of the key>","machine":{"hostname":"mbp","os":"macos","arch":"aarch64"},"build":"0.1.0"}"#
+        );
+        assert!(
+            !json.contains(key.expose_secret().as_str()),
+            "the key never leaves the worker"
+        );
+        let decoded: EnrolRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.key, request.key, "the digest reads back");
+        assert_eq!(
+            decoded.token.expose_secret().digest(),
+            request.token.expose_secret().digest(),
+            "and the token"
+        );
+    }
+
+    #[test]
+    fn the_response_names_the_worker() {
+        let response = EnrolResponse {
+            worker: abc_core::id::FromUuid::from_uuid(uuid::Uuid::from_u128(1)),
+            workspace: abc_core::id::FromUuid::from_uuid(uuid::Uuid::from_u128(2)),
+            name: DisplayName::parse("mbp").unwrap(),
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        insta::assert_snapshot!(
+            json,
+            @r#"{"worker":"00000000-0000-0000-0000-000000000001","workspace":"00000000-0000-0000-0000-000000000002","name":"mbp"}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<EnrolResponse>(&json).unwrap(),
+            response,
+            "and reads back"
+        );
+    }
 }

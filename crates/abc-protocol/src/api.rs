@@ -11,7 +11,6 @@ use ts_rs::TS;
 
 /// The JSON body of every non-2xx response: `{"error":{"code":"…","message":"…"}}`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS, JsonSchema)]
-#[ts(export)]
 pub struct ApiErrorBody {
     /// The error.
     pub error: ApiErrorDetail,
@@ -19,7 +18,6 @@ pub struct ApiErrorBody {
 
 /// An error's code and human message.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS, JsonSchema)]
-#[ts(export)]
 pub struct ApiErrorDetail {
     /// Branch on this.
     pub code: ApiCode,
@@ -30,7 +28,6 @@ pub struct ApiErrorDetail {
 /// Every error code. Grouped by who has to act.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, TS, JsonSchema)]
 #[serde(rename_all = "snake_case")]
-#[ts(export)]
 pub enum ApiCode {
     // The request itself.
     /// The body or path did not parse. The message names the field, never its value.
@@ -40,6 +37,8 @@ pub enum ApiCode {
     CrossSiteRequest,
     /// Nothing at this path.
     NotFound,
+    /// The path exists, but not for this method.
+    MethodNotAllowed,
 
     // Authentication.
     /// The request needs a signed-in tailnet person and carried no identity (for example, a
@@ -53,8 +52,6 @@ pub enum ApiCode {
     // Authorization.
     /// Not a member of this workspace.
     NotAMember,
-    /// Only the workspace owner can do this.
-    OwnerOnly,
     /// Only a worker can do this.
     WorkerOnly,
     /// The server already has an owner.
@@ -65,7 +62,7 @@ pub enum ApiCode {
     SetupCodeMismatch,
     /// The setup code expired. Run `abc server setup-code` on the server again.
     SetupCodeExpired,
-    /// Only the server itself can do this (never expected from a client; a bug if seen).
+    /// Only the server itself can do this. A client never causes it; seeing it is a bug.
     ServerOnly,
     /// No such worker.
     UnknownWorker,
@@ -89,4 +86,71 @@ pub enum ApiCode {
     Unavailable,
     /// A bug. The response carries a request id to quote.
     Internal,
+}
+
+impl ApiCode {
+    /// Every code, for exhaustive tests on both sides of the wire.
+    pub const ALL: [Self; 23] = [
+        Self::MalformedRequest,
+        Self::CrossSiteRequest,
+        Self::NotFound,
+        Self::MethodNotAllowed,
+        Self::TailnetIdentityRequired,
+        Self::InvalidWorkerKey,
+        Self::WorkerRevoked,
+        Self::NotAMember,
+        Self::WorkerOnly,
+        Self::ServerAlreadyClaimed,
+        Self::SetupCodeRequired,
+        Self::SetupCodeMismatch,
+        Self::SetupCodeExpired,
+        Self::ServerOnly,
+        Self::UnknownWorker,
+        Self::EnrolmentTokenRequired,
+        Self::EnrolmentTokenUnknown,
+        Self::EnrolmentTokenExpired,
+        Self::EnrolmentTokenRevoked,
+        Self::EnrolmentTokenUsed,
+        Self::EnrolmentTokenAlreadyRedeemed,
+        Self::Unavailable,
+        Self::Internal,
+    ];
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn codes_are_snake_case_on_the_wire() {
+        let body = ApiErrorBody {
+            error: ApiErrorDetail {
+                code: ApiCode::EnrolmentTokenAlreadyRedeemed,
+                message: "revoke the worker instead".to_owned(),
+            },
+        };
+        let json = serde_json::to_string(&body).unwrap();
+        insta::assert_snapshot!(
+            json,
+            @r#"{"error":{"code":"enrolment_token_already_redeemed","message":"revoke the worker instead"}}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<ApiErrorBody>(&json).unwrap(),
+            body,
+            "and read back"
+        );
+    }
+
+    #[test]
+    fn every_code_has_a_distinct_name() {
+        let names: std::collections::BTreeSet<String> = ApiCode::ALL
+            .iter()
+            .map(|code| serde_json::to_string(code).unwrap())
+            .collect();
+        assert_eq!(names.len(), ApiCode::ALL.len(), "no two codes share a name");
+        assert!(
+            serde_json::from_str::<ApiCode>(r#""owner_only""#).is_err(),
+            "an unknown code is an error"
+        );
+    }
 }
