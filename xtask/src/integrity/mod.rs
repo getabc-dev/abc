@@ -10,9 +10,10 @@
 //! joins.
 
 mod approval;
+mod reasons;
 mod rust;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
 use std::io::Write;
@@ -21,6 +22,7 @@ use std::path::Path;
 use anyhow::Context;
 
 pub(crate) use approval::PullRequest;
+pub(crate) use reasons::description;
 
 use crate::git;
 
@@ -125,17 +127,39 @@ impl fmt::Display for Finding {
     }
 }
 
-/// Runs the check against the merge base with `base`. With a pull request, findings pass when an
-/// approver has approved them.
+impl Finding {
+    /// The test this finding changes, as the description's "## Test changes" section names it:
+    /// `<file>::<test>`, or the file for a deleted test file. `None` for gate changes.
+    fn test(&self) -> Option<String> {
+        match self {
+            Self::DeletedTest { file, test }
+            | Self::NewlyIgnored { file, test }
+            | Self::NewlyShouldPanic { file, test }
+            | Self::FewerAssertions { file, test, .. } => Some(format!("{file}::{test}")),
+            Self::DeletedTestFile { file, .. } => Some(file.clone()),
+            Self::GateFile { .. } | Self::WorkspaceLints => None,
+        }
+    }
+}
+
+/// Runs the check against the merge base with `base`. Each flagged test change needs a reason in
+/// the pull request's `description`; with a pull request, findings then pass when an approver
+/// has approved them.
 pub(crate) fn run(
     root: &Path,
     base: &str,
     pull_request: Option<&PullRequest>,
+    description: Option<&str>,
     out: &mut impl Write,
 ) -> anyhow::Result<bool> {
-    run_with(root, base, pull_request, out, &mut |url, token| {
-        approval::github_get(url, token)
-    })
+    run_with(
+        root,
+        base,
+        pull_request,
+        description,
+        out,
+        &mut |url, token| approval::github_get(url, token),
+    )
 }
 
 /// [`run`], reading GitHub's API through `fetch` (URL and token).
@@ -143,6 +167,7 @@ fn run_with(
     root: &Path,
     base: &str,
     pull_request: Option<&PullRequest>,
+    description: Option<&str>,
     out: &mut impl Write,
     fetch: &mut impl FnMut(&str, &str) -> anyhow::Result<Vec<u8>>,
 ) -> anyhow::Result<bool> {
@@ -159,6 +184,14 @@ fn run_with(
     for finding in &found {
         writeln!(out, "  {finding}")?;
     }
+    let flagged: Vec<String> = found
+        .iter()
+        .filter_map(Finding::test)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let explained = reasons::explained(&flagged, description.unwrap_or_default());
+    explained.report(out)?;
     let Some(pull_request) = pull_request else {
         writeln!(
             out,
@@ -174,7 +207,7 @@ fn run_with(
         fetch(url, &pull_request.token)
     })?;
     writeln!(out, "integrity: {}", verdict.reason)?;
-    Ok(verdict.approved)
+    Ok(verdict.approved && explained.complete())
 }
 
 /// Every finding in the changes from `commit` to the working tree.
@@ -489,7 +522,7 @@ mod tests {
         };
         let mut out = Vec::new();
         assert!(
-            run_with(&clean, "base", None, &mut out, unused).unwrap(),
+            run_with(&clean, "base", None, None, &mut out, unused).unwrap(),
             "no findings pass"
         );
         assert!(
@@ -505,7 +538,7 @@ mod tests {
         );
         let mut refused = Vec::new();
         assert!(
-            !run_with(&gated, "base", None, &mut refused, unused).unwrap(),
+            !run_with(&gated, "base", None, None, &mut refused, unused).unwrap(),
             "findings fail"
         );
         assert!(
@@ -539,6 +572,7 @@ mod tests {
                 &gated,
                 "base",
                 Some(&pull_request),
+                None,
                 &mut accepted,
                 &mut approving
             )
@@ -551,6 +585,126 @@ mod tests {
                 .contains("accepted by snehilvj"),
             "who"
         );
+    }
+
+    #[test]
+    fn test_changes_need_a_reason_even_when_approved() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = repository(&temp.path().join("repo"));
+        fs::create_dir_all(repo.join("src")).unwrap();
+        fs::write(repo.join("src/t.rs"), "#[test]\nfn kept() {}\n").unwrap();
+        git(&repo, &["add", "--all"]);
+        git(&repo, &["commit", "--quiet", "-m", "a test"]);
+        git(&repo, &["branch", "base"]);
+        fs::remove_file(repo.join("src/t.rs")).unwrap();
+        git(&repo, &["commit", "--quiet", "--all", "-m", "drop it"]);
+
+        let pull_request = PullRequest {
+            api: "https://api.example".to_owned(),
+            repository: "o/r".to_owned(),
+            number: 7,
+            token: "token".to_owned(),
+        };
+        let mut approving = |url: &str, _: &str| -> anyhow::Result<Vec<u8>> {
+            Ok(if url.ends_with("/pulls/7") {
+                br#"{"head": {"sha": "abc"}, "labels": [{"name": "integrity-approved"}]}"#.to_vec()
+            } else if url.contains("/actions/runs") {
+                br#"{"workflow_runs": [{"created_at": "2026-11-01T09:00:00Z"}]}"#.to_vec()
+            } else if url.ends_with("page=1") {
+                br#"[{"event": "labeled", "created_at": "2026-11-01T10:00:00Z", "actor": {"login": "snehilvj"}, "label": {"name": "integrity-approved"}}]"#.to_vec()
+            } else {
+                b"[]".to_vec()
+            })
+        };
+        fs::create_dir_all(repo.join(".github")).unwrap();
+        fs::write(repo.join(".github/integrity-approvers"), "snehilvj\n").unwrap();
+
+        let mut bare = Vec::new();
+        assert!(
+            !run_with(
+                &repo,
+                "base",
+                Some(&pull_request),
+                Some("Drops t."),
+                &mut bare,
+                &mut approving
+            )
+            .unwrap(),
+            "the label alone does not pass a test change"
+        );
+        let bare = String::from_utf8(bare).unwrap();
+        assert!(
+            bare.contains("deleted test file  src/t.rs (1 tests)"),
+            "{bare}"
+        );
+        assert!(bare.contains("- `src/t.rs`: <which requirement"), "{bare}");
+        assert!(
+            bare.contains("accepted by snehilvj"),
+            "approved all the same: {bare}"
+        );
+
+        let reasoned =
+            "Drops t.\n\n## Test changes\n\n- `src/t.rs`: t covered the removed parser.\n";
+        assert!(
+            run_with(
+                &repo,
+                "base",
+                Some(&pull_request),
+                Some(reasoned),
+                &mut Vec::new(),
+                &mut approving
+            )
+            .unwrap(),
+            "a stated reason, approved, passes"
+        );
+        let mut local = Vec::new();
+        assert!(
+            !run_with(
+                &repo,
+                "base",
+                None,
+                Some(reasoned),
+                &mut local,
+                &mut approving
+            )
+            .unwrap(),
+            "a reason without approval still fails"
+        );
+    }
+
+    #[test]
+    fn names_the_test_each_finding_changes() {
+        assert_eq!(
+            Finding::FewerAssertions {
+                file: "a.rs".into(),
+                test: "tests::t".into(),
+                before: 2,
+                after: 1
+            }
+            .test()
+            .as_deref(),
+            Some("a.rs::tests::t"),
+            "file and test"
+        );
+        assert_eq!(
+            Finding::DeletedTestFile {
+                file: "a.rs".into(),
+                tests: 2
+            }
+            .test()
+            .as_deref(),
+            Some("a.rs"),
+            "a deleted file by its path"
+        );
+        assert_eq!(
+            Finding::GateFile {
+                file: "deny.toml".into()
+            }
+            .test(),
+            None,
+            "gate changes need approval, not a test reason"
+        );
+        assert_eq!(Finding::WorkspaceLints.test(), None, "nor the lints");
     }
 
     #[test]

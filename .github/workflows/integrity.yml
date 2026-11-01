@@ -2,8 +2,9 @@ name: Integrity
 
 on:
   pull_request:
-    # Labelling re-runs it, so an approver's integrity-approved label counts at once.
-    types: [opened, synchronize, reopened, labeled, unlabeled]
+    # Labelling re-runs it, so an approver's integrity-approved label counts at once; editing the
+    # description re-reads its "## Test changes" reasons.
+    types: [opened, synchronize, reopened, edited, labeled, unlabeled]
   merge_group:
 
 permissions: {}

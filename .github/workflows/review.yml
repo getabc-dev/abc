@@ -2,7 +2,8 @@ name: Review
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
+    # An edited description re-reviews the reasons it gives for test changes.
+    types: [opened, synchronize, reopened, edited, ready_for_review]
   merge_group:
 
 permissions: {}

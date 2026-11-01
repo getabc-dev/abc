@@ -108,9 +108,9 @@ watchdog compares the diff with that task and the rules above, and keeps it work
 | `cargo xtask doctor [TOOLS]` | Fails unless every pinned tool, or each one named, is installed, matches its pinned sha256 and reports its pinned version. |
 | `cargo xtask check` | Format check, clippy (`--all-targets --locked -D warnings`), nextest, doctests and rustdoc with warnings denied, on the whole workspace. Property tests run with a fixed seed. |
 | `cargo xtask check --changed` | The same, limited to the crates affected by changes since the merge base with the default branch (`upstream/HEAD`, else `origin/HEAD`). |
-| `cargo xtask integrity --base <rev>` | Lists deleted test files and tests, newly skipped or `should_panic` tests, tests with fewer assertions, and changed gate files since the merge base. In CI it fails on any of them unless an approver in `.github/integrity-approvers` labelled the PR `integrity-approved` after its last push. |
+| `cargo xtask integrity --base <rev> [--description <file>]` | Lists deleted test files and tests, newly skipped or `should_panic` tests, tests with fewer assertions, and changed gate files since the merge base. In CI it fails on any of them unless an approver in `.github/integrity-approvers` labelled the PR `integrity-approved` after its last push and last description edit. Each flagged test change also needs a reason in the PR description, label or not (below). |
 | `cargo xtask coverage --base <rev>` | Runs the tests under cargo-llvm-cov and fails unless 90% of the changed, instrumented lines are covered, listing the ones that are not. |
-| `cargo xtask mutants --base <rev> [--jobs N]` | Runs cargo-mutants on the Rust lines changed since the merge base and fails on any missed or timed-out mutant. |
+| `cargo xtask mutants --base <rev> [--jobs N]` | Runs cargo-mutants on the Rust lines changed since the merge base and fails on any missed mutant: a change to the code that no test notices. A mutant whose tests hang counts as caught. |
 | `cargo xtask review --base <rev>` | Gemini reviews the diff, the PR's title and description against this file. Runs in CI; it blocks on a `block` verdict and fails closed on quota, size and missing-key errors. |
 | `cargo xtask task set "<text>"` / `show` / `clear` | Records, prints or forgets the current task in `.abc/task.md` (not committed), for the watchdog. |
 | `cargo xtask gh -- <args>` | Runs gh as the agent App with a fresh one-hour installation token. Agents create, merge and change things on GitHub only through this; the guard blocks plain `gh pr create`, `gh pr merge` and `gh api` writes. |
@@ -126,6 +126,18 @@ CI runs `check`, `integrity`, `coverage`, `mutants` and `review` on every pull r
 `cargo xtask tool osv-scanner scan source --lockfile Cargo.lock`, `cargo xtask tool zizmor
 --pedantic .github`, `cargo xtask tool pinact run --check --verify-comment` and `cargo xtask tool
 gitleaks git --redact --no-banner --verbose .`. Every job is a required check on `main`.
+
+A PR that deletes, skips or weakens a test explains each one in its description, in a
+`## Test changes` section: one entry per test, naming the test in backticks as the integrity check
+reports it (`<file>::<test>`, or the file for a deleted test file), then the requirement or
+behaviour that changed. A test change that only makes the code pass is not a reason; the Gemini
+review blocks it.
+
+```markdown
+## Test changes
+
+- `xtask/src/a.rs::tests::accepts_tabs`: tabs are now rejected (plan step 3), so this test is gone.
+```
 
 The gate files, listed in `xtask/src/integrity/mod.rs` and owned in `.github/CODEOWNERS`, are the
 files that decide what passes: CI, lint and tool configuration, the agent settings, and the xtask

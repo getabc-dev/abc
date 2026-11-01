@@ -2,7 +2,9 @@ name: Integrity approval
 
 on:
   pull_request:
-    types: [synchronize]
+    # The label approves the head commit and the reasons in the description, so a new push or an
+    # edited description needs a new approval.
+    types: [synchronize, edited]
 
 permissions: {}
 
@@ -14,13 +16,15 @@ jobs:
   remove-stale-approval:
     name: Remove a stale integrity approval
     # A fork's token cannot edit labels; its approval is checked against the push time anyway.
-    if: github.event.pull_request.head.repo.full_name == github.repository
+    if: >-
+      github.event.pull_request.head.repo.full_name == github.repository
+      && (github.event.action == 'synchronize' || github.event.changes.body != null)
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
-      pull-requests: write # remove the integrity-approved label after a push
+      pull-requests: write # remove the integrity-approved label after a push or description edit
     steps:
-      - name: A new push needs a new approval
+      - name: A new push or description needs a new approval
         run: |
           if gh api "repos/$REPO/issues/$PR/labels" --jq '.[].name' | grep -qx integrity-approved; then
             gh api -X DELETE "repos/$REPO/issues/$PR/labels/integrity-approved"

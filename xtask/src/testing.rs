@@ -57,7 +57,22 @@ pub(crate) fn serve_once(
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     let server = std::thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
+        // A request that never comes fails the test instead of hanging it.
+        listener.set_nonblocking(true).unwrap();
+        let started = std::time::Instant::now();
+        let mut stream = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+                        && started.elapsed() < std::time::Duration::from_secs(10) =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(error) => panic!("no request arrived: {error}"),
+            }
+        };
+        stream.set_nonblocking(false).unwrap();
         let mut request = Vec::new();
         let mut buffer = [0_u8; 8192];
         loop {

@@ -202,11 +202,7 @@ pub(crate) fn credential(
 
 /// Runs `gh` (the user's GitHub CLI, from `PATH`) with `args`, acting as the App through
 /// `GH_TOKEN`.
-pub(crate) fn gh(
-    program: &Path,
-    args: &[OsString],
-    token: &str,
-) -> anyhow::Result<ExitCode> {
+pub(crate) fn gh(program: &Path, args: &[OsString], token: &str) -> anyhow::Result<ExitCode> {
     let status = Command::new(program)
         .args(args)
         .env("GH_TOKEN", token)

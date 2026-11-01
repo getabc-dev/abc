@@ -85,9 +85,14 @@ enum Task {
         /// The revision whose merge base with HEAD the diff starts from.
         #[arg(long)]
         base: String,
-        /// In CI, the pull request whose `integrity-approved` label can accept the findings.
+        /// In CI, the pull request whose `integrity-approved` label can accept the findings. Its
+        /// description is read from the event payload at `GITHUB_EVENT_PATH`.
         #[arg(long)]
         pr: Option<u64>,
+        /// A file holding the pull request description, whose "## Test changes" section must give
+        /// a reason for each flagged test change; read instead of the event payload.
+        #[arg(long)]
+        description: Option<PathBuf>,
     },
     /// git's credential helper: answers `get` for github.com with an agent App token on stdout.
     GitCredential {
@@ -189,12 +194,19 @@ fn run(task: Task) -> anyhow::Result<ExitCode> {
         Task::Check { changed } => Ok(verdict(check::run(&root, changed, report)?)),
         Task::Coverage { base } => Ok(verdict(coverage::run(&root, &base, report)?)),
         Task::Mutants { base, jobs } => Ok(verdict(mutants::run(&root, &base, jobs, report)?)),
-        Task::Integrity { base, pr } => {
+        Task::Integrity {
+            base,
+            pr,
+            description,
+        } => {
             let pull_request = pr.map(integrity::PullRequest::from_env).transpose()?;
+            let event = pr.and_then(|_| std::env::var_os("GITHUB_EVENT_PATH").map(PathBuf::from));
+            let description = integrity::description(description.as_deref(), event)?;
             Ok(verdict(integrity::run(
                 &root,
                 &base,
                 pull_request.as_ref(),
+                description.as_deref(),
                 report,
             )?))
         }
