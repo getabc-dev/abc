@@ -12,7 +12,9 @@
 //! - `xtask/src/old.rs`: the old parser was removed with its tests.
 //! ```
 //!
-//! A test is named `<file>::<test>`, or by its file alone when the whole file was deleted. The
+//! A test is named `<file>::<test>`, or by its file alone when the whole file was deleted. HTML
+//! comments, such as the hints in `.github/pull_request_template.md`, are not read, and "None" (the
+//! template's default) names no test, so it passes only when no test change was flagged. The
 //! `integrity-approved` label approves a stated reason, so the reasons are required with or
 //! without it.
 
@@ -29,6 +31,7 @@ pub(super) const HEADING: &str = "Test changes";
 
 /// The reason given for each test the section names, keyed by the test; a reason may be empty.
 fn entries(description: &str) -> Option<BTreeMap<String, String>> {
+    let description = without_comments(description);
     let mut lines = description.lines();
     lines.find(|line| {
         line.strip_prefix("## ")
@@ -70,6 +73,18 @@ fn entries(description: &str) -> Option<BTreeMap<String, String>> {
         }
     }
     Some(entries)
+}
+
+/// `text` without its HTML comments; an unclosed comment runs to the end.
+fn without_comments(text: &str) -> String {
+    let mut kept = String::new();
+    let mut rest = text;
+    while let Some((before, comment)) = rest.split_once("<!--") {
+        kept.push_str(before);
+        rest = comment.split_once("-->").map_or("", |(_, after)| after);
+    }
+    kept.push_str(rest);
+    kept
 }
 
 fn append(reason: &mut String, more: &str) {
@@ -272,6 +287,37 @@ mod tests {
         assert!(
             explained(&[], "no section").complete(),
             "nothing flagged needs no section"
+        );
+    }
+
+    #[test]
+    fn the_pull_request_template_agrees_with_the_parser() {
+        let template = include_str!("../../../.github/pull_request_template.md");
+        let untouched = explained(&[], template);
+        assert!(
+            untouched.section && untouched.complete() && untouched.extra.is_empty(),
+            "the template's \"None\" passes when nothing is flagged, and its hint is no entry"
+        );
+        assert_eq!(
+            explained(&flagged(), template).unexplained,
+            flagged(),
+            "\"None\" explains no flagged test"
+        );
+        let filled = template.replace(
+            "\nNone\n",
+            "\n- `src/a.rs::tests::one`: a\n- `src/a.rs::tests::two`: b\n- `src/gone.rs`: c\n",
+        );
+        assert!(
+            explained(&flagged(), &filled).complete(),
+            "filled in, it passes"
+        );
+        assert_eq!(
+            entries("## Test changes\n<!-- - `x`: hint\n-->\n- `y`: real <!-- aside --> reason\n<!-- open")
+                .unwrap()
+                .into_iter()
+                .collect::<Vec<_>>(),
+            [("y".to_owned(), "real  reason".to_owned())],
+            "comments are dropped, an unclosed one to the end"
         );
     }
 

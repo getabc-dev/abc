@@ -131,7 +131,8 @@ A PR that deletes, skips or weakens a test explains each one in its description,
 `## Test changes` section: one entry per test, naming the test in backticks as the integrity check
 reports it (`<file>::<test>`, or the file for a deleted test file), then the requirement or
 behaviour that changed. A test change that only makes the code pass is not a reason; the Gemini
-review blocks it.
+review blocks it. `.github/pull_request_template.md` has the section, with "None" for a PR that
+changes no tests.
 
 ```markdown
 ## Test changes
