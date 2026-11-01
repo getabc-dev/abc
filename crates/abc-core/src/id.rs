@@ -1,4 +1,4 @@
-//! Typed identifiers. Every id is a UUIDv7 minted through [`crate::decision::Mint`]. The type
+//! Typed identifiers. Every id is a `UUIDv7` minted through [`crate::decision::Mint`]. The type
 //! names what the id refers to, so a `WorkerId` cannot be passed where a `WorkspaceId` is expected.
 //! Ids are not secrets or capabilities: knowing one grants nothing, which is why their
 //! constructors are public.
@@ -8,9 +8,10 @@ use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 use uuid::Uuid;
 
-/// Builds an id from a freshly minted UUID. Implemented by every id type.
+/// Builds an id from a UUID. Implemented by every id type.
 pub trait FromUuid {
-    /// Wraps `uuid`. The caller guarantees it was minted for this kind of entity.
+    /// Wraps `uuid`. The caller guarantees it names this kind of entity: a freshly minted UUID, or
+    /// one read back from storage where it was recorded as this kind.
     fn from_uuid(uuid: Uuid) -> Self;
 }
 
@@ -22,7 +23,7 @@ macro_rules! id_type {
             Serialize, Deserialize, TS, JsonSchema,
         )]
         #[serde(transparent)]
-        #[ts(export, type = "string")]
+        #[ts(type = "string")]
         pub struct $name(Uuid);
 
         impl $name {
@@ -36,6 +37,12 @@ macro_rules! id_type {
         impl FromUuid for $name {
             fn from_uuid(uuid: Uuid) -> Self {
                 Self(uuid)
+            }
+        }
+
+        impl std::fmt::Display for $name {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                self.0.fmt(f)
             }
         }
     };
@@ -70,3 +77,27 @@ id_type!(
     /// the request id, so a log line and the events it produced share it.
     CorrelationId
 );
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_id_is_its_uuid_on_the_wire_and_in_text() {
+        let uuid = Uuid::from_u128(0x0190_0000_0000_7000_8000_0000_0000_0001);
+        let id = WorkerId::from_uuid(uuid);
+        assert_eq!(id.as_uuid(), uuid, "the id keeps its UUID");
+        assert_eq!(id.to_string(), uuid.to_string(), "Display is the UUID's");
+        let json = serde_json::to_string(&id).unwrap();
+        assert_eq!(
+            json,
+            format!("\"{uuid}\""),
+            "an id is a bare string on the wire"
+        );
+        assert_eq!(
+            serde_json::from_str::<WorkerId>(&json).unwrap(),
+            id,
+            "and reads back"
+        );
+    }
+}

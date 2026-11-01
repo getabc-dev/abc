@@ -48,3 +48,105 @@ pub trait Command: Request<Action = WriteAction> {
         ctx: &DecideCtx<'_>,
     ) -> Result<Decision<Self::Outcome>, Self::Rejection>;
 }
+
+/// Shared fixtures for the command tests.
+#[cfg(test)]
+pub(crate) mod fixtures {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use time::macros::datetime;
+    use uuid::Uuid;
+    use zeroize::Zeroizing;
+
+    use crate::actor::{Membership, Principal, Role};
+    use crate::decision::{DecideCtx, Decision, Mint, Pending};
+    use crate::id::FromUuid;
+    use crate::identity::TailnetLogin;
+    use crate::policy::authorize;
+    use crate::time::Timestamp;
+
+    use super::Command;
+
+    /// A mint that counts: ids 1, 2, 3… and secret bytes that change with each call.
+    #[derive(Debug, Default)]
+    pub(crate) struct CountingMint(AtomicU64);
+
+    impl CountingMint {
+        fn next(&self) -> u64 {
+            self.0.fetch_add(1, Ordering::SeqCst).saturating_add(1)
+        }
+    }
+
+    impl Mint for CountingMint {
+        fn uuid(&self, _now: Timestamp) -> Uuid {
+            Uuid::from_u128(u128::from(self.next()))
+        }
+
+        fn secret(&self) -> Zeroizing<[u8; 32]> {
+            let mut bytes = [0; 32];
+            bytes[..8].copy_from_slice(&self.next().to_be_bytes());
+            Zeroizing::new(bytes)
+        }
+    }
+
+    pub(crate) fn id<T: FromUuid>(n: u128) -> T {
+        T::from_uuid(Uuid::from_u128(n))
+    }
+
+    pub(crate) fn now() -> Timestamp {
+        Timestamp::from_utc(datetime!(2026-01-01 00:00:00 UTC))
+    }
+
+    pub(crate) const HOME: u128 = 100;
+
+    pub(crate) fn owner() -> Principal {
+        Principal::Person {
+            id: id(1),
+            memberships: vec![Membership {
+                workspace: id(HOME),
+                role: Role::Owner,
+            }],
+        }
+    }
+
+    pub(crate) fn visitor() -> Principal {
+        Principal::Visitor {
+            login: TailnetLogin::parse("alice@example.com").unwrap(),
+        }
+    }
+
+    /// Authorizes and decides `command` for `principal` at `at`, as the store would.
+    pub(crate) fn run<C: Command>(
+        principal: &Principal,
+        command: C,
+        facts: C::Facts,
+        at: Timestamp,
+    ) -> Result<Decision<C::Outcome>, Outcome<C::Rejection>>
+    where
+        C::Facts: Clone,
+    {
+        let authorized = authorize(principal, command, &facts, at).map_err(Outcome::Denied)?;
+        C::decide(
+            authorized,
+            facts,
+            &DecideCtx::new(at, &CountingMint::default()),
+        )
+        .map_err(Outcome::Rejected)
+    }
+
+    /// Why `run` produced no decision.
+    #[derive(Debug, PartialEq, Eq)]
+    pub(crate) enum Outcome<R> {
+        Denied(crate::policy::Denied),
+        Rejected(R),
+    }
+
+    /// The (stream id, payload) pairs of a decision, for comparing.
+    pub(crate) fn events<O>(decision: &Decision<O>) -> Vec<(Uuid, crate::event::Event)> {
+        decision
+            .events()
+            .iter()
+            .map(|pending: &Pending| (pending.stream().id, pending.event().clone()))
+            .collect()
+    }
+}

@@ -46,7 +46,7 @@ use crate::time::Timestamp;
     schemars::JsonSchema,
 )]
 #[serde(transparent)]
-#[ts(export, type = "number")]
+#[ts(type = "number")]
 pub struct Position(i64);
 
 impl Position {
@@ -124,6 +124,12 @@ impl StreamKind {
             Self::EnrolmentToken => "enrolment_token",
             Self::Worker => "worker",
         }
+    }
+
+    /// Reads a stored name.
+    #[must_use]
+    pub fn parse(stored: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|kind| kind.as_str() == stored)
     }
 }
 
@@ -338,17 +344,42 @@ impl Event {
     /// The payload's schema version. It has an exhaustive match per variant, so a new event has to
     /// state its version.
     #[must_use]
-    pub fn schema_version(&self) -> u16 {
-        unimplemented!("exhaustive match; every variant is 1 today")
+    pub const fn schema_version(&self) -> SchemaVersion {
+        match self {
+            Self::Installation(
+                InstallationEvent::SetupCodeIssued { .. } | InstallationEvent::Claimed { .. },
+            )
+            | Self::Person(PersonEvent::Registered { .. })
+            | Self::Workspace(
+                WorkspaceEvent::Created { .. } | WorkspaceEvent::MemberAdded { .. },
+            )
+            | Self::Enrolment(
+                EnrolmentEvent::Issued { .. }
+                | EnrolmentEvent::Revoked
+                | EnrolmentEvent::Redeemed { .. },
+            )
+            | Self::Worker(
+                WorkerEvent::Enrolled { .. }
+                | WorkerEvent::SessionStarted { .. }
+                | WorkerEvent::SessionEnded { .. }
+                | WorkerEvent::Revoked,
+            ) => SchemaVersion::V1,
+        }
     }
 
     /// The JSON stored in `event.payload`. It always includes `type`.
     ///
     /// # Errors
     ///
-    /// Returns the serde error, which cannot happen for these types but is not hidden.
+    /// Returns the serde error, which these types never produce but which is not hidden.
     pub fn encode(&self) -> Result<serde_json::Value, serde_json::Error> {
-        unimplemented!("serialize the inner enum")
+        match self {
+            Self::Installation(event) => serde_json::to_value(event),
+            Self::Person(event) => serde_json::to_value(event),
+            Self::Workspace(event) => serde_json::to_value(event),
+            Self::Enrolment(event) => serde_json::to_value(event),
+            Self::Worker(event) => serde_json::to_value(event),
+        }
     }
 
     /// Decodes a stored payload, choosing the enum from the row's `stream_kind`.
@@ -358,12 +389,35 @@ impl Event {
     /// Returns [`UndecodableEvent`] for an unknown type or version: a corrupt or future log.
     pub fn decode(
         kind: StreamKind,
-        version: u16,
+        version: i16,
         payload: serde_json::Value,
     ) -> Result<Self, UndecodableEvent> {
-        let _ = (kind, version, payload);
-        unimplemented!()
+        let undecodable = |source| UndecodableEvent {
+            kind: kind.as_str(),
+            version,
+            source,
+        };
+        if version != SchemaVersion::V1.0 {
+            return Err(undecodable(None));
+        }
+        let decoded = match kind {
+            StreamKind::Installation => serde_json::from_value(payload).map(Self::Installation),
+            StreamKind::Person => serde_json::from_value(payload).map(Self::Person),
+            StreamKind::Workspace => serde_json::from_value(payload).map(Self::Workspace),
+            StreamKind::EnrolmentToken => serde_json::from_value(payload).map(Self::Enrolment),
+            StreamKind::Worker => serde_json::from_value(payload).map(Self::Worker),
+        };
+        decoded.map_err(|error| undecodable(Some(error)))
     }
+}
+
+/// The version of an event payload's schema, stored in `event.schema_version`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SchemaVersion(pub i16);
+
+impl SchemaVersion {
+    /// The first version, which every payload has today.
+    pub const V1: Self = Self(1);
 }
 
 /// A stored payload this build cannot read.
@@ -373,7 +427,7 @@ pub struct UndecodableEvent {
     /// The stream kind's name.
     pub kind: &'static str,
     /// The stored schema version.
-    pub version: u16,
+    pub version: i16,
     /// The serde error.
     #[source]
     pub source: Option<serde_json::Error>,
@@ -441,3 +495,229 @@ stream!(
     |s| s.as_uuid()
 );
 stream!(WorkerId, Worker, WorkerEvent, Worker, |s| s.as_uuid());
+
+#[cfg(test)]
+mod tests {
+    use time::macros::datetime;
+
+    use super::*;
+    use crate::credential::Digest;
+    use crate::id::FromUuid;
+    use crate::identity::{Arch, Os};
+
+    fn id<T: FromUuid>(n: u128) -> T {
+        T::from_uuid(Uuid::from_u128(n))
+    }
+
+    fn at() -> Timestamp {
+        Timestamp::from_utc(datetime!(2026-01-01 00:00:00 UTC))
+    }
+
+    /// One payload of every variant.
+    pub(crate) fn every_event() -> Vec<Event> {
+        let name = DisplayName::parse("mbp").unwrap();
+        vec![
+            InstallationEvent::SetupCodeIssued {
+                digest: Digest::from_bytes([1; 32]),
+                owner: id(1),
+                workspace: id(2),
+                expires_at: at(),
+            }
+            .into(),
+            InstallationEvent::Claimed {
+                owner: id(1),
+                workspace: id(2),
+            }
+            .into(),
+            PersonEvent::Registered {
+                display_name: name.clone(),
+                tailnet_login: TailnetLogin::parse("alice@example.com").unwrap(),
+            }
+            .into(),
+            WorkspaceEvent::Created {
+                name: WorkspaceName::parse("home").unwrap(),
+            }
+            .into(),
+            WorkspaceEvent::MemberAdded {
+                person: id(1),
+                role: Role::Owner,
+            }
+            .into(),
+            EnrolmentEvent::Issued {
+                digest: Digest::from_bytes([2; 32]),
+                worker: id(3),
+                label: Some(MachineLabel::parse("laptop").unwrap()),
+                expires_at: at(),
+            }
+            .into(),
+            EnrolmentEvent::Revoked.into(),
+            EnrolmentEvent::Redeemed {
+                key: Digest::from_bytes([3; 32]),
+            }
+            .into(),
+            WorkerEvent::Enrolled {
+                token: id(4),
+                key: Digest::from_bytes([3; 32]),
+                name: name.clone(),
+                machine: MachineInfo {
+                    hostname: name,
+                    os: Os::Linux,
+                    arch: Arch::Aarch64,
+                },
+                build: Version::new(0, 1, 0),
+            }
+            .into(),
+            WorkerEvent::SessionStarted {
+                session: id(5),
+                build: Version::new(0, 1, 1),
+            }
+            .into(),
+            WorkerEvent::SessionEnded {
+                session: id(5),
+                reason: SessionEndReason::ServerRestart,
+            }
+            .into(),
+            WorkerEvent::Revoked.into(),
+        ]
+    }
+
+    #[test]
+    fn every_event_survives_encode_and_decode() {
+        for event in every_event() {
+            let payload = event.encode().unwrap();
+            assert!(payload["type"].is_string(), "{event:?} is tagged");
+            assert_eq!(
+                event.schema_version(),
+                SchemaVersion(1),
+                "every payload is at version 1"
+            );
+            assert_eq!(
+                Event::decode(event.stream_kind(), event.schema_version().0, payload).unwrap(),
+                event,
+                "decodes to itself"
+            );
+        }
+    }
+
+    #[test]
+    fn every_stream_kind_is_covered_and_named() {
+        let kinds: Vec<StreamKind> = every_event().iter().map(Event::stream_kind).collect();
+        for kind in StreamKind::ALL {
+            assert!(kinds.contains(&kind), "{kind:?} has an event");
+            assert_eq!(
+                StreamKind::parse(kind.as_str()),
+                Some(kind),
+                "{kind:?} round-trips"
+            );
+        }
+        assert_eq!(StreamKind::parse("run"), None, "not yet");
+    }
+
+    #[test]
+    fn the_stored_tags_are_stable() {
+        let tags: Vec<String> = every_event()
+            .iter()
+            .map(|event| event.encode().unwrap()["type"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(
+            tags,
+            [
+                "installation.setup_code_issued",
+                "installation.claimed",
+                "person.registered",
+                "workspace.created",
+                "workspace.member_added",
+                "enrolment_token.issued",
+                "enrolment_token.revoked",
+                "enrolment_token.redeemed",
+                "worker.enrolled",
+                "worker.session_started",
+                "worker.session_ended",
+                "worker.revoked",
+            ],
+            "the log's event types"
+        );
+    }
+
+    #[test]
+    fn an_unknown_version_or_type_is_undecodable() {
+        let payload = WorkerEvent::Revoked.into_payload();
+        let future = Event::decode(StreamKind::Worker, 2, payload.clone()).unwrap_err();
+        assert_eq!(
+            future.to_string(),
+            "cannot decode a worker event at schema version 2",
+            "a future version is refused"
+        );
+        assert!(
+            future.source.is_none(),
+            "no serde error for a version mismatch"
+        );
+        let misfiled = Event::decode(StreamKind::Person, 1, payload).unwrap_err();
+        assert!(
+            misfiled.source.is_some(),
+            "a worker payload is not a person event"
+        );
+        assert_eq!(misfiled.kind, "person", "the error names the stream kind");
+    }
+
+    #[test]
+    fn positions_are_non_negative_and_advance() {
+        assert_eq!(
+            Position::from_stored(0),
+            Ok(Position::ORIGIN),
+            "zero is the origin"
+        );
+        assert_eq!(Position::from_stored(5).map(Position::get), Ok(5), "kept");
+        assert_eq!(
+            Position::from_stored(-1).unwrap_err().to_string(),
+            "event position -1 is negative",
+            "negative is corrupt"
+        );
+        assert_eq!(Position::ORIGIN.next().map(Position::get), Some(1), "next");
+        assert_eq!(
+            Position::from_stored(i64::MAX).unwrap().next(),
+            None,
+            "the end of the log"
+        );
+    }
+
+    #[test]
+    fn streams_name_their_kind_and_id() {
+        assert_eq!(
+            Installation.stream_id(),
+            Uuid::nil(),
+            "the installation is a singleton"
+        );
+        assert_eq!(
+            <Installation as Stream>::KIND,
+            StreamKind::Installation,
+            "kind"
+        );
+        let worker: WorkerId = id(9);
+        assert_eq!(
+            worker.stream_id(),
+            Uuid::from_u128(9),
+            "an id is its stream's id"
+        );
+        assert_eq!(<WorkerId as Stream>::KIND, StreamKind::Worker, "kind");
+        assert_eq!(<PersonId as Stream>::KIND, StreamKind::Person, "kind");
+        assert_eq!(<WorkspaceId as Stream>::KIND, StreamKind::Workspace, "kind");
+        assert_eq!(
+            <EnrolmentTokenId as Stream>::KIND,
+            StreamKind::EnrolmentToken,
+            "kind"
+        );
+        let person: PersonId = id(10);
+        let workspace: WorkspaceId = id(11);
+        let token: EnrolmentTokenId = id(12);
+        assert_eq!(person.stream_id(), Uuid::from_u128(10), "person");
+        assert_eq!(workspace.stream_id(), Uuid::from_u128(11), "workspace");
+        assert_eq!(token.stream_id(), Uuid::from_u128(12), "token");
+    }
+
+    impl WorkerEvent {
+        fn into_payload(self) -> serde_json::Value {
+            Event::from(self).encode().unwrap()
+        }
+    }
+}

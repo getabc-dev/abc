@@ -217,35 +217,83 @@ pub enum ReadPermit {
     Workspace(WorkspaceId),
 }
 
+/// The write permit for `actor` in `workspace`.
+const fn write(actor: Actor, workspace: WorkspaceId) -> WritePermit {
+    WritePermit { actor, workspace }
+}
+
+/// The workspace a workspace-scoped request names, if it names one.
+const fn named_workspace(scope: Scope) -> Option<WorkspaceId> {
+    match scope {
+        Scope::Workspace(workspace) => Some(workspace),
+        Scope::Installation | Scope::OwnWorkspace | Scope::CapabilityWorkspace => None,
+    }
+}
+
+/// Who may act on a workspace's tokens and workers: an owner of the workspace the request names.
+fn owner_of(standing: &Standing<'_>) -> Result<WritePermit, DenialReason> {
+    match standing.principal {
+        Principal::Person { id, .. } => named_workspace(standing.scope)
+            .filter(|&workspace| standing.principal.role_in(workspace) == Some(Role::Owner))
+            .map(|workspace| write(Actor::Person(*id), workspace))
+            .ok_or(DenialReason::NotAMember),
+        Principal::Visitor { .. } => Err(DenialReason::NotAMember),
+        Principal::Worker { .. } | Principal::Anonymous | Principal::Server => {
+            Err(DenialReason::TailnetIdentityRequired)
+        }
+    }
+}
+
 impl PolicyAction for WriteAction {
     type Permit = WritePermit;
 
     fn permit(self, standing: &Standing<'_>) -> Result<WritePermit, DenialReason> {
-        // The write matrix. Sketch of the arms (each `match` lists every variant, with no wildcards):
-        //
-        // IssueSetupCode:
-        //   (Server, ReserveInstallation { workspace }) => Server in workspace
-        //   (anyone else, _)                            => ServerOnly
-        // RecordAsServer:
-        //   (Server, WorkerHome { workspace })          => Server in workspace
-        //   (anyone else, _)                            => ServerOnly
-        // ClaimServer:
-        //   (Visitor, OwnerSetup { owner, workspace })  => Person(owner) in workspace
-        //   (Person, _)                                 => ServerAlreadyClaimed
-        //   (Visitor, None | EnrolmentToken)            => SetupCodeRequired
-        //   (Worker | Anonymous | Server, _)            => TailnetIdentityRequired
-        // ManageEnrolment | ManageWorkers:
-        //   scope Workspace(w), Person with role_in(w) == Some(Owner) => Person(id) in w
-        //   Person without membership                   => NotAMember
-        //   Worker | Visitor | Anonymous                => TailnetIdentityRequired / NotAMember
-        // EnrolWorker:
-        //   (_, EnrolmentToken { worker, workspace })   => Worker(worker) in workspace
-        //   (_, None | OwnerSetup | ReserveInstallation | WorkerHome) => EnrolmentTokenRequired
-        // ActAsWorker:
-        //   (Worker { id, workspace }, scope OwnWorkspace) => Worker(id) in workspace
-        //   otherwise                                   => WorkerOnly
-        let _ = (standing, Role::Owner);
-        unimplemented!()
+        let principal = standing.principal;
+        match self {
+            Self::IssueSetupCode => match (principal, standing.capability) {
+                (Principal::Server, Capability::ReserveInstallation { workspace }) => {
+                    Ok(write(Actor::Server, workspace))
+                }
+                _ => Err(DenialReason::ServerOnly),
+            },
+            Self::RecordAsServer => match (principal, standing.capability) {
+                (Principal::Server, Capability::WorkerHome { workspace }) => {
+                    Ok(write(Actor::Server, workspace))
+                }
+                _ => Err(DenialReason::ServerOnly),
+            },
+            Self::ClaimServer => match principal {
+                Principal::Visitor { .. } => match standing.capability {
+                    Capability::OwnerSetup { owner, workspace } => {
+                        Ok(write(Actor::Person(owner), workspace))
+                    }
+                    Capability::None
+                    | Capability::ReserveInstallation { .. }
+                    | Capability::WorkerHome { .. }
+                    | Capability::EnrolmentToken { .. } => Err(DenialReason::SetupCodeRequired),
+                },
+                Principal::Person { .. } => Err(DenialReason::ServerAlreadyClaimed),
+                Principal::Worker { .. } | Principal::Anonymous | Principal::Server => {
+                    Err(DenialReason::TailnetIdentityRequired)
+                }
+            },
+            Self::ManageEnrolment | Self::ManageWorkers => owner_of(standing),
+            Self::EnrolWorker => match standing.capability {
+                Capability::EnrolmentToken { worker, workspace } => {
+                    Ok(write(Actor::Worker(worker), workspace))
+                }
+                Capability::None
+                | Capability::OwnerSetup { .. }
+                | Capability::ReserveInstallation { .. }
+                | Capability::WorkerHome { .. } => Err(DenialReason::EnrolmentTokenRequired),
+            },
+            Self::ActAsWorker => match (principal, standing.scope) {
+                (Principal::Worker { id, workspace }, Scope::OwnWorkspace) => {
+                    Ok(write(Actor::Worker(*id), *workspace))
+                }
+                _ => Err(DenialReason::WorkerOnly),
+            },
+        }
     }
 }
 
@@ -253,12 +301,34 @@ impl PolicyAction for ReadAction {
     type Permit = ReadPermit;
 
     fn permit(self, standing: &Standing<'_>) -> Result<ReadPermit, DenialReason> {
-        // ViewSession:      any principal                         => Installation
-        // ViewWorkspace:    Person with any role in Workspace(w)  => Workspace(w); else NotAMember
-        // ViewSelfAsWorker: Worker { workspace, .. } + OwnWorkspace => Workspace(workspace); else WorkerOnly
-        // ViewAsServer:     Server                                => Installation; else ServerOnly
-        let _ = standing;
-        unimplemented!()
+        let principal = standing.principal;
+        match self {
+            Self::ViewSession => Ok(ReadPermit::Installation),
+            Self::ViewWorkspace => match principal {
+                Principal::Person { .. } | Principal::Visitor { .. } => {
+                    named_workspace(standing.scope)
+                        .filter(|&workspace| principal.role_in(workspace).is_some())
+                        .map(ReadPermit::Workspace)
+                        .ok_or(DenialReason::NotAMember)
+                }
+                Principal::Worker { .. } | Principal::Anonymous | Principal::Server => {
+                    Err(DenialReason::TailnetIdentityRequired)
+                }
+            },
+            Self::ViewSelfAsWorker => match (principal, standing.scope) {
+                (Principal::Worker { workspace, .. }, Scope::OwnWorkspace) => {
+                    Ok(ReadPermit::Workspace(*workspace))
+                }
+                _ => Err(DenialReason::WorkerOnly),
+            },
+            Self::ViewAsServer => match principal {
+                Principal::Server => Ok(ReadPermit::Installation),
+                Principal::Person { .. }
+                | Principal::Worker { .. }
+                | Principal::Visitor { .. }
+                | Principal::Anonymous => Err(DenialReason::ServerOnly),
+            },
+        }
     }
 }
 
@@ -348,9 +418,6 @@ pub enum DenialReason {
     /// The person is not a member of the workspace.
     #[error("you are not a member of this workspace")]
     NotAMember,
-    /// The action needs the owner role.
-    #[error("only the workspace owner can do this")]
-    OwnerOnly,
     /// Only a worker acting for itself may do this.
     #[error("only a worker can do this")]
     WorkerOnly,
@@ -387,4 +454,348 @@ pub enum DenialReason {
     /// Another key already redeemed the token.
     #[error("the enrolment token was already used")]
     EnrolmentTokenUsed,
+}
+
+#[cfg(test)]
+mod tests {
+    use uuid::Uuid;
+
+    use super::*;
+    use crate::actor::Membership;
+    use crate::id::FromUuid;
+    use crate::identity::TailnetLogin;
+
+    fn id<T: FromUuid>(n: u128) -> T {
+        T::from_uuid(Uuid::from_u128(n))
+    }
+
+    const HOME: u128 = 100;
+    const OTHER: u128 = 200;
+
+    fn owner() -> Principal {
+        Principal::Person {
+            id: id(1),
+            memberships: vec![Membership {
+                workspace: id(HOME),
+                role: Role::Owner,
+            }],
+        }
+    }
+
+    fn visitor() -> Principal {
+        Principal::Visitor {
+            login: TailnetLogin::parse("bob@example.com").unwrap(),
+        }
+    }
+
+    fn worker() -> Principal {
+        Principal::Worker {
+            id: id(3),
+            workspace: id(HOME),
+        }
+    }
+
+    /// Every principal, with a name for messages.
+    fn everyone() -> Vec<(&'static str, Principal)> {
+        vec![
+            ("owner", owner()),
+            ("visitor", visitor()),
+            ("worker", worker()),
+            ("anonymous", Principal::Anonymous),
+            ("server", Principal::Server),
+        ]
+    }
+
+    /// Every capability.
+    fn capabilities() -> Vec<Capability> {
+        vec![
+            Capability::None,
+            Capability::OwnerSetup {
+                owner: id(1),
+                workspace: id(HOME),
+            },
+            Capability::ReserveInstallation {
+                workspace: id(HOME),
+            },
+            Capability::WorkerHome {
+                workspace: id(HOME),
+            },
+            Capability::EnrolmentToken {
+                worker: id(3),
+                workspace: id(HOME),
+            },
+        ]
+    }
+
+    /// Every scope.
+    fn scopes() -> Vec<Scope> {
+        vec![
+            Scope::Installation,
+            Scope::Workspace(id(HOME)),
+            Scope::Workspace(id(OTHER)),
+            Scope::OwnWorkspace,
+            Scope::CapabilityWorkspace,
+        ]
+    }
+
+    fn standing(principal: &Principal, scope: Scope, capability: Capability) -> Standing<'_> {
+        Standing {
+            principal,
+            scope,
+            capability,
+        }
+    }
+
+    /// Runs `action` over every principal, scope and capability and checks each verdict against
+    /// `expected`, an independent statement of the rule.
+    fn check<A>(
+        action: A,
+        expected: impl Fn(&str, Scope, Capability) -> Result<A::Permit, DenialReason>,
+    ) where
+        A: PolicyAction + std::fmt::Debug,
+        A::Permit: PartialEq,
+    {
+        for (name, principal) in everyone() {
+            for scope in scopes() {
+                for capability in capabilities() {
+                    assert_eq!(
+                        action.permit(&standing(&principal, scope, capability)),
+                        expected(name, scope, capability),
+                        "{action:?} for {name} in {scope:?} with {capability:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn only_the_server_issues_setup_codes() {
+        check(WriteAction::IssueSetupCode, |who, _, capability| {
+            match (who, capability) {
+                ("server", Capability::ReserveInstallation { workspace }) => {
+                    Ok(write(Actor::Server, workspace))
+                }
+                _ => Err(DenialReason::ServerOnly),
+            }
+        });
+    }
+
+    #[test]
+    fn only_the_server_records_what_it_observed() {
+        check(WriteAction::RecordAsServer, |who, _, capability| {
+            match (who, capability) {
+                ("server", Capability::WorkerHome { workspace }) => {
+                    Ok(write(Actor::Server, workspace))
+                }
+                _ => Err(DenialReason::ServerOnly),
+            }
+        });
+    }
+
+    #[test]
+    fn a_visitor_with_a_setup_code_claims_as_the_reserved_person() {
+        check(WriteAction::ClaimServer, |who, _, capability| match who {
+            "visitor" => {
+                if let Capability::OwnerSetup { owner, workspace } = capability {
+                    Ok(write(Actor::Person(owner), workspace))
+                } else {
+                    Err(DenialReason::SetupCodeRequired)
+                }
+            }
+            "owner" => Err(DenialReason::ServerAlreadyClaimed),
+            _ => Err(DenialReason::TailnetIdentityRequired),
+        });
+    }
+
+    #[test]
+    fn only_an_owner_of_the_named_workspace_manages_it() {
+        for action in [WriteAction::ManageEnrolment, WriteAction::ManageWorkers] {
+            check(action, |who, scope, _| match who {
+                "owner" if scope == Scope::Workspace(id(HOME)) => {
+                    Ok(write(Actor::Person(id(1)), id(HOME)))
+                }
+                "owner" | "visitor" => Err(DenialReason::NotAMember),
+                _ => Err(DenialReason::TailnetIdentityRequired),
+            });
+        }
+    }
+
+    #[test]
+    fn an_enrolment_token_enrols_as_its_reserved_worker_whoever_presents_it() {
+        check(WriteAction::EnrolWorker, |_, _, capability| {
+            if let Capability::EnrolmentToken { worker, workspace } = capability {
+                Ok(write(Actor::Worker(worker), workspace))
+            } else {
+                Err(DenialReason::EnrolmentTokenRequired)
+            }
+        });
+    }
+
+    #[test]
+    fn a_worker_acts_only_for_itself_in_its_own_workspace() {
+        check(WriteAction::ActAsWorker, |who, scope, _| {
+            match (who, scope) {
+                ("worker", Scope::OwnWorkspace) => Ok(write(Actor::Worker(id(3)), id(HOME))),
+                _ => Err(DenialReason::WorkerOnly),
+            }
+        });
+    }
+
+    #[test]
+    fn anyone_may_view_the_session() {
+        check(ReadAction::ViewSession, |_, _, _| {
+            Ok(ReadPermit::Installation)
+        });
+    }
+
+    #[test]
+    fn only_members_view_a_workspace() {
+        check(ReadAction::ViewWorkspace, |who, scope, _| match who {
+            "owner" if scope == Scope::Workspace(id(HOME)) => Ok(ReadPermit::Workspace(id(HOME))),
+            "owner" | "visitor" => Err(DenialReason::NotAMember),
+            _ => Err(DenialReason::TailnetIdentityRequired),
+        });
+    }
+
+    #[test]
+    fn a_worker_views_only_itself() {
+        check(ReadAction::ViewSelfAsWorker, |who, scope, _| {
+            match (who, scope) {
+                ("worker", Scope::OwnWorkspace) => Ok(ReadPermit::Workspace(id(HOME))),
+                _ => Err(DenialReason::WorkerOnly),
+            }
+        });
+    }
+
+    #[test]
+    fn only_the_server_views_installation_wide_state() {
+        check(ReadAction::ViewAsServer, |who, _, _| match who {
+            "server" => Ok(ReadPermit::Installation),
+            _ => Err(DenialReason::ServerOnly),
+        });
+    }
+
+    /// A request for exercising `authorize`: its proof is whatever the facts say.
+    #[derive(Debug)]
+    struct Probe(Scope);
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct ProbeProof(Capability);
+
+    impl Proof for ProbeProof {
+        fn capability(&self) -> Capability {
+            self.0
+        }
+    }
+
+    impl Request for Probe {
+        type Action = WriteAction;
+        const ACTION: WriteAction = WriteAction::EnrolWorker;
+        type Facts = Result<Capability, DenialReason>;
+        type Proof = ProbeProof;
+
+        fn scope(&self) -> Scope {
+            self.0
+        }
+
+        fn prove(
+            &self,
+            facts: &Result<Capability, DenialReason>,
+            _now: Timestamp,
+        ) -> Result<ProbeProof, DenialReason> {
+            facts.map(ProbeProof)
+        }
+    }
+
+    fn now() -> Timestamp {
+        Timestamp::from_utc(time::OffsetDateTime::UNIX_EPOCH)
+    }
+
+    #[test]
+    fn authorize_proves_then_permits_and_keeps_both() {
+        let token = Capability::EnrolmentToken {
+            worker: id(3),
+            workspace: id(HOME),
+        };
+        let authorized = authorize(
+            &Principal::Anonymous,
+            Probe(Scope::CapabilityWorkspace),
+            &Ok(token),
+            now(),
+        )
+        .unwrap();
+        assert_eq!(
+            authorized.permit(),
+            &write(Actor::Worker(id(3)), id(HOME)),
+            "the matrix's permit"
+        );
+        assert_eq!(authorized.proof(), &ProbeProof(token), "the proof is kept");
+        assert_eq!(
+            authorized.request().0,
+            Scope::CapabilityWorkspace,
+            "and the request"
+        );
+        assert_eq!(
+            authorized.into_request().0,
+            Scope::CapabilityWorkspace,
+            "which can be taken back"
+        );
+    }
+
+    #[test]
+    fn authorize_reports_a_failed_proof_before_the_matrix() {
+        let denied = authorize(
+            &Principal::Anonymous,
+            Probe(Scope::CapabilityWorkspace),
+            &Err(DenialReason::EnrolmentTokenExpired),
+            now(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            denied,
+            Denied {
+                action: ActionName::Write(WriteAction::EnrolWorker),
+                reason: DenialReason::EnrolmentTokenExpired,
+            },
+            "the proof's reason"
+        );
+        assert_eq!(
+            denied.to_string(),
+            "Write(EnrolWorker) denied: the enrolment token expired",
+            "the message names the action and the reason"
+        );
+    }
+
+    #[test]
+    fn authorize_reports_the_matrix_refusal() {
+        let denied = authorize(
+            &Principal::Anonymous,
+            Probe(Scope::CapabilityWorkspace),
+            &Ok(Capability::None),
+            now(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            denied.reason,
+            DenialReason::EnrolmentTokenRequired,
+            "no capability, no enrolment"
+        );
+        assert_eq!(
+            ActionName::from(ReadAction::ViewSession),
+            ActionName::Read(ReadAction::ViewSession),
+            "reads are named too"
+        );
+    }
+
+    #[test]
+    fn a_write_permit_exposes_its_actor_and_workspace() {
+        let permit = write(Actor::Server, id(HOME));
+        assert_eq!(permit.actor(), Actor::Server, "actor");
+        assert_eq!(permit.workspace(), id(HOME), "workspace");
+        assert_eq!(
+            NoProof.capability(),
+            Capability::None,
+            "no proof, no capability"
+        );
+    }
 }

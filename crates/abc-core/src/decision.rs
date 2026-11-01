@@ -14,11 +14,11 @@ use crate::id::{CorrelationId, EventId, FromUuid};
 use crate::policy::{Authorized, WritePermit};
 use crate::time::Timestamp;
 
-/// The source of fresh ids and secret bytes. Implemented by the store: `OsMint` (OS entropy, UUIDv7)
-/// in production, `SeededMint` (ChaCha with a fixed seed) in tests, which keeps every test
-/// deterministic (P2). The worker uses `OsMint` too, to generate its key.
+/// The source of fresh ids and secret bytes. Implemented by the store: OS entropy and `UUIDv7` in
+/// production, and a `ChaCha20` generator with a fixed seed in tests, which keeps every test
+/// deterministic (P2). The worker uses OS entropy too, to generate its key.
 pub trait Mint: Send + Sync + std::fmt::Debug {
-    /// A UUIDv7 whose time part is `now`.
+    /// A `UUIDv7` whose time part is `now`.
     fn uuid(&self, now: Timestamp) -> Uuid;
     /// 32 bytes of secret entropy, zeroized when dropped.
     fn secret(&self) -> Zeroizing<[u8; 32]>;

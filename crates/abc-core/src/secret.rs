@@ -3,8 +3,8 @@
 //! What it does not implement is the design: no `Display`, no `Serialize`, no `Clone`, and a
 //! `Debug` that prints `Secret(<redacted>)`. Reading the value takes [`Secret::expose_secret`], and
 //! serializing it takes [`serialize_exposed`] named on the one field that must carry it (the
-//! once-only token in `TokenIssued`, the worker's enrolment request). Both are greppable, so a
-//! reviewer can audit every place a secret leaves its wrapper.
+//! once-only token in the issue response, the worker's enrolment request). Both are greppable, so
+//! a reviewer can audit every place a secret leaves its wrapper.
 
 use std::fmt;
 
@@ -63,31 +63,13 @@ where
     secret.expose_secret().serialize(serializer)
 }
 
-/// On the wire a secret is a string: the setup code in the claim request, the token in the one
-/// response that hands it out.
-impl<T: Zeroize> ts_rs::TS for Secret<T> {
-    type WithoutGenerics = Self;
-    type OptionInnerType = Self;
-    fn name(_: &ts_rs::Config) -> String {
-        "string".to_owned()
-    }
-    fn inline(_: &ts_rs::Config) -> String {
-        "string".to_owned()
-    }
-    fn decl(_: &ts_rs::Config) -> String {
-        unimplemented!("a primitive alias has no declaration")
-    }
-    fn decl_concrete(_: &ts_rs::Config) -> String {
-        unimplemented!("a primitive alias has no declaration")
-    }
-}
-
 /// `{"type": "string", "writeOnly": true}`: a client sends it and never reads it back, except in
 /// the one response that exists to hand it out.
 impl<T: Zeroize> schemars::JsonSchema for Secret<T> {
     fn schema_name() -> std::borrow::Cow<'static, str> {
         "Secret".into()
     }
+
     fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
         schemars::json_schema!({ "type": "string", "writeOnly": true })
     }
@@ -95,7 +77,91 @@ impl<T: Zeroize> schemars::JsonSchema for Secret<T> {
 
 #[cfg(test)]
 mod tests {
-    // proptest: for any string s, format!("{:?}", Secret::new(Plain(s))) does not contain s.
-    // compile-fail (trybuild is not needed): there is no Serialize impl, so a type that derives
-    // Serialize over a Secret field without serialize_exposed does not compile.
+    use proptest::prelude::*;
+    use serde::Serialize;
+
+    use super::*;
+
+    #[derive(Zeroize, Deserialize, Serialize)]
+    struct Plain(String);
+
+    #[derive(Serialize)]
+    struct Carrier {
+        #[serde(serialize_with = "serialize_exposed")]
+        secret: Secret<Plain>,
+    }
+
+    #[test]
+    fn serialize_exposed_writes_the_plaintext() {
+        let carrier = Carrier {
+            secret: Secret::new(Plain("hunter2".to_owned())),
+        };
+        assert_eq!(
+            serde_json::to_string(&carrier).unwrap(),
+            r#"{"secret":"hunter2"}"#,
+            "the one field that exists to carry it does"
+        );
+    }
+
+    #[test]
+    fn a_secret_deserializes_through_its_inner_type() {
+        let secret: Secret<Plain> = serde_json::from_str(r#""s3cret""#).unwrap();
+        assert_eq!(secret.expose_secret().0, "s3cret", "the value is kept");
+    }
+
+    #[test]
+    fn the_schema_is_a_write_only_string() {
+        let schema = schemars::schema_for!(Secret<Plain>);
+        let value = serde_json::to_value(&schema).unwrap();
+        assert_eq!(value["type"], "string", "on the wire a secret is a string");
+        assert_eq!(
+            value["writeOnly"], true,
+            "clients send it and never read it"
+        );
+    }
+
+    /// Records whether it was zeroized.
+    struct Probe(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+    impl Zeroize for Probe {
+        fn zeroize(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn dropping_zeroizes_the_value() {
+        let zeroized = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let secret = Secret::new(Probe(std::sync::Arc::clone(&zeroized)));
+        assert!(
+            !zeroized.load(std::sync::atomic::Ordering::SeqCst),
+            "a live secret is intact"
+        );
+        drop(secret);
+        assert!(
+            zeroized.load(std::sync::atomic::Ordering::SeqCst),
+            "dropping a secret zeroizes it"
+        );
+    }
+
+    fn proptest_config() -> ProptestConfig {
+        ProptestConfig {
+            failure_persistence: Some(Box::new(
+                proptest::test_runner::FileFailurePersistence::SourceParallel(
+                    "proptest-regressions",
+                ),
+            )),
+            ..ProptestConfig::default()
+        }
+    }
+
+    proptest! {
+        #![proptest_config(proptest_config())]
+
+        #[test]
+        fn debug_never_contains_the_value(value in ".{1,40}") {
+            let printed = format!("{:?}", Secret::new(Plain(value)));
+            prop_assert_eq!(printed, "Secret(<redacted>)");
+        }
+    }
 }

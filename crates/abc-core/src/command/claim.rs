@@ -33,6 +33,12 @@ use super::Command;
 /// How long a setup code stays valid.
 pub const SETUP_CODE_TTL: time::Duration = time::Duration::hours(1);
 
+/// `now + ttl`. A request's instant is a real clock reading, far from the end of time, so the sum
+/// always exists; were it ever not to, the credential would simply be expired at once.
+pub(crate) fn expiry(now: Timestamp, ttl: time::Duration) -> Timestamp {
+    now.checked_add(ttl).unwrap_or(now)
+}
+
 /// The host operator asks for a setup code. Only `Principal::Server` may do this, and only while
 /// the server is unclaimed. Each issue supersedes the previous code. The reserved ids carry over
 /// from the first code, so every code claims the same owner and workspace ids; `candidate` (minted
@@ -129,24 +135,23 @@ impl Command for IssueSetupCode {
 
     fn decide(
         auth: Authorized<Self>,
-        facts: InstallationFacts,
+        _facts: InstallationFacts,
         ctx: &DecideCtx<'_>,
     ) -> Result<Decision<SetupCodeIssued>, Infallible> {
-        // The permit (actor Server, workspace = the reservation's) came from the matrix.
-        // let mut decision = DecisionBuilder::new(&auth);
-        // let Reservation { owner, workspace } = auth.proof().reservation;
-        // let code = SetupCode::generate(ctx.mint()); let digest = code.expose_secret().digest();
-        // let expires_at = ctx.now().checked_add(SETUP_CODE_TTL)   (saturates; never panics)
-        // decision.emit(Installation, InstallationEvent::SetupCodeIssued { digest, owner, workspace, expires_at });
-        // Ok(decision.finish(SetupCodeIssued { code, expires_at }))
-        let _ = (
-            auth,
-            facts,
-            ctx,
-            DecisionBuilder::finish::<()>,
-            SETUP_CODE_TTL,
+        let mut decision = DecisionBuilder::new(&auth);
+        let Reservation { owner, workspace } = auth.proof().reservation;
+        let code = SetupCode::generate(ctx.mint());
+        let expires_at = expiry(ctx.now(), SETUP_CODE_TTL);
+        decision.emit(
+            Installation,
+            InstallationEvent::SetupCodeIssued {
+                digest: code.expose_secret().digest(),
+                owner,
+                workspace,
+                expires_at,
+            },
         );
-        unimplemented!()
+        Ok(decision.finish(SetupCodeIssued { code, expires_at }))
     }
 }
 
@@ -198,15 +203,27 @@ impl Request for ClaimServer {
     }
 
     fn prove(&self, facts: &InstallationFacts, now: Timestamp) -> Result<ClaimProof, DenialReason> {
-        // if facts.claimed                                          => ServerAlreadyClaimed
-        // let Some(r) = facts.setup_code else                       => SetupCodeRequired (none issued)
-        // let Some(login) = facts.login.clone() else                => TailnetIdentityRequired
-        // if !self.code.expose_secret().digest().matches(&r.digest) => SetupCodeMismatch
-        //    (checked before expiry, so an expired code's state is revealed only to its holder)
-        // if now >= r.expires_at                                    => SetupCodeExpired
-        // Ok(ClaimProof { owner: r.owner, workspace: r.workspace, login })
-        let _ = (facts, now);
-        unimplemented!()
+        if facts.claimed {
+            return Err(DenialReason::ServerAlreadyClaimed);
+        }
+        let Some(record) = facts.setup_code else {
+            return Err(DenialReason::SetupCodeRequired);
+        };
+        let Some(login) = facts.login.clone() else {
+            return Err(DenialReason::TailnetIdentityRequired);
+        };
+        // The digest is checked before expiry, so only the code's holder learns that it expired.
+        if !self.code.expose_secret().digest().matches(&record.digest) {
+            return Err(DenialReason::SetupCodeMismatch);
+        }
+        if now >= record.expires_at {
+            return Err(DenialReason::SetupCodeExpired);
+        }
+        Ok(ClaimProof {
+            owner: record.owner,
+            workspace: record.workspace,
+            login,
+        })
     }
 }
 
@@ -251,5 +268,315 @@ impl Command for ClaimServer {
             InstallationEvent::Claimed { owner, workspace },
         );
         Ok(decision.finish(Claimed { owner, workspace }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::fixtures::{Outcome, events, id, now, owner, run, visitor};
+    use super::*;
+    use crate::actor::{Actor, Principal};
+    use crate::policy::{ActionName, Denied};
+
+    fn reservation() -> Reservation {
+        Reservation {
+            owner: id(1),
+            workspace: id(2),
+        }
+    }
+
+    fn unclaimed() -> InstallationFacts {
+        InstallationFacts {
+            claimed: false,
+            setup_code: None,
+            login: None,
+        }
+    }
+
+    fn denied(action: WriteAction, reason: DenialReason) -> Denied {
+        Denied {
+            action: ActionName::Write(action),
+            reason,
+        }
+    }
+
+    #[test]
+    fn the_first_setup_code_reserves_the_candidate_ids() {
+        let decision = run(
+            &Principal::Server,
+            IssueSetupCode {
+                candidate: reservation(),
+            },
+            unclaimed(),
+            now(),
+        )
+        .unwrap();
+        assert_eq!(
+            decision.permit().actor(),
+            Actor::Server,
+            "recorded as the server"
+        );
+        assert_eq!(
+            decision.permit().workspace(),
+            id(2),
+            "in the reserved workspace"
+        );
+        let expires_at = now().checked_add(SETUP_CODE_TTL).unwrap();
+        let recorded = events(&decision);
+        let issued = decision.into_outcome();
+        assert_eq!(issued.expires_at, expires_at, "an hour from now");
+        assert_eq!(
+            recorded,
+            [(
+                uuid::Uuid::nil(),
+                InstallationEvent::SetupCodeIssued {
+                    digest: issued.code.expose_secret().digest(),
+                    owner: id(1),
+                    workspace: id(2),
+                    expires_at,
+                }
+                .into()
+            )],
+            "only the digest is recorded, on the installation stream"
+        );
+    }
+
+    #[test]
+    fn a_later_setup_code_keeps_the_first_reservation() {
+        let facts = InstallationFacts {
+            setup_code: Some(SetupCodeRecord {
+                digest: crate::credential::Digest::from_bytes([0; 32]),
+                owner: id(7),
+                workspace: id(8),
+                expires_at: now(),
+            }),
+            ..unclaimed()
+        };
+        let decision = run(
+            &Principal::Server,
+            IssueSetupCode {
+                candidate: reservation(),
+            },
+            facts,
+            now(),
+        )
+        .unwrap();
+        assert_eq!(
+            decision.permit().workspace(),
+            id(8),
+            "the earlier workspace"
+        );
+        assert!(
+            matches!(
+                events(&decision).as_slice(),
+                [(_, crate::event::Event::Installation(InstallationEvent::SetupCodeIssued {
+                    owner,
+                    workspace,
+                    ..
+                }))] if *owner == id(7) && *workspace == id(8)
+            ),
+            "the earlier reservation is kept"
+        );
+    }
+
+    #[test]
+    fn no_setup_code_once_claimed_and_none_but_for_the_server() {
+        let claimed = InstallationFacts {
+            claimed: true,
+            ..unclaimed()
+        };
+        let issue = || IssueSetupCode {
+            candidate: reservation(),
+        };
+        assert_eq!(
+            run(&Principal::Server, issue(), claimed, now()).unwrap_err(),
+            Outcome::Denied(denied(
+                WriteAction::IssueSetupCode,
+                DenialReason::ServerAlreadyClaimed
+            )),
+            "once claimed, never again"
+        );
+        assert_eq!(
+            run(&owner(), issue(), unclaimed(), now()).unwrap_err(),
+            Outcome::Denied(denied(
+                WriteAction::IssueSetupCode,
+                DenialReason::ServerOnly
+            )),
+            "a person cannot mint one"
+        );
+    }
+
+    fn code() -> Secret<SetupCode> {
+        SetupCode::parse("10ABC-DEFGH-JKMNP-QRSTV").unwrap()
+    }
+
+    fn claim() -> ClaimServer {
+        ClaimServer {
+            code: code(),
+            display_name: DisplayName::parse("Alice").unwrap(),
+            workspace_name: WorkspaceName::parse("Home").unwrap(),
+        }
+    }
+
+    fn issued(expires_at: Timestamp) -> InstallationFacts {
+        InstallationFacts {
+            claimed: false,
+            setup_code: Some(SetupCodeRecord {
+                digest: code().expose_secret().digest(),
+                owner: id(1),
+                workspace: id(2),
+                expires_at,
+            }),
+            login: Some(TailnetLogin::parse("alice@example.com").unwrap()),
+        }
+    }
+
+    fn later() -> Timestamp {
+        now().checked_add(time::Duration::minutes(10)).unwrap()
+    }
+
+    #[test]
+    fn a_valid_claim_registers_the_owner_and_the_first_workspace() {
+        let decision = run(&visitor(), claim(), issued(later()), now()).unwrap();
+        assert_eq!(
+            decision.permit().actor(),
+            Actor::Person(id(1)),
+            "the reserved person"
+        );
+        assert_eq!(
+            decision.permit().workspace(),
+            id(2),
+            "the reserved workspace"
+        );
+        assert_eq!(
+            events(&decision),
+            [
+                (
+                    uuid::Uuid::from_u128(1),
+                    PersonEvent::Registered {
+                        display_name: DisplayName::parse("Alice").unwrap(),
+                        tailnet_login: TailnetLogin::parse("alice@example.com").unwrap(),
+                    }
+                    .into()
+                ),
+                (
+                    uuid::Uuid::from_u128(2),
+                    WorkspaceEvent::Created {
+                        name: WorkspaceName::parse("Home").unwrap(),
+                    }
+                    .into()
+                ),
+                (
+                    uuid::Uuid::from_u128(2),
+                    WorkspaceEvent::MemberAdded {
+                        person: id(1),
+                        role: Role::Owner,
+                    }
+                    .into()
+                ),
+                (
+                    uuid::Uuid::nil(),
+                    InstallationEvent::Claimed {
+                        owner: id(1),
+                        workspace: id(2),
+                    }
+                    .into()
+                ),
+            ],
+            "person, workspace, membership, claim"
+        );
+        assert_eq!(
+            decision.into_outcome(),
+            Claimed {
+                owner: id(1),
+                workspace: id(2),
+            },
+            "the outcome names both"
+        );
+    }
+
+    #[test]
+    fn a_claim_needs_an_unclaimed_server_a_login_and_the_current_code_in_time() {
+        let refuse = |facts: InstallationFacts, at: Timestamp| {
+            run(&visitor(), claim(), facts, at).map(|_| ()).unwrap_err()
+        };
+        let reason = |reason| Outcome::Denied(denied(WriteAction::ClaimServer, reason));
+        assert_eq!(
+            refuse(
+                InstallationFacts {
+                    claimed: true,
+                    ..issued(later())
+                },
+                now()
+            ),
+            reason(DenialReason::ServerAlreadyClaimed),
+            "claimed"
+        );
+        assert_eq!(
+            refuse(
+                InstallationFacts {
+                    setup_code: None,
+                    ..issued(later())
+                },
+                now()
+            ),
+            reason(DenialReason::SetupCodeRequired),
+            "no code issued"
+        );
+        assert_eq!(
+            refuse(
+                InstallationFacts {
+                    login: None,
+                    ..issued(later())
+                },
+                now()
+            ),
+            reason(DenialReason::TailnetIdentityRequired),
+            "no login"
+        );
+        let mut other = issued(later());
+        if let Some(record) = other.setup_code.as_mut() {
+            record.digest = crate::credential::Digest::from_bytes([9; 32]);
+        }
+        assert_eq!(
+            refuse(other.clone(), now()),
+            reason(DenialReason::SetupCodeMismatch),
+            "wrong"
+        );
+        assert_eq!(
+            refuse(other, later()),
+            reason(DenialReason::SetupCodeMismatch),
+            "a wrong code does not learn that the current one expired"
+        );
+        assert_eq!(
+            refuse(issued(later()), later()),
+            reason(DenialReason::SetupCodeExpired),
+            "expired at exactly expires_at"
+        );
+        assert!(
+            run(
+                &visitor(),
+                claim(),
+                issued(later()),
+                later()
+                    .checked_add(time::Duration::microseconds(-1))
+                    .unwrap()
+            )
+            .is_ok(),
+            "valid until the last microsecond"
+        );
+    }
+
+    #[test]
+    fn expiry_saturates_at_the_end_of_time() {
+        let end = Timestamp::from_utc(time::OffsetDateTime::new_utc(
+            time::Date::MAX,
+            time::Time::from_hms(23, 30, 0).unwrap(),
+        ));
+        assert_eq!(
+            expiry(end, SETUP_CODE_TTL),
+            end,
+            "no overflow, just already expired"
+        );
     }
 }

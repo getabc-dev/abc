@@ -53,7 +53,6 @@ query!(WhoAmI, ReadAction::ViewSession, SessionView, |_s| {
 /// The answer to [`WhoAmI`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, TS, JsonSchema)]
 #[serde(tag = "state", rename_all = "snake_case")]
-#[ts(export)]
 pub enum SessionView {
     /// The request carried no tailnet identity (a tagged device, or a non-browser client).
     NoIdentity,
@@ -80,7 +79,6 @@ pub enum SessionView {
 
 /// One of a person's workspaces.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, TS, JsonSchema)]
-#[ts(export)]
 pub struct WorkspaceSummary {
     /// The workspace.
     pub id: WorkspaceId,
@@ -122,7 +120,6 @@ query!(
 /// Machine cards and the head position they reflect. Both are read in one REPEATABLE READ
 /// transaction, so `head` is exact: nothing at or below it is missing from `machines`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, TS, JsonSchema)]
-#[ts(export)]
 pub struct MachinesSnapshot {
     /// The log head the cards reflect.
     pub head: Position,
@@ -134,7 +131,6 @@ pub struct MachinesSnapshot {
 /// from the log through the `worker` view, so one SSE mechanism (a cursor over positions) keeps the
 /// screen current.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, TS, JsonSchema)]
-#[ts(export)]
 pub struct MachineCard {
     /// The worker.
     pub worker: WorkerId,
@@ -177,7 +173,6 @@ query!(
 
 /// A token as the owner sees it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, TS, JsonSchema)]
-#[ts(export)]
 pub struct TokenSummary {
     /// The token.
     pub id: EnrolmentTokenId,
@@ -195,7 +190,6 @@ pub struct TokenSummary {
 /// stored, so it never goes stale.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, TS, JsonSchema)]
 #[serde(tag = "status", rename_all = "snake_case")]
-#[ts(export)]
 pub enum TokenStatus {
     /// Redeemable.
     Open,
@@ -208,6 +202,25 @@ pub enum TokenStatus {
         /// The worker it created.
         worker: WorkerId,
     },
+}
+
+impl TokenStatus {
+    /// A token's status at `now`: revoked and redeemed are final; otherwise it is open until
+    /// `expires_at`.
+    #[must_use]
+    pub fn at(
+        revoked: bool,
+        redeemed_by: Option<WorkerId>,
+        expires_at: Timestamp,
+        now: Timestamp,
+    ) -> Self {
+        match (revoked, redeemed_by) {
+            (true, _) => Self::Revoked,
+            (false, Some(worker)) => Self::Redeemed { worker },
+            (false, None) if now >= expires_at => Self::Expired,
+            (false, None) => Self::Open,
+        }
+    }
 }
 
 /// A connected worker reading its own identity: at the WebSocket upgrade, and again each time the
@@ -239,3 +252,44 @@ query!(
     Vec<crate::command::OpenSession>,
     |_s| Scope::Installation
 );
+
+#[cfg(test)]
+mod tests {
+    use time::macros::datetime;
+    use uuid::Uuid;
+
+    use super::*;
+    use crate::id::FromUuid;
+
+    #[test]
+    fn a_tokens_status_is_derived_at_read_time() {
+        let expires = Timestamp::from_utc(datetime!(2026-01-01 01:00:00 UTC));
+        let before = Timestamp::from_utc(datetime!(2026-01-01 00:59:59 UTC));
+        let worker = WorkerId::from_uuid(Uuid::from_u128(1));
+        assert_eq!(
+            TokenStatus::at(false, None, expires, before),
+            TokenStatus::Open,
+            "open"
+        );
+        assert_eq!(
+            TokenStatus::at(false, None, expires, expires),
+            TokenStatus::Expired,
+            "expired at expires_at"
+        );
+        assert_eq!(
+            TokenStatus::at(true, None, expires, before),
+            TokenStatus::Revoked,
+            "revoked"
+        );
+        assert_eq!(
+            TokenStatus::at(false, Some(worker), expires, expires),
+            TokenStatus::Redeemed { worker },
+            "redeemed stays redeemed after expiry"
+        );
+        assert_eq!(
+            serde_json::to_string(&TokenStatus::Redeemed { worker }).unwrap(),
+            format!(r#"{{"status":"redeemed","worker":"{}"}}"#, worker.as_uuid()),
+            "tagged by status on the wire"
+        );
+    }
+}
