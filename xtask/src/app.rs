@@ -263,6 +263,14 @@ mod tests {
     const KEY: &str = include_str!("../testdata/agent-app-test-key.pem");
 
     #[test]
+    fn finds_the_config_in_this_environment() {
+        assert!(
+            super::config_dir().unwrap().ends_with("abc/agent-app"),
+            "under the user's config directory"
+        );
+    }
+
+    #[test]
     fn finds_the_config_under_xdg_or_home() {
         let lookup = |xdg: Option<&'static str>| {
             move |name: &str| match name {
@@ -305,6 +313,15 @@ mod tests {
     fn signs_a_jwt_github_can_verify() {
         let dir = app_dir();
         let app = App::load(dir.path()).unwrap();
+        let debug = format!("{app:?}");
+        assert!(
+            debug.contains("Iv23test") && debug.contains("42"),
+            "the IDs show: {debug}"
+        );
+        assert!(
+            !debug.contains("key"),
+            "the private key never does: {debug}"
+        );
         let jwt = app.jwt(1_000_000).unwrap();
         let parts: Vec<&str> = jwt.split('.').collect();
         assert_eq!(parts.len(), 3, "header, claims and signature");
@@ -429,6 +446,11 @@ mod tests {
         )
         .unwrap();
         fs::set_permissions(&fake, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        assert_eq!(
+            gh(&fake, &["issue".into()], "ghs_test").unwrap(),
+            std::process::ExitCode::from(3),
+            "gh's own exit code comes back"
+        );
         let code = gh(&fake, &["pr".into(), "create".into()], "ghs_test").unwrap();
         assert_eq!(
             code,

@@ -30,7 +30,8 @@ const fn timeout_multiplier(jobs: u32) -> u32 {
     TIMEOUT_MULTIPLIER_PER_JOB.saturating_mul(jobs)
 }
 
-/// How cargo-mutants ended, from its exit code.
+/// How cargo-mutants ended, from its exit code. It exits with [`Outcome::TimedOut`] when any
+/// mutant timed out, even if others were missed, so the result files decide the verdict.
 #[derive(Debug, PartialEq, Eq)]
 enum Outcome {
     AllCaught,
@@ -81,6 +82,15 @@ fn run_with(
     let output = root.join(OUTPUT);
     fs::create_dir_all(&output)
         .with_context(|| format!("could not create {}", output.display()))?;
+    let results = output.join("mutants.out");
+    // Results of an earlier run must not decide this one.
+    match fs::remove_dir_all(&results) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| format!("could not remove {}", results.display()));
+        }
+    }
     let diff_file = output.join("changes.diff");
     fs::write(&diff_file, &diff).context("could not write the diff for cargo-mutants")?;
     writeln!(out, "xtask: mutating the changed Rust code")?;
@@ -110,11 +120,11 @@ fn run_with(
         .status()
         .context("could not run cargo-mutants")?;
     let result = outcome(status.code())?;
-    let results = output.join("mutants.out");
     let missed = listed(&results.join("missed.txt"))?;
     let timed_out = listed(&results.join("timeout.txt"))?;
-    write!(out, "{}", describe(&result, &missed, &timed_out))?;
-    Ok(result != Outcome::Missed)
+    let passed = missed.is_empty() && result != Outcome::Missed;
+    write!(out, "{}", describe(passed, &missed, &timed_out))?;
+    Ok(passed)
 }
 
 /// Whether the diff adds or changes lines in Rust files.
@@ -139,7 +149,7 @@ fn listed(path: &Path) -> anyhow::Result<Vec<String>> {
     }
 }
 
-fn describe(result: &Outcome, missed: &[String], timed_out: &[String]) -> String {
+fn describe(passed: bool, missed: &[String], timed_out: &[String]) -> String {
     let mut text = String::new();
     for (label, mutants) in [
         ("missed", missed),
@@ -153,13 +163,10 @@ fn describe(result: &Outcome, missed: &[String], timed_out: &[String]) -> String
             text.push('\n');
         }
     }
-    text.push_str(match result {
-        Outcome::AllCaught | Outcome::TimedOut => {
-            "mutants: passed; the tests caught every mutant\n"
-        }
-        Outcome::Missed => {
-            "mutants: failed; add or sharpen tests so each missed mutant above makes one fail\n"
-        }
+    text.push_str(if passed {
+        "mutants: passed; the tests caught every mutant\n"
+    } else {
+        "mutants: failed; add or sharpen tests so each missed mutant above makes one fail\n"
     });
     text
 }
@@ -168,7 +175,9 @@ fn describe(result: &Outcome, missed: &[String], timed_out: &[String]) -> String
 mod tests {
     use std::fs;
 
-    use super::{Outcome, changes_rust, describe, listed, outcome, run_with, timeout_multiplier};
+    use super::{
+        Outcome, changes_rust, describe, listed, outcome, run, run_with, timeout_multiplier,
+    };
     use crate::testing::{repository_with_change, script};
 
     #[test]
@@ -191,6 +200,15 @@ mod tests {
             "documentation only"
         );
         assert!(!changes_rust(""), "no change");
+    }
+
+    #[test]
+    fn needs_the_pinned_tools() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo =
+            repository_with_change(&temp.path().join("repo"), &[("src/a.rs", "fn a() {}\n")]);
+        let error = run(&repo, "base", 2, &mut Vec::new()).unwrap_err();
+        assert!(format!("{error:#}").contains("tools.toml"), "{error:#}");
     }
 
     #[test]
@@ -242,6 +260,21 @@ mod tests {
             "{text}"
         );
 
+        let mixed = temp.path().join("mixed");
+        script(
+            &mixed,
+            "while [ $# -gt 0 ]; do case \"$1\" in --output) out=$2 ;; esac; shift; done\nmkdir -p \"$out/mutants.out\"\necho 'src/a.rs:1:18: replace a -> bool with false' > \"$out/mutants.out/missed.txt\"\necho 'src/a.rs:1:1: replace a with ()' > \"$out/mutants.out/timeout.txt\"\nexit 3\n",
+        );
+        let mut both = Vec::new();
+        assert!(
+            !run_with(&repo, "base", 2, &mixed, &nextest, &mut both).unwrap(),
+            "a missed mutant fails even when another timed out"
+        );
+        assert!(
+            String::from_utf8(both).unwrap().contains("mutants: failed"),
+            "said so"
+        );
+
         let caught = temp.path().join("caught");
         script(&caught, "exit 0\n");
         assert!(
@@ -268,14 +301,14 @@ mod tests {
     #[test]
     fn describes_the_result() {
         let missed = ["src/a.rs:3:5: replace f -> bool with true".to_owned()];
-        let text = describe(&Outcome::Missed, &missed, &[]);
+        let text = describe(false, &missed, &[]);
         assert!(text.starts_with("  missed: src/a.rs:3:5"), "{text}");
         assert!(
             text.ends_with("missed mutant above makes one fail\n"),
             "{text}"
         );
         let timeouts = ["src/b.rs:1:1: replace g with ()".to_owned()];
-        let passing = describe(&Outcome::TimedOut, &[], &timeouts);
+        let passing = describe(true, &[], &timeouts);
         assert!(
             passing.contains("timed out (counted as caught)"),
             "{passing}"

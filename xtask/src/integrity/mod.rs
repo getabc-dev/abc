@@ -339,7 +339,7 @@ fn compare(file: &str, before: Option<&[Test]>, after: Option<&[Test]>) -> Vec<F
 mod tests {
     use std::fs;
 
-    use super::{Finding, PullRequest, Test, compare, findings, is_gate_file, run_with};
+    use super::{Finding, PullRequest, Test, compare, findings, is_gate_file, run, run_with};
     use crate::testing::{git, repository, repository_with_change};
 
     fn test(name: &str, ignored: bool, should_panic: bool, assertions: usize) -> Test {
@@ -584,6 +584,45 @@ mod tests {
                 .unwrap()
                 .contains("accepted by snehilvj"),
             "who"
+        );
+    }
+
+    #[test]
+    fn runs_against_github() {
+        let temp = tempfile::tempdir().unwrap();
+        let clean =
+            repository_with_change(&temp.path().join("clean"), &[("src/a.rs", "fn a() {}\n")]);
+        assert!(
+            run(&clean, "base", None, None, &mut Vec::new()).unwrap(),
+            "clean"
+        );
+        let gated = repository_with_change(&temp.path().join("gated"), &[("deny.toml", "\n")]);
+        assert!(
+            !run(&gated, "base", None, None, &mut Vec::new()).unwrap(),
+            "a gate change outside a pull request"
+        );
+    }
+
+    #[test]
+    fn reformatting_the_lints_is_no_change() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = repository(&temp.path().join("repo"));
+        fs::write(
+            repo.join("Cargo.toml"),
+            "[workspace]\nmembers = []\n\n[workspace.lints.clippy]\nall = \"deny\"\n",
+        )
+        .unwrap();
+        git(&repo, &["add", "--all"]);
+        git(&repo, &["commit", "--quiet", "-m", "base"]);
+        let base = git(&repo, &["rev-parse", "HEAD"]).trim().to_owned();
+        fs::write(
+            repo.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"a\"]\n\n[workspace.lints]\nclippy = { all = \"deny\" }\n",
+        )
+        .unwrap();
+        assert!(
+            findings(&repo, &base).unwrap().is_empty(),
+            "the same lints written another way, and another table changed"
         );
     }
 

@@ -304,6 +304,13 @@ mod tests {
             std::process::ExitCode::SUCCESS,
             "the checked-in ruleset is in step with CI"
         );
+        assert!(
+            run(Task::Doctor {
+                tools: vec!["no-such-tool".to_owned()]
+            })
+            .is_err(),
+            "a command's error comes back"
+        );
         assert_eq!(
             verdict(true),
             std::process::ExitCode::SUCCESS,

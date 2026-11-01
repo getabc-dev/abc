@@ -6,6 +6,7 @@
 //! diff, a missing key or an unreadable answer fails the check with the reason, never passes it.
 //! Drafts are skipped, and merge-queue runs pass at once, since the pull request was reviewed.
 
+use std::ffi::OsString;
 use std::fmt::Write as _;
 use std::fs;
 use std::io::Write;
@@ -225,11 +226,13 @@ pub(crate) struct Event {
 }
 
 impl Event {
-    /// The event GitHub Actions describes in `GITHUB_EVENT_NAME` and `GITHUB_EVENT_PATH`; a
-    /// local run otherwise.
-    pub(crate) fn from_env() -> anyhow::Result<Self> {
-        let name = std::env::var("GITHUB_EVENT_NAME").unwrap_or_else(|_| "local".to_owned());
-        let payload = match std::env::var_os("GITHUB_EVENT_PATH") {
+    /// The event GitHub Actions describes in `GITHUB_EVENT_NAME` and `GITHUB_EVENT_PATH`, read
+    /// through `lookup`; a local run otherwise.
+    fn from_lookup(lookup: &impl Fn(&str) -> Option<OsString>) -> anyhow::Result<Self> {
+        let name = lookup("GITHUB_EVENT_NAME")
+            .and_then(|name| name.into_string().ok())
+            .unwrap_or_else(|| "local".to_owned());
+        let payload = match lookup("GITHUB_EVENT_PATH") {
             Some(path) => serde_json::from_str(
                 &fs::read_to_string(&path).context("could not read the GitHub event")?,
             )
@@ -346,16 +349,34 @@ fn review_changes(
 
 /// [`run`] against the real Gemini API.
 pub(crate) fn run_live(root: &Path, base: &str, out: &mut impl Write) -> anyhow::Result<bool> {
-    let key = std::env::var("GEMINI_API_KEY").ok();
-    let summary_path = std::env::var_os("GITHUB_STEP_SUMMARY").map(PathBuf::from);
+    run_from(
+        root,
+        base,
+        &|name| std::env::var_os(name),
+        out,
+        &mut post_gemini,
+    )
+}
+
+/// [`run`], with the event, the key and the job summary's path read from GitHub Actions'
+/// variables through `lookup`.
+fn run_from(
+    root: &Path,
+    base: &str,
+    lookup: &impl Fn(&str) -> Option<OsString>,
+    out: &mut impl Write,
+    post: &mut impl FnMut(&str, &str, &str) -> anyhow::Result<(u16, String)>,
+) -> anyhow::Result<bool> {
+    let key = lookup("GEMINI_API_KEY").and_then(|key| key.into_string().ok());
+    let summary_path = lookup("GITHUB_STEP_SUMMARY").map(PathBuf::from);
     run(
         root,
         base,
-        &Event::from_env()?,
+        &Event::from_lookup(lookup)?,
         key.as_deref(),
         summary_path.as_ref(),
         out,
-        &mut post_gemini,
+        post,
     )
 }
 
@@ -365,7 +386,7 @@ mod tests {
 
     use super::{
         Decision, Event, MAX_DIFF_BYTES, MODEL, Plan, Request, plan, post_gemini, review, run,
-        summary,
+        run_from, summary,
     };
     use crate::testing::{git, repository, serve_once};
 
@@ -407,6 +428,11 @@ mod tests {
             assert_eq!(
                 sent["generationConfig"]["responseMimeType"], "application/json",
                 "structured output"
+            );
+            assert_eq!(
+                sent["generationConfig"]["responseJsonSchema"]["properties"]["verdict"]["enum"],
+                serde_json::json!(["pass", "block"]),
+                "the answer's schema"
             );
             assert!(
                 sent["systemInstruction"]["parts"][0]["text"]
@@ -640,6 +666,75 @@ mod tests {
         );
         assert!(request.contains("x-goog-api-key: test-key"), "{request}");
         assert!(!request.contains("key=test-key"), "never in the URL");
+    }
+
+    #[test]
+    fn reads_the_event_key_and_summary_from_github_actions() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = repository(&temp.path().join("repo"));
+        fs::write(repo.join("AGENTS.md"), "- **S1 · Correctness.**\n").unwrap();
+        git(&repo, &["add", "--all"]);
+        git(&repo, &["commit", "--quiet", "-m", "base"]);
+        git(&repo, &["branch", "base"]);
+        let summary_path = temp.path().join("summary.md");
+        let event_path = temp.path().join("event.json");
+        fs::write(
+            &event_path,
+            serde_json::json!({"pull_request": {
+                "title": "feat: x", "body": "Adds x.", "draft": false,
+                "head": {"repo": {"full_name": "o/r"}}, "base": {"repo": {"full_name": "o/r"}}
+            }})
+            .to_string(),
+        )
+        .unwrap();
+        let variables = |event: &'static str| {
+            let summary_path = summary_path.clone();
+            let event_path = event_path.clone();
+            move |name: &str| match name {
+                "GITHUB_EVENT_NAME" => Some(event.into()),
+                "GITHUB_EVENT_PATH" => Some(event_path.clone().into_os_string()),
+                "GEMINI_API_KEY" => Some("test-key".into()),
+                "GITHUB_STEP_SUMMARY" => Some(summary_path.clone().into_os_string()),
+                _ => None,
+            }
+        };
+        let mut post = |_: &str, request: &str, key: &str| -> anyhow::Result<(u16, String)> {
+            assert_eq!(key, "test-key", "the secret");
+            assert!(request.contains("feat: x"), "the title from the event");
+            Ok((200, recorded(BLOCK)))
+        };
+        assert!(
+            !run_from(
+                &repo,
+                "base",
+                &variables("pull_request"),
+                &mut Vec::new(),
+                &mut post
+            )
+            .unwrap(),
+            "the verdict decides"
+        );
+        assert!(
+            fs::read_to_string(&summary_path)
+                .unwrap()
+                .contains("## Gemini review: block"),
+            "to the job summary"
+        );
+        assert!(
+            run_from(
+                &repo,
+                "base",
+                &variables("merge_group"),
+                &mut Vec::new(),
+                &mut post
+            )
+            .unwrap(),
+            "the merge queue passes"
+        );
+        assert!(
+            run_from(&repo, "base", &|_: &str| None, &mut Vec::new(), &mut post).is_err(),
+            "a local run without a key fails closed"
+        );
     }
 
     #[test]

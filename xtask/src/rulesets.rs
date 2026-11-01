@@ -396,6 +396,36 @@ mod tests {
     }
 
     #[test]
+    fn checks_the_files_in_a_repository() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        fs::create_dir_all(root.join(".github/workflows")).unwrap();
+        fs::create_dir_all(root.join(".github/rulesets")).unwrap();
+        fs::write(root.join(".github/workflows/ci.yaml"), CI).unwrap();
+        fs::write(
+            root.join(".github/workflows/notes.md"),
+            "# not a workflow: [",
+        )
+        .unwrap();
+        fs::write(
+            root.join(".github/rulesets/main.json"),
+            ruleset(&["Checks", "lint"]),
+        )
+        .unwrap();
+        check(root).unwrap();
+        fs::write(
+            root.join(".github/rulesets/main.json"),
+            ruleset(&["Checks"]),
+        )
+        .unwrap();
+        let error = format!("{:#}", check(root).unwrap_err());
+        assert!(
+            error.contains("lint"),
+            "a job missing from the ruleset: {error}"
+        );
+    }
+
+    #[test]
     fn the_checked_in_ruleset_matches_the_workflows() {
         check(&crate::repo_root().unwrap()).unwrap();
     }

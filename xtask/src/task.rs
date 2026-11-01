@@ -57,6 +57,8 @@ mod tests {
             "trimmed"
         );
         assert!(dir.path().join(TASK).is_file(), "in .abc/task.md");
+        std::fs::write(dir.path().join(TASK), " \n").unwrap();
+        assert_eq!(read(dir.path()).unwrap(), None, "a blank task is none");
         clear(dir.path()).unwrap();
         clear(dir.path()).unwrap();
         assert_eq!(

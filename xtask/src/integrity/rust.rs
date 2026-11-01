@@ -1,8 +1,9 @@
 //! The test inventory of a Rust file: every `#[test]` function, including those inside
 //! `proptest!`, with its markers and how many assertion macros it calls.
 
-use anyhow::Context;
-use proc_macro2::{Delimiter, TokenStream, TokenTree};
+use anyhow::{Context, anyhow};
+use proc_macro2::{TokenStream, TokenTree};
+use syn::parse::{Parse, ParseStream};
 use syn::visit::{self, Visit};
 
 use super::Test;
@@ -13,14 +14,20 @@ pub(super) fn tests(source: &str) -> anyhow::Result<Vec<Test>> {
     let mut finder = Finder {
         module: Vec::new(),
         tests: Vec::new(),
+        error: None,
     };
     finder.visit_file(&file);
-    Ok(finder.tests)
+    match finder.error {
+        Some(error) => Err(error),
+        None => Ok(finder.tests),
+    }
 }
 
 struct Finder {
     module: Vec<String>,
     tests: Vec<Test>,
+    /// The first `proptest!` block that could not be read.
+    error: Option<anyhow::Error>,
 }
 
 impl Finder {
@@ -42,30 +49,93 @@ impl<'ast> Visit<'ast> for Finder {
     }
 
     fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
-        let markers: Vec<String> = item.attrs.iter().filter_map(attribute_name).collect();
-        if markers.iter().any(|name| name == "test") {
-            let mut assertions = Assertions(0);
-            assertions.visit_block(&item.block);
+        if let Some(test) = test(&item.attrs, &item.sig.ident, &item.block) {
             self.tests.push(Test {
-                name: self.qualified(&item.sig.ident.to_string()),
-                ignored: markers.iter().any(|name| name == "ignore"),
-                should_panic: markers.iter().any(|name| name == "should_panic"),
-                assertions: assertions.0,
+                name: self.qualified(&test.name),
+                ..test
             });
         }
         visit::visit_item_fn(self, item);
     }
 
     fn visit_item_macro(&mut self, item: &'ast syn::ItemMacro) {
-        if macro_name(&item.mac.path).as_deref() == Some("proptest") {
-            let tests = macro_tests(item.mac.tokens.clone());
-            for (name, test) in tests {
-                self.tests.push(Test {
-                    name: self.qualified(&name),
-                    ..test
+        if macro_name(&item.mac.path).as_deref() != Some("proptest") {
+            return;
+        }
+        match item.mac.parse_body::<PropTests>() {
+            Ok(PropTests(functions)) => {
+                for function in functions {
+                    if let Some(test) = test(&function.attrs, &function.name, &function.body) {
+                        self.tests.push(Test {
+                            name: self.qualified(&test.name),
+                            ..test
+                        });
+                    }
+                }
+            }
+            Err(error) => {
+                let place = if self.module.is_empty() {
+                    "the file".to_owned()
+                } else {
+                    self.module.join("::")
+                };
+                self.error.get_or_insert_with(|| {
+                    anyhow!("could not read the proptest! block in {place}: {error}")
                 });
             }
         }
+    }
+}
+
+/// The test a function is, if its attributes mark it as one.
+fn test(attrs: &[syn::Attribute], name: &syn::Ident, body: &syn::Block) -> Option<Test> {
+    let markers: Vec<String> = attrs.iter().filter_map(attribute_name).collect();
+    if !markers.iter().any(|marker| marker == "test") {
+        return None;
+    }
+    let mut assertions = Assertions(0);
+    assertions.visit_block(body);
+    Some(Test {
+        name: name.to_string(),
+        ignored: markers.iter().any(|marker| marker == "ignore"),
+        should_panic: markers.iter().any(|marker| marker == "should_panic"),
+        assertions: assertions.0,
+    })
+}
+
+/// The functions of a `proptest!` block: inner attributes such as `#![proptest_config(..)]`,
+/// then functions whose parameters bind strategies with `in`, which are not Rust patterns and
+/// are skipped.
+struct PropTests(Vec<PropFunction>);
+
+struct PropFunction {
+    attrs: Vec<syn::Attribute>,
+    name: syn::Ident,
+    body: syn::Block,
+}
+
+impl Parse for PropTests {
+    fn parse(input: ParseStream<'_>) -> syn::Result<Self> {
+        input.call(syn::Attribute::parse_inner)?;
+        let mut functions = Vec::new();
+        while !input.is_empty() {
+            let attrs = input.call(syn::Attribute::parse_outer)?;
+            input.parse::<syn::Token![fn]>()?;
+            let name = input.parse()?;
+            let parameters;
+            syn::parenthesized!(parameters in input);
+            parameters.parse::<TokenStream>()?;
+            if input.peek(syn::Token![->]) {
+                input.parse::<syn::Token![->]>()?;
+                input.parse::<syn::Type>()?;
+            }
+            functions.push(PropFunction {
+                attrs,
+                name,
+                body: input.parse()?,
+            });
+        }
+        Ok(Self(functions))
     }
 }
 
@@ -122,60 +192,6 @@ fn count_assertions(tokens: TokenStream) -> usize {
         }
     }
     count
-}
-
-/// The `#[test]` functions inside a `proptest!` block, which uses `in` patterns syn cannot parse
-/// as functions, read from its tokens.
-fn macro_tests(tokens: TokenStream) -> Vec<(String, Test)> {
-    let mut tests = Vec::new();
-    let mut markers: Vec<String> = Vec::new();
-    let mut tokens = tokens.into_iter().peekable();
-    while let Some(token) = tokens.next() {
-        match token {
-            TokenTree::Punct(punct) if punct.as_char() == '#' => {
-                if let Some(TokenTree::Group(group)) = tokens.peek()
-                    && group.delimiter() == Delimiter::Bracket
-                {
-                    if let Some(TokenTree::Ident(name)) = group.stream().into_iter().next() {
-                        markers.push(name.to_string());
-                    }
-                    tokens.next();
-                }
-            }
-            TokenTree::Ident(keyword) if keyword == "fn" => {
-                let Some(TokenTree::Ident(name)) = tokens.next() else {
-                    continue;
-                };
-                let name = name.to_string();
-                let body = tokens.find_map(|candidate| match candidate {
-                    TokenTree::Group(group) if group.delimiter() == Delimiter::Brace => {
-                        Some(group.stream())
-                    }
-                    TokenTree::Group(_)
-                    | TokenTree::Ident(_)
-                    | TokenTree::Punct(_)
-                    | TokenTree::Literal(_) => None,
-                });
-                if markers.iter().any(|marker| marker == "test") {
-                    tests.push((
-                        name.clone(),
-                        Test {
-                            name,
-                            ignored: markers.iter().any(|marker| marker == "ignore"),
-                            should_panic: markers.iter().any(|marker| marker == "should_panic"),
-                            assertions: body.map_or(0, count_assertions),
-                        },
-                    ));
-                }
-                markers.clear();
-            }
-            TokenTree::Punct(_)
-            | TokenTree::Ident(_)
-            | TokenTree::Group(_)
-            | TokenTree::Literal(_) => {}
-        }
-    }
-    tests
 }
 
 #[cfg(test)]
@@ -257,7 +273,36 @@ mod tests {
                 test("tests::round_trips", false, false, 2),
                 test("tests::skipped", true, false, 0),
             ],
-            "proptest! bodies are read from their tokens"
+            "proptest! functions are parsed; their strategies are skipped"
+        );
+    }
+
+    #[test]
+    fn rejects_a_proptest_block_it_cannot_read() {
+        let error = tests("mod tests { proptest! { #[test] fn broken } }")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("could not read the proptest! block in tests"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn counts_only_assertion_macros_inside_other_macros() {
+        let source = r#"
+            #[test]
+            fn t() {
+                let asserted = vec![!false, 1 + 1 == 2];
+                println!("{}", asserted.len());
+                let calls = vec![assert!(true), debug_assert_eq!(1, 1)];
+                drop(calls);
+            }
+        "#;
+        assert_eq!(
+            tests(source).unwrap(),
+            [test("t", false, false, 2)],
+            "a name containing assert, or a ! after another word, is no assertion"
         );
     }
 

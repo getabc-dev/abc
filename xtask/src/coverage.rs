@@ -196,7 +196,7 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
     use std::path::Path;
 
-    use super::{Measured, measure, parse_lcov, ranges, run_with};
+    use super::{Measured, measure, parse_lcov, ranges, run, run_with};
     use crate::testing::{repository_with_change, script};
 
     const LCOV: &str = "TN:\nSF:/repo/src/a.rs\nFN:1,a\nDA:1,3\nDA:2,0\nDA:3,0\nDA:4,1\nDA:4,0\nend_of_record\nSF:/elsewhere/dep.rs\nDA:1,0\nend_of_record\nSF:/repo/src/b.rs\nDA:7,0,abc\nend_of_record\n";
@@ -293,6 +293,15 @@ mod tests {
             ),
         );
         path
+    }
+
+    #[test]
+    fn needs_the_pinned_tools() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo =
+            repository_with_change(&temp.path().join("repo"), &[("src/a.rs", "fn a() {}\n")]);
+        let error = run(&repo, "base", &mut Vec::new()).unwrap_err();
+        assert!(format!("{error:#}").contains("tools.toml"), "{error:#}");
     }
 
     #[test]

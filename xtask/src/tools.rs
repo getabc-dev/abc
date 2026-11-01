@@ -1019,8 +1019,9 @@ mod tests {
     use flate2::write::GzEncoder;
 
     use super::{
-        Manifest, Status, Target, Tool, extract, install, install_unready, pin_text,
-        published_sha256, remove_other_versions, report, reports_version, set_pin, sha256_hex,
+        Manifest, Status, Target, Tool, doctor, extract, install, install_unready, pin_text,
+        published_sha256, remove_other_versions, report, reports_version, set_pin, setup,
+        sha256_hex,
     };
 
     const SHA_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -1592,6 +1593,20 @@ targets.aarch64-unknown-linux-gnu = {{ platform = "linux-arm64", sha256 = "{sha2
                 .contains("sha256 must be"),
             "the crate's sha256 is checked"
         );
+        for release_only in [
+            "binary = \"fake\"",
+            "checksums = \"https://x/{version}.sha256\"",
+            "attestations = \"o/r\"",
+            &format!(
+                "targets.aarch64-apple-darwin = {{ platform = \"p\", sha256 = \"{SHA_A}\", binary-sha256 = \"{SHA_B}\" }}"
+            ),
+        ] {
+            let text = format!("{}{release_only}\n", crate_manifest(SHA_A));
+            assert!(
+                format!("{:#}", Manifest::parse(&text).unwrap_err()).contains("set either `url`"),
+                "a crate tool takes no {release_only}"
+            );
+        }
     }
 
     #[test]
@@ -1637,6 +1652,19 @@ targets.aarch64-unknown-linux-gnu = {{ platform = "linux-arm64", sha256 = "{sha2
                 })
             }
         };
+        let mut same = Vec::new();
+        pin_text(
+            &crate_manifest(&sha256),
+            &mut same,
+            &mut serve(sha256.clone()),
+        )
+        .unwrap();
+        assert!(
+            String::from_utf8(same)
+                .unwrap()
+                .starts_with("same     fake 1.2.3"),
+            "an unchanged pin"
+        );
         let mut out = Vec::new();
         let pinned =
             pin_text(&crate_manifest(SHA_A), &mut out, &mut serve(sha256.clone())).unwrap();
@@ -1648,8 +1676,8 @@ targets.aarch64-unknown-linux-gnu = {{ platform = "linux-arm64", sha256 = "{sha2
         assert!(
             String::from_utf8(out)
                 .unwrap()
-                .contains("matches the crates.io index"),
-            "and reported as verified"
+                .starts_with("changed  fake 1.2.3: matches the crates.io index"),
+            "and reported as changed and verified"
         );
         let error = pin_text(
             &crate_manifest(SHA_A),
@@ -1707,6 +1735,16 @@ targets.aarch64-unknown-linux-gnu = {{ platform = "linux-arm64", sha256 = "{sha2
 
     #[test]
     fn setup_and_doctor_can_select_tools() {
+        let root = crate::repo_root().unwrap();
+        let unknown = ["no-such-tool".to_owned()];
+        assert!(
+            setup(&root, &unknown, &mut Vec::new()).is_err(),
+            "setup refuses a tool that is not pinned"
+        );
+        assert!(
+            doctor(&root, &unknown, &mut Vec::new()).is_err(),
+            "so does doctor"
+        );
         let manifest = Manifest::parse(&manifest_text(SHA_A, SHA_B)).unwrap();
         let only = vec!["fake".to_owned()];
         assert_eq!(manifest.select(&only).unwrap().tools.len(), 1, "selected");

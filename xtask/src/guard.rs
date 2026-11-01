@@ -397,10 +397,11 @@ fn api_write(rest: &[&Word]) -> Option<String> {
             .filter(|value| !value.is_empty())
         {
             method = Some(value.to_ascii_uppercase());
-        } else if matches!(word, "-f" | "-F" | "--field" | "--raw-field" | "--input")
+        } else if matches!(word, "--field" | "--raw-field" | "--input")
+            // gh api has no other single-dash flag that starts with f or F.
             || ["-f", "-F", "--field=", "--raw-field=", "--input="]
                 .iter()
-                .any(|prefix| word.len() > prefix.len() && word.starts_with(prefix))
+                .any(|prefix| word.starts_with(prefix))
         {
             body = true;
         }

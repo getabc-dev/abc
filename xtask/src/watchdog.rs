@@ -89,6 +89,21 @@ pub(crate) fn check(
     }
 }
 
+/// `diff`, cut to at most `max` bytes on a character boundary, with a note when it was cut.
+fn cut(diff: String, max: usize) -> String {
+    if diff.len() <= max {
+        return diff;
+    }
+    let end = (0..=max)
+        .rev()
+        .find(|&end| diff.is_char_boundary(end))
+        .unwrap_or_default();
+    format!(
+        "{}\n(diff cut at {max} bytes)",
+        diff.get(..end).unwrap_or_default()
+    )
+}
+
 /// The prompt: the task, the rules with their IDs, and the diff.
 fn prompt(root: &Path, task: &str) -> anyhow::Result<String> {
     let agents = std::fs::read_to_string(root.join("AGENTS.md")).unwrap_or_default();
@@ -100,12 +115,7 @@ fn prompt(root: &Path, task: &str) -> anyhow::Result<String> {
         Ok(commit) => git::diff(root, &commit, 3)?,
         Err(error) => format!("(no diff: {error:#})"),
     };
-    let diff = if diff.len() > MAX_DIFF_BYTES {
-        let cut: String = diff.chars().take(MAX_DIFF_BYTES).collect();
-        format!("{cut}\n(diff cut at {MAX_DIFF_BYTES} bytes)")
-    } else {
-        diff
-    };
+    let diff = cut(diff, MAX_DIFF_BYTES);
     Ok(format!(
         "You are a watchdog for a coding agent that is about to stop. Decide whether its changes \
          still serve its task and follow the rules. Off track means work outside the task, the \
@@ -178,7 +188,7 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::time::Duration;
 
-    use super::{Assessment, assessment, check};
+    use super::{Assessment, assessment, check, cut, prompt};
     use crate::task;
     use crate::testing::{git, repository};
 
@@ -203,7 +213,7 @@ mod tests {
         let repo = repository(&temp.path().join("repo"));
         fs::write(
             repo.join("AGENTS.md"),
-            "# abc\n\n- **S1 · Correctness over everything.** Text.\nProse.\n",
+            "# abc\n\n- **S1 · Correctness over everything.** Text.\nProse · with a dot.\n- **Data:** Postgres.\n",
         )
         .unwrap();
         git(&repo, &["add", "--all"]);
@@ -244,6 +254,37 @@ mod tests {
         );
         assert!(prompt.contains("**S1 · Correctness"), "the rules: {prompt}");
         assert!(!prompt.contains("Prose."), "only the rule lines");
+    }
+
+    #[test]
+    fn prompts_with_the_task_the_rules_and_the_diff() {
+        let (_temp, repo) = worktree();
+        let text = prompt(&repo, "Add the coverage gate").unwrap();
+        assert!(text.contains("Add the coverage gate"), "the task");
+        assert!(
+            text.contains("- **S1 · Correctness over everything.**"),
+            "a rule"
+        );
+        assert!(!text.contains("Prose · with a dot"), "prose is not a rule");
+        assert!(
+            !text.contains("**Data:**"),
+            "a bullet without an ID is not a rule"
+        );
+    }
+
+    #[test]
+    fn cuts_a_long_diff_on_a_character_boundary() {
+        assert_eq!(cut("abc".to_owned(), 3), "abc", "at the limit");
+        assert_eq!(
+            cut("abcd".to_owned(), 3),
+            "abc\n(diff cut at 3 bytes)",
+            "over it"
+        );
+        assert_eq!(
+            cut("aé".to_owned(), 2),
+            "a\n(diff cut at 2 bytes)",
+            "never mid-character"
+        );
     }
 
     #[test]
