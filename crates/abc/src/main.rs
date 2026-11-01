@@ -1,9 +1,16 @@
 //! The abc binary. Thin: parse, set up logging, call the library, map errors to exit codes.
+//!
+//! Exit codes: 0 on success, 1 when running fails, 2 for a configuration error.
 
+use std::error::Error as StdError;
+use std::io::Write as _;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::time::Duration;
 
+use abc_server::{LinkTimings, PublicUrl, ServerConfig};
+use abc_store::{DatabaseUrl, ExecuteError, Store, StoreOptions};
 use clap::{Parser, Subcommand};
 
 /// abc: a self-hosted software factory.
@@ -16,9 +23,8 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Run the server (migrates Postgres on start), or administer it from its host.
+    /// Run the server (it migrates Postgres on start), or administer it from its host.
     Server(ServerCommand),
-    // Worker(WorkerArgs): PR 4. `abc worker enrol <url> --token …` and `abc worker`.
 }
 
 #[derive(Debug, clap::Args)]
@@ -33,18 +39,20 @@ struct ServerCommand {
 
 #[derive(Debug, Subcommand)]
 enum ServerAction {
-    /// Print a one-time code that claims this unclaimed server (valid one hour). Run it from a
+    /// Print a one-time code that claims this unclaimed server (valid for one hour). Run it from a
     /// shell on the server host, such as `docker compose exec abc abc server setup-code`. The code
-    /// is printed to this terminal only: never logged, never stored (only its digest).
+    /// is printed to this terminal only: never logged, and only its digest is stored.
     SetupCode,
 }
 
 #[derive(Debug, clap::Args)]
 struct DatabaseArgs {
-    /// Postgres URL. Read as a raw string so clap never echoes it in an error; validated when
-    /// connecting, with errors that do not contain it.
+    /// Postgres URL. Errors never repeat it.
     #[arg(long, env = "ABC_DATABASE_URL", hide_env_values = true)]
     database_url: String,
+    /// How many seconds to keep retrying while Postgres starts.
+    #[arg(long, env = "ABC_DATABASE_WAIT", default_value_t = 60)]
+    database_wait: u64,
 }
 
 #[derive(Debug, clap::Args)]
@@ -56,7 +64,7 @@ struct ServeArgs {
         default_value = "/run/abc-sidecar/abc.sock"
     )]
     sidecar_socket: PathBuf,
-    /// Health and readiness.
+    /// Where health and readiness listen.
     #[arg(long, env = "ABC_OPS_ADDR", default_value = "127.0.0.1:7071")]
     ops_addr: SocketAddr,
     /// The https URL Tailscale Serve answers on, such as `https://abc.tail1234.ts.net`.
@@ -67,38 +75,128 @@ struct ServeArgs {
     log: Option<String>,
 }
 
-/// Why the process failed. Each message tells the user what to do.
-#[derive(Debug, thiserror::Error)]
-enum RunError {
-    #[error(transparent)]
-    Telemetry(#[from] abc_server::telemetry::TelemetryError),
-    #[error(transparent)]
-    Serve(#[from] abc_server::ServeError),
-    #[error(transparent)]
-    Store(#[from] abc_store::OpenError),
-    #[error(transparent)]
-    SetupCode(#[from] abc_store::ExecuteError<std::convert::Infallible>),
-    #[error("ABC_PUBLIC_URL is required to run the server")]
-    MissingPublicUrl,
-    #[error("could not start the async runtime")]
-    Runtime(#[source] std::io::Error),
+/// Why the process failed, and with which exit code.
+enum Failure {
+    /// Fix the configuration and run again.
+    Config(Box<dyn StdError>),
+    /// Running failed.
+    Run(Box<dyn StdError>),
+}
+
+/// The error and its causes, joined with `: `.
+fn chain(error: &dyn StdError) -> String {
+    let mut text = error.to_string();
+    let mut next = error.source();
+    while let Some(cause) = next {
+        text.push_str(": ");
+        text.push_str(&cause.to_string());
+        next = cause.source();
+    }
+    text
 }
 
 fn main() -> ExitCode {
-    // Parse; build a multi-thread tokio runtime; dispatch.
-    // Server: telemetry::init(args.log), then abc_server::run(ServerConfig { database_url:
-    //   abc_store::DatabaseUrl::new(args.database_url), .. }, shutdown_signal()), where
-    //   shutdown_signal is SIGTERM or SIGINT.
-    // Server + SetupCode: connect, Store::open (refuses an unmigrated database with a clear
-    //   message), store.issue_setup_code(), then writeln!(io::stdout().lock(), …) the code's
-    //   display form and expiry to the operator's own terminal. No subscriber is installed, so
-    //   nothing reaches the server's log; `ServerAlreadyClaimed` prints "already claimed".
-    // Errors: the chain is written to stderr through the JSON logger (server) or plainly
-    //   (setup-code); exit 1 for runtime failures, 2 for configuration errors.
-    let _ = Cli::parse;
-    unimplemented!()
+    let cli = Cli::parse();
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => return report(&Failure::Run(Box::new(error))),
+    };
+    let Command::Server(server) = cli.command;
+    let result = match server.action {
+        Some(ServerAction::SetupCode) => runtime.block_on(setup_code(&server.database)),
+        None => runtime.block_on(serve(server)),
+    };
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(failure) => report(&failure),
+    }
 }
 
+/// Writes the failure to stderr and returns its exit code.
+fn report(failure: &Failure) -> ExitCode {
+    let (error, code) = match failure {
+        Failure::Config(error) => (error, 2),
+        Failure::Run(error) => (error, 1),
+    };
+    // Nothing more can be done if stderr is gone.
+    let _unwritten = writeln!(std::io::stderr().lock(), "abc: {}", chain(error.as_ref()));
+    ExitCode::from(code)
+}
+
+async fn serve(server: ServerCommand) -> Result<(), Failure> {
+    let config = |error: Box<dyn StdError>| Failure::Config(error);
+    let raw_url = server
+        .serve
+        .public_url
+        .ok_or_else(|| config("ABC_PUBLIC_URL is required to run the server".into()))?;
+    let public_url = PublicUrl::parse(&raw_url).map_err(|error| config(Box::new(error)))?;
+    abc_server::telemetry::init(server.serve.log.as_deref())
+        .map_err(|error| config(Box::new(error)))?;
+    let settings = ServerConfig {
+        database_url: DatabaseUrl::new(server.database.database_url),
+        database_wait: Duration::from_secs(server.database.database_wait),
+        sidecar_socket: server.serve.sidecar_socket,
+        ops_addr: server.serve.ops_addr,
+        public_url,
+        link: LinkTimings::default(),
+    };
+    abc_server::run(settings, shutdown_signal())
+        .await
+        .map_err(|error| {
+            tracing::error!(error = %chain(&error), "the server stopped");
+            Failure::Run(Box::new(error))
+        })
+}
+
+/// Issues a setup code and prints it to this terminal. No logger is installed, so nothing about
+/// the code reaches the server's log.
+async fn setup_code(database: &DatabaseArgs) -> Result<(), Failure> {
+    let run = |error: Box<dyn StdError>| Failure::Run(error);
+    let url = DatabaseUrl::new(database.database_url.clone());
+    let db = abc_store::connect(&url, Duration::from_secs(database.database_wait))
+        .await
+        .map_err(|error| run(Box::new(error)))?;
+    let store = Store::open(db, StoreOptions::production())
+        .await
+        .map_err(|error| run(Box::new(error)))?;
+    let issued = match store.issue_setup_code().await {
+        Ok(issued) => issued,
+        // Only an unclaimed server issues setup codes; the reason says so.
+        Err(ExecuteError::Denied(denied)) => {
+            return Err(run(format!("no setup code: {}", denied.reason).into()));
+        }
+        Err(error) => return Err(run(Box::new(error))),
+    };
+    let expires = issued.expires_at.as_offset();
+    let shown = issued.code.expose_secret().display_form();
+    writeln!(
+        std::io::stdout().lock(),
+        "Setup code (valid until {:02}:{:02} UTC): {}\nOpen the server's tailnet URL and enter it to become its owner.",
+        expires.hour(),
+        expires.minute(),
+        shown.as_str()
+    )
+    .map_err(|error| run(Box::new(error)))
+}
+
+/// Resolves on SIGTERM or SIGINT.
 async fn shutdown_signal() {
-    unimplemented!()
+    use tokio::signal::unix::{SignalKind, signal};
+    match (
+        signal(SignalKind::terminate()),
+        signal(SignalKind::interrupt()),
+    ) {
+        (Ok(mut terminate), Ok(mut interrupt)) => {
+            tokio::select! {
+                _ = terminate.recv() => {}
+                _ = interrupt.recv() => {}
+            }
+        }
+        (Err(error), _) | (_, Err(error)) => {
+            tracing::error!(error = %error, "cannot listen for shutdown signals; stopping");
+        }
+    }
 }
