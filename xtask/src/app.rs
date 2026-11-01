@@ -247,8 +247,6 @@ pub(crate) fn configure_git(root: &Path, dir: &Path, out: &mut impl Write) -> an
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::io::{Read as _, Write as _};
-    use std::net::TcpListener;
     use std::path::Path;
 
     use base64::Engine as _;
@@ -258,7 +256,7 @@ mod tests {
     use super::{
         App, HELPER, HELPER_KEY, config_dir_from, configure_git, credential, gh, parse_key,
     };
-    use crate::testing::{git, repository};
+    use crate::testing::{git, repository, serve_once};
 
     const KEY: &str = include_str!("../testdata/agent-app-test-key.pem");
 
@@ -370,32 +368,14 @@ mod tests {
 
     #[test]
     fn requests_an_installation_token() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut request = Vec::new();
-            let mut buffer = [0_u8; 4096];
-            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
-                let read = stream.read(&mut buffer).unwrap();
-                request.extend_from_slice(&buffer[..read]);
-            }
-            let body = r#"{"token": "ghs_test", "expires_at": "2026-11-01T11:00:00Z"}"#;
-            write!(
-                stream,
-                "HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            )
-            .unwrap();
-            String::from_utf8(request).unwrap()
-        });
+        let (url, server) = serve_once(
+            "201 Created",
+            r#"{"token": "ghs_test", "expires_at": "2026-11-01T11:00:00Z"}"#,
+        );
         let dir = app_dir();
-        let token = App::load(dir.path())
-            .unwrap()
-            .token(&format!("http://{address}"))
-            .unwrap();
-        let request = server.join().unwrap();
+        let token = App::load(dir.path()).unwrap().token(&url).unwrap();
         assert_eq!(token, "ghs_test", "the token from the response");
+        let request = server.join().unwrap();
         assert!(
             request.starts_with("POST /app/installations/42/access_tokens HTTP/1.1"),
             "{request}"
