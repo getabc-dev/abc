@@ -99,25 +99,45 @@ brief.
 Everything runs through `cargo xtask`, and agent hooks and CI call the same commands. The Rust
 toolchain is pinned in `rust-toolchain.toml`; rustup installs it on first use.
 
+Agents start every task with `cargo xtask task set "<the task>"`. When the agent stops, the
+watchdog compares the diff with that task and the rules above, and keeps it working if it drifted.
+
 | Command | What it does |
 | --- | --- |
-| `cargo xtask setup` | Installs the tools pinned in `xtask/tools.toml` into `.tools/`, checking the sha256 of each archive and of the executable in it. Run it in every new clone or worktree, and after the list changes. |
-| `cargo xtask doctor` | Fails unless every pinned tool is installed, matches its pinned sha256 and reports its pinned version. |
+| `cargo xtask setup [TOOLS]` | Installs the tools pinned in `xtask/tools.toml` into `.tools/`, checking the sha256 of each archive or crate and of the executable. Configures git to push as the agent App when `~/.config/abc/agent-app/` exists. Run it in every new clone or worktree, and after the list changes. |
+| `cargo xtask doctor [TOOLS]` | Fails unless every pinned tool, or each one named, is installed, matches its pinned sha256 and reports its pinned version. |
 | `cargo xtask check` | Format check, clippy (`--all-targets --locked -D warnings`), nextest, doctests and rustdoc with warnings denied, on the whole workspace. Property tests run with a fixed seed. |
 | `cargo xtask check --changed` | The same, limited to the crates affected by changes since the merge base with the default branch (`upstream/HEAD`, else `origin/HEAD`). |
+| `cargo xtask integrity --base <rev>` | Lists deleted test files and tests, newly skipped or `should_panic` tests, tests with fewer assertions, and changed gate files since the merge base. In CI it fails on any of them unless an approver in `.github/integrity-approvers` labelled the PR `integrity-approved` after its last push. |
+| `cargo xtask coverage --base <rev>` | Runs the tests under cargo-llvm-cov and fails unless 90% of the changed, instrumented lines are covered, listing the ones that are not. |
+| `cargo xtask mutants --base <rev> [--jobs N]` | Runs cargo-mutants on the Rust lines changed since the merge base and fails on any missed or timed-out mutant. |
+| `cargo xtask review --base <rev>` | Gemini reviews the diff, the PR's title and description against this file. Runs in CI; it blocks on a `block` verdict and fails closed on quota, size and missing-key errors. |
+| `cargo xtask task set "<text>"` / `show` / `clear` | Records, prints or forgets the current task in `.abc/task.md` (not committed), for the watchdog. |
+| `cargo xtask gh -- <args>` | Runs gh as the agent App with a fresh one-hour installation token. Agents create, merge and change things on GitHub only through this; the guard blocks plain `gh pr create`, `gh pr merge` and `gh api` writes. |
+| `cargo xtask git-credential <op>` | git's credential helper for github.com, set up by `setup`: it answers with an agent App token. Never run it yourself. |
+| `cargo xtask rulesets check` | Checks `.github/rulesets/main.json` against the CI workflows: every job that runs on pull requests and in the merge queue is a required check. |
+| `cargo xtask rulesets apply` | For the maintainer only, with their own gh login: puts the ruleset on GitHub, replacing the ones it supersedes. Agents never run it. |
 | `cargo xtask tool <name> [args]` | Runs a pinned tool from `.tools/`, such as `cargo xtask tool cargo-deny check`. Never run these tools from `PATH`. |
-| `cargo xtask pin` | After a version changes in `xtask/tools.toml`, downloads each target's archive and records its sha256 and its executable's. To add a tool, write zeros for both and run it. |
+| `cargo xtask pin` | After a version changes in `xtask/tools.toml`, records each target's archive sha256 and its executable's, or a crate's sha256 from the crates.io index. To add a tool, write zeros and run it. |
 | `cargo fmt --all` | Fixes formatting. |
 
-CI also runs `cargo xtask doctor`, `cargo xtask tool cargo-deny check`, `cargo xtask tool
-cargo-shear --deny-warnings --locked`, `cargo xtask tool osv-scanner scan source --lockfile
-Cargo.lock`, `cargo xtask tool zizmor --pedantic .github`, `cargo xtask tool pinact run --check
---verify-comment` and `cargo xtask tool gitleaks git --redact --no-banner --verbose .`.
+CI runs `check`, `integrity`, `coverage`, `mutants` and `review` on every pull request, and
+`cargo xtask tool cargo-deny check`, `cargo xtask tool cargo-shear --deny-warnings --locked`,
+`cargo xtask tool osv-scanner scan source --lockfile Cargo.lock`, `cargo xtask tool zizmor
+--pedantic .github`, `cargo xtask tool pinact run --check --verify-comment` and `cargo xtask tool
+gitleaks git --redact --no-banner --verbose .`. Every job is a required check on `main`.
 
-The git guard in the agent hooks catches accidents: force pushes, and git or gh commands it
-cannot read. It cannot stop a deliberate bypass, since no text check of a shell command can, and it
-does not try to. Enforcement is on GitHub: rulesets on `main` forbid force pushes and deletion and
-require the checks, and agents push as the abc-agent GitHub App with limited permissions.
+The gate files, listed in `xtask/src/integrity/mod.rs` and owned in `.github/CODEOWNERS`, are the
+files that decide what passes: CI, lint and tool configuration, the agent settings, and the xtask
+code of the gates themselves. A change to one needs the integrity approval and a code owner's
+review.
+
+The git guard in the agent hooks catches accidents: force pushes, git or gh commands it cannot
+read, and gh changes made as the user instead of through `cargo xtask gh`. It cannot stop a
+deliberate bypass, since no text check of a shell command can, and it does not try to. Enforcement
+is on GitHub: the ruleset on `main` forbids force pushes and deletion and requires a code owner's
+approval and every check, and agents act as the getabc-dev-agent GitHub App with limited
+permissions.
 
 Commit the `proptest-regressions/` files proptest writes when a property test fails: they replay
 the failing cases first on every run.

@@ -761,9 +761,14 @@ mod tests {
         assert_eq!(
             settings["permissions"]["deny"],
             serde_json::json!([
+                "Bash(gh auth token)",
                 "Bash(gh auth token *)",
+                "Bash(gh auth status --show-token)",
                 "Bash(gh auth status --show-token *)",
+                "Bash(gh auth status * --show-token*)",
+                "Bash(gh auth status -t)",
                 "Bash(gh auth status -t *)",
+                "Bash(gh auth status * -t*)",
                 "Read(~/.config/gh/**)",
                 "Bash(security find-generic-password *)",
                 "Bash(security find-internet-password *)"
