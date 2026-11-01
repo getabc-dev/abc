@@ -2,6 +2,12 @@
 # Claude Code PreToolUse hook for Bash and Monitor. It runs `cargo xtask hook pre-tool-use`, which
 # blocks force pushes and git or gh commands it cannot read.
 #
+# xtask builds into target/hook, apart from target/, so the guard never waits on the build lock of
+# a cargo command the agent is running. .claude/settings.json gives this hook 300 seconds, enough to
+# build xtask there the first time. Claude Code cancels a hook at its timeout, and a timed-out
+# PreToolUse hook does not block the tool call: the guard fails open only then, and GitHub's rules
+# still stand.
+#
 # When xtask itself cannot run, for example because it does not build, this script blocks commands
 # that mention git or gh and lets every other command through with a warning, so a broken build
 # never locks the agent out of the shell. xtask/src/hook.rs applies the same rule when the guard
@@ -9,7 +15,7 @@
 
 input=$(cat)
 if cd "$CLAUDE_PROJECT_DIR" 2>/dev/null; then
-  printf '%s' "$input" | cargo xtask hook pre-tool-use
+  printf '%s' "$input" | CARGO_TARGET_DIR="$CLAUDE_PROJECT_DIR/target/hook" cargo xtask hook pre-tool-use
   status=$?
 else
   echo "CLAUDE_PROJECT_DIR is not a directory: $CLAUDE_PROJECT_DIR" >&2

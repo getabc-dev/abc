@@ -10,6 +10,10 @@
 //!   repository, so the checkout is held to its own toolchain, tools and gate;
 //! - does nothing when the directory is in no repository, or in a different one.
 //!
+//! Claude Code cancels a hook at its `timeout` in `.claude/settings.json`: 300 seconds for
+//! `PreToolUse` and 900 for `Stop`. A timed-out hook renders no decision, so the tool call runs or
+//! the agent stops. The guard builds in `target/hook`, so it never waits on the agent's cargo lock.
+//!
 //! The `PreToolUse` guard catches accidents; it is not the enforcement. GitHub rulesets on `main`
 //! (no force push, no deletion, required checks) and the abc-agent App's limited permissions are.
 //!
@@ -263,6 +267,10 @@ fn delegate(cargo: &Path, root: &Path, event: Event, input: &str) -> anyhow::Res
         .env_remove("RUSTUP_TOOLCHAIN")
         .env_remove("CARGO")
         .env(DELEGATED, OsStr::new("1"))
+        .envs(
+            (event == Event::PreToolUse)
+                .then(|| ("CARGO_TARGET_DIR", root.join("target/hook"))),
+        )
         .stdin(Stdio::piped())
         .spawn()
         .with_context(|| format!("could not run cargo xtask in {}", root.display()))?;
@@ -315,10 +323,17 @@ mod tests {
         }
     }
 
-    /// A script at `dir/cargo` that drains its input and exits with `code`.
+    /// A script at `dir/cargo` that drains its input, records `CARGO_TARGET_DIR` in
+    /// `dir/target-dir`, and exits with `code`.
     fn fake_cargo(dir: &Path, code: u8) -> PathBuf {
         let path = dir.join("cargo");
-        fs::write(&path, format!("#!/bin/sh\ncat >/dev/null\nexit {code}\n")).unwrap();
+        fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\ncat >/dev/null\nprintf %s \"$CARGO_TARGET_DIR\" > \"$(dirname \"$0\")/target-dir\"\nexit {code}\n"
+            ),
+        )
+        .unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
         path
     }
@@ -538,6 +553,11 @@ mod tests {
             2,
             "the worktree's own block passes through"
         );
+        assert_eq!(
+            fs::read_to_string(temp.path().join("target-dir")).unwrap(),
+            worktree.join("target/hook").display().to_string(),
+            "the worktree's guard builds apart from its cargo lock"
+        );
     }
 
     /// The shells hooks must work under: the system `sh` and dash, Debian's and Ubuntu's `sh`.
@@ -670,6 +690,19 @@ mod tests {
 
         let socket = r#"{"tool_name":"Monitor","tool_input":{"ws":{"url":"wss://example.com"}}}"#;
         assert_eq!(run_hook_script(101, socket).0, Some(0), "no command at all");
+    }
+
+    #[test]
+    fn the_hook_script_builds_xtask_apart_from_the_agents_builds() {
+        let temp = tempfile::tempdir().unwrap();
+        fake_cargo(temp.path(), 0);
+        let script = crate::repo_root().unwrap().join(super::HOOK_SCRIPT);
+        run_shell("sh", &[script.as_os_str()], temp.path(), temp.path(), "{}");
+        assert_eq!(
+            fs::read_to_string(temp.path().join("target-dir")).unwrap(),
+            temp.path().join("target/hook").display().to_string(),
+            "the guard never waits on the lock of target/"
+        );
     }
 
     #[test]

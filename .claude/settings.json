@@ -6,7 +6,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "if [ -f \"$CLAUDE_PROJECT_DIR/xtask/hooks/pre-tool-use.sh\" ]; then sh \"$CLAUDE_PROJECT_DIR/xtask/hooks/pre-tool-use.sh\"; else echo \"xtask hook: $CLAUDE_PROJECT_DIR has no xtask/hooks/pre-tool-use.sh; the git guard is off\" >&2; fi"
+            "command": "if [ -f \"$CLAUDE_PROJECT_DIR/xtask/hooks/pre-tool-use.sh\" ]; then sh \"$CLAUDE_PROJECT_DIR/xtask/hooks/pre-tool-use.sh\"; else echo \"xtask hook: $CLAUDE_PROJECT_DIR has no xtask/hooks/pre-tool-use.sh; the git guard is off\" >&2; fi",
+            "timeout": 300
           }
         ]
       }
