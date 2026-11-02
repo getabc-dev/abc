@@ -172,8 +172,14 @@ pub(crate) fn review(
     let (status, answer) = post(&url, &body(request).to_string(), key)?;
     match status {
         200 => {}
-        429 => bail!("Gemini quota exhausted, re-run after it resets"),
-        500..=599 => bail!("Gemini is unavailable (HTTP {status}); re-run later"),
+        429 => bail!(
+            "Gemini quota exhausted, re-run after it resets: {}",
+            google_reason(&answer)
+        ),
+        500..=599 => bail!(
+            "Gemini is unavailable (HTTP {status}): {}; re-run later",
+            google_reason(&answer)
+        ),
         _ => bail!(
             "Gemini refused the request (HTTP {status}): {}",
             answer.chars().take(500).collect::<String>()
@@ -194,6 +200,38 @@ pub(crate) fn review(
             text.chars().take(300).collect::<String>()
         )
     })
+}
+
+/// Google's own explanation of a failed request: the error's status and message from its JSON
+/// body, with the retry delay it suggests when it gives one, or the start of the raw body when the
+/// body is not Google's error format. Without it a 503 reads as "down" when Google said why.
+fn google_reason(answer: &str) -> String {
+    let Ok(body) = serde_json::from_str::<serde_json::Value>(answer) else {
+        let raw: String = answer.trim().chars().take(300).collect();
+        return if raw.is_empty() {
+            "no explanation in the response".to_owned()
+        } else {
+            raw
+        };
+    };
+    let field = |name: &str| body.pointer(&format!("/error/{name}"));
+    let status = field("status")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("UNKNOWN");
+    let message = field("message")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("no message");
+    let retry = field("details")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|details| {
+            details
+                .iter()
+                .find_map(|detail| detail.get("retryDelay").and_then(serde_json::Value::as_str))
+        });
+    match retry {
+        Some(delay) => format!("{status}: {message} (Google suggests retrying in {delay})"),
+        None => format!("{status}: {message}"),
+    }
 }
 
 /// Sends a request to Gemini, returning the status and body whatever the status.
@@ -640,8 +678,8 @@ mod tests {
         .unwrap_err();
         assert_eq!(
             error.to_string(),
-            "Gemini quota exhausted, re-run after it resets",
-            "the reason"
+            "Gemini quota exhausted, re-run after it resets: RESOURCE_EXHAUSTED: no message",
+            "the reason, with Google's status"
         );
         let down = review(
             &request("+x"),
@@ -689,6 +727,59 @@ mod tests {
             ),
         );
         (outcome, calls.get(), waits)
+    }
+
+    #[test]
+    fn says_what_google_said_when_it_fails() {
+        let overloaded = r#"{"error": {"code": 503, "message": "The model is overloaded. Please try again later.", "status": "UNAVAILABLE"}}"#;
+        let error = review(
+            &request("+x"),
+            "test-key",
+            &mut answering(503, overloaded.to_owned()),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Gemini is unavailable (HTTP 503): UNAVAILABLE: The model is overloaded. Please try \
+             again later.; re-run later",
+            "Google's status and message, not a guess"
+        );
+        let limited = r#"{"error": {"code": 429, "message": "Quota exceeded", "status": "RESOURCE_EXHAUSTED", "details": [{"@type": "type.googleapis.com/google.rpc.QuotaFailure"}, {"@type": "type.googleapis.com/google.rpc.RetryInfo", "retryDelay": "37s"}]}}"#;
+        let quota = review(
+            &request("+x"),
+            "test-key",
+            &mut answering(429, limited.to_owned()),
+        )
+        .unwrap_err();
+        assert!(
+            quota
+                .to_string()
+                .ends_with("RESOURCE_EXHAUSTED: Quota exceeded (Google suggests retrying in 37s)"),
+            "the retry delay Google suggests: {quota}"
+        );
+        let gateway = review(
+            &request("+x"),
+            "test-key",
+            &mut answering(502, "<html>Bad Gateway</html>".to_owned()),
+        )
+        .unwrap_err();
+        assert_eq!(
+            gateway.to_string(),
+            "Gemini is unavailable (HTTP 502): <html>Bad Gateway</html>; re-run later",
+            "a body that is not Google's error format is quoted"
+        );
+        let silent = review(
+            &request("+x"),
+            "test-key",
+            &mut answering(500, String::new()),
+        )
+        .unwrap_err();
+        assert!(
+            silent
+                .to_string()
+                .contains("no explanation in the response"),
+            "an empty body says so: {silent}"
+        );
     }
 
     #[test]
