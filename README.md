@@ -43,5 +43,3 @@ code follows.
 - [Security policy](SECURITY.md) and the [threat model](docs/threat-model.md)
 - [Code of conduct](CODE_OF_CONDUCT.md)
 - [Licence: MIT](LICENSE)
-- Sponsor abc through [GitHub Sponsors](https://github.com/sponsors/getabc-dev). abc is funded by
-  donations.
