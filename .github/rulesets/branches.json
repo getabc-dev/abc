@@ -1,0 +1,21 @@
+{
+  "name": "branches: agents write agent/* only",
+  "target": "branch",
+  "enforcement": "active",
+  "conditions": {
+    "ref_name": {
+      "include": ["~ALL"],
+      "exclude": ["~DEFAULT_BRANCH", "refs/heads/agent/**", "refs/heads/gh-readonly-queue/**"]
+    }
+  },
+  "bypass_actors": [
+    { "actor_type": "RepositoryRole", "actor_id": 5, "bypass_mode": "always" },
+    { "actor_type": "Integration", "actor_id": 2740, "bypass_mode": "always" }
+  ],
+  "rules": [
+    { "type": "creation" },
+    { "type": "update" },
+    { "type": "deletion" },
+    { "type": "non_fast_forward" }
+  ]
+}

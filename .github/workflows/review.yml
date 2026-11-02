@@ -1,7 +1,11 @@
 name: Review
 
+# pull_request_target, not pull_request: this job holds GEMINI_API_KEY, so on a pull request it
+# must run the base's workflow and the base's actions, never ones the pull request could change.
+# It reads the pull request only as a diff and runs nothing from its tree. In the merge queue the
+# workflow comes from the queued change, which a code owner approved after its last push.
 on:
-  pull_request:
+  pull_request_target: # zizmor: ignore[dangerous-triggers] runs only the base's code; reads the PR as a diff
     # An edited description re-reviews the reasons it gives for test changes.
     types: [opened, synchronize, reopened, edited, ready_for_review]
   merge_group:
@@ -24,20 +28,31 @@ jobs:
     timeout-minutes: 20
     permissions:
       contents: read
-    # GEMINI_API_KEY is in reach of this job alone, which builds and runs only the base commit's
-    # xtask and reads the pull request as a diff; nothing from the pull request's tree runs here.
+    # GEMINI_API_KEY is in reach of this job alone. Its workspace is the base commit, whose
+    # base-xtask action builds the base's xtask; the change under review is checked out beside it
+    # under pr/ and only read, as a diff.
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Check out the base commit, whose action and xtask run here
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
           persist-credentials: false
           fetch-depth: 0
+      - name: Check out the change under review beside it, to read
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          path: pr
+          persist-credentials: false
+          fetch-depth: 0
+      # On pull_request_target, $/ is this repository at the base branch's commit, never the change.
       - uses: $/.github/actions/base-xtask
         with:
           base: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
           gate: review
       - name: Gemini reviews the diff against AGENTS.md
         working-directory: ${{ runner.temp }}/base
-        run: cargo xtask review --root "$GITHUB_WORKSPACE" --base "$BASE"
+        run: cargo xtask review --root "$GITHUB_WORKSPACE/pr" --base "$BASE"
         env:
           BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
