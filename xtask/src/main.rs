@@ -194,7 +194,8 @@ fn main() -> ExitCode {
         Ok(invocation) => invocation,
         Err(error) => return report_error(&error),
     };
-    match run(cli.command, &invocation, &mut io::stderr().lock()) {
+    // Not a held lock: the broker's threads write the report too.
+    match run(cli.command, &invocation, &mut io::stderr()) {
         Ok(code) => code,
         Err(error) => match writeln!(io::stderr().lock(), "error: {error:#}") {
             // With stderr gone there is nowhere left to report; the exit code still fails.
@@ -267,7 +268,7 @@ fn verdict(passed: bool) -> ExitCode {
 fn run(
     task: Task,
     invocation: &Invocation<'_>,
-    report: &mut impl Write,
+    report: &mut (impl Write + Send),
 ) -> anyhow::Result<ExitCode> {
     let Invocation {
         home, root, tool, ..
@@ -319,7 +320,7 @@ fn run(
         )?)),
         Task::GitCredential { operation } => git_credential(&operation),
         Task::Gh { args } => gh_as_app(&args, report),
-        Task::Broker => run_broker(),
+        Task::Broker => run_broker(report),
         Task::Watchdog => Ok(ExitCode::from(watchdog::verdict(
             &stdin("claude's answer")?,
             report,
@@ -411,13 +412,13 @@ fn integrity(
 }
 
 /// `cargo xtask broker`, from this executable, with the App and socket in their places under the
-/// home directory, logging to stderr, which every client's thread may write.
-fn run_broker() -> anyhow::Result<ExitCode> {
+/// home directory, logging to `log`.
+fn run_broker(log: &mut (impl Write + Send)) -> anyhow::Result<ExitCode> {
     serve_tokens(
         &std::env::current_exe().context("could not find the running executable")?,
         &app::config_dir()?,
         &broker::socket()?,
-        &mut io::stderr(),
+        log,
     )
 }
 
