@@ -2,3 +2,4 @@
 /.tools/
 /.claude/worktrees/
 /.abc/
+*.pending-snap

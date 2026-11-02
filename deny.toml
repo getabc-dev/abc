@@ -46,7 +46,11 @@ deny = [
 ]
 # Every skip names the crates holding the old version back:
 # { crate = "name@version", reason = "held back by ...; drop when ..." }
-skip = []
+skip = [
+    # Added 2026-11-01 with abc-core and abc-protocol (S0 PR 3); review at each bump of their holders.
+    { crate = "syn@2", reason = "held back by proc-macro crates on syn 2 (ts-rs-macros, zeroize_derive); drop when they move to syn 3" },
+    { crate = "getrandom@0.2", reason = "held back by ring, through rustls and xtask; drop when ring moves to getrandom 0.4" },
+]
 
 [sources]
 unknown-registry = "deny"
