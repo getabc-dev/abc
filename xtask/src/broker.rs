@@ -366,9 +366,10 @@ mod tests {
     fn serves_tokens_on_its_socket_or_the_sandbox_refuses_the_socket() {
         use std::os::unix::fs::PermissionsExt as _;
 
-        let home = tempfile::tempdir().unwrap();
-        let socket = home.path().join("agent-broker/broker.sock");
-        std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        // A short path: a socket's must fit in 104 bytes, and the jail's temporary directory is
+        // long already, so binding there fails on the sandbox, not on the length.
+        let dir = tempfile::Builder::new().prefix("s").tempdir().unwrap();
+        let socket = dir.path().join("broker.sock");
         // A socket left behind by a broker that is gone.
         let stale = std::os::unix::net::UnixListener::bind(&socket);
         if let Err(error) = stale {
