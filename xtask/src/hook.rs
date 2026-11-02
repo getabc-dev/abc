@@ -190,20 +190,14 @@ fn act(event: Event, input: &str, context: &Context, out: &mut impl Write) -> an
             Event::PreToolUse => guard(input, out),
             // Exit 1 when the check fails; the hook command turns any failure into a block.
             Event::Stop => {
-                if check::run(
+                let passed = check::run(
                     &context.own_root,
                     true,
                     &tools::pinned(&context.own_root, "cargo-nextest")?,
                     None,
                     out,
-                )? {
-                    if let (true, Some(file)) = (fields.watched(), &context.watchdog_prompt) {
-                        watchdog::prepare(&context.own_root, file, out)?;
-                    }
-                    Ok(0)
-                } else {
-                    Ok(1)
-                }
+                )?;
+                finish_stop(passed, &fields, context, out)
             }
         },
         // GitHub is the gate, so a checkout that cannot take the hook is noted, never locked out.
@@ -237,6 +231,23 @@ fn act(event: Event, input: &str, context: &Context, out: &mut impl Write) -> an
             Ok(0)
         }
     }
+}
+
+/// The stop hook's exit code once the check has run: 1 when it failed. Otherwise 0, after writing
+/// the watchdog's prompt for the main agent's stop when `.claude/hooks/stop.sh` asked for one.
+fn finish_stop(
+    passed: bool,
+    fields: &HookInput,
+    context: &Context,
+    out: &mut impl Write,
+) -> anyhow::Result<u8> {
+    if !passed {
+        return Ok(1);
+    }
+    if let (true, Some(file)) = (fields.watched(), &context.watchdog_prompt) {
+        watchdog::prepare(&context.own_root, file, out)?;
+    }
+    Ok(0)
 }
 
 fn guard(input: &str, out: &mut impl Write) -> anyhow::Result<u8> {
@@ -1396,6 +1407,46 @@ mod tests {
         assert!(
             started.elapsed() < std::time::Duration::from_secs(20),
             "claude was stopped at the deadline"
+        );
+    }
+
+    #[test]
+    fn a_passed_check_writes_the_watchdogs_prompt_for_the_main_agent_alone() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = repository(&temp.path().join("repo"));
+        crate::task::set(&repo, "Sandbox the agents").unwrap();
+        let prompt = temp.path().join("prompt.md");
+        let mut asked = context(&repo, Some(&repo));
+        asked.watchdog_prompt = Some(prompt.clone());
+        let fields = |json: &str| serde_json::from_str::<super::HookInput>(json).unwrap();
+        let main_stop = fields(r#"{"hook_event_name": "Stop"}"#);
+        let mut out = Vec::new();
+        assert_eq!(
+            super::finish_stop(false, &main_stop, &asked, &mut out).unwrap(),
+            1,
+            "a failed check keeps the agent working"
+        );
+        assert!(!prompt.exists(), "and asks no watchdog");
+        let subagent = fields(r#"{"hook_event_name": "SubagentStop"}"#);
+        assert_eq!(
+            super::finish_stop(true, &subagent, &asked, &mut out).unwrap(),
+            0
+        );
+        assert!(!prompt.exists(), "subagents are not judged");
+        assert_eq!(
+            super::finish_stop(true, &main_stop, &context(&repo, Some(&repo)), &mut out).unwrap(),
+            0
+        );
+        assert!(!prompt.exists(), "no prompt unless stop.sh asks for one");
+        assert_eq!(
+            super::finish_stop(true, &main_stop, &asked, &mut out).unwrap(),
+            0
+        );
+        assert!(
+            fs::read_to_string(&prompt)
+                .unwrap()
+                .contains("Sandbox the agents"),
+            "the main agent's stop is judged on its task"
         );
     }
 }

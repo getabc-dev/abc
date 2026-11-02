@@ -176,7 +176,7 @@ mod tests {
     use std::os::unix::net::UnixStream;
     use std::path::Path;
 
-    use super::{SOCKET, answer, answer_all, exchange, request, socket};
+    use super::{SOCKET, answer, answer_all, exchange, request, serve, socket};
     use crate::app::Scope;
 
     /// The broker's answer to `request`, with `mint` minting, and the scope it reports.
@@ -341,6 +341,89 @@ mod tests {
             settings["sandbox"]["network"]["allowUnixSockets"],
             serde_json::json!([format!("~/{SOCKET}")]),
             "the broker's socket and no other"
+        );
+    }
+
+    /// A log another thread can read while the broker writes it.
+    #[derive(Clone, Default)]
+    struct SharedLog(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for SharedLog {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .map_err(|error| std::io::Error::other(error.to_string()))?
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn serves_tokens_on_its_socket_or_the_sandbox_refuses_the_socket() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let home = tempfile::tempdir().unwrap();
+        let socket = home.path().join("agent-broker/broker.sock");
+        std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        // A socket left behind by a broker that is gone.
+        let stale = std::os::unix::net::UnixListener::bind(&socket);
+        if let Err(error) = stale {
+            // Claude Code's sandbox and the hooks' jail forbid binding a socket: so does the
+            // broker, which never runs there.
+            assert_eq!(
+                error.kind(),
+                std::io::ErrorKind::PermissionDenied,
+                "{error}"
+            );
+            let refused = serve(&socket, |_| Ok(String::new()), &mut Vec::new()).unwrap_err();
+            assert!(
+                format!("{refused:#}").contains("could not listen"),
+                "{refused:#}"
+            );
+            return;
+        }
+        drop(stale);
+        let log = SharedLog::default();
+        let mut writer = log.clone();
+        let path = socket.clone();
+        std::thread::spawn(move || {
+            serve(
+                &path,
+                |scope| Ok(format!("ghs_{}", scope.name())),
+                &mut writer,
+            )
+        });
+        let started = std::time::Instant::now();
+        while !log.0.lock().unwrap().starts_with(b"broker: serving") {
+            assert!(
+                started.elapsed().as_secs() < 10,
+                "the broker never listened"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(request(&socket, Scope::Git).unwrap(), "ghs_git");
+        assert_eq!(request(&socket, Scope::Gh).unwrap(), "ghs_gh");
+        let mode = |file: &Path| std::fs::metadata(file).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode(socket.parent().unwrap()),
+            0o700,
+            "only its owner enters"
+        );
+        assert_eq!(mode(&socket), 0o600, "only its owner connects");
+        // The broker notes a request after answering it.
+        let noted = b"broker: minted a git token\nbroker: minted a gh token\n";
+        while !log.0.lock().unwrap().ends_with(noted) {
+            assert!(started.elapsed().as_secs() < 10, "both requests noted");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let second = serve(&socket, |_| Ok(String::new()), &mut Vec::new()).unwrap_err();
+        assert!(
+            format!("{second:#}").contains("already listening"),
+            "one broker per socket: {second:#}"
         );
     }
 }

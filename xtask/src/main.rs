@@ -357,16 +357,26 @@ fn run(
         Task::Hook {
             event,
             watchdog_prompt,
-        } => {
-            let context = hook::Context::from_env(home.clone(), watchdog_prompt);
-            Ok(ExitCode::from(hook::run(
-                event,
-                &stdin("the hook input")?,
-                &context,
-                report,
-            )?))
-        }
+        } => run_hook(
+            event,
+            watchdog_prompt,
+            &stdin("the hook input")?,
+            home,
+            report,
+        ),
     }
+}
+
+/// `cargo xtask hook`: runs the hook for `event` on the hook `input`, for the checkout at `home`.
+fn run_hook(
+    event: hook::Event,
+    watchdog_prompt: Option<PathBuf>,
+    input: &str,
+    home: &Path,
+    report: &mut impl Write,
+) -> anyhow::Result<ExitCode> {
+    let context = hook::Context::from_env(home.to_path_buf(), watchdog_prompt);
+    Ok(ExitCode::from(hook::run(event, input, &context, report)?))
 }
 
 /// Everything on stdin, which holds `what`.
@@ -454,7 +464,8 @@ mod tests {
     use std::process::ExitCode;
 
     use super::{
-        Cli, Invocation, RulesetAction, Task, TaskAction, repo_root, run, usage_exit_code, verdict,
+        Cli, Invocation, RulesetAction, Task, TaskAction, repo_root, run, run_hook,
+        usage_exit_code, verdict,
     };
     use crate::testing::{git, repository_with_change, script};
 
@@ -777,6 +788,34 @@ mod tests {
             manifest["workspace"]["package"]["rust-version"].as_str(),
             toolchain["toolchain"]["channel"].as_str(),
             "Cargo.toml's rust-version must equal the channel in rust-toolchain.toml"
+        );
+    }
+
+    #[test]
+    fn a_hook_runs_on_the_input_it_is_given() {
+        let root = repo_root().unwrap();
+        let input = serde_json::json!({
+            "cwd": root,
+            "tool_name": "Bash",
+            "tool_input": {"command": "git push --force origin main"},
+        })
+        .to_string();
+        let mut out = Vec::new();
+        assert_eq!(
+            run_hook(
+                crate::hook::Event::PreToolUse,
+                None,
+                &input,
+                &root,
+                &mut out
+            )
+            .unwrap(),
+            ExitCode::from(2),
+            "the guard blocks a force push"
+        );
+        assert!(
+            String::from_utf8(out).unwrap().contains("--force"),
+            "and says why"
         );
     }
 }
