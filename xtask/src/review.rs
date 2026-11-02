@@ -34,7 +34,10 @@ pub(crate) struct Request {
     pub(crate) rules: String,
     pub(crate) title: String,
     pub(crate) description: String,
+    /// The diff without generated files.
     pub(crate) diff: String,
+    /// The generated files the change touches, whose content the diff leaves out.
+    pub(crate) generated: Vec<String>,
 }
 
 /// Gemini's verdict.
@@ -117,8 +120,8 @@ fn body(request: &Request) -> serde_json::Value {
         "contents": [{
             "role": "user",
             "parts": [{"text": format!(
-                "# Pull request title\n\n{}\n\n# Description\n\n{}\n\n# Diff\n\n```diff\n{}\n```\n",
-                request.title, request.description, request.diff
+                "# Pull request title\n\n{}\n\n# Description\n\n{}\n\n# Diff\n\n```diff\n{}\n```\n{}",
+                request.title, request.description, request.diff, generated(&request.generated)
             )}]
         }],
         "generationConfig": {
@@ -126,6 +129,23 @@ fn body(request: &Request) -> serde_json::Value {
             "responseJsonSchema": schema()
         }
     })
+}
+
+/// The section naming the generated files whose content the diff leaves out; empty when none.
+fn generated(files: &[String]) -> String {
+    if files.is_empty() {
+        return String::new();
+    }
+    let mut section = String::from(
+        "\n# Generated files\n\nThe change also touches these generated files; their content is \
+         left out of the diff above.\n\n",
+    );
+    for file in files {
+        section.push_str("- `");
+        section.push_str(file);
+        section.push_str("`\n");
+    }
+    section
 }
 
 /// Fails when the diff is over [`MAX_DIFF_BYTES`].
@@ -348,13 +368,15 @@ fn review_changes(
         Plan::Review { title, description } => (title, description),
     };
     let commit = git::merge_base(root, base)?;
+    let (diff, generated) = git::reviewable_diff(root, &commit, 3)?;
     let request = Request {
         // The rules come from the merge base, so a pull request cannot rewrite what judges it.
         rules: git::show(root, &commit, "AGENTS.md")?
             .context("the merge base has no AGENTS.md to review against")?,
         title,
         description,
-        diff: git::diff(root, &commit, 3)?,
+        diff,
+        generated,
     };
     let verdict = review(&request, key.unwrap_or_default(), post)?;
     Ok((summary(&verdict), !verdict.blocks()))
@@ -387,8 +409,8 @@ mod tests {
     use std::fs;
 
     use super::{
-        Decision, Event, MAX_DIFF_BYTES, MODEL, Plan, Request, plan, post_gemini, review, run,
-        run_from, summary,
+        Decision, Event, MAX_DIFF_BYTES, MODEL, Plan, Request, body, plan, post_gemini, review,
+        run, run_from, summary,
     };
     use crate::testing::{git, repository, serve_once};
 
@@ -398,6 +420,7 @@ mod tests {
             title: "feat: add x".to_owned(),
             description: "Adds x.".to_owned(),
             diff: diff.to_owned(),
+            generated: Vec::new(),
         }
     }
 
@@ -472,6 +495,36 @@ mod tests {
         )
         .unwrap();
         assert!(!minor.blocks(), "a minor finding does not");
+    }
+
+    #[test]
+    fn lists_generated_files_without_their_content() {
+        let mut with_generated = request("+fn a() {}");
+        with_generated.generated = vec![
+            "Cargo.lock".to_owned(),
+            "web/src/generated/api.ts".to_owned(),
+        ];
+        let text = body(&with_generated)["contents"][0]["parts"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(
+            text.ends_with(
+                "```\n\n# Generated files\n\nThe change also touches these generated files; their \
+                 content is left out of the diff above.\n\n- `Cargo.lock`\n- \
+                 `web/src/generated/api.ts`\n"
+            ),
+            "each generated file is named after the diff: {text}"
+        );
+
+        let without = body(&request("+fn a() {}"))["contents"][0]["parts"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(
+            without.ends_with("```diff\n+fn a() {}\n```\n"),
+            "no section when nothing generated changed: {without}"
+        );
     }
 
     #[test]
