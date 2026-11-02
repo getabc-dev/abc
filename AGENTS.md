@@ -115,8 +115,10 @@ watchdog compares the diff with that task and the rules above, and keeps it work
 | `cargo xtask mutants --base <rev> [--jobs N] [--shard k/n]` | Runs cargo-mutants on the Rust lines changed since the merge base, or one shard of them, and fails on any missed mutant: a change to the code that no test notices. A mutant whose tests hang counts as caught. |
 | `cargo xtask review --base <rev>` | Gemini reviews the diff, the PR's title and description against this file as it stands at the merge base. Runs in CI; it blocks on a `block` verdict or any blocking finding, and fails closed on quota, size and missing-key errors. |
 | `cargo xtask task set "<text>"` / `show` / `clear` | Records, prints or forgets the current task in `.abc/task.md` (not committed), for the watchdog. |
-| `cargo xtask gh -- <args>` | Runs gh as the agent App with a token minted for this run and revoked when gh exits. Agents create, merge and change things on GitHub only through this; the guard blocks plain `gh pr create`, `gh pr merge` and `gh api` writes. |
-| `cargo xtask git-credential <op>` | git's credential helper for github.com in agent sessions, which `.claude/settings.json` sets through `GIT_CONFIG_*` variables: it answers with an agent App token. Never run it yourself. |
+| `cargo xtask gh -- <args>` | Runs gh as the agent App with a token the broker minted for this run, revoked when gh exits, and an empty gh configuration of its own. Agents create, merge and change things on GitHub only through this; the guard blocks plain `gh pr create`, `gh pr merge` and `gh api` writes. |
+| `cargo xtask git-credential <op>` | git's credential helper for github.com in agent sessions, which `.claude/settings.json` sets through `GIT_CONFIG_*` variables: it answers with an agent App token from the broker. Never run it yourself. |
+| `cargo xtask broker` | For the maintainer only, outside Claude Code, from a build of `main` installed with `cargo install` (see `cargo xtask broker --help`), never from a checkout agents work in: holds the agent App's private key and serves its tokens to agent sessions on a Unix socket. |
+| `cargo xtask watchdog` | Judges claude's answer to the watchdog's prompt, for `.claude/hooks/stop.sh`. Never run it yourself. |
 | `cargo xtask rulesets check` | Checks `.github/rulesets/main.json` against the CI workflows: every job that runs on pull requests and in the merge queue is a required check. |
 | `cargo xtask rulesets apply` | For the maintainer only, with their own gh login: puts the ruleset on GitHub, replacing the ones it supersedes. Agents never run it. |
 | `cargo xtask tool <name> [args]` | Runs a pinned tool from `.tools/`, such as `cargo xtask tool cargo-deny check`. Never run these tools from `PATH`. |
@@ -150,8 +152,9 @@ changes no tests.
 ```
 
 The gate files are the files that decide what passes: CI and rulesets (`.github/`), cargo, lint,
-toolchain and tool configuration, `Cargo.toml` and `Cargo.lock`, the agent settings, this file
-and `CLAUDE.md`, and all of `xtask/`. `GATES` in `xtask/src/integrity/mod.rs` lists them, and a
+toolchain and tool configuration, `Cargo.toml` and `Cargo.lock`, the agent settings and hook
+scripts (`.claude/settings.json`, `.claude/hooks/`), this file and `CLAUDE.md`, and all of
+`xtask/`. `GATES` in `xtask/src/integrity/mod.rs` lists them, and a
 test keeps `.github/CODEOWNERS` identical. A change to one needs the integrity approval and a code
 owner's review.
 
@@ -160,6 +163,13 @@ its checks or reviews; GitHub logs every use. Use it only when a gate itself is 
 blocks every pull request, when Gemini is down for longer than the change can wait, or for the
 maintainer's own gate-file change, which no other approver can review. Say why in the pull
 request.
+
+Agent sessions run their commands in Claude Code's sandbox, which `.claude/settings.json`
+configures: they cannot read the user's gh login, the keychains, SSH keys or the agent App's key,
+write outside the checkout, or reach hosts beyond GitHub, crates.io and the pinned tools'
+downloads, and the model cannot rerun a command outside it. Hooks run outside the sandbox, so
+they run repository code only through `.claude/hooks/jail.sh`, which holds it to the same limits
+with macOS Seatbelt; sessions need macOS for now. Every edit under `.claude/` asks the user.
 
 The git guard in the agent hooks catches accidents: force pushes, git or gh commands it cannot
 read, and gh changes made as the user instead of through `cargo xtask gh`. It cannot stop a
