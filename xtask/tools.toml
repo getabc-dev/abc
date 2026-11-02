@@ -124,3 +124,16 @@ crate = "sqlx-cli"
 version-args = ["sqlx", "--version"]
 sha256 = "93ef3857a4a0b48fcbf536b77a9122a35c7631686f2ccfbc75e616335771e8d0"
 features = ["postgres", "rustls"]
+
+[[tool]]
+name = "msb"
+version = "0.7.13"
+url = "https://github.com/superradcompany/microsandbox/releases/download/v{version}/microsandbox-{platform}.tar.gz"
+# microsandbox runs agent VMs (`cargo xtask vm`). It loads libkrunfw, the guest kernel, from beside
+# itself. It is beta and breaks compatibility between releases, so `cargo xtask vm` keeps each
+# version's state apart (MSB_HOME) and sessions move to a new version by `stop --purge`.
+checksums = "https://github.com/superradcompany/microsandbox/releases/download/v{version}/checksums.sha256"
+binary = "msb"
+targets.aarch64-apple-darwin = { platform = "darwin-aarch64", sha256 = "5eb53ca1d6beb36caa64d19602284b9ce37872eff340a8db0542ab91b5808c96", binary-sha256 = "ac657a3b145f5bee3672a997922fc88ad8dacff702ee593c8cd33d52c0a971c7", library = "libkrunfw.5.dylib", library-sha256 = "c6f21a1af7466cdb5a94ee6b9d90010c9b8685fdee8814c5a6fa32094e226c67" }
+targets.x86_64-unknown-linux-gnu = { platform = "linux-x86_64", sha256 = "c41aeefc050e97f42cd55ce55cc139efc13c6ee2dc371e8d30c325a305a5c3b1", binary-sha256 = "cf2c59c00c447a6d3251a36b903fff32303f9c32e2456a5657f99a28f7eed95b", library = "libkrunfw.so.5.6.1", library-sha256 = "3854efcd3fe625528fa00207d97586d9790db8c436bb6881a43986604336d18e" }
+targets.aarch64-unknown-linux-gnu = { platform = "linux-aarch64", sha256 = "bd95fbc51954c2c20077c782262157bf5aed17b3717c5d4494d9d34035f3432c", binary-sha256 = "b773279f86c58b5d76760268af43dfc00a8feecb427c22c8a375a3a71e9ae7ca", library = "libkrunfw.so.5.6.1", library-sha256 = "37bf9056888ee14033aef5755ea2066ce1cb0065dbac5a8ff58b68f4ea052c35" }
