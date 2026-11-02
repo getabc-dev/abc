@@ -46,7 +46,7 @@ leave the user's machines for GitHub and the model providers.
 | Production secrets | The vault on the server (planned) | Access to the user's production systems (I2). |
 | Provider API keys | The vault on the server (planned) | Billable model access (I1). |
 | GitHub App private key, product | The server (planned) | Mints installation tokens for every repository the App is installed on. |
-| GitHub App private key, abc's own development | `~/.config/abc/agent-app/` on the maintainer's laptop | Mints tokens for this repository; see [Today: abc's own development](#today-abcs-own-development). |
+| GitHub App private key, abc's own development | `~/.config/abc/agent-app/` on the maintainer's laptop, read only by the token broker | Mints tokens for this repository; see [Today: abc's own development](#today-abcs-own-development). |
 | Installation tokens | Minted per use, handed to agents | Write access to code and PRs until revoked or for up to one hour. |
 | Webhook secret | The server (planned) | Lets anyone forge GitHub events to the public path. |
 | `GEMINI_API_KEY` | A GitHub Actions secret, given only to the Gemini review job | Billable model access, and the review gate itself. |
@@ -73,28 +73,43 @@ leave the user's machines for GitHub and the model providers.
 
 ## Today: abc's own development
 
-Status: **Open**. Until abc can build itself, the maintainer builds it with Claude Code sessions on
-a laptop. This section covers that setup, not the product.
+Status: **Mitigated in part**. Until abc can build itself, the maintainer builds it with Claude
+Code sessions on a macOS laptop. This section covers that setup, not the product.
 
-- The getabc-dev-agent App's private key lives in `~/.config/abc/agent-app/` on the laptop.
-- Agent sessions mint App tokens through `cargo xtask git-credential` and `cargo xtask gh`. They run
-  without a sandbox, as the maintainer's user, and the maintainer's own gh login is on the same
-  machine.
-- `.claude/settings.json` denies the Read tool on `~/.config/abc/agent-app/` and `~/.config/gh/`,
-  and denies `gh auth token` and `security find-*-password`. Bash can still read the key, because
-  the git guard catches accidents only. A prompt-injected session can therefore mint tokens with
-  all of the App's permissions: contents, pull requests and workflows write.
-- The `main` ruleset bounds what those tokens can do: nothing merges without a code owner's
-  approval after the last push, and the admin bypass works only through a pull request. Within
-  that bound, a session can still push any other branch and open or change pull requests. It can
-  also add or edit workflows on a branch, and workflows that run from this repository's branches
-  get its secrets, such as `GEMINI_API_KEY`.
-- The maintainer's gh login is a repository admin. A session that reads it can act as the
-  maintainer, and the ruleset does not bound that.
+- The getabc-dev-agent App's private key lives in `~/.config/abc/agent-app/` on the laptop. Only
+  the token broker, `cargo xtask broker`, reads it. The maintainer runs the broker outside Claude
+  Code from a build of `main` installed with `cargo install`, never from a checkout agents work
+  in, since agents can change xtask there. Sessions ask it for an installation token per use over
+  `~/.config/abc/agent-broker/broker.sock`; the key never reaches them.
+- Every Bash command in a session runs in Claude Code's sandbox, and the model cannot rerun one
+  outside it. The sandbox denies reads of the maintainer's gh login (`~/.config/gh/`), the App's
+  directory, the keychains, where gh and git keep tokens, and `~/.ssh/`. It allows writes only
+  inside the checkout and its temporary directory, connections only to GitHub, crates.io, the Rust
+  toolchain's and the pinned tools' download hosts, and the broker's socket. Sessions never reach
+  Docker, whose daemon would mount the whole home directory for them, or other local services.
+- Claude Code runs hooks outside its sandbox. The hooks run repository code, which agents can
+  change, only through `.claude/hooks/jail.sh`, a macOS Seatbelt profile with the sandbox's
+  limits and no network. Only the watchdog's `claude -p` runs outside it, with no tools. Writes to
+  `.claude/` ask the maintainer, and the sandbox cannot write there.
+- Tokens still reach sessions, with the App's permissions: contents, pull requests and workflows
+  write. The `main` ruleset bounds them as before: nothing merges without a code owner's approval
+  after the last push. Within that bound, a session can push any other branch, open or change pull
+  requests, and add or edit workflows on a branch, which then run with this repository's secrets,
+  such as `GEMINI_API_KEY`.
 
-Mitigation candidates: run sessions in Claude Code's Bash sandbox with reads of
-`~/.config/abc/agent-app/` and `~/.config/gh/` denied; move the App key off the laptop so sessions
-only ever receive tokens; keep an admin login out of agent sessions.
+Open:
+
+- Sessions can read the rest of the home directory, including other tools' credentials, and can
+  send what they read to GitHub, which they must reach, or through the certificate checks of
+  macOS's trustd, which gh needs (`enableWeakerNetworkIsolation`).
+- Claude Code's file tools run outside the sandbox. Permission rules and Claude Code's protected
+  paths bound them, not the operating system.
+- Code from an agent's checkout, run from the maintainer's own terminal, runs with the
+  maintainer's full access. Review it first, or run it in a session.
+- Sessions need macOS; elsewhere the jail refuses and every Bash call is blocked.
+
+Mitigation candidates: deny reads of the whole home directory except what builds need; move the
+App key off the laptop.
 
 ## Boundaries and threats
 

@@ -23,7 +23,8 @@ reviewing.
 ## Set up
 
 Supported platforms are macOS on Apple silicon (aarch64) and Linux on x86_64 or aarch64: the tools
-pinned in `xtask/tools.toml` are built for those three.
+pinned in `xtask/tools.toml` are built for those three. Claude Code sessions in this repository
+need macOS for now (see [Claude Code](#claude-code)).
 
 You need:
 
@@ -73,8 +74,8 @@ The Integrity check compares your PR with its merge base and flags:
 - tests newly marked `#[ignore]` or `#[should_panic]`;
 - tests with fewer assertions than before;
 - changes to gate files: CI and rulesets (`.github/`), cargo, lint, toolchain and tool
-  configuration, `Cargo.toml` and `Cargo.lock`, the agent settings, `AGENTS.md`, `CLAUDE.md` and
-  `xtask/`. AGENTS.md has the full list. Gate files also need a code owner's review.
+  configuration, `Cargo.toml` and `Cargo.lock`, the agent settings and hook scripts, `AGENTS.md`,
+  `CLAUDE.md` and `xtask/`. AGENTS.md has the full list. Gate files also need a code owner's review.
 
 Each flagged test needs an entry in the `## Test changes` section of your PR description, in the
 form `` `path::test`: reason ``. Name the test as the check reports it (`<file>::<test>`, or the
@@ -97,31 +98,26 @@ reasons, so the entries are needed with or without it.
 ## Claude Code
 
 If you work with Claude Code, the committed `.claude/settings.json` applies to your sessions. Read
-[CLAUDE.md](CLAUDE.md) for the details. Three parts affect contributors:
+[CLAUDE.md](CLAUDE.md) for the details. These parts affect contributors:
 
+- **The sandbox.** Every Bash command runs in Claude Code's sandbox, with no way to rerun it
+  outside. It cannot read your gh login, your keychains or `~/.ssh/`, write outside the checkout,
+  or reach hosts other than GitHub, crates.io and the toolchain's and pinned tools' downloads.
+  `~/.cargo` is read-only in it, so run `cargo fetch` yourself when a change adds a crate. Agents
+  never use Docker. Sessions need macOS for now: the hooks run repository code only under macOS
+  Seatbelt, and elsewhere every Bash call is blocked.
 - **git credentials.** Its `env` block points git's credential helper for github.com at
-  `cargo xtask git-credential`, which mints tokens for the maintainers' agent App from
-  `~/.config/abc/agent-app/`. Without that key, git cannot push from your sessions. Override it
-  for yourself in `.claude/settings.local.json`, which takes precedence over the project file for
-  each variable it sets:
-
-  ```json
-  {
-    "env": {
-      "GIT_CONFIG_COUNT": "0"
-    }
-  }
-  ```
-
-  With `GIT_CONFIG_COUNT` at 0, git ignores the project's helper settings and uses your own. In a
-  worktree, Claude Code reads this file from the main checkout's root. The git guard still blocks
-  gh changes such as `gh pr create` in agent sessions, so open your PR from your own terminal.
-- **The watchdog.** When the agent stops, the Stop hook runs `cargo xtask check --changed` and then
-  the watchdog, which runs your own `claude -p` with Haiku on the diff. It uses your Claude quota.
+  `cargo xtask git-credential`, which asks the maintainers' token broker for an agent App token.
+  Without that broker, git cannot push from your sessions, and the sandbox keeps your own
+  credentials out of them too. Push and open your PR from your own terminal.
+- **The hooks.** Hooks run outside the sandbox, so they run repository code through
+  `.claude/hooks/jail.sh`. When the agent stops, the Stop hook runs `cargo xtask check --changed`
+  in it, then the watchdog, which runs your own `claude -p` with Haiku on the diff. It uses your
+  Claude quota. Every edit Claude makes under `.claude/` asks you first.
 - **Plugins.** The file enables the `pstack@cursor-plugins` and `egm@egm` plugins from GitHub
   marketplaces that are not pinned to a commit. Plugins can ship hooks and MCP servers that run as
-  you. Review them before you trust the folder in Claude Code, as the maintainers do before
-  adopting a pack (rule B1).
+  you, outside the sandbox. Review them before you trust the folder in Claude Code, as the
+  maintainers do before adopting a pack (rule B1).
 
 ## Open a pull request
 
