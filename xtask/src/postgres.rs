@@ -66,6 +66,7 @@ fn ensure_running(
         return Ok(());
     }
     if TcpStream::connect_timeout(&address, Duration::from_secs(1)).is_ok() {
+        writeln!(out, "xtask: database tests use the Postgres at {address}")?;
         return Ok(());
     }
     let inspect = Command::new(docker)
@@ -272,6 +273,17 @@ mod tests {
         result.unwrap();
         assert!(out.contains("ABC_TEST_DATABASE_URL names"), "{out}");
         assert!(calls(dir.path()).is_empty(), "docker is not touched");
+    }
+
+    #[test]
+    fn warm_finds_the_test_server_this_checkout_configures() {
+        let mut out = Vec::new();
+        warm(&mut out).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert!(
+            out.contains("database tests use"),
+            "it says which server: {out}"
+        );
     }
 
     #[test]

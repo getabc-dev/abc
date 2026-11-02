@@ -85,15 +85,16 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn finished_windows_are_forgotten_when_many_keys_pile_up() {
         let limiter = RateLimiter::new(1);
-        for key in 0..PRUNE_AT {
+        for key in 0..PRUNE_AT - 1 {
             assert!(limiter.allow(key), "{key}");
         }
-        tokio::time::advance(WINDOW).await;
-        assert!(limiter.allow(PRUNE_AT), "one more key");
+        tokio::time::advance(WINDOW + Duration::from_secs(1)).await;
+        assert!(limiter.allow(PRUNE_AT), "a fresh key");
+        assert!(limiter.allow(PRUNE_AT + 1), "another, which prunes");
         assert_eq!(
             limiter.windows.lock().unwrap().len(),
-            1,
-            "only the live window is kept"
+            2,
+            "only the live windows are kept"
         );
         assert_eq!(Limits::default().sockets_per_worker, 4, "the defaults");
     }

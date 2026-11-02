@@ -714,10 +714,11 @@ mod tests {
         );
         assert_eq!(*first.secret(), *second.secret(), "and the same secret");
         assert_ne!(
-            *first.secret(),
+            *SeededMint::new(7).secret(),
             *SeededMint::new(8).secret(),
-            "another seed differs"
+            "another seed starts another sequence"
         );
+        assert_ne!(expand(7), [0; 32], "a seed expands to real bytes");
         assert_ne!(first.uuid(now), first.uuid(now), "each draw is new");
     }
 }

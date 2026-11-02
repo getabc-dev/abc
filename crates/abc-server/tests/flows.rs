@@ -1081,6 +1081,18 @@ mod tests {
         let workspace = server.claimed().await;
         let (_, token) = server.token(&workspace).await;
         let (key, _) = server.enrol(&token, &keys).await;
+        let mut padded = server.connect(&key).await;
+        let roomy = format!(
+            r#"{{"type":"hello","protocol":{{"min":1,"max":1}},"build":"0.1.0","note":"{}"}}"#,
+            "x".repeat(32 * 1024)
+        );
+        padded.send_text(&roomy).await;
+        assert!(
+            matches!(padded.message().await, ServerMessage::Welcome(_)),
+            "a 32 KiB hello is within the limit"
+        );
+        drop(padded);
+        server.wait_for_ends(1).await;
         let mut link = server.connect(&key).await;
         link.handshake().await;
         let big = tokio_tungstenite::tungstenite::Message::Text("x".repeat(70 * 1024).into());
@@ -1092,8 +1104,8 @@ mod tests {
             "the server drops a frame over 64 KiB"
         );
         assert_eq!(
-            server.wait_for_ends(1).await,
-            ["closed"],
+            server.wait_for_ends(2).await,
+            ["closed", "closed"],
             "and the session ends"
         );
         server.stop().await.unwrap();
@@ -1146,6 +1158,20 @@ mod tests {
         )
         .await;
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let outer = socket_dir();
+        let inner = outer.path().join("inner");
+        std::fs::create_dir(&inner).unwrap();
+        std::fs::set_permissions(outer.path(), std::fs::Permissions::from_mode(0o000)).unwrap();
+        let hidden = abc_server::run(
+            config(&pool, inner.join("abc.sock"), LinkTimings::default()),
+            async {},
+        )
+        .await;
+        std::fs::set_permissions(outer.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            matches!(hidden, Err(ServeError::SocketAccess { .. })),
+            "a directory that cannot be reached is not missing either: {hidden:?}"
+        );
         assert!(
             matches!(result, Err(ServeError::SocketAccess { .. })),
             "permission denied is not \"does not exist\": {result:?}"
