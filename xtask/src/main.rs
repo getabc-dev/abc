@@ -475,7 +475,8 @@ mod tests {
     use std::process::ExitCode;
 
     use super::{
-        Cli, Invocation, RulesetAction, Task, TaskAction, repo_root, run, usage_exit_code, verdict,
+        Cli, Invocation, RulesetAction, Task, TaskAction, repo_root, run, serve_tokens,
+        usage_exit_code, user_home, verdict,
     };
     use crate::testing::{git, repository_with_change, script};
 
@@ -517,6 +518,74 @@ mod tests {
             env,
         };
         run(task, &invocation, &mut Vec::new())
+    }
+
+    #[test]
+    fn vm_commands_run_from_the_main_clone_and_the_billing_check_in_the_vm() {
+        let temp = tempfile::tempdir().unwrap();
+        let main = crate::testing::repository(&temp.path().join("main"));
+        let linked = temp.path().join("linked");
+        git(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "--detach",
+                linked.to_str().unwrap(),
+            ],
+        );
+        let vm = |action| Task::Vm { action };
+        let key = |name: &str| (name == "ANTHROPIC_API_KEY").then(|| OsString::from("k"));
+        let billing = format!(
+            "{:#}",
+            dispatch(vm(crate::vm::Action::Billing), &linked, &linked, &key).unwrap_err()
+        );
+        assert!(
+            billing.contains("ANTHROPIC_API_KEY in the environment"),
+            "{billing}"
+        );
+        let clean = |_: &str| None;
+        assert_eq!(
+            dispatch(vm(crate::vm::Action::Billing), &linked, &linked, &clean).unwrap(),
+            ExitCode::SUCCESS,
+            "the billing check runs anywhere"
+        );
+        let linked_error = format!(
+            "{:#}",
+            dispatch(vm(crate::vm::Action::Ls), &linked, &linked, &clean).unwrap_err()
+        );
+        assert!(
+            linked_error.contains("run it from the main clone"),
+            "{linked_error}"
+        );
+        let no_home = format!(
+            "{:#}",
+            dispatch(vm(crate::vm::Action::Ls), &main, &main, &clean).unwrap_err()
+        );
+        assert_eq!(no_home, "HOME is not set");
+    }
+
+    #[test]
+    fn finds_the_users_home() {
+        let set = |name: &str| (name == "HOME").then(|| OsString::from("/home/m"));
+        assert_eq!(user_home(&set).unwrap(), Path::new("/home/m"));
+        let empty = |_: &str| Some(OsString::new());
+        assert_eq!(
+            format!("{:#}", user_home(&empty).unwrap_err()),
+            "HOME is not set"
+        );
+    }
+
+    #[test]
+    fn the_broker_refuses_a_build_in_a_checkout() {
+        let temp = tempfile::tempdir().unwrap();
+        let checkout = crate::testing::repository(&temp.path().join("abc"));
+        let error = format!(
+            "{:#}",
+            serve_tokens(&checkout.join("target/debug/xtask"), temp.path()).unwrap_err()
+        );
+        assert!(error.contains("installed outside any checkout"), "{error}");
     }
 
     #[test]

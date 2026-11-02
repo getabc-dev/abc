@@ -409,6 +409,27 @@ mod tests {
     }
 
     #[test]
+    fn a_refusal_drops_what_is_left_of_the_request() {
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        client.write_all(&[b'x'; 5000]).unwrap();
+        super::refuse(&mut server, "no scope is named \"xxx\"");
+        let mut left = [0_u8; 1];
+        server.set_nonblocking(true).unwrap();
+        assert_eq!(
+            server.read(&mut left).map_err(|error| error.kind()),
+            Err(std::io::ErrorKind::WouldBlock),
+            "nothing unread, so closing cannot reset the connection on Linux"
+        );
+        drop(server);
+        let mut reply = String::new();
+        client.read_to_string(&mut reply).unwrap();
+        assert_eq!(
+            reply, "error no scope is named \"xxx\"\n",
+            "the reason arrives"
+        );
+    }
+
+    #[test]
     fn refuses_to_run_from_a_checkout() {
         let temp = tempfile::tempdir().unwrap();
         let installed = temp.path().join("install/bin/xtask");
