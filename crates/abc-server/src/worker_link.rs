@@ -13,7 +13,8 @@
 //!             frame from worker -> a second Hello, binary or undecodable text: close 4400
 //!             ping tick         -> ping; no pong for the idle timeout: close (timed out)
 //!             kick              -> close 4409 (superseded) or 4503 (server shutdown)
-//!             feed.changed()    -> query WorkerSelf; WorkerRevoked: close 4403
+//!             worker feed       -> query WorkerSelf; WorkerRevoked: close 4403 (the feed follows
+//!                                  the worker's stream from before its start; every ping re-checks)
 //!           }
 //!           execute(&Caller::Server, EndSession { worker, session, reason })
 //! ```
@@ -37,7 +38,7 @@ use abc_core::command::{EndSession, StartSession};
 use abc_core::credential::WorkerKey;
 use abc_core::decision::Origin;
 use abc_core::event::SessionEndReason;
-use abc_core::id::{CorrelationId, FromUuid as _, SessionId};
+use abc_core::id::SessionId;
 use abc_core::query::{WorkerIdentity, WorkerSelf};
 use abc_core::secret::Secret;
 use abc_protocol::api::ApiCode;
@@ -45,11 +46,11 @@ use abc_protocol::link::{CloseCode, HANDSHAKE_TIMEOUT, IDLE_TIMEOUT, PING_INTERV
 use abc_protocol::{
     Reject, RejectReason, SUPPORTED_VERSIONS, ServerMessage, Welcome, WorkerMessage, negotiate,
 };
-use abc_store::{AuthError, Caller, ExecuteError, QueryError};
+use abc_store::{AuthError, Caller, ExecuteError, QueryError, StoreError};
 
 use crate::api::SidecarState;
 use crate::api::error::ApiError;
-use crate::sessions::Kick;
+use crate::sessions::{Kick, Socket};
 
 /// The worker link's timings. The protocol's own by default; tests shorten them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -113,8 +114,26 @@ pub(crate) async fn upgrade(
     let upgrade = upgrade
         .ok()
         .ok_or_else(|| ApiError::malformed("expected a WebSocket upgrade"))?;
+    let slot = app
+        .sessions
+        .open_socket(me.worker, app.limits.sockets_per_worker)
+        .ok_or_else(|| {
+            ApiError::new(
+                ApiCode::RateLimited,
+                "this worker already holds as many connections as it may",
+            )
+        })?;
+    if !app.session_starts.allow(me.worker) {
+        return Err(ApiError::new(
+            ApiCode::RateLimited,
+            "this worker connected too often in the last minute",
+        ));
+    }
+    let session: SessionId = app.store.fresh_id()?;
+    let upgrade = upgrade
+        .max_message_size(MAX_MESSAGE)
+        .max_frame_size(MAX_MESSAGE);
     Ok(upgrade.on_upgrade(move |socket| {
-        let session = SessionId::from_uuid(uuid::Uuid::now_v7());
         let span = tracing::info_span!("worker_session", worker = %me.worker, session = %session);
         Link {
             app,
@@ -122,11 +141,15 @@ pub(crate) async fn upgrade(
             me,
             session,
             socket,
+            _slot: slot,
         }
         .run()
         .instrument(span)
     }))
 }
+
+/// The largest message or frame a worker may send.
+const MAX_MESSAGE: usize = 64 * 1024;
 
 /// What the worker sent while the server waited for its `Hello`.
 enum Incoming {
@@ -187,14 +210,16 @@ struct Link {
     me: WorkerIdentity,
     session: SessionId,
     socket: WebSocket,
+    /// This socket's place in the worker's quota, given back when the session ends.
+    _slot: Socket,
 }
 
 impl Link {
-    fn origin() -> Origin {
-        Origin {
-            correlation: CorrelationId::from_uuid(uuid::Uuid::now_v7()),
+    fn origin(&self) -> Result<Origin, StoreError> {
+        Ok(Origin {
+            correlation: self.app.store.fresh_id()?,
             causation: None,
-        }
+        })
     }
 
     async fn close(&mut self, code: u16, reason: &'static str) {
@@ -261,17 +286,19 @@ impl Link {
             }
             return;
         };
+        // Follow the worker's stream before its session starts: a revocation that commits any time
+        // after the start wakes this session.
+        let feed = self.app.store.worker_feed(self.me.worker);
         let sessions = self.app.sessions.clone();
         let admission = sessions.admission().await;
         let start = StartSession {
             session: self.session,
             build: hello.build,
         };
-        let started = self
-            .app
-            .store
-            .execute(&self.caller, &Self::origin(), start)
-            .await;
+        let started = match self.origin() {
+            Ok(origin) => self.app.store.execute(&self.caller, &origin, start).await,
+            Err(error) => Err(ExecuteError::Store(error)),
+        };
         match started {
             Ok(()) => {}
             Err(ExecuteError::Auth(AuthError::WorkerRevoked)) => {
@@ -294,7 +321,7 @@ impl Link {
             .send(&ServerMessage::Welcome(Welcome { protocol }))
             .await
         {
-            self.serve(kicked).await
+            self.serve(kicked, feed).await
         } else {
             End::Closed
         };
@@ -304,20 +331,27 @@ impl Link {
             session: self.session,
             reason: end.reason(),
         };
-        match self
-            .app
-            .store
-            .execute(&Caller::Server, &Self::origin(), finish)
-            .await
-        {
+        let ended = match self.origin() {
+            Ok(origin) => {
+                self.app
+                    .store
+                    .execute(&Caller::Server, &origin, finish)
+                    .await
+            }
+            Err(error) => Err(ExecuteError::Store(error)),
+        };
+        match ended {
             Ok(()) => tracing::info!(reason = ?end.reason(), "worker disconnected"),
             Err(error) => tracing::error!(error = %error, "could not record the session's end"),
         }
     }
 
     /// The connected loop: frames, heartbeats, kicks and revocation.
-    async fn serve(&mut self, mut kicked: tokio::sync::oneshot::Receiver<Kick>) -> End {
-        let mut feed = self.app.store.feed();
+    async fn serve(
+        &mut self,
+        mut kicked: tokio::sync::oneshot::Receiver<Kick>,
+        mut feed: abc_store::LogFeed,
+    ) -> End {
         let mut ping = tokio::time::interval(self.app.link.ping);
         ping.reset();
         let mut last_pong = Instant::now();
@@ -336,6 +370,10 @@ impl Link {
                     if last_pong.elapsed() > self.app.link.idle {
                         return End::TimedOut;
                     }
+                    // A backstop for a wake-up the feed lost: revocation is re-checked anyway.
+                    if revoked(&self.app.store, &self.caller).await {
+                        return End::Revoked;
+                    }
                     if self.socket.send(Message::Ping(Bytes::new())).await.is_err() {
                         return End::Closed;
                     }
@@ -348,12 +386,19 @@ impl Link {
                     if woke.is_none() {
                         return End::Shutdown;
                     }
-                    let me = self.app.store.query(&self.caller, WorkerSelf).await;
-                    if let Err(QueryError::Auth(AuthError::WorkerRevoked)) = me {
+                    if revoked(&self.app.store, &self.caller).await {
                         return End::Revoked;
                     }
                 }
             }
         }
     }
+}
+
+/// Whether `caller`'s key no longer authenticates because the worker was revoked.
+async fn revoked(store: &abc_store::Store, caller: &Caller) -> bool {
+    matches!(
+        store.query(caller, WorkerSelf).await,
+        Err(QueryError::Auth(AuthError::WorkerRevoked))
+    )
 }

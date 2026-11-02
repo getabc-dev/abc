@@ -24,7 +24,7 @@ use std::fs;
 use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
-use std::os::unix::fs::{FileTypeExt as _, PermissionsExt as _};
+use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _, PermissionsExt as _};
 use std::path::Path;
 
 use axum::Router;
@@ -42,8 +42,9 @@ pub(crate) struct SidecarSocket {
 }
 
 impl SidecarSocket {
-    /// Checks that the directory exists and gives "other" users no access, removes a stale
-    /// socket, binds, and sets the socket's mode to 0660.
+    /// Checks that the directory exists, gives "other" users no access and belongs to this
+    /// process's user; refuses a socket another server is listening on and removes a stale one;
+    /// binds, and sets the socket's mode to 0660.
     pub(crate) fn bind(path: &Path) -> Result<Self, ServeError> {
         let refuse = |reason| ServeError::SocketPath {
             path: path.to_owned(),
@@ -53,9 +54,17 @@ impl SidecarSocket {
             .parent()
             .filter(|dir| !dir.as_os_str().is_empty())
             .ok_or_else(|| refuse("the path has no directory"))?;
-        let dir_meta = fs::metadata(dir)
-            .ok()
-            .ok_or_else(|| refuse("its directory does not exist"))?;
+        let access = |source| ServeError::SocketAccess {
+            path: path.to_owned(),
+            source,
+        };
+        let dir_meta = match fs::metadata(dir) {
+            Ok(meta) => meta,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Err(refuse("its directory does not exist"));
+            }
+            Err(source) => return Err(access(source)),
+        };
         if !dir_meta.is_dir() {
             return Err(refuse("its parent is not a directory"));
         }
@@ -68,13 +77,27 @@ impl SidecarSocket {
         }
         match fs::symlink_metadata(path) {
             Ok(existing) if existing.file_type().is_socket() => {
+                if std::os::unix::net::UnixStream::connect(path).is_ok() {
+                    return Err(refuse("another server is listening on it"));
+                }
                 fs::remove_file(path).map_err(listener_error)?;
             }
             Ok(_) => return Err(refuse("a file that is not a socket is in the way")),
-            // Nothing there, or nothing this process may see: binding reports the real problem.
-            Err(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(source) => return Err(access(source)),
         }
         let listener = UnixListener::bind(path).map_err(listener_error)?;
+        // A socket belongs to the user that bound it: this process's.
+        let server = fs::metadata(path).map_err(listener_error)?.uid();
+        if dir_meta.uid() != server {
+            drop(listener);
+            let _removed = fs::remove_file(path);
+            return Err(ServeError::SocketDirNotOwned {
+                path: dir.to_owned(),
+                owner: dir_meta.uid(),
+                server,
+            });
+        }
         fs::set_permissions(path, fs::Permissions::from_mode(SOCKET_MODE))
             .map_err(listener_error)?;
         Ok(Self { listener })

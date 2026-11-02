@@ -15,7 +15,7 @@ mod tests {
     use abc_protocol::{
         Hello, ProtocolVersion, RejectReason, ServerMessage, VersionRange, WorkerMessage,
     };
-    use abc_server::{LinkTimings, ServeError};
+    use abc_server::{Limits, LinkTimings, ServeError};
     use abc_store::testing::{Fixture, assert_views_replay};
     use hyper::StatusCode;
     use semver::Version;
@@ -832,6 +832,323 @@ mod tests {
                 Err(ServeError::Store(abc_store::OpenError::Connect(_)))
             ),
             "{result:?}"
+        );
+    }
+
+    /// Waits until `count` backends of `pool`'s database wait for a lock.
+    async fn waiting_for_locks(pool: &sqlx::PgPool, count: i64) {
+        for _ in 0..400 {
+            let waiting: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM pg_stat_activity
+                 WHERE datname = current_database() AND wait_event_type = 'Lock'",
+            )
+            .fetch_one(pool)
+            .await
+            .unwrap();
+            if waiting >= count {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("{count} backends never waited for the log head");
+    }
+
+    #[tokio::test]
+    async fn a_revocation_right_after_a_session_starts_still_closes_it() {
+        let database = TestDatabase::migrated().await;
+        let pool = database.pool();
+        let server = Server::start(pool.clone()).await;
+        let keys = Fixture::new(pool.clone()).await;
+        let workspace = server.claimed().await;
+        let (_, token) = server.token(&workspace).await;
+        let (key, worker) = server.enrol(&token, &keys).await;
+        let mut link = server.connect(&key).await;
+        // Hold the log head so the session's start and the revocation queue behind it, in that
+        // order: the revocation commits right after the start, before the session's loop runs.
+        let mut gate = pool.begin().await.unwrap();
+        sqlx::query("SELECT position FROM event_log_head FOR UPDATE")
+            .execute(&mut *gate)
+            .await
+            .unwrap();
+        link.hello().await;
+        waiting_for_locks(&pool, 1).await;
+        let revoke = Call::delete(&format!("/api/workspaces/{workspace}/workers/{worker}")).alice();
+        let socket = server.socket.clone();
+        let revoking = tokio::spawn(async move { crate::common::send_on(&socket, revoke).await.0 });
+        waiting_for_locks(&pool, 2).await;
+        gate.commit().await.unwrap();
+        assert_eq!(revoking.await.unwrap(), StatusCode::NO_CONTENT, "revoked");
+        assert!(
+            matches!(link.message().await, ServerMessage::Welcome(_)),
+            "the session started"
+        );
+        let closed = tokio::time::timeout(Duration::from_secs(5), link.closed()).await;
+        assert_eq!(
+            closed.ok(),
+            Some(4403),
+            "and closes as revoked, long before its next ping"
+        );
+        server.stop().await.unwrap();
+        assert_views_replay(&pool).await;
+    }
+
+    #[tokio::test]
+    async fn every_ping_re_checks_revocation_even_without_a_wake_up() {
+        let database = TestDatabase::migrated().await;
+        let pool = database.pool();
+        let timings = LinkTimings {
+            handshake: Duration::from_secs(5),
+            ping: Duration::from_millis(100),
+            idle: Duration::from_secs(30),
+        };
+        let server = Server::start_with(pool.clone(), timings).await;
+        let keys = Fixture::new(pool.clone()).await;
+        let workspace = server.claimed().await;
+        let (_, token) = server.token(&workspace).await;
+        let (key, _) = server.enrol(&token, &keys).await;
+        let mut link = server.connect(&key).await;
+        link.handshake().await;
+        // Revoke behind the log's back: no notification, so only the ping's check can notice.
+        // (The views no longer match the log, so this test checks no replay.)
+        sqlx::query("UPDATE worker SET revoked_at = now()")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            link.closed().await,
+            4403,
+            "the next ping finds the worker revoked"
+        );
+        server.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_reused_key_conflicts_and_a_revoked_workers_token_stops_answering() {
+        let database = TestDatabase::migrated().await;
+        let pool = database.pool();
+        let server = Server::start(pool.clone()).await;
+        let keys = Fixture::new(pool.clone()).await;
+        let workspace = server.claimed().await;
+        let (_, first) = server.token(&workspace).await;
+        let (_, second) = server.token(&workspace).await;
+        let (key, worker) = server.enrol(&first, &keys).await;
+        let reuse = Call::post("/api/enrol").json(&enrol_body(&second, &key));
+        server
+            .refused(
+                reuse,
+                StatusCode::CONFLICT,
+                "worker_key_in_use",
+                "one key, one worker",
+            )
+            .await;
+        let revoke = Call::delete(&format!("/api/workspaces/{workspace}/workers/{worker}")).alice();
+        server
+            .expect(revoke, StatusCode::NO_CONTENT, "revoked")
+            .await;
+        let retry = Call::post("/api/enrol").json(&enrol_body(&first, &key));
+        server
+            .refused(
+                retry,
+                StatusCode::UNAUTHORIZED,
+                "worker_revoked",
+                "no answer for a revoked worker",
+            )
+            .await;
+        server.stop().await.unwrap();
+        assert_views_replay(&pool).await;
+    }
+
+    #[tokio::test]
+    async fn an_issued_token_is_never_cached() {
+        let database = TestDatabase::migrated().await;
+        let pool = database.pool();
+        let server = Server::start(pool.clone()).await;
+        let workspace = server.claimed().await;
+        let issue = Call::post(&format!("/api/workspaces/{workspace}/enrolment-tokens"))
+            .alice()
+            .json(&json!({}));
+        let response = server.raw(issue).await;
+        assert_eq!(response.status(), OK, "issued");
+        assert_eq!(
+            response
+                .headers()
+                .get("cache-control")
+                .map(hyper::header::HeaderValue::as_bytes),
+            Some(&b"no-store"[..]),
+            "the one response with a secret says no-store"
+        );
+        server.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn enrolment_attempts_are_limited_per_source() {
+        let database = TestDatabase::migrated().await;
+        let pool = database.pool();
+        let limits = Limits {
+            enrolments_per_minute: 2,
+            ..Limits::default()
+        };
+        let server = Server::start_limited(pool.clone(), LinkTimings::default(), limits).await;
+        let keys = Fixture::new(pool.clone()).await;
+        let token = format!("abc_enr_{}", "0".repeat(52));
+        let attempt = |forwarded: &str| {
+            Call::post("/api/enrol")
+                .header("x-forwarded-for", forwarded)
+                .json(&enrol_body(&token, &keys.worker_key()))
+        };
+        for _ in 0..2 {
+            let unknown = attempt("10.0.0.9, 100.64.0.1");
+            server
+                .refused(
+                    unknown,
+                    StatusCode::NOT_FOUND,
+                    "enrolment_token_unknown",
+                    "unknown",
+                )
+                .await;
+        }
+        let spoofed = attempt("10.0.0.10, 100.64.0.1");
+        server
+            .refused(
+                spoofed,
+                StatusCode::TOO_MANY_REQUESTS,
+                "rate_limited",
+                "the address Serve added counts",
+            )
+            .await;
+        let other = attempt("100.64.0.2");
+        server
+            .refused(
+                other,
+                StatusCode::NOT_FOUND,
+                "enrolment_token_unknown",
+                "another machine has its own quota",
+            )
+            .await;
+        server.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_worker_is_limited_in_sockets_and_session_starts() {
+        let database = TestDatabase::migrated().await;
+        let pool = database.pool();
+        let limits = Limits {
+            sockets_per_worker: 2,
+            session_starts_per_minute: 3,
+            ..Limits::default()
+        };
+        let server = Server::start_limited(pool.clone(), LinkTimings::default(), limits).await;
+        let keys = Fixture::new(pool.clone()).await;
+        let workspace = server.claimed().await;
+        let (_, token) = server.token(&workspace).await;
+        let (key, _) = server.enrol(&token, &keys).await;
+        let bearer = key.expose_secret().as_str().to_owned();
+        let first = server.connect(&key).await;
+        let second = server.connect(&key).await;
+        let (status, body) = server.try_connect(Some(&bearer)).await.err().unwrap();
+        assert_eq!(
+            (status, body["error"]["code"].as_str()),
+            (429, Some("rate_limited")),
+            "a third socket"
+        );
+        drop((first, second));
+        let mut third = None;
+        for _ in 0..100 {
+            if let Ok(link) = server.try_connect(Some(&bearer)).await {
+                third = Some(link);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(third.is_some(), "closed sockets free their slots");
+        drop(third);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let (fourth, refusal) = server.try_connect(Some(&bearer)).await.err().unwrap();
+        assert_eq!(
+            (fourth, refusal["error"]["code"].as_str()),
+            (429, Some("rate_limited")),
+            "a fourth start in a minute is refused"
+        );
+        server.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_oversized_message_closes_the_link() {
+        let database = TestDatabase::migrated().await;
+        let pool = database.pool();
+        let server = Server::start(pool.clone()).await;
+        let keys = Fixture::new(pool.clone()).await;
+        let workspace = server.claimed().await;
+        let (_, token) = server.token(&workspace).await;
+        let (key, _) = server.enrol(&token, &keys).await;
+        let mut link = server.connect(&key).await;
+        link.handshake().await;
+        let big = tokio_tungstenite::tungstenite::Message::Text("x".repeat(70 * 1024).into());
+        // The server may cut the connection before the whole frame is written.
+        let _sent = futures::SinkExt::send(&mut link.socket, big).await;
+        assert_ne!(
+            link.closed().await,
+            4403,
+            "the server drops a frame over 64 KiB"
+        );
+        assert_eq!(
+            server.wait_for_ends(1).await,
+            ["closed"],
+            "and the session ends"
+        );
+        server.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn one_server_runs_per_database_and_a_live_socket_is_left_alone() {
+        let database = TestDatabase::migrated().await;
+        let pool = database.pool();
+        let server = Server::start(pool.clone()).await;
+        let dir = socket_dir();
+        let second = abc_server::run(
+            config(&pool, dir.path().join("abc.sock"), LinkTimings::default()),
+            async {},
+        )
+        .await;
+        assert!(
+            matches!(second, Err(ServeError::AlreadyRunning)),
+            "{second:?}"
+        );
+        let other = TestDatabase::migrated().await;
+        let live = abc_server::run(
+            config(&other.pool(), server.socket.clone(), LinkTimings::default()),
+            async {},
+        )
+        .await;
+        assert!(
+            matches!(&live, Err(ServeError::SocketPath { reason, .. }) if reason.contains("listening")),
+            "another server's socket is not deleted: {live:?}"
+        );
+        server
+            .expect(
+                Call::get("/api/session"),
+                OK,
+                "the first server still serves",
+            )
+            .await;
+        server.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_socket_path_that_cannot_be_inspected_is_reported_as_such() {
+        let database = TestDatabase::migrated().await;
+        let pool = database.pool();
+        let dir = socket_dir();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o600)).unwrap();
+        let result = abc_server::run(
+            config(&pool, dir.path().join("abc.sock"), LinkTimings::default()),
+            async {},
+        )
+        .await;
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            matches!(result, Err(ServeError::SocketAccess { .. })),
+            "permission denied is not \"does not exist\": {result:?}"
         );
     }
 }

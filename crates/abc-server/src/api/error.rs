@@ -16,6 +16,8 @@ use abc_core::policy::{DenialReason, Denied};
 use abc_protocol::api::{ApiCode, ApiErrorBody, ApiErrorDetail};
 use abc_store::{AuthError, ExecuteError, QueryError, StoreError};
 
+use crate::telemetry::chain;
+
 /// An error response: `{"error":{"code":…,"message":…}}`, with the request id in `x-request-id`.
 #[derive(Debug)]
 pub(crate) struct ApiError {
@@ -52,18 +54,6 @@ impl ApiError {
     pub(crate) const fn code(&self) -> ApiCode {
         self.code
     }
-}
-
-/// The source chain of `error`, joined with `: `.
-fn chain(error: &(dyn StdError + 'static)) -> String {
-    let mut text = error.to_string();
-    let mut next = error.source();
-    while let Some(cause) = next {
-        text.push_str(": ");
-        text.push_str(&cause.to_string());
-        next = cause.source();
-    }
-    text
 }
 
 impl IntoResponse for ApiError {
@@ -108,9 +98,10 @@ pub(crate) const fn status_of(code: ApiCode) -> StatusCode {
         | ApiCode::WorkerRevoked
         | ApiCode::SetupCodeRequired
         | ApiCode::EnrolmentTokenRequired => StatusCode::UNAUTHORIZED,
-        ApiCode::ServerAlreadyClaimed | ApiCode::EnrolmentTokenAlreadyRedeemed => {
-            StatusCode::CONFLICT
-        }
+        ApiCode::ServerAlreadyClaimed
+        | ApiCode::EnrolmentTokenAlreadyRedeemed
+        | ApiCode::WorkerKeyInUse => StatusCode::CONFLICT,
+        ApiCode::RateLimited => StatusCode::TOO_MANY_REQUESTS,
         ApiCode::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
         ApiCode::Internal | ApiCode::ServerOnly => StatusCode::INTERNAL_SERVER_ERROR,
     }
@@ -132,6 +123,8 @@ const fn denial_code(reason: DenialReason) -> ApiCode {
         DenialReason::EnrolmentTokenExpired => ApiCode::EnrolmentTokenExpired,
         DenialReason::EnrolmentTokenRevoked => ApiCode::EnrolmentTokenRevoked,
         DenialReason::EnrolmentTokenUsed => ApiCode::EnrolmentTokenUsed,
+        DenialReason::WorkerKeyInUse => ApiCode::WorkerKeyInUse,
+        DenialReason::WorkerRevoked => ApiCode::WorkerRevoked,
     }
 }
 
@@ -191,6 +184,10 @@ impl From<StoreError> for ApiError {
             StoreError::Database(_) => Self::new(
                 ApiCode::Unavailable,
                 "the database is unavailable; retry shortly",
+            ),
+            StoreError::Entropy(_) => Self::new(
+                ApiCode::Unavailable,
+                "the server could not draw randomness; retry shortly",
             ),
             StoreError::CorruptEvent { .. }
             | StoreError::Corrupt(_)
@@ -317,21 +314,6 @@ mod tests {
             ApiError::from(ExecuteError::<Infallible>::Auth(AuthError::WorkerRevoked)).code(),
             ApiCode::WorkerRevoked,
             "command auth"
-        );
-    }
-
-    #[test]
-    fn the_cause_chain_is_joined() {
-        #[derive(Debug, thiserror::Error)]
-        #[error("outer")]
-        struct Outer(#[source] Inner);
-        #[derive(Debug, thiserror::Error)]
-        #[error("inner")]
-        struct Inner;
-        assert_eq!(
-            chain(&Outer(Inner)),
-            "outer: inner",
-            "every cause, in order"
         );
     }
 }

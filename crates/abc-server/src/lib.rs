@@ -17,6 +17,7 @@
 //! binary, run from a shell on the host) mints it through the store and prints it to that shell.
 
 mod api;
+mod limits;
 mod listen;
 mod live;
 mod ops;
@@ -33,14 +34,14 @@ use std::time::Duration;
 use abc_core::command::EndSession;
 use abc_core::decision::Origin;
 use abc_core::event::SessionEndReason;
-use abc_core::id::{CorrelationId, FromUuid as _};
-use abc_core::query::OpenSessions;
+use abc_core::query::{InstallationState, InstallationStatus, OpenSessions};
 use abc_core::secret::Secret;
 use abc_store::{Caller, DatabaseUrl, Store, StoreOptions};
 use thiserror::Error;
 use tokio::sync::oneshot;
 
 pub use api::PublicUrl;
+pub use limits::Limits;
 pub use worker_link::LinkTimings;
 
 /// Everything the server needs, parsed by the binary from flags and `ABC_*` environment variables.
@@ -61,6 +62,8 @@ pub struct ServerConfig {
     /// The worker link's handshake, ping and idle timings: the protocol's own unless a test
     /// shortens them.
     pub link: LinkTimings,
+    /// Load limits.
+    pub limits: Limits,
 }
 
 /// How long a draining server waits for live worker sessions to record their end.
@@ -102,9 +105,19 @@ async fn serve(
     readiness.set(ops::Phase::Migrating);
     abc_store::migrate(&db).await?;
     let store = Store::open(db, StoreOptions::production()).await?;
+    // One server per installation: in-process supersession and the boot sweep assume it.
+    let _installation = store
+        .lock_installation()
+        .await
+        .map_err(ServeError::Installation)?
+        .ok_or(ServeError::AlreadyRunning)?;
     readiness.attach(store.clone());
     boot_sweep(&store).await?;
-    if !store.is_claimed().await.map_err(ServeError::Installation)? {
+    let state = store
+        .query(&Caller::Server, InstallationStatus)
+        .await
+        .map_err(|error| ServeError::Sweep(Box::new(error)))?;
+    if state == InstallationState::Unclaimed {
         tracing::info!(
             "this server is unclaimed; run `abc server setup-code` on this host for a one-time code"
         );
@@ -118,6 +131,9 @@ async fn serve(
         public_url: config.public_url,
         link: config.link,
         drain: drain.clone(),
+        limits: config.limits,
+        enrolments: limits::RateLimiter::new(config.limits.enrolments_per_minute),
+        session_starts: limits::RateLimiter::new(config.limits.session_starts_per_minute),
     });
     readiness.set(ops::Phase::Ready);
     tracing::info!(socket = %config.sidecar_socket.display(), "serving the tailnet API");
@@ -150,7 +166,7 @@ async fn boot_sweep(store: &Store) -> Result<(), ServeError> {
         .await
         .map_err(|error| ServeError::Sweep(Box::new(error)))?;
     let origin = Origin {
-        correlation: CorrelationId::from_uuid(uuid::Uuid::now_v7()),
+        correlation: store.fresh_id().map_err(ServeError::Installation)?,
         causation: None,
     };
     for session in open
@@ -189,6 +205,34 @@ pub enum ServeError {
         /// Its mode.
         mode: u32,
     },
+    /// Another server process already serves this database.
+    #[error(
+        "another abc server is already running on this database; stop it first (one server \
+         process per installation)"
+    )]
+    AlreadyRunning,
+    /// The socket's directory belongs to another user.
+    #[error(
+        "{path} belongs to uid {owner}, but this server runs as uid {server}; the sidecar socket \
+         directory must belong to the server's user"
+    )]
+    SocketDirNotOwned {
+        /// The directory.
+        path: PathBuf,
+        /// Its owner.
+        owner: u32,
+        /// The server's user.
+        server: u32,
+    },
+    /// The socket path or its directory cannot be read.
+    #[error("cannot inspect {path} for the sidecar socket")]
+    SocketAccess {
+        /// The path.
+        path: PathBuf,
+        /// Why.
+        #[source]
+        source: std::io::Error,
+    },
     /// The sidecar socket path cannot be used.
     #[error("cannot use {path} as the sidecar socket: {reason}")]
     SocketPath {
@@ -215,7 +259,7 @@ pub enum ServeError {
         #[source]
         source: std::io::Error,
     },
-    /// Reading whether the server is claimed failed.
+    /// The installation's state or lock could not be read.
     #[error("could not read the installation's state")]
     Installation(#[source] abc_store::StoreError),
     /// The boot sweep could not end stale sessions.

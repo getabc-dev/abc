@@ -77,7 +77,7 @@ pub(crate) async fn stream(
     ApiPath(workspace): ApiPath<WorkspaceId>,
     LastEventId(last): LastEventId,
 ) -> Result<Sse<impl Stream<Item = Result<SseEvent, Infallible>>>, ApiError> {
-    let feed = app.store.feed();
+    let feed = app.store.workspace_feed(workspace);
     let caller = Caller::from(caller);
     let first = match last {
         None => {

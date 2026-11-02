@@ -10,7 +10,7 @@ use std::time::Duration;
 use abc_core::credential::WorkerKey;
 use abc_core::secret::Secret;
 use abc_protocol::{Hello, ServerMessage, WorkerMessage};
-use abc_server::{LinkTimings, PublicUrl, ServeError, ServerConfig};
+use abc_server::{Limits, LinkTimings, PublicUrl, ServeError, ServerConfig};
 use abc_store::testing::{Fixture, database};
 use abc_store::{Store, StoreOptions};
 use futures::{SinkExt as _, StreamExt as _};
@@ -64,14 +64,7 @@ pub(crate) const DATABASE_PASSWORD: &str = "db-pass-7f3e9a";
 
 /// The configuration a test server runs with.
 pub(crate) fn config(pool: &PgPool, socket: PathBuf, link: LinkTimings) -> ServerConfig {
-    let options = pool.connect_options();
-    let url = format!(
-        "postgres://{}:{DATABASE_PASSWORD}@{}:{}/{}",
-        options.get_username(),
-        options.get_host(),
-        options.get_port(),
-        options.get_database().unwrap_or("postgres"),
-    );
+    let url = abc_store::testing::database_url_text(pool, Some(DATABASE_PASSWORD));
     ServerConfig {
         database_url: abc_store::DatabaseUrl::new(url),
         database_wait: Duration::from_secs(5),
@@ -79,6 +72,7 @@ pub(crate) fn config(pool: &PgPool, socket: PathBuf, link: LinkTimings) -> Serve
         ops_addr: free_port(),
         public_url: PublicUrl::parse(&format!("https://{HOST}")).unwrap(),
         link,
+        limits: Limits::default(),
     }
 }
 
@@ -88,9 +82,14 @@ impl Server {
     }
 
     pub(crate) async fn start_with(pool: PgPool, link: LinkTimings) -> Self {
+        Self::start_limited(pool, link, Limits::default()).await
+    }
+
+    pub(crate) async fn start_limited(pool: PgPool, link: LinkTimings, limits: Limits) -> Self {
         let dir = socket_dir();
         let socket = dir.path().join("abc.sock");
-        let config = config(&pool, socket.clone(), link);
+        let mut config = config(&pool, socket.clone(), link);
+        config.limits = limits;
         let ops = config.ops_addr;
         let (stop, stopped) = oneshot::channel::<()>();
         let task = tokio::spawn(abc_server::run(config, async move {
@@ -148,7 +147,9 @@ impl Server {
 
     /// Issues a setup code as `abc server setup-code` does, and returns its display form.
     pub(crate) async fn setup_code(&self) -> String {
-        let issued = self.store.issue_setup_code().await.unwrap();
+        let issued = abc_store::testing::issue_setup_code(&self.store)
+            .await
+            .unwrap();
         issued.code.expose_secret().display_form().to_string()
     }
 
@@ -307,6 +308,26 @@ impl Server {
             self.session_ends().await
         );
     }
+}
+
+/// Sends `call` over the socket at `socket` and returns the status and JSON body.
+pub(crate) async fn send_on(socket: &std::path::Path, call: Call) -> (StatusCode, Value) {
+    let stream = UnixStream::connect(socket).await.unwrap();
+    let mut builder = Request::builder()
+        .method(call.method)
+        .uri(&call.path)
+        .header("host", HOST);
+    for (name, value) in &call.headers {
+        builder = builder.header(name.as_str(), value.as_str());
+    }
+    let body = call.body.map_or_else(Bytes::new, Bytes::from);
+    let response = send(TokioIo::new(stream), builder.body(Full::new(body)).unwrap()).await;
+    let status = response.status();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
 }
 
 async fn send(

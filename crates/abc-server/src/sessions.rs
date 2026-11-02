@@ -24,6 +24,27 @@ pub(crate) struct Sessions {
     admission: Arc<tokio::sync::Mutex<()>>,
     /// How many sessions are attached, so a drain can wait for them to record their end.
     count: Arc<watch::Sender<usize>>,
+    /// How many sockets each worker holds, before and after its handshake.
+    sockets: Arc<Mutex<BTreeMap<WorkerId, u32>>>,
+}
+
+/// One of a worker's sockets, counted until it drops.
+#[derive(Debug)]
+pub(crate) struct Socket {
+    sockets: Arc<Mutex<BTreeMap<WorkerId, u32>>>,
+    worker: WorkerId,
+}
+
+impl Drop for Socket {
+    fn drop(&mut self) {
+        let mut sockets = self.sockets.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(count) = sockets.get_mut(&self.worker) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                sockets.remove(&self.worker);
+            }
+        }
+    }
 }
 
 impl Default for Sessions {
@@ -32,6 +53,7 @@ impl Default for Sessions {
             live: Arc::default(),
             admission: Arc::default(),
             count: Arc::new(watch::Sender::new(0)),
+            sockets: Arc::default(),
         }
     }
 }
@@ -63,6 +85,20 @@ pub(crate) struct Attached {
 impl Sessions {
     fn map(&self) -> std::sync::MutexGuard<'_, BTreeMap<WorkerId, Live>> {
         self.live.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Counts one more socket for `worker`, unless it already holds `cap`.
+    pub(crate) fn open_socket(&self, worker: WorkerId, cap: u32) -> Option<Socket> {
+        let mut sockets = self.sockets.lock().unwrap_or_else(PoisonError::into_inner);
+        let count = sockets.entry(worker).or_insert(0);
+        if *count >= cap {
+            return None;
+        }
+        *count = count.saturating_add(1);
+        Some(Socket {
+            sockets: Arc::clone(&self.sockets),
+            worker,
+        })
     }
 
     /// Waits for this session's turn to record its start and attach. Hold the guard across both.
@@ -175,6 +211,29 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+    }
+
+    #[test]
+    fn a_worker_holds_at_most_its_cap_of_sockets() {
+        let sessions = Sessions::default();
+        let first = sessions.open_socket(id(1), 2).unwrap();
+        let second = sessions.open_socket(id(1), 2).unwrap();
+        assert!(
+            sessions.open_socket(id(1), 2).is_none(),
+            "the third is refused"
+        );
+        assert!(
+            sessions.open_socket(id(2), 2).is_some(),
+            "another worker has its own"
+        );
+        drop(first);
+        let third = sessions.open_socket(id(1), 2);
+        assert!(third.is_some(), "a closed socket frees its slot");
+        drop((second, third));
+        assert!(
+            sessions.sockets.lock().unwrap().is_empty(),
+            "a worker with no sockets is forgotten"
+        );
     }
 
     #[test]

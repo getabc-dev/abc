@@ -147,9 +147,19 @@
           "const": "enrolment_token_used"
         },
         {
+          "description": "Another worker already enrolled with this key. Generate a new key and enrol again.",
+          "type": "string",
+          "const": "worker_key_in_use"
+        },
+        {
           "description": "The token was already redeemed: revoke the worker instead.",
           "type": "string",
           "const": "enrolment_token_already_redeemed"
+        },
+        {
+          "description": "Too many requests from this source or for this worker. Retry later.",
+          "type": "string",
+          "const": "rate_limited"
         },
         {
           "description": "The server is starting, draining, or cannot reach its database. Retry.",

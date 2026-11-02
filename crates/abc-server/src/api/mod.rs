@@ -26,7 +26,7 @@ use axum::Router;
 use axum::extract::{
     DefaultBodyLimit, FromRequest, FromRequestParts, MatchedPath, Path, Request, State,
 };
-use axum::http::header::CONTENT_TYPE;
+use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE, HeaderName};
 use axum::http::request::Parts;
 use axum::http::{HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
@@ -42,7 +42,7 @@ use abc_core::command::{
     ClaimServer, EnrolWorker, IssueEnrolmentToken, RevokeEnrolmentToken, RevokeWorker,
 };
 use abc_core::decision::Origin;
-use abc_core::id::{CorrelationId, EnrolmentTokenId, FromUuid as _, WorkerId, WorkspaceId};
+use abc_core::id::{CorrelationId, EnrolmentTokenId, WorkerId, WorkspaceId};
 use abc_core::query::{ListEnrolmentTokens, SessionView, TokenSummary, WhoAmI};
 use abc_protocol::api::ApiCode;
 use abc_protocol::enrol::{ENROL_PATH, EnrolRequest, EnrolResponse};
@@ -50,6 +50,7 @@ use abc_protocol::link::CONNECT_PATH;
 use abc_store::{Caller, Store};
 
 use crate::ServeError;
+use crate::limits::{Limits, RateLimiter};
 use crate::listen::SidecarApp;
 use crate::sessions::Sessions;
 use crate::sidecar::{MaybeTailnetCaller, TailnetCaller};
@@ -73,6 +74,11 @@ pub(crate) struct SidecarState {
     pub(crate) public_url: PublicUrl,
     pub(crate) link: LinkTimings,
     pub(crate) drain: Drain,
+    pub(crate) limits: Limits,
+    /// Enrolment attempts per source.
+    pub(crate) enrolments: RateLimiter<String>,
+    /// Session starts per worker.
+    pub(crate) session_starts: RateLimiter<WorkerId>,
 }
 
 /// The server-wide signal that it is shutting down: live streams end when it fires.
@@ -186,7 +192,7 @@ pub(crate) fn sidecar_app(state: SidecarState) -> SidecarApp {
         .fallback(not_found)
         .method_not_allowed_fallback(method_not_allowed)
         .layer(DefaultBodyLimit::max(BODY_LIMIT))
-        .layer(middleware::from_fn(observe))
+        .layer(middleware::from_fn_with_state(state.clone(), observe))
         .with_state(state);
     SidecarApp::new(router)
 }
@@ -203,11 +209,12 @@ async fn method_not_allowed() -> ApiError {
 }
 
 /// Gives the request its id and span, and logs its end.
-async fn observe(mut request: Request, next: Next) -> Response {
-    let id = uuid::Uuid::now_v7();
-    request
-        .extensions_mut()
-        .insert(RequestOrigin(CorrelationId::from_uuid(id)));
+async fn observe(State(app): State<SidecarState>, mut request: Request, next: Next) -> Response {
+    let id: CorrelationId = match app.store.fresh_id() {
+        Ok(id) => id,
+        Err(error) => return ApiError::from(error).into_response(),
+    };
+    request.extensions_mut().insert(RequestOrigin(id));
     let route = request
         .extensions()
         .get::<MatchedPath>()
@@ -271,6 +278,32 @@ impl<S: Send + Sync> FromRequestParts<S> for RequestOrigin {
             .get::<Self>()
             .copied()
             .ok_or_else(|| ApiError::new(ApiCode::Internal, "the request has no id"))
+    }
+}
+
+/// Where a request came from: the last `X-Forwarded-For` entry, which Serve appends with the
+/// tailnet address it accepted the connection from (entries before it are the client's own claims).
+/// Requests without one share a single source.
+#[derive(Debug)]
+pub(crate) struct Source(pub(crate) String);
+
+impl<S: Send + Sync> FromRequestParts<S> for Source {
+    type Rejection = std::convert::Infallible;
+
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "axum's extractor trait is async; this one has nothing to wait for"
+    )]
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        let forwarded = parts
+            .headers
+            .get_all("x-forwarded-for")
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .flat_map(|value| value.split(','))
+            .map(str::trim)
+            .rfind(|entry| !entry.is_empty());
+        Ok(Self(forwarded.unwrap_or("unknown").to_owned()))
     }
 }
 
@@ -363,7 +396,7 @@ async fn issue_token(
     origin: RequestOrigin,
     ApiPath(workspace): ApiPath<WorkspaceId>,
     ApiJson(body): ApiJson<IssueTokenRequest>,
-) -> Result<Json<TokenIssuedResponse>, ApiError> {
+) -> Result<([(HeaderName, HeaderValue); 1], Json<TokenIssuedResponse>), ApiError> {
     let command = IssueEnrolmentToken {
         workspace,
         label: body.label,
@@ -373,7 +406,9 @@ async fn issue_token(
         .store
         .execute(&caller.into(), &origin.into(), command)
         .await?;
-    Ok(Json(issued.into()))
+    // The one response that carries a secret is never stored by a cache.
+    let no_store = [(CACHE_CONTROL, HeaderValue::from_static("no-store"))];
+    Ok((no_store, Json(issued.into())))
 }
 
 async fn list_tokens(
@@ -421,8 +456,15 @@ async fn revoke_worker(
 async fn enrol(
     State(app): State<SidecarState>,
     origin: RequestOrigin,
+    source: Source,
     ApiJson(body): ApiJson<EnrolRequest>,
 ) -> Result<Json<EnrolResponse>, ApiError> {
+    if !app.enrolments.allow(source.0) {
+        return Err(ApiError::new(
+            ApiCode::RateLimited,
+            "too many enrolment attempts from this machine; wait a minute",
+        ));
+    }
     let command = EnrolWorker {
         token: body.token,
         key: body.key,

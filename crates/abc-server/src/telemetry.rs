@@ -41,6 +41,19 @@ pub fn init(filter: Option<&str>) -> Result<(), TelemetryError> {
         .map_err(TelemetryError::AlreadySet)
 }
 
+/// `error` and every cause under it, joined with `: `: how a failure is logged and reported.
+#[must_use]
+pub fn chain(error: &(dyn std::error::Error + 'static)) -> String {
+    let mut text = error.to_string();
+    let mut next = error.source();
+    while let Some(cause) = next {
+        text.push_str(": ");
+        text.push_str(&cause.to_string());
+        next = cause.source();
+    }
+    text
+}
+
 /// Logging could not be set up.
 #[derive(Debug, thiserror::Error)]
 pub enum TelemetryError {
@@ -50,4 +63,22 @@ pub enum TelemetryError {
     /// A global subscriber was already installed.
     #[error("logging was already initialised")]
     AlreadySet(#[source] tracing::subscriber::SetGlobalDefaultError),
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn the_cause_chain_is_joined() {
+        #[derive(Debug, thiserror::Error)]
+        #[error("outer")]
+        struct Outer(#[source] Inner);
+        #[derive(Debug, thiserror::Error)]
+        #[error("inner")]
+        struct Inner;
+        assert_eq!(
+            super::chain(&Outer(Inner)),
+            "outer: inner",
+            "every cause, in order"
+        );
+    }
 }

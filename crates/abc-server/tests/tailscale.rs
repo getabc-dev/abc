@@ -3,8 +3,8 @@
 //! reaches it over the tailnet. It checks that Serve asserts the identity header and keeps the
 //! public `Host`, upgrades the worker WebSocket, and streams SSE without buffering.
 //!
-//! It needs a real tailnet, so it runs only with these set, and passes without checking anything
-//! otherwise (it prints why):
+//! It needs a real tailnet, so it is ignored unless asked for (`--run-ignored only`), and then
+//! fails unless these are set:
 //!
 //! * `ABC_TAILSCALE_AUTHKEY`: an auth key owned by a user (not tagged: tagged devices carry no
 //!   identity), reusable so both nodes can join, ideally ephemeral and approved in advance;
@@ -12,7 +12,8 @@
 //!   HTTPS certificates enabled.
 //!
 //! It also needs Docker on a Linux host: a Unix socket in a bind mount is shared with the
-//! container only when the host and the container share a kernel.
+//! container only when the host and the container share a kernel. CI runs it in the `Tailscale`
+//! workflow on a pull request labelled `tailscale-check`.
 
 #[cfg(test)]
 #[expect(
@@ -24,7 +25,6 @@ mod common;
 #[cfg(test)]
 mod tests {
     use abc_store::testing::TestDatabase;
-    use std::io::Write as _;
     use std::os::unix::fs::PermissionsExt as _;
     use std::path::Path;
     use std::process::Command;
@@ -232,7 +232,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let issued = cli.issue_setup_code().await.unwrap();
+        let issued = abc_store::testing::issue_setup_code(&cli).await.unwrap();
         let code = issued.code.expose_secret().display_form().to_string();
         let claim = Some(claim_body(&code));
         let (status, claimed) = call(proxy, host, "POST", "/api/owner/claim", claim).await;
@@ -252,17 +252,16 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "needs a tailnet: ABC_TAILSCALE_AUTHKEY and ABC_TAILSCALE_TAILNET; run with --run-ignored only"]
     async fn serve_passes_identity_websockets_and_unbuffered_sse_to_the_unix_socket() {
         let (Ok(key), Ok(tailnet)) = (
             std::env::var("ABC_TAILSCALE_AUTHKEY"),
             std::env::var("ABC_TAILSCALE_TAILNET"),
         ) else {
-            let _unwritten = writeln!(
-                std::io::stderr().lock(),
-                "skipped: the Tailscale passthrough check needs ABC_TAILSCALE_AUTHKEY and \
-                 ABC_TAILSCALE_TAILNET (see this file's header); nothing was checked"
+            panic!(
+                "the Tailscale passthrough check needs ABC_TAILSCALE_AUTHKEY and \
+                 ABC_TAILSCALE_TAILNET (see this file's header)"
             );
-            return;
         };
         let database = TestDatabase::migrated().await;
         let pool = database.pool();
