@@ -1,9 +1,10 @@
 //! [`LogFeed`]: how consumers learn that the log moved, without the notifier carrying events.
 //!
-//! `append` runs `pg_notify('abc_log', <new head>)` inside its transaction, and Postgres delivers
-//! the notification only if and when the transaction commits. One `PgListener` task per store
-//! publishes each head into a `tokio::sync::watch`. Every subscriber (SSE stream, worker session,
-//! the S1 runner later) then follows the same loop:
+//! `append` runs `pg_notify('abc_log', …)` inside its transaction, and Postgres delivers the
+//! notification only if and when the transaction commits. The payload names the new head, the
+//! workspace the commit belongs to and the streams it touched. One `PgListener` task per store
+//! publishes each head into `tokio::sync::watch` channels: one for the whole log, and one per
+//! workspace or stream that someone subscribed to. Every subscriber then follows the same loop:
 //!
 //! ```text
 //! loop { feed.changed().await; read from MY cursor (an authorized query); advance my cursor }
@@ -13,78 +14,182 @@
 //! * **No lost events.** The notifier is only a wake-up. Data always comes from the subscriber's
 //!   own cursor, and positions are gapless and commit-ordered, so `position > cursor` misses
 //!   nothing.
+//! * **Only relevant wake-ups.** A live stream follows its workspace and a worker session follows
+//!   its worker's stream, so a commit elsewhere wakes neither.
 //! * **No unbounded buffers.** `watch` keeps one value. A burst of commits, or a slow subscriber,
 //!   coalesces into one wake-up.
 //! * **Reconnects are safe.** When the listener's connection drops, the task reconnects with
 //!   backoff. Notifications during the gap are lost, so after reconnecting it reads
-//!   `event_log_head` and publishes it, which wakes everyone to re-read from their cursors.
+//!   `event_log_head` and wakes every subscriber to re-read from its cursor.
 //! * **Health.** The task's connection state feeds `Store::ready`.
 
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use abc_core::event::Position;
+use abc_core::event::{Position, StreamKind, StreamRef};
+use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use sqlx::postgres::PgListener;
 use tokio::sync::watch;
+use uuid::Uuid;
 
 use crate::error::StoreError;
 
-/// The notification channel `append` sends the new head on.
-const CHANNEL: &str = "abc_log";
+/// The notification channel `append` sends commits on.
+pub(crate) const CHANNEL: &str = "abc_log";
 
 /// The longest pause between reconnection attempts.
 const MAX_RECONNECT_PAUSE: Duration = Duration::from_secs(5);
 
-/// Wakes when the log head advances. Clone one per subscriber.
+/// What one commit changed: the notification's payload.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct Commit {
+    /// The head after the commit.
+    pub(crate) head: i64,
+    /// The workspace its events belong to.
+    pub(crate) workspace: Uuid,
+    /// The streams it appended to, as (kind, id).
+    pub(crate) streams: Vec<(String, Uuid)>,
+}
+
+/// Wakes when the log head advances in what it follows. Clone one per subscriber.
 #[derive(Debug, Clone)]
 pub struct LogFeed {
     head: watch::Receiver<Position>,
 }
 
 impl LogFeed {
-    /// Waits until the head moves past what this handle last saw (at first, the head when it was
-    /// subscribed), then returns the new head.
-    /// Returns `None` when the store has shut down.
+    /// Waits until a commit this feed follows moves the head past what this handle last saw (at
+    /// first, the head when it was subscribed), then returns the new head. Returns `None` when the
+    /// store has shut down.
     pub async fn changed(&mut self) -> Option<Position> {
         self.head.changed().await.ok()?;
         Some(*self.head.borrow_and_update())
     }
 
-    /// The latest head this process knows of.
+    /// The latest head this feed was woken for.
     #[must_use]
     pub fn head(&self) -> Position {
         *self.head.borrow()
     }
 }
 
+/// What a scoped feed follows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum Scope {
+    /// Commits in one workspace.
+    Workspace(Uuid),
+    /// Commits to one stream.
+    Stream(StreamKind, Uuid),
+}
+
+/// The channels the listener publishes into.
+#[derive(Debug)]
+struct Hub {
+    head: watch::Sender<Position>,
+    scoped: Mutex<BTreeMap<Scope, watch::Sender<Position>>>,
+}
+
+impl Hub {
+    fn scoped(&self) -> std::sync::MutexGuard<'_, BTreeMap<Scope, watch::Sender<Position>>> {
+        self.scoped.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Publishes `commit` to the log's channel and to the channels following what it touched,
+    /// dropping channels no one follows any more.
+    fn publish(&self, commit: &Commit) {
+        let Ok(head) = Position::from_stored(commit.head) else {
+            tracing::error!("ignored a log notification with a negative head");
+            return;
+        };
+        advance(&self.head, head);
+        let mut scoped = self.scoped();
+        scoped.retain(|_, sender| sender.receiver_count() > 0);
+        let touched = std::iter::once(Scope::Workspace(commit.workspace)).chain(
+            commit.streams.iter().filter_map(|(kind, id)| {
+                StreamKind::parse(kind).map(|kind| Scope::Stream(kind, *id))
+            }),
+        );
+        for scope in touched {
+            if let Some(sender) = scoped.get(&scope) {
+                advance(sender, head);
+            }
+        }
+    }
+
+    /// Wakes every channel at `head`: after a reconnect, when notifications may have been lost.
+    fn publish_everywhere(&self, head: Position) {
+        advance(&self.head, head);
+        for sender in self.scoped().values() {
+            advance(sender, head);
+        }
+    }
+
+    fn subscribe(&self, scope: Option<Scope>) -> LogFeed {
+        let head = match scope {
+            None => self.head.subscribe(),
+            Some(scope) => {
+                let current = *self.head.borrow();
+                self.scoped()
+                    .entry(scope)
+                    .or_insert_with(|| watch::Sender::new(current))
+                    .subscribe()
+            }
+        };
+        LogFeed { head }
+    }
+}
+
+/// Moves `sender` to `head` if that is ahead of it.
+fn advance(sender: &watch::Sender<Position>, head: Position) {
+    sender.send_if_modified(|current| {
+        let ahead = head > *current;
+        if ahead {
+            *current = head;
+        }
+        ahead
+    });
+}
+
 /// Owns the listener task. It is aborted when the store's last clone drops.
 #[derive(Debug)]
 pub(crate) struct FeedHandle {
-    head: watch::Receiver<Position>,
+    hub: Arc<Hub>,
     connected: watch::Receiver<bool>,
     task: tokio::task::JoinHandle<()>,
 }
 
 impl FeedHandle {
-    /// Listens on the store's pool, seeds the watch from `event_log_head`, and spawns the task.
+    /// Listens on the store's pool, seeds the channels from `event_log_head`, and spawns the task.
     pub(crate) async fn start(pool: &PgPool) -> Result<Self, StoreError> {
         let listener = listen(pool).await?;
-        let head = current_head(pool).await?;
-        let (head_tx, head_rx) = watch::channel(head);
-        let (connected_tx, connected_rx) = watch::channel(true);
-        let task = tokio::spawn(follow(pool.clone(), listener, head_tx, connected_tx));
+        let hub = Arc::new(Hub {
+            head: watch::Sender::new(current_head(pool).await?),
+            scoped: Mutex::default(),
+        });
+        let (connected_tx, connected) = watch::channel(true);
+        let task = tokio::spawn(follow(
+            pool.clone(),
+            listener,
+            Arc::clone(&hub),
+            connected_tx,
+        ));
         Ok(Self {
-            head: head_rx,
-            connected: connected_rx,
+            hub,
+            connected,
             task,
         })
     }
 
-    /// A feed whose first wake-up is the first advance after this call.
+    /// A feed of every commit, whose first wake-up is the first advance after this call.
     pub(crate) fn subscribe(&self) -> LogFeed {
-        let mut head = self.head.clone();
-        head.borrow_and_update();
-        LogFeed { head }
+        self.hub.subscribe(None)
+    }
+
+    /// A feed of the commits in `scope` only.
+    pub(crate) fn subscribe_to(&self, scope: Scope) -> LogFeed {
+        self.hub.subscribe(Some(scope))
     }
 
     pub(crate) fn connected(&self) -> bool {
@@ -96,6 +201,26 @@ impl Drop for FeedHandle {
     fn drop(&mut self) {
         self.task.abort();
     }
+}
+
+/// The payload `append` sends for a commit of `streams` in `workspace` at `head`.
+pub(crate) fn payload(
+    head: Position,
+    workspace: Uuid,
+    streams: &[StreamRef],
+) -> Result<String, StoreError> {
+    let mut touched: Vec<(String, Uuid)> = streams
+        .iter()
+        .map(|stream| (stream.kind.as_str().to_owned(), stream.id))
+        .collect();
+    touched.sort();
+    touched.dedup();
+    serde_json::to_string(&Commit {
+        head: head.get(),
+        workspace,
+        streams: touched,
+    })
+    .map_err(StoreError::Encode)
 }
 
 /// A listener on [`CHANNEL`].
@@ -115,34 +240,18 @@ async fn current_head(pool: &PgPool) -> Result<Position, StoreError> {
         .ok_or(StoreError::Corrupt("event_log_head.position"))
 }
 
-/// Publishes `head` if it is ahead of what subscribers have.
-fn publish(heads: &watch::Sender<Position>, head: Position) {
-    heads.send_if_modified(|current| {
-        let ahead = head > *current;
-        if ahead {
-            *current = head;
-        }
-        ahead
-    });
-}
-
-/// The listener task: publish every notified head; on a lost connection, reconnect with backoff
-/// and publish the database's head, since notifications sent meanwhile are gone.
+/// The listener task: publish every commit; on a lost connection, reconnect with backoff and
+/// wake everyone at the database's head, since notifications sent meanwhile are gone.
 async fn follow(
     pool: PgPool,
     mut listener: PgListener,
-    heads: watch::Sender<Position>,
+    hub: Arc<Hub>,
     connected: watch::Sender<bool>,
 ) {
     loop {
         if let Ok(Some(notification)) = listener.try_recv().await {
-            let head = notification
-                .payload()
-                .parse()
-                .ok()
-                .map(Position::from_stored);
-            if let Some(Ok(head)) = head {
-                publish(&heads, head);
+            if let Ok(commit) = serde_json::from_str::<Commit>(notification.payload()) {
+                hub.publish(&commit);
             } else {
                 tracing::error!("ignored a malformed log notification");
             }
@@ -151,7 +260,7 @@ async fn follow(
             tracing::warn!("lost the log listener's connection; reconnecting");
             let (fresh, head) = resume(&pool).await;
             listener = fresh;
-            publish(&heads, head);
+            hub.publish_everywhere(head);
             connected.send_replace(true);
             tracing::info!("log listener reconnected");
         }
@@ -180,12 +289,25 @@ async fn resume(pool: &PgPool) -> (PgListener, Position) {
 mod tests {
     use super::*;
 
-    /// A handle around `task`, with the listener's connection state `connected`.
+    fn hub() -> Hub {
+        Hub {
+            head: watch::Sender::new(Position::ORIGIN),
+            scoped: Mutex::default(),
+        }
+    }
+
+    fn commit(head: i64, workspace: u128, worker: u128) -> Commit {
+        Commit {
+            head,
+            workspace: Uuid::from_u128(workspace),
+            streams: vec![("worker".to_owned(), Uuid::from_u128(worker))],
+        }
+    }
+
     fn handle(connected: bool, task: tokio::task::JoinHandle<()>) -> FeedHandle {
-        let (_heads, head) = watch::channel(Position::ORIGIN);
         let (_state, connected) = watch::channel(connected);
         FeedHandle {
-            head,
+            hub: Arc::new(hub()),
             connected,
             task,
         }
@@ -218,30 +340,101 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_new_feed_wakes_only_for_heads_published_after_it() {
-        let (heads, head) = watch::channel(Position::ORIGIN);
-        let (_state, connected) = watch::channel(true);
-        let feed = FeedHandle {
-            head,
-            connected,
-            task: tokio::spawn(async {}),
-        };
-        publish(&heads, Position::from_stored(3).unwrap());
-        let mut subscriber = feed.subscribe();
-        assert_eq!(subscriber.head().get(), 3, "it starts at the head");
-        publish(&heads, Position::from_stored(3).unwrap());
+    async fn scoped_feeds_wake_only_for_what_they_follow() {
+        let hub = hub();
+        let mut all = hub.subscribe(None);
+        let mut home = hub.subscribe(Some(Scope::Workspace(Uuid::from_u128(1))));
+        let mut worker = hub.subscribe(Some(Scope::Stream(StreamKind::Worker, Uuid::from_u128(9))));
+        hub.publish(&commit(1, 2, 8));
+        assert_eq!(
+            all.changed().await.map(Position::get),
+            Some(1),
+            "the log moved"
+        );
         assert!(
-            !subscriber.head.has_changed().unwrap(),
+            !home.head.has_changed().unwrap(),
+            "another workspace wakes no one here"
+        );
+        assert!(!worker.head.has_changed().unwrap(), "nor another worker");
+        hub.publish(&commit(2, 1, 9));
+        assert_eq!(
+            home.changed().await.map(Position::get),
+            Some(2),
+            "this workspace"
+        );
+        assert_eq!(
+            worker.changed().await.map(Position::get),
+            Some(2),
+            "this worker"
+        );
+        hub.publish(&commit(2, 1, 9));
+        assert!(
+            !worker.head.has_changed().unwrap(),
             "the same head wakes no one"
         );
-        publish(&heads, Position::from_stored(2).unwrap());
-        publish(&heads, Position::from_stored(4).unwrap());
-        assert_eq!(
-            subscriber.changed().await.map(Position::get),
-            Some(4),
-            "an older head is ignored; a newer one wakes it"
+        hub.publish(&Commit {
+            head: 3,
+            workspace: Uuid::from_u128(1),
+            streams: vec![("unknown".to_owned(), Uuid::from_u128(9))],
+        });
+        assert!(
+            !worker.head.has_changed().unwrap(),
+            "an unknown stream kind is no one's"
         );
-        drop(heads);
-        assert_eq!(subscriber.changed().await, None, "a closed feed ends");
+        hub.publish(&Commit {
+            head: -1,
+            workspace: Uuid::from_u128(1),
+            streams: Vec::new(),
+        });
+        assert_eq!(
+            home.changed().await.map(Position::get),
+            Some(3),
+            "a negative head is dropped"
+        );
+        hub.publish_everywhere(Position::from_stored(5).unwrap());
+        assert_eq!(
+            worker.changed().await.map(Position::get),
+            Some(5),
+            "a reconnect wakes all"
+        );
+        assert_eq!(home.head().get(), 5, "home too");
+    }
+
+    #[tokio::test]
+    async fn channels_no_one_follows_are_dropped() {
+        let hub = hub();
+        let feed = hub.subscribe(Some(Scope::Workspace(Uuid::from_u128(1))));
+        assert_eq!(hub.scoped().len(), 1, "one followed scope");
+        drop(feed);
+        hub.publish(&commit(1, 2, 3));
+        assert!(hub.scoped().is_empty(), "dropped once no one follows it");
+        drop(hub);
+    }
+
+    #[test]
+    fn the_payload_names_each_stream_once() {
+        let stream = StreamRef {
+            kind: StreamKind::Worker,
+            id: Uuid::from_u128(3),
+        };
+        let text = payload(
+            Position::from_stored(4).unwrap(),
+            Uuid::from_u128(1),
+            &[stream, stream],
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Commit>(&text).unwrap(),
+            commit(4, 1, 3),
+            "head, workspace, and the worker stream once"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_closed_feed_ends() {
+        let hub = hub();
+        let mut feed = hub.subscribe(None);
+        drop(hub);
+        assert_eq!(feed.changed().await, None, "no store, no more heads");
     }
 }

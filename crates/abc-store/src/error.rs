@@ -53,6 +53,9 @@ pub enum StoreError {
     /// The log reached `i64::MAX` positions.
     #[error("the event log is full")]
     LogFull,
+    /// No randomness could be drawn for ids and secrets.
+    #[error(transparent)]
+    Entropy(#[from] crate::entropy::EntropyUnavailable),
 }
 
 impl From<sqlx::Error> for StoreError {

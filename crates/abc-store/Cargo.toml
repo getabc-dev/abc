@@ -12,7 +12,8 @@ publish.workspace = true
 # reach the database except through Store's API; cargo-shear keeps this list honest.
 [dependencies]
 abc-core = { path = "../abc-core" }
-rand.workspace = true
+rand = { workspace = true, features = ["chacha"] }
+serde.workspace = true
 serde_json.workspace = true
 sqlx.workspace = true
 thiserror.workspace = true
@@ -27,7 +28,7 @@ semver = { workspace = true, optional = true }
 [features]
 # Test support for this crate's and abc-server's tests: ManualClock, SeededMint, Fixture,
 # assert_views_replay. Enabled only through dev-dependencies (resolver 3 keeps it out of builds).
-testing = ["dep:semver", "rand/chacha", "time/macros"]
+testing = ["dep:semver", "time/macros"]
 
 [dev-dependencies]
 abc-store = { path = ".", features = ["testing"] }

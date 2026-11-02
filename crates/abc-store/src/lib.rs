@@ -14,6 +14,7 @@
 //! let mut feed = store.feed(); // wakes when the log head advances
 //! ```
 
+mod entropy;
 mod error;
 mod execute;
 mod facts;
@@ -31,7 +32,8 @@ use std::time::Duration;
 
 use abc_core::command::{IssueSetupCode, Reservation, SetupCodeIssued};
 use abc_core::credential::WorkerKey;
-use abc_core::decision::{DecideCtx, Mint, Origin};
+use abc_core::decision::{DecideCtx, Origin};
+use abc_core::id::{FromUuid, WorkerId, WorkspaceId};
 use abc_core::identity::TailnetLogin;
 use abc_core::secret::Secret;
 use abc_core::time::Clock;
@@ -39,6 +41,7 @@ use sqlx::PgPool;
 use sqlx::migrate::Migrator;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 
+pub use entropy::{Entropy, EntropyUnavailable};
 pub use error::{AuthError, ExecuteError, NotReady, OpenError, QueryError, StoreError};
 pub use execute::Executable;
 pub use feed::LogFeed;
@@ -73,6 +76,21 @@ pub struct Database(PgPool);
 
 /// Postgres's SQLSTATE for a missing table.
 const UNDEFINED_TABLE: &str = "42P01";
+
+/// The advisory lock key one server process holds for its whole life: `abc_srvr` in ASCII.
+const INSTALLATION_LOCK: i64 = 0x6162_635f_7372_7672;
+
+/// Proof that this process is the one server for its database. Dropping it closes its connection,
+/// which releases the lock.
+pub struct InstallationLock {
+    _conn: sqlx::PgConnection,
+}
+
+impl std::fmt::Debug for InstallationLock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("InstallationLock")
+    }
+}
 
 /// The most connections the store opens. Writes queue on the log head one at a time, so more would
 /// only wait; reads and the SSE streams share the rest.
@@ -161,8 +179,9 @@ pub async fn migrate(db: &Database) -> Result<(), OpenError> {
 pub struct StoreOptions {
     /// The clock: the system clock in production, `testing::ManualClock` in tests.
     pub clock: Arc<dyn Clock>,
-    /// The mint: OS entropy in production, `testing::SeededMint` in tests.
-    pub mint: Arc<dyn Mint>,
+    /// Where each request's generator is seeded from: the operating system in production, a
+    /// fixed sequence (`testing::SeededEntropy`) in tests.
+    pub entropy: Arc<dyn Entropy>,
 }
 
 impl StoreOptions {
@@ -171,7 +190,7 @@ impl StoreOptions {
     pub fn production() -> Self {
         Self {
             clock: Arc::new(execute::SystemClock),
-            mint: Arc::new(execute::OsMint),
+            entropy: Arc::new(entropy::SystemEntropy),
         }
     }
 }
@@ -186,7 +205,7 @@ pub struct Store {
 struct Inner {
     pool: PgPool,
     clock: Arc<dyn Clock>,
-    mint: Arc<dyn Mint>,
+    entropy: Arc<dyn Entropy>,
     feed: feed::FeedHandle,
 }
 
@@ -237,7 +256,7 @@ impl Store {
             inner: Arc::new(Inner {
                 pool,
                 clock: options.clock,
-                mint: options.mint,
+                entropy: options.entropy,
                 feed,
             }),
         })
@@ -275,46 +294,82 @@ impl Store {
         read::run(&self.inner, caller, query).await
     }
 
-    /// Issues a fresh owner setup code for an unclaimed server: `execute(&Caller::Server, ..,
-    /// IssueSetupCode { candidate })` with candidate ids from this store's mint. Called only by the
-    /// `abc server setup-code` CLI, which prints the code to the operator's terminal; the running
-    /// server never holds a plaintext code.
+    /// Issues a fresh owner setup code for an unclaimed server: runs `IssueSetupCode` as
+    /// `Caller::Server`, with candidate ids from this store's generator. Only the host operator's
+    /// `abc server setup-code` calls it, which prints the code to the operator's terminal; the
+    /// running server never holds a plaintext code. `IssueSetupCode` is not [`Executable`], so
+    /// this is the only way to run it, and `clippy.toml` disallows this method everywhere but the
+    /// one sanctioned call.
     ///
     /// # Errors
     ///
     /// [`ExecuteError::Denied`] with `ServerAlreadyClaimed` once claimed; [`ExecuteError::Store`].
     pub async fn issue_setup_code(&self) -> Result<SetupCodeIssued, ExecuteError<Infallible>> {
-        let fresh = DecideCtx::new(self.inner.clock.now(), self.inner.mint.as_ref());
         let candidate = Reservation {
-            owner: fresh.id(),
-            workspace: fresh.id(),
+            owner: self.fresh_id()?,
+            workspace: self.fresh_id()?,
         };
         let origin = Origin {
-            correlation: fresh.id(),
+            correlation: self.fresh_id()?,
             causation: None,
         };
-        self.execute(&Caller::Server, &origin, IssueSetupCode { candidate })
-            .await
+        execute::run(
+            &self.inner,
+            &Caller::Server,
+            &origin,
+            IssueSetupCode { candidate },
+        )
+        .await
     }
 
-    /// Whether the server has been claimed. Installation state, not tenant data: the server logs
-    /// "unclaimed; run `abc server setup-code`" at start when this is false, and nothing else
-    /// reads it.
+    /// A fresh id of any kind from this store's generator: a `UUIDv7` at the store's clock.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Entropy`] when no seed can be drawn.
+    pub fn fresh_id<T: FromUuid>(&self) -> Result<T, StoreError> {
+        let mint = entropy::ChaChaMint::from_seed(self.inner.entropy.seed()?);
+        Ok(DecideCtx::new(self.inner.clock.now(), &mint).id())
+    }
+
+    /// Claims this database for one server process until the returned guard drops: a session-level
+    /// advisory lock on a connection of its own. `None` when another process holds it.
     ///
     /// # Errors
     ///
     /// [`StoreError::Database`].
-    pub async fn is_claimed(&self) -> Result<bool, StoreError> {
-        sqlx::query_scalar!(r#"SELECT EXISTS (SELECT 1 FROM installation) AS "claimed!""#)
-            .fetch_one(&self.inner.pool)
-            .await
-            .map_err(StoreError::Database)
+    pub async fn lock_installation(&self) -> Result<Option<InstallationLock>, StoreError> {
+        let mut conn = self.inner.pool.acquire().await?.detach();
+        let held = sqlx::query_scalar!(
+            r#"SELECT pg_try_advisory_lock($1) AS "held!""#,
+            INSTALLATION_LOCK
+        )
+        .fetch_one(&mut conn)
+        .await?;
+        Ok(held.then_some(InstallationLock { _conn: conn }))
     }
 
     /// A handle that wakes whenever the log head advances. See [`LogFeed`].
     #[must_use]
     pub fn feed(&self) -> LogFeed {
         self.inner.feed.subscribe()
+    }
+
+    /// A handle that wakes only for commits in `workspace`.
+    #[must_use]
+    pub fn workspace_feed(&self, workspace: WorkspaceId) -> LogFeed {
+        self.inner
+            .feed
+            .subscribe_to(feed::Scope::Workspace(workspace.as_uuid()))
+    }
+
+    /// A handle that wakes only for commits to `worker`'s stream.
+    #[must_use]
+    pub fn worker_feed(&self, worker: WorkerId) -> LogFeed {
+        self.inner.feed.subscribe_to(feed::Scope::Stream(
+            abc_core::event::StreamKind::Worker,
+            worker.as_uuid(),
+        ))
     }
 
     /// Readiness: the database answers within a second and the log listener is connected.

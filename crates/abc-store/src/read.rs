@@ -10,9 +10,9 @@ use abc_core::id::{EnrolmentTokenId, FromUuid as _, PersonId, SessionId, WorkerI
 use abc_core::identity::{Arch, DisplayName, MachineLabel, Os, WorkspaceName};
 use abc_core::policy::{Authorized, authorize};
 use abc_core::query::{
-    ListEnrolmentTokens, ListMachines, MachineCard, MachinesSince, MachinesSnapshot, OpenSessions,
-    Query, SessionView, TokenStatus, TokenSummary, WhoAmI, WorkerIdentity, WorkerSelf,
-    WorkspaceSummary,
+    InstallationState, InstallationStatus, ListEnrolmentTokens, ListMachines, MachineCard,
+    MachinesSince, MachinesSnapshot, OpenSessions, Query, SessionView, TokenStatus, TokenSummary,
+    WhoAmI, WorkerIdentity, WorkerSelf, WorkspaceSummary,
 };
 use abc_core::time::Timestamp;
 use sqlx::PgConnection;
@@ -283,5 +283,25 @@ impl Fetchable for OpenSessions {
                 session: row.open_session.map(SessionId::from_uuid),
             })
             .collect())
+    }
+}
+
+impl sealed::Sealed for InstallationStatus {}
+impl Fetchable for InstallationStatus {
+    async fn fetch(
+        _auth: &Authorized<Self>,
+        _principal: &Principal,
+        conn: &mut PgConnection,
+        _now: Timestamp,
+    ) -> Result<InstallationState, StoreError> {
+        let claimed =
+            sqlx::query_scalar!(r#"SELECT EXISTS (SELECT 1 FROM installation) AS "claimed!""#)
+                .fetch_one(&mut *conn)
+                .await?;
+        Ok(if claimed {
+            InstallationState::Claimed
+        } else {
+            InstallationState::Unclaimed
+        })
     }
 }

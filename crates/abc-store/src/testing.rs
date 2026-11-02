@@ -1,6 +1,6 @@
 //! Test support (feature `testing`, dev-dependencies only). Every database test gets a fresh,
-//! migrated database of its own from [`TestDatabase::migrated`], on the server `DATABASE_URL`
-//! names: the one warm Postgres container per machine (D7). Time and randomness are fixed, so
+//! migrated database of its own from [`TestDatabase::migrated`], on the server
+//! `ABC_TEST_DATABASE_URL` names (not `DATABASE_URL`, so a developer's own database is never used): the one warm Postgres container per machine (D7). Time and randomness are fixed, so
 //! tests are deterministic (P2).
 //!
 //! `#[sqlx::test]` would do the same, but it names each database after its test alone, so two runs
@@ -32,11 +32,13 @@ use semver::Version;
 use std::str::FromStr as _;
 
 use sqlx::postgres::PgConnectOptions;
-use sqlx::{Connection as _, PgConnection, PgPool};
+use sqlx::{ConnectOptions as _, Connection as _, PgConnection, PgPool};
 use zeroize::Zeroizing;
 
+use crate::entropy::ChaChaMint;
 use crate::error::StoreError;
 use crate::{Caller, Database, DatabaseUrl, ExecuteError, Store, StoreOptions, projection};
+use crate::{Entropy, EntropyUnavailable};
 
 /// Wraps a test's pool.
 #[must_use]
@@ -52,6 +54,9 @@ pub struct TestDatabase {
     name: String,
     server: PgConnectOptions,
 }
+
+/// The variable naming the server test databases are created on.
+pub const TEST_DATABASE_URL: &str = "ABC_TEST_DATABASE_URL";
 
 /// How long a test database may outlive its test (a killed process cannot drop it) before a later
 /// test sweeps it away.
@@ -76,13 +81,13 @@ impl TestDatabase {
     ///
     /// # Panics
     ///
-    /// When `DATABASE_URL` is unset or the server is unreachable (test code).
+    /// When `ABC_TEST_DATABASE_URL` is unset or the server is unreachable (test code).
     pub async fn empty() -> Self {
-        let url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
-            panic!("database tests need DATABASE_URL; `cargo xtask check` sets up Postgres")
+        let url = std::env::var(TEST_DATABASE_URL).unwrap_or_else(|_| {
+            panic!("database tests need {TEST_DATABASE_URL}; `cargo xtask check` sets up Postgres")
         });
         let server = PgConnectOptions::from_str(&url)
-            .unwrap_or_else(|error| panic!("DATABASE_URL does not parse: {error}"));
+            .unwrap_or_else(|error| panic!("{TEST_DATABASE_URL} does not parse: {error}"));
         let mut admin = PgConnection::connect_with(&server)
             .await
             .unwrap_or_else(|error| panic!("connecting to the test server: {error}"));
@@ -116,19 +121,30 @@ const fn stale(created: u64, now: u64) -> bool {
     now.saturating_sub(created) > STALE_AFTER_SECONDS
 }
 
-/// Drops the test databases older than [`STALE_AFTER_SECONDS`]: leftovers of killed runs.
+/// The prefixes of the databases tests and `cargo xtask check` create, each followed by the
+/// creation time in seconds since the Unix epoch and `_`.
+const DISPOSABLE: [&str; 2] = ["abc_test_", "abc_query_cache_"];
+
+/// When the disposable database `name` was created, if it is one.
+fn created(name: &str) -> Option<u64> {
+    DISPOSABLE
+        .iter()
+        .find_map(|prefix| name.strip_prefix(prefix))
+        .and_then(|rest| rest.split('_').next())
+        .and_then(|seconds| seconds.parse().ok())
+}
+
+/// Drops the disposable databases older than [`STALE_AFTER_SECONDS`]: leftovers of killed runs.
 async fn sweep(admin: &mut PgConnection, now: u64) {
-    let names: Vec<String> =
-        sqlx::query_scalar(r"SELECT datname FROM pg_database WHERE datname LIKE 'abc\_test\_%'")
-            .fetch_all(&mut *admin)
-            .await
-            .unwrap_or_default();
+    let names: Vec<String> = sqlx::query_scalar(
+        r"SELECT datname FROM pg_database
+          WHERE datname LIKE 'abc\_test\_%' OR datname LIKE 'abc\_query\_cache\_%'",
+    )
+    .fetch_all(&mut *admin)
+    .await
+    .unwrap_or_default();
     for name in names {
-        let created = name
-            .split('_')
-            .nth(2)
-            .and_then(|seconds| seconds.parse::<u64>().ok());
-        if created.is_some_and(|created| stale(created, now)) {
+        if created(&name).is_some_and(|created| stale(created, now)) {
             let _dropped = sqlx::query(sqlx::AssertSqlSafe(format!(
                 "DROP DATABASE IF EXISTS {name:?} WITH (FORCE)"
             )))
@@ -163,18 +179,28 @@ impl Drop for TestDatabase {
     }
 }
 
-/// A URL for the database behind `pool`, for code under test that connects by itself (the
-/// server's `run`). The test container trusts local connections, so it carries no password.
+/// The URL of the database behind `pool`, with `password` if given: the one way tests build a
+/// database URL. It keeps everything the pool connects with, a Unix-socket host and query
+/// parameters included.
+///
+/// # Panics
+///
+/// When the password cannot be set on the URL (test code).
+#[must_use]
+pub fn database_url_text(pool: &PgPool, password: Option<&str>) -> String {
+    let mut url = pool.connect_options().to_url_lossy();
+    if let Some(password) = password
+        && url.set_password(Some(password)).is_err()
+    {
+        panic!("the test database URL cannot carry a password");
+    }
+    url.to_string()
+}
+
+/// [`database_url_text`] without a password, as the secret the server takes.
 #[must_use]
 pub fn database_url(pool: &PgPool) -> Secret<DatabaseUrl> {
-    let options = pool.connect_options();
-    DatabaseUrl::new(format!(
-        "postgres://{}@{}:{}/{}",
-        options.get_username(),
-        options.get_host(),
-        options.get_port(),
-        options.get_database().unwrap_or("postgres"),
-    ))
+    DatabaseUrl::new(database_url_text(pool, None))
 }
 
 /// A clock tests move by hand, for expiry.
@@ -215,38 +241,53 @@ impl Clock for ManualClock {
 
 /// A `ChaCha20`-seeded mint: the same seed gives the same ids and secrets.
 #[derive(Debug)]
-pub struct SeededMint {
-    rng: Mutex<ChaCha20Rng>,
+pub struct SeededMint(ChaChaMint);
+
+/// 32 seed bytes drawn deterministically from `seed`.
+fn expand(seed: u64) -> [u8; 32] {
+    let mut bytes = [0; 32];
+    ChaCha20Rng::seed_from_u64(seed).fill_bytes(&mut bytes);
+    bytes
 }
 
 impl SeededMint {
     /// A mint seeded with `seed`.
     #[must_use]
     pub fn new(seed: u64) -> Self {
-        Self {
-            rng: Mutex::new(ChaCha20Rng::seed_from_u64(seed)),
-        }
-    }
-
-    fn fill(&self, bytes: &mut [u8]) {
-        self.rng
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .fill_bytes(bytes);
+        Self(ChaChaMint::from_seed(expand(seed)))
     }
 }
 
 impl Mint for SeededMint {
     fn uuid(&self, now: Timestamp) -> uuid::Uuid {
-        let mut random = [0; 10];
-        self.fill(&mut random);
-        crate::execute::uuid_v7(now, &random)
+        self.0.uuid(now)
     }
 
     fn secret(&self) -> Zeroizing<[u8; 32]> {
-        let mut bytes = Zeroizing::new([0; 32]);
-        self.fill(bytes.as_mut_slice());
-        bytes
+        self.0.secret()
+    }
+}
+
+/// Seeds from a fixed sequence: every run of a test mints the same values.
+#[derive(Debug)]
+pub struct SeededEntropy(Mutex<ChaCha20Rng>);
+
+impl SeededEntropy {
+    /// The sequence that starts from `seed`.
+    #[must_use]
+    pub fn new(seed: u64) -> Self {
+        Self(Mutex::new(ChaCha20Rng::seed_from_u64(seed)))
+    }
+}
+
+impl Entropy for SeededEntropy {
+    fn seed(&self) -> Result<[u8; 32], EntropyUnavailable> {
+        let mut bytes = [0; 32];
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .fill_bytes(&mut bytes);
+        Ok(bytes)
     }
 }
 
@@ -255,7 +296,7 @@ impl Mint for SeededMint {
 pub fn options(clock: &ManualClock, seed: u64) -> StoreOptions {
     StoreOptions {
         clock: Arc::new(clock.clone()),
-        mint: Arc::new(SeededMint::new(seed)),
+        entropy: Arc::new(SeededEntropy::new(seed)),
     }
 }
 
@@ -380,6 +421,21 @@ pub async fn assert_views_replay(pool: &PgPool) {
     }
 }
 
+/// Issues a setup code on `store`, as `abc server setup-code` does: the one place tests do.
+///
+/// # Errors
+///
+/// What [`Store::issue_setup_code`] returns.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "tests play the host operator's CLI, the one caller allowed to mint setup codes"
+)]
+pub async fn issue_setup_code(
+    store: &Store,
+) -> Result<abc_core::command::SetupCodeIssued, ExecuteError<Infallible>> {
+    store.issue_setup_code().await
+}
+
 /// The seed every fixture's store uses.
 pub const SEED: u64 = 20_261_031;
 
@@ -477,9 +533,7 @@ impl Fixture {
     ///
     /// When no setup code can be issued (test code).
     pub async fn claim(&self, caller: &Caller) -> Result<Claimed, ExecuteError<Infallible>> {
-        let issued = self
-            .store
-            .issue_setup_code()
+        let issued = issue_setup_code(&self.store)
             .await
             .unwrap_or_else(|error| panic!("a setup code is issued: {error}"));
         self.claim_with(caller, &issued.code).await
@@ -603,6 +657,22 @@ pub fn machine() -> MachineInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn disposable_databases_carry_their_creation_time() {
+        assert_eq!(
+            created("abc_test_1700000000_abcdef"),
+            Some(1_700_000_000),
+            "a test's"
+        );
+        assert_eq!(
+            created("abc_query_cache_1700000000_42"),
+            Some(1_700_000_000),
+            "xtask's"
+        );
+        assert_eq!(created("abc_test_soon_x"), None, "no time");
+        assert_eq!(created("abc"), None, "someone else's");
+    }
 
     #[test]
     fn a_test_database_is_a_leftover_after_a_day() {

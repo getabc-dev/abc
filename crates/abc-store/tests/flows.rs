@@ -3,6 +3,8 @@
 
 #[cfg(test)]
 mod tests {
+    use abc_core::credential::EnrolmentToken;
+    use abc_core::query::{InstallationState, InstallationStatus};
     use abc_store::testing::TestDatabase;
     use std::sync::Arc;
 
@@ -50,11 +52,20 @@ mod tests {
         let pool = database.pool();
         let fixture = Fixture::new(pool.clone()).await;
         assert!(
-            !fixture.store.is_claimed().await.unwrap(),
+            !(fixture
+                .store
+                .query(&Caller::Server, InstallationStatus)
+                .await
+                .unwrap()
+                == InstallationState::Claimed),
             "unclaimed at first"
         );
-        let first = fixture.store.issue_setup_code().await.unwrap();
-        let second = fixture.store.issue_setup_code().await.unwrap();
+        let first = abc_store::testing::issue_setup_code(&fixture.store)
+            .await
+            .unwrap();
+        let second = abc_store::testing::issue_setup_code(&fixture.store)
+            .await
+            .unwrap();
         assert_eq!(
             denial(fixture.claim_with(&Fixture::alice(), &first.code).await),
             DenialReason::SetupCodeMismatch,
@@ -75,7 +86,15 @@ mod tests {
             .claim_with(&Fixture::alice(), &second.code)
             .await
             .unwrap();
-        assert!(fixture.store.is_claimed().await.unwrap(), "claimed");
+        assert!(
+            (fixture
+                .store
+                .query(&Caller::Server, InstallationStatus)
+                .await
+                .unwrap()
+                == InstallationState::Claimed),
+            "claimed"
+        );
         assert_eq!(
             denial(
                 fixture
@@ -91,7 +110,7 @@ mod tests {
             "nor can the owner claim again"
         );
         assert_eq!(
-            denial(fixture.store.issue_setup_code().await),
+            denial(abc_store::testing::issue_setup_code(&fixture.store).await),
             DenialReason::ServerAlreadyClaimed,
             "no code is issued once claimed"
         );
@@ -118,7 +137,9 @@ mod tests {
         let database = TestDatabase::migrated().await;
         let pool = database.pool();
         let fixture = Fixture::new(pool.clone()).await;
-        let issued = fixture.store.issue_setup_code().await.unwrap();
+        let issued = abc_store::testing::issue_setup_code(&fixture.store)
+            .await
+            .unwrap();
         fixture.clock.advance(SETUP_CODE_TTL);
         assert_eq!(
             denial(fixture.claim_with(&Fixture::alice(), &issued.code).await),
@@ -137,7 +158,9 @@ mod tests {
         let database = TestDatabase::migrated().await;
         let pool = database.pool();
         let fixture = Arc::new(Fixture::new(pool.clone()).await);
-        let issued = fixture.store.issue_setup_code().await.unwrap();
+        let issued = abc_store::testing::issue_setup_code(&fixture.store)
+            .await
+            .unwrap();
         let display = issued.code.expose_secret().display_form();
         let claims = ["alice@example.com", "bob@example.com"].map(|login| {
             let fixture = Arc::clone(&fixture);
@@ -211,7 +234,7 @@ mod tests {
         let redemptions: Vec<_> = (0..4)
             .map(|_| {
                 let fixture = Arc::clone(&fixture);
-                let token = abc_core::credential::EnrolmentToken::parse(&text).unwrap();
+                let token = EnrolmentToken::parse(&text).unwrap();
                 let key = fixture.worker_key();
                 tokio::spawn(async move { fixture.enrol(&token, &key).await.is_ok() })
             })
@@ -268,9 +291,7 @@ mod tests {
             DenialReason::EnrolmentTokenExpired,
             "thirty minutes later"
         );
-        let unknown =
-            abc_core::credential::EnrolmentToken::parse(&format!("abc_enr_{}", "0".repeat(52)))
-                .unwrap();
+        let unknown = EnrolmentToken::parse(&format!("abc_enr_{}", "0".repeat(52))).unwrap();
         assert_eq!(
             denial(fixture.enrol(&unknown, &fixture.worker_key()).await),
             DenialReason::EnrolmentTokenUnknown,
@@ -810,6 +831,75 @@ mod tests {
             DenialReason::UnknownWorker,
             "an unknown worker has no session"
         );
+        assert_views_replay(&pool).await;
+    }
+
+    #[tokio::test]
+    async fn a_key_names_one_worker_and_a_revoked_workers_token_stops_answering() {
+        let database = TestDatabase::migrated().await;
+        let pool = database.pool();
+        let (fixture, claimed) = Fixture::claimed(pool.clone()).await;
+        let first = fixture.issue_token(claimed.workspace).await;
+        let second = fixture.issue_token(claimed.workspace).await;
+        let key = fixture.worker_key();
+        let enrolled = fixture.enrol(&first.token, &key).await.unwrap();
+        let events = fixture.event_count().await;
+        assert_eq!(
+            denial(fixture.enrol(&second.token, &key).await),
+            DenialReason::WorkerKeyInUse,
+            "a second token cannot enrol the same key again"
+        );
+        assert_eq!(fixture.event_count().await, events, "and records nothing");
+        fixture
+            .store
+            .execute(
+                &Fixture::alice(),
+                &fixture.origin(),
+                RevokeWorker {
+                    workspace: claimed.workspace,
+                    worker: enrolled.worker,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            denial(fixture.enrol(&first.token, &key).await),
+            DenialReason::WorkerRevoked,
+            "a revoked worker's token no longer answers a retry"
+        );
+        assert_views_replay(&pool).await;
+    }
+
+    #[tokio::test]
+    async fn an_unknown_enrolment_token_is_refused_without_waiting_for_the_log() {
+        let database = TestDatabase::migrated().await;
+        let pool = database.pool();
+        let (fixture, claimed) = Fixture::claimed(pool.clone()).await;
+        let issued = fixture.issue_token(claimed.workspace).await;
+        let mut writer = pool.begin().await.unwrap();
+        sqlx::query("SELECT position FROM event_log_head FOR UPDATE")
+            .execute(&mut *writer)
+            .await
+            .unwrap();
+        let unknown = EnrolmentToken::parse(&format!("abc_enr_{}", "0".repeat(52))).unwrap();
+        let refused = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            fixture.enrol(&unknown, &fixture.worker_key()),
+        )
+        .await
+        .expect("an unknown token is refused while another write holds the log");
+        assert_eq!(
+            denial(refused),
+            DenialReason::EnrolmentTokenUnknown,
+            "unknown"
+        );
+        let known = tokio::time::timeout(
+            std::time::Duration::from_millis(300),
+            fixture.enrol(&issued.token, &fixture.worker_key()),
+        )
+        .await;
+        assert!(known.is_err(), "a real token still queues for the log");
+        writer.rollback().await.unwrap();
         assert_views_replay(&pool).await;
     }
 }

@@ -3,10 +3,12 @@
 
 #[cfg(test)]
 mod tests {
+    use abc_core::query::{InstallationState, InstallationStatus};
+    use abc_store::Caller;
     use abc_store::testing::TestDatabase;
     use std::time::Duration;
 
-    use abc_core::command::{IssueEnrolmentToken, RevokeEnrolmentToken, TokenTtl};
+    use abc_core::command::{IssueEnrolmentToken, RevokeEnrolmentToken, RevokeWorker, TokenTtl};
     use abc_core::event::{Position, StreamKind};
     use abc_core::policy::DenialReason;
     use abc_store::testing::{Fixture, assert_views_replay, database_url, views_replay_diff};
@@ -469,7 +471,11 @@ mod tests {
         .await
         .unwrap();
         assert!(
-            !store.is_claimed().await.unwrap(),
+            !(store
+                .query(&Caller::Server, InstallationStatus)
+                .await
+                .unwrap()
+                == InstallationState::Claimed),
             "a new server is unclaimed"
         );
         assert_eq!(store.ready().await, Ok(()), "and ready");
@@ -617,5 +623,82 @@ mod tests {
         .execute(&admin.pool())
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn one_process_holds_the_installation_at_a_time() {
+        let database = TestDatabase::migrated().await;
+        let fixture = Fixture::new(database.pool()).await;
+        let held = fixture.store.lock_installation().await.unwrap();
+        assert!(held.is_some(), "the first process gets the lock");
+        assert!(
+            fixture.store.lock_installation().await.unwrap().is_none(),
+            "a second is refused"
+        );
+        assert_eq!(
+            format!("{held:?}"),
+            "Some(InstallationLock)",
+            "Debug names it"
+        );
+        drop(held);
+        let mut again = None;
+        for _ in 0..50 {
+            again = fixture.store.lock_installation().await.unwrap();
+            if again.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(again.is_some(), "released when the holder drops it");
+        let first: abc_core::id::SessionId = fixture.store.fresh_id().unwrap();
+        let second: abc_core::id::SessionId = fixture.store.fresh_id().unwrap();
+        assert_ne!(first, second, "fresh ids are fresh");
+    }
+
+    #[tokio::test]
+    async fn scoped_feeds_wake_for_their_workspace_and_worker_only() {
+        let database = TestDatabase::migrated().await;
+        let (fixture, claimed) = Fixture::claimed(database.pool()).await;
+        let issued = fixture.issue_token(claimed.workspace).await;
+        let key = fixture.worker_key();
+        let enrolled = fixture.enrol(&issued.token, &key).await.unwrap();
+        let mut caught_up = fixture.store.feed();
+        let head = Position::from_stored(fixture.event_count().await).unwrap();
+        while caught_up.head() < head {
+            tokio::time::timeout(Duration::from_secs(5), caught_up.changed())
+                .await
+                .unwrap();
+        }
+        let mut workspace = fixture.store.workspace_feed(claimed.workspace);
+        let mut worker = fixture.store.worker_feed(enrolled.worker);
+        fixture.issue_token(claimed.workspace).await;
+        let woke = tokio::time::timeout(Duration::from_secs(5), workspace.changed())
+            .await
+            .unwrap();
+        assert_eq!(woke, head.next(), "the workspace saw the new token");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), worker.changed())
+                .await
+                .is_err(),
+            "the worker did not: the token is not its stream"
+        );
+        fixture
+            .store
+            .execute(
+                &Fixture::alice(),
+                &fixture.origin(),
+                RevokeWorker {
+                    workspace: claimed.workspace,
+                    worker: enrolled.worker,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), worker.changed())
+                .await
+                .is_ok(),
+            "its revocation wakes the worker's feed"
+        );
     }
 }

@@ -8,7 +8,7 @@
 //!   abc_core::authorize(..)   -> Authorized<C>        -- the one permission check
 //!   C::decide(..)             -> Decision<Outcome>    -- pure
 //!   for each event: INSERT event (position = head+i, stream_seq = next) ; projection::apply
-//!   UPDATE event_log_head ; SELECT pg_notify('abc_log', head)
+//!   UPDATE event_log_head ; SELECT pg_notify('abc_log', {head, workspace, streams})
 //! COMMIT                                               -- the notification is delivered here
 //! ```
 //!
@@ -22,65 +22,89 @@
 //! Revoking a worker, redeeming a token, claiming: each is decided against state no one else can
 //! change until this transaction ends.
 
-use std::future::Future;
-
 use abc_core::actor::{Membership, Principal, Role};
-use abc_core::command::Command;
 use abc_core::decision::{DecideCtx, Decision, Mint, Origin};
 use abc_core::event::{Position, Recorded};
 use abc_core::id::{EventId, FromUuid as _, PersonId, WorkerId, WorkspaceId};
+use abc_core::policy::Denied;
 use abc_core::policy::authorize;
 use abc_core::time::{Clock, Timestamp};
-use rand::Rng as _;
-use rand::rand_core::UnwrapErr;
-use rand::rngs::SysRng;
 use sqlx::{PgConnection, PgPool, Postgres, Transaction};
-use zeroize::Zeroizing;
 
+use crate::entropy::ChaChaMint;
 use crate::error::{AuthError, ExecuteError, StoreError};
 use crate::{Caller, Inner, projection};
 
 mod sealed {
-    pub trait Sealed {}
+    use std::future::Future;
+
+    use abc_core::actor::Principal;
+    use abc_core::command::Command;
+    use sqlx::PgConnection;
+
+    use crate::error::StoreError;
+
+    /// A command the store knows how to load facts for, implemented in `facts.rs` for every
+    /// abc-core command. Public only inside this private module: no other crate can name it.
+    pub trait Load: Command<Facts: Send, Outcome: Send> + Send + Sync {
+        /// Loads the facts `authorize` and `decide` need, from the open write transaction.
+        /// Read-only SQL: a write here would make views diverge from the log, which
+        /// `assert_views_replay` catches.
+        fn load<'c>(
+            &'c self,
+            conn: &'c mut PgConnection,
+            principal: &'c Principal,
+        ) -> impl Future<Output = Result<Self::Facts, StoreError>> + Send + 'c;
+    }
 }
 
-/// A command the store knows how to load facts for. Sealed and implemented for every abc-core
-/// command in `facts.rs`. A command without an impl cannot be passed to `Store::execute`, so adding
-/// a command fails the build until its loader exists.
-pub trait Executable: Command<Facts: Send, Outcome: Send> + Send + Sync + Sealed {
-    /// Loads the facts `authorize` and `decide` need, from the open write transaction. Read-only
-    /// SQL: a write here would make views diverge from the log, which `assert_views_replay`
-    /// catches.
-    fn load<'c>(
-        &'c self,
-        conn: &'c mut PgConnection,
-        principal: &'c Principal,
-    ) -> impl Future<Output = Result<Self::Facts, StoreError>> + Send + 'c;
-}
+/// A command any caller of `Store::execute` may run: every abc-core command except
+/// `IssueSetupCode`, which only `Store::issue_setup_code` runs. A command without a loader cannot
+/// be passed to `execute`, so adding a command fails the build until its loader exists.
+pub trait Executable: Load {}
 
-pub(crate) use sealed::Sealed;
+pub(crate) use sealed::Load;
 
 /// The whole pipeline for one command.
-pub(crate) async fn run<C: Executable>(
+pub(crate) async fn run<C: Load>(
     inner: &Inner,
     caller: &Caller,
     origin: &Origin,
     command: C,
 ) -> Result<C::Outcome, ExecuteError<C::Rejection>> {
+    let mint = ChaChaMint::from_seed(inner.entropy.seed().map_err(StoreError::from)?);
+    if matches!(caller, Caller::Anonymous) {
+        admit(inner, &command).await?;
+    }
     let mut tx = WriteTx::begin(&inner.pool).await?;
     let now = inner.clock.now();
     let principal = authenticate(tx.conn(), caller).await??;
     let facts = command.load(tx.conn(), &principal).await?;
     let authorized = authorize(&principal, command, &facts, now)?;
-    let decision = C::decide(authorized, facts, &DecideCtx::new(now, inner.mint.as_ref()))
+    let decision = C::decide(authorized, facts, &DecideCtx::new(now, &mint))
         .map_err(ExecuteError::Rejected)?;
     let events = decision.events().len();
-    let outcome = tx
-        .append(decision, origin, now, inner.mint.as_ref())
-        .await?;
+    let outcome = tx.append(decision, origin, now, &mint).await?;
     tx.commit().await?;
     tracing::debug!(action = ?C::ACTION, events, "command recorded");
     Ok(outcome)
+}
+
+/// Refuses an anonymous command whose own capability already fails, before it can queue for the
+/// log head: an unknown enrolment token costs a read, never the global write lock. The command is
+/// checked again, in full, under the lock, so this only ever refuses early.
+async fn admit<C: Load>(inner: &Inner, command: &C) -> Result<(), ExecuteError<C::Rejection>> {
+    let mut conn = inner.pool.acquire().await.map_err(StoreError::from)?;
+    let facts = command.load(&mut conn, &Principal::Anonymous).await?;
+    command
+        .prove(&facts, inner.clock.now())
+        .map(drop)
+        .map_err(|reason| {
+            ExecuteError::Denied(Denied {
+                action: C::ACTION.into(),
+                reason,
+            })
+        })
 }
 
 /// Resolves a [`Caller`] into a [`Principal`] on `conn`, inside the caller's transaction.
@@ -250,12 +274,15 @@ impl WriteTx {
             sqlx::query!("UPDATE event_log_head SET position = $1", self.head.get())
                 .execute(&mut *self.tx)
                 .await?;
-            sqlx::query!(
-                "SELECT pg_notify('abc_log', $1)",
-                self.head.get().to_string()
-            )
-            .execute(&mut *self.tx)
-            .await?;
+            let streams: Vec<_> = decision
+                .events()
+                .iter()
+                .map(abc_core::decision::Pending::stream)
+                .collect();
+            let payload = crate::feed::payload(self.head, permit.workspace().as_uuid(), &streams)?;
+            sqlx::query!("SELECT pg_notify('abc_log', $1)", payload)
+                .execute(&mut *self.tx)
+                .await?;
         }
         Ok(decision.into_outcome())
     }
@@ -276,56 +303,9 @@ impl Clock for SystemClock {
     }
 }
 
-/// Production mint: `UUIDv7` from the given instant, and secrets straight from the operating
-/// system's generator.
-#[derive(Debug)]
-pub(crate) struct OsMint;
-
-impl Mint for OsMint {
-    fn uuid(&self, now: Timestamp) -> uuid::Uuid {
-        let mut random = [0; 10];
-        UnwrapErr(SysRng).fill_bytes(&mut random);
-        uuid_v7(now, &random)
-    }
-
-    fn secret(&self) -> Zeroizing<[u8; 32]> {
-        let mut bytes = Zeroizing::new([0; 32]);
-        UnwrapErr(SysRng).fill_bytes(bytes.as_mut_slice());
-        bytes
-    }
-}
-
-/// A `UUIDv7` whose time part is `now` (milliseconds since the Unix epoch) and whose remaining
-/// bits come from `random`.
-pub(crate) fn uuid_v7(now: Timestamp, random: &[u8; 10]) -> uuid::Uuid {
-    let millis = now.as_offset().unix_timestamp_nanos() / 1_000_000;
-    uuid::Builder::from_unix_timestamp_millis(u64::try_from(millis).unwrap_or(0), random)
-        .into_uuid()
-}
-
 #[cfg(test)]
 mod tests {
-    use time::macros::datetime;
-
     use super::*;
-
-    #[test]
-    fn the_os_mint_makes_fresh_secrets_and_time_ordered_ids() {
-        let now = Timestamp::from_utc(datetime!(2026-01-01 00:00:01.5 UTC));
-        let first = OsMint.uuid(now);
-        let second = OsMint.uuid(now);
-        assert_ne!(first, second, "every id is fresh");
-        assert_eq!(first.get_version_num(), 7, "a UUIDv7");
-        let (seconds, nanos) = first.get_timestamp().unwrap().to_unix();
-        assert_eq!(
-            (seconds, nanos),
-            (1_767_225_601, 500_000_000),
-            "its time is now, to the ms"
-        );
-        let secret = OsMint.secret();
-        assert_ne!(*secret, *OsMint.secret(), "every secret is fresh");
-        assert_ne!(*secret, [0; 32], "and not zero");
-    }
 
     #[test]
     fn the_system_clock_reads_the_present() {

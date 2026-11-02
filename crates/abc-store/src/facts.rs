@@ -20,7 +20,7 @@ use sqlx::PgConnection;
 use uuid::Uuid;
 
 use crate::error::StoreError;
-use crate::execute::{Executable, Sealed};
+use crate::execute::{Executable, Load};
 
 /// Shared by the two installation commands: whether the server is claimed, the newest setup code,
 /// and the claimant's login from a `Visitor` principal.
@@ -61,8 +61,7 @@ async fn installation_facts(
     })
 }
 
-impl Sealed for IssueSetupCode {}
-impl Executable for IssueSetupCode {
+impl Load for IssueSetupCode {
     fn load<'c>(
         &'c self,
         conn: &'c mut PgConnection,
@@ -72,8 +71,8 @@ impl Executable for IssueSetupCode {
     }
 }
 
-impl Sealed for ClaimServer {}
-impl Executable for ClaimServer {
+impl Executable for ClaimServer {}
+impl Load for ClaimServer {
     fn load<'c>(
         &'c self,
         conn: &'c mut PgConnection,
@@ -122,8 +121,8 @@ impl TryFrom<TokenRow> for TokenRecord {
     }
 }
 
-impl Sealed for EnrolWorker {}
-impl Executable for EnrolWorker {
+impl Executable for EnrolWorker {}
+impl Load for EnrolWorker {
     /// The token whose digest is the presented token's.
     async fn load(
         &self,
@@ -140,14 +139,33 @@ impl Executable for EnrolWorker {
         )
         .fetch_optional(&mut *conn)
         .await?;
+        let token = row.map(TokenRecord::try_from).transpose()?;
+        let reserved = token.as_ref().map(|token| token.worker.as_uuid());
+        let key_in_use = sqlx::query_scalar!(
+            r#"SELECT EXISTS (SELECT 1 FROM worker WHERE key_digest = $1
+                              AND id IS DISTINCT FROM $2) AS "in_use!""#,
+            self.key.as_bytes().as_slice(),
+            reserved
+        )
+        .fetch_one(&mut *conn)
+        .await?;
+        let reserved_worker_revoked = sqlx::query_scalar!(
+            r#"SELECT EXISTS (SELECT 1 FROM worker WHERE id = $1 AND revoked_at IS NOT NULL)
+               AS "revoked!""#,
+            reserved
+        )
+        .fetch_one(&mut *conn)
+        .await?;
         Ok(EnrolFacts {
-            token: row.map(TokenRecord::try_from).transpose()?,
+            token,
+            key_in_use,
+            reserved_worker_revoked,
         })
     }
 }
 
-impl Sealed for IssueEnrolmentToken {}
-impl Executable for IssueEnrolmentToken {
+impl Executable for IssueEnrolmentToken {}
+impl Load for IssueEnrolmentToken {
     /// No facts: the policy's membership check, from the principal, is all it needs.
     fn load<'c>(
         &'c self,
@@ -158,8 +176,8 @@ impl Executable for IssueEnrolmentToken {
     }
 }
 
-impl Sealed for RevokeEnrolmentToken {}
-impl Executable for RevokeEnrolmentToken {
+impl Executable for RevokeEnrolmentToken {}
+impl Load for RevokeEnrolmentToken {
     /// The token with this id.
     async fn load(
         &self,
@@ -179,8 +197,8 @@ impl Executable for RevokeEnrolmentToken {
     }
 }
 
-impl Sealed for RevokeWorker {}
-impl Executable for RevokeWorker {
+impl Executable for RevokeWorker {}
+impl Load for RevokeWorker {
     /// The worker with this id.
     async fn load(
         &self,
@@ -202,8 +220,8 @@ impl Executable for RevokeWorker {
     }
 }
 
-impl Sealed for StartSession {}
-impl Executable for StartSession {
+impl Executable for StartSession {}
+impl Load for StartSession {
     /// The authenticated worker, copied from the principal.
     fn load<'c>(
         &'c self,
@@ -221,8 +239,8 @@ impl Executable for StartSession {
     }
 }
 
-impl Sealed for EndSession {}
-impl Executable for EndSession {
+impl Executable for EndSession {}
+impl Load for EndSession {
     /// The worker and its open session, if any.
     async fn load(
         &self,
