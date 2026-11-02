@@ -320,7 +320,7 @@ fn run(
         )?)),
         Task::GitCredential { operation } => git_credential(&operation),
         Task::Gh { args } => gh_as_app(&args, report),
-        Task::Broker => run_broker(report),
+        Task::Broker => run_broker(&current_exe()?, report),
         Task::Watchdog => Ok(ExitCode::from(watchdog::verdict(
             &stdin("claude's answer")?,
             report,
@@ -411,15 +411,15 @@ fn integrity(
     integrity::run(root, base, pull_request.as_ref(), &event, report)
 }
 
-/// `cargo xtask broker`, from this executable, with the App and socket in their places under the
-/// home directory, logging to `log`.
-fn run_broker(log: &mut (impl Write + Send)) -> anyhow::Result<ExitCode> {
-    serve_tokens(
-        &std::env::current_exe().context("could not find the running executable")?,
-        &app::config_dir()?,
-        &broker::socket()?,
-        log,
-    )
+/// The running executable.
+fn current_exe() -> anyhow::Result<PathBuf> {
+    std::env::current_exe().context("could not find the running executable")
+}
+
+/// `cargo xtask broker`, run from `exe`, with the App and socket in their places under the home
+/// directory, logging to `log`.
+fn run_broker(exe: &Path, log: &mut (impl Write + Send)) -> anyhow::Result<ExitCode> {
+    serve_tokens(exe, &app::config_dir()?, &broker::socket()?, log)
 }
 
 /// The broker, run from `exe`: loads the App from `config` and serves its tokens on
@@ -487,8 +487,8 @@ mod tests {
     use std::process::ExitCode;
 
     use super::{
-        Cli, Invocation, RulesetAction, Task, TaskAction, repo_root, run, run_hook, serve_tokens,
-        usage_exit_code, verdict,
+        Cli, Invocation, RulesetAction, Task, TaskAction, repo_root, run, run_broker, run_hook,
+        serve_tokens, usage_exit_code, verdict,
     };
     use crate::testing::{git, repository_with_change, script};
 
@@ -853,6 +853,12 @@ mod tests {
         let socket = temp.path().join("agent-broker/broker.sock");
         let installed = temp.path().join("install/bin/xtask");
         let checkout = crate::testing::repository(&temp.path().join("checkout"));
+        let refused =
+            run_broker(&checkout.join("target/debug/xtask"), &mut Vec::new()).unwrap_err();
+        assert!(
+            format!("{refused:#}").contains("outside any checkout"),
+            "the command refuses a build in a checkout too: {refused:#}"
+        );
         let inside = serve_tokens(
             &checkout.join("target/debug/xtask"),
             &config,
