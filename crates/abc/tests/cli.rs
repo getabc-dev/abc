@@ -159,8 +159,13 @@ mod tests {
             .stderr(Stdio::piped())
             .spawn()
             .unwrap();
+        // Thirty seconds: the first run of a freshly linked binary can be slow to start (macOS
+        // scans it), and a server that exits instead fails at once with its status.
         let mut ready = false;
-        for _ in 0..200 {
+        for _ in 0..1200 {
+            if let Some(status) = server.try_wait().unwrap() {
+                panic!("the server exited before it was ready: {status}");
+            }
             if socket.exists() && readyz(ops).await.starts_with("HTTP/1.0 200") {
                 ready = true;
                 break;
