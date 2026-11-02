@@ -144,7 +144,11 @@ fn fake_broker(home: &Path) -> std::thread::JoinHandle<()> {
 }
 
 fn world(token: &str) -> World {
-    let dir = tempfile::tempdir().unwrap();
+    // Not under /tmp: on Linux the temporary directory is a guest system directory, which a
+    // session's worktree may not be.
+    let target = crate::repo_root().unwrap().join("target");
+    std::fs::create_dir_all(&target).unwrap();
+    let dir = tempfile::Builder::new().tempdir_in(target).unwrap();
     let root = dir.path().canonicalize().unwrap();
     let main = repository(&root.join("main"));
     git(
