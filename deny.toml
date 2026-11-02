@@ -59,6 +59,10 @@ skip = [
     { crate = "base64@0.22", reason = "held back by sqlx-core and sqlx-postgres; drop when sqlx moves to base64 0.23" },
     { crate = "hashlink@0.11", reason = "held back by sqlx-core; drop when sqlx moves to hashlink 0.12" },
     { crate = "hashbrown@0.16", reason = "held back by sqlx-core and hashlink 0.11; drop with hashlink@0.11" },
+    # Added 2026-11-01 with axum 0.8.9 (S0 PR 3); review at each axum bump.
+    { crate = "rand@0.9", reason = "held back by tungstenite 0.29, through axum's ws feature; drop when axum moves to tungstenite 0.30" },
+    { crate = "rand_core@0.9", reason = "held back by rand 0.9, through axum's tungstenite; drop with rand@0.9" },
+    { crate = "getrandom@0.3", reason = "held back by rand_core 0.9, through axum's tungstenite; drop with rand@0.9" },
 ]
 
 [sources]

@@ -603,6 +603,8 @@ mod tests {
             find("abc-store").database && find("abc-store").query_cache,
             "the store"
         );
+        assert!(find("abc-server").database, "the server's tests");
+        assert!(!find("abc-server").query_cache, "the server has no queries");
         assert!(
             !find("abc-core").database,
             "the core never touches a database"
