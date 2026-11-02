@@ -117,13 +117,16 @@ enum Task {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<OsString>,
     },
-    /// Serve agent App tokens to agent VMs (D3). The one process that reads the App's key. Install
-    /// it from main, outside any checkout: `cargo install --locked --git
-    /// https://github.com/getabc-dev/abc --branch main xtask --root ~/.local/share/abc/broker`;
-    /// `cargo xtask vm start` starts it when it is not running. It refuses to run from inside a
-    /// checkout, whose xtask an agent may have changed, and listens on
-    /// `~/.config/abc/agent-broker/broker.sock`, which each VM reaches over vsock.
-    Broker,
+    /// Serve agent App tokens to one agent VM (D3): the one process that reads the App's key.
+    /// `cargo xtask vm start` starts it, one per session, from a build of main installed outside
+    /// any checkout: `cargo install --locked --git https://github.com/getabc-dev/abc --branch main
+    /// xtask --root ~/.local/share/abc/broker`. It refuses to run from inside a checkout, a guard
+    /// against mistakes, and listens on the session's sockets in `~/.config/abc/agent-broker/`.
+    Broker {
+        /// The session's name, such as abc-my-change.
+        #[arg(long)]
+        session: String,
+    },
     /// Run agent sessions in microVMs, one per worktree (D37). Run it from the main clone.
     Vm {
         #[command(subcommand)]
@@ -309,7 +312,9 @@ fn run(
             git_credential(&operation)?;
             Ok(ExitCode::SUCCESS)
         }
-        Task::Broker => serve_tokens(&std::env::current_exe()?, &user_home(&env)?),
+        Task::Broker { session } => {
+            serve_tokens(&std::env::current_exe()?, &user_home(&env)?, &session)
+        }
         Task::Vm { action } => run_vm(action, home, &env, report),
         Task::Gh { args } => app::run_gh(
             || broker::token(app::Scope::Gh),
@@ -421,14 +426,18 @@ fn user_home(env: &impl Fn(&str) -> Option<OsString>) -> anyhow::Result<PathBuf>
         .context("HOME is not set")
 }
 
-/// `cargo xtask broker`, run from `exe`: serves tokens signed with the App's key on the broker's
-/// socket under `home`, refusing to run from a checkout.
-fn serve_tokens(exe: &Path, home: &Path) -> anyhow::Result<ExitCode> {
+/// `cargo xtask broker`, run from `exe`: serves session `session` tokens signed with the App's
+/// key on its sockets under `home`, refusing to run from a checkout, until it is stopped.
+fn serve_tokens(exe: &Path, home: &Path, session: &str) -> anyhow::Result<ExitCode> {
     broker::refuse_checkout(exe)?;
+    broker::check_session(session)?;
     let app = app::App::load(&app::config_dir()?)?;
     broker::serve(
-        &broker::socket(home),
+        session,
+        &broker::sockets(home, session),
         |scope| app.token(app::GITHUB_API, scope),
+        |token| app::revoke(app::GITHUB_API, token),
+        broker::MAX_PER_HOUR,
         &mut io::stderr(),
     )?;
     Ok(ExitCode::SUCCESS)
@@ -583,9 +592,14 @@ mod tests {
         let checkout = crate::testing::repository(&temp.path().join("abc"));
         let error = format!(
             "{:#}",
-            serve_tokens(&checkout.join("target/debug/xtask"), temp.path()).unwrap_err()
+            serve_tokens(&checkout.join("target/debug/xtask"), temp.path(), "abc-w").unwrap_err()
         );
         assert!(error.contains("installed outside any checkout"), "{error}");
+        let named = format!(
+            "{:#}",
+            serve_tokens(&temp.path().join("bin/xtask"), temp.path(), "../x").unwrap_err()
+        );
+        assert!(named.contains("is not a session's name"), "{named}");
     }
 
     #[test]

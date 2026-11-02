@@ -66,7 +66,7 @@ const IMAGE: &str = "abc-agent:latest";
 const BROKER_PORT: u32 = 5000;
 
 /// The broker's socket inside the VM (`xtask/vm/entrypoint.sh` relays it to the vsock port).
-const GUEST_BROKER: &str = "/run/abc/broker.sock";
+const GUEST_BROKER: &str = "/run/abc/agent/broker.sock";
 
 /// The keychain item holding the maintainer's `claude setup-token` token.
 pub(crate) const TOKEN_ITEM: &str = "abc-vm-claude-code-oauth-token";
@@ -186,8 +186,8 @@ pub(crate) struct Host {
     pub(crate) repo: PathBuf,
     /// Where sessions keep their state.
     pub(crate) state: PathBuf,
-    /// The token broker's socket.
-    pub(crate) broker_socket: PathBuf,
+    /// The user's home directory, under which each session's broker listens.
+    pub(crate) home: PathBuf,
     /// The installed broker, started when none is listening.
     pub(crate) broker_exe: PathBuf,
     /// The program printing the subscription token, with its arguments.
@@ -216,7 +216,7 @@ impl Host {
             os,
             repo: repo.to_path_buf(),
             state: dir("XDG_STATE_HOME", ".local/state").join("abc/vm"),
-            broker_socket: crate::broker::socket(home),
+            home: home.to_path_buf(),
             broker_exe: dir("XDG_DATA_HOME", ".local/share").join(BROKER_EXE),
             secret: (PathBuf::from(program), args),
             builder: PathBuf::from(os.builder()),
@@ -289,22 +289,32 @@ pub(crate) fn run(
 ) -> anyhow::Result<ExitCode> {
     match action {
         Action::Start { worktree } => {
-            start(&Session::open(&worktree, &host.state)?, host, backend, out)?;
+            start(
+                &Session::open(&worktree, &host.repo, &host.state)?,
+                host,
+                backend,
+                out,
+            )?;
         }
         Action::Shell { worktree, command } => {
-            let session = Session::open(&worktree, &host.state)?;
+            let session = Session::open(&worktree, &host.repo, &host.state)?;
             return shell(&session, backend, command);
         }
         Action::Auth { worktree } => {
-            let session = Session::open(&worktree, &host.state)?;
+            let session = Session::open(&worktree, &host.repo, &host.state)?;
             writeln!(out, "vm: claude auth status: {}", auth(&session, backend)?)?;
         }
         Action::Sync { worktree } => {
-            let session = Session::open(&worktree, &host.state)?;
+            let session = Session::open(&worktree, &host.repo, &host.state)?;
             writeln!(out, "vm: {}", session.sync()?)?;
         }
         Action::Stop { worktree, purge } => {
-            stop(&Session::open(&worktree, &host.state)?, backend, purge)?;
+            stop(
+                &Session::open(&worktree, &host.repo, &host.state)?,
+                host,
+                backend,
+                purge,
+            )?;
             writeln!(out, "vm: stopped {}", worktree.display())?;
         }
         Action::Image => image(host, backend, out)?,
@@ -319,7 +329,10 @@ pub(crate) fn run(
 pub(crate) fn billing(env: &dyn Fn(&str) -> Option<OsString>) -> anyhow::Result<()> {
     let home = env("HOME").map_or_else(|| PathBuf::from("/home/agent"), PathBuf::from);
     let worktree = env("ABC_WORKTREE").map_or_else(|| PathBuf::from("/nonexistent"), PathBuf::from);
-    billing::check(env, &billing::settings_files(&home, &worktree))
+    billing::check(
+        env,
+        &billing::settings_files(billing::managed(), &home, &worktree),
+    )
 }
 
 fn start(
@@ -329,28 +342,34 @@ fn start(
     out: &mut impl Write,
 ) -> anyhow::Result<()> {
     let token = subscription_token(host)?;
-    if let Some(note) = session.prepare_git()? {
-        writeln!(out, "vm: {note}")?;
-    }
-    ensure_broker(host)?;
-    for dir in ["target", ".tools"] {
-        std::fs::create_dir_all(session.worktree.join(dir))?;
-    }
-    if !backend.is_running(&session.name)? {
+    check_mount_paths(&[&session.worktree, &session.common])?;
+    let sockets = crate::broker::sockets(&host.home, &session.name);
+    ensure_broker(host, &session.name, &sockets)?;
+    if backend.is_running(&session.name)? {
+        writeln!(
+            out,
+            "vm: {} is running; its git repository is refreshed only while it is stopped",
+            session.name
+        )?;
+    } else {
+        // The VM is stopped, so nothing can change the session repository while the host
+        // rewrites it.
+        if let Some(note) = session.prepare_git()? {
+            writeln!(out, "vm: {note}")?;
+        }
+        for dir in ["target", ".tools"] {
+            std::fs::create_dir_all(session.worktree.join(dir))?;
+        }
         let egress = egress::parse(
             &std::fs::read_to_string(host.repo.join(egress::FILE))
                 .with_context(|| format!("could not read {}", egress::FILE))?,
         )?;
-        backend.start(&spec(session, host, egress))?;
+        backend.start(&spec(session, &sockets.tokens, egress))?;
     }
     wait_ready(session, backend, host.patience)?;
     let handed = backend.exec(
         &session.name,
-        &words(&[
-            "sh",
-            "-c",
-            "umask 077 && cat > /run/abc/claude-token && chown agent:agent /run/abc/claude-token",
-        ]),
+        &words(&["sh", "-c", "umask 077 && cat > /run/abc/claude-token"]),
         &token,
     )?;
     ensure!(
@@ -369,8 +388,8 @@ fn start(
     Ok(())
 }
 
-/// The VM to start for `session`.
-fn spec(session: &Session, host: &Host, egress: Vec<String>) -> Spec {
+/// The VM to start for `session`, reaching its broker at `broker`.
+fn spec(session: &Session, broker: &Path, egress: Vec<String>) -> Spec {
     let worktree = session.worktree.display().to_string();
     Spec {
         name: session.name.clone(),
@@ -380,17 +399,18 @@ fn spec(session: &Session, host: &Host, egress: Vec<String>) -> Spec {
         egress,
         mounts: vec![
             (session.worktree.clone(), session.worktree.clone()),
-            (session.git_dir(), session.common.clone()),
+            (session.git_dir(), PathBuf::from(session::GUEST_GIT)),
         ],
         volumes: volumes(&session.worktree),
         tmpfs: vec![
             PathBuf::from("/run/abc"),
             PathBuf::from("/var/lib/postgresql"),
         ],
-        vsock: (host.broker_socket.clone(), BROKER_PORT),
+        vsock: (broker.to_path_buf(), BROKER_PORT),
         env: [
             ("ABC_VM", "1".to_owned()),
             ("ABC_WORKTREE", worktree),
+            ("ABC_GIT_COMMON", session.common.display().to_string()),
             ("ABC_BROKER_VSOCK_PORT", BROKER_PORT.to_string()),
             (crate::broker::ENV, GUEST_BROKER.to_owned()),
             (
@@ -427,17 +447,23 @@ fn subscription_token(host: &Host) -> anyhow::Result<Vec<u8>> {
     Ok(token)
 }
 
-/// Makes sure the token broker listens, starting the installed one when it does not.
-fn ensure_broker(host: &Host) -> anyhow::Result<()> {
-    if std::os::unix::net::UnixStream::connect(&host.broker_socket).is_ok() {
+/// Makes sure session `session`'s token broker listens on `sockets`, starting the installed one
+/// when it does not.
+fn ensure_broker(
+    host: &Host,
+    session: &str,
+    sockets: &crate::broker::Sockets,
+) -> anyhow::Result<()> {
+    let listening = || std::os::unix::net::UnixStream::connect(&sockets.control).is_ok();
+    if listening() {
         return Ok(());
     }
     ensure!(
         host.broker_exe.is_file(),
-        "the token broker is not running and not installed at {}; see `cargo xtask broker --help`",
+        "the token broker is not installed at {}; see `cargo xtask broker --help`",
         host.broker_exe.display()
     );
-    let log = host.state.join("broker.log");
+    let log = host.state.join(format!("{session}.broker.log"));
     std::fs::create_dir_all(&host.state)?;
     let file = std::fs::OpenOptions::new()
         .create(true)
@@ -445,14 +471,15 @@ fn ensure_broker(host: &Host) -> anyhow::Result<()> {
         .open(&log)
         .with_context(|| format!("could not open {}", log.display()))?;
     let mut broker = Command::new(&host.broker_exe)
-        .arg("broker")
+        .args(["broker", "--session", session])
+        .env("HOME", &host.home)
         .stdin(Stdio::null())
         .stdout(file.try_clone()?)
         .stderr(file)
         .spawn()
         .with_context(|| format!("could not start {}", host.broker_exe.display()))?;
     for _ in 0..host.patience {
-        if std::os::unix::net::UnixStream::connect(&host.broker_socket).is_ok() {
+        if listening() {
             return Ok(());
         }
         if let Some(status) = broker.try_wait()? {
@@ -463,6 +490,55 @@ fn ensure_broker(host: &Host) -> anyhow::Result<()> {
     // It may be stuck; it will not be left running unseen.
     let _killed = broker.kill();
     bail!("the token broker did not start; see {}", log.display())
+}
+
+/// Guest system directories a mount must never cover: a mount there could replace the image's
+/// own programs, such as agent-exec and abc-xtask, which run as root.
+const RESERVED: [&str; 17] = [
+    "/abc",
+    "/bin",
+    "/boot",
+    "/dev",
+    "/etc",
+    "/home/agent",
+    "/lib",
+    "/lib64",
+    "/opt",
+    "/proc",
+    "/root",
+    "/run",
+    "/sbin",
+    "/sys",
+    "/tmp",
+    "/usr",
+    "/var",
+];
+
+/// Fails unless each of `paths` can be mounted at its own path in the guest: absolute, plain,
+/// free of the separators microsandbox's mount syntax uses, and clear of the guest's system
+/// directories.
+fn check_mount_paths(paths: &[&Path]) -> anyhow::Result<()> {
+    for path in paths {
+        let text = path
+            .to_str()
+            .with_context(|| format!("{} is not UTF-8", path.display()))?;
+        ensure!(
+            path.is_absolute()
+                && path
+                    .components()
+                    .skip(1)
+                    .all(|component| matches!(component, std::path::Component::Normal(_)))
+                && !text.contains([':', ',', '\n', '='])
+                && path.components().count() > 2,
+            "{text} cannot be mounted in an agent VM: it must be an absolute, plain path without \
+             ':', ',' or '='"
+        );
+        ensure!(
+            !RESERVED.iter().any(|reserved| path.starts_with(reserved)),
+            "{text} cannot be mounted in an agent VM: it lies in a guest system directory"
+        );
+    }
+    Ok(())
 }
 
 /// Waits until the VM's entrypoint has readied it.
@@ -508,7 +584,11 @@ fn shell(
     Ok(ExitCode::from(crate::tools::status_code(status)))
 }
 
-fn stop(session: &Session, backend: &dyn Backend, purge: bool) -> anyhow::Result<()> {
+fn stop(session: &Session, host: &Host, backend: &dyn Backend, purge: bool) -> anyhow::Result<()> {
+    let control = crate::broker::sockets(&host.home, &session.name).control;
+    if control.exists() {
+        crate::broker::stop(&control).context("could not stop the session's token broker")?;
+    }
     backend.remove(&session.name)?;
     if purge {
         let names: Vec<String> = volumes(&session.worktree)

@@ -47,7 +47,8 @@ fn default_repository() -> String {
 /// What a token is for, which decides the permissions it gets (I5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Scope {
-    /// git fetching and pushing, workflow files included.
+    /// git fetching and pushing, never workflow files: a change to one is the maintainer's to
+    /// push.
     Git,
     /// gh: pull requests and the branches behind them, and reading CI results.
     Gh,
@@ -71,7 +72,7 @@ impl Scope {
 
     fn permissions(self) -> serde_json::Value {
         match self {
-            Self::Git => serde_json::json!({"contents": "write", "workflows": "write"}),
+            Self::Git => serde_json::json!({"contents": "write"}),
             Self::Gh => serde_json::json!({
                 "contents": "write",
                 "pull_requests": "write",
@@ -286,7 +287,7 @@ pub(crate) fn run_gh(
 }
 
 /// Revokes the installation `token` at `api`.
-fn revoke(api: &str, token: &str) -> anyhow::Result<()> {
+pub(crate) fn revoke(api: &str, token: &str) -> anyhow::Result<()> {
     ureq::delete(&format!("{api}/installation/token"))
         .header("Authorization", &format!("Bearer {token}"))
         .header("Accept", "application/vnd.github+json")
@@ -459,7 +460,7 @@ mod tests {
             body,
             serde_json::json!({
                 "repositories": ["abc"],
-                "permissions": {"contents": "write", "workflows": "write"}
+                "permissions": {"contents": "write"}
             }),
             "one repository, and only what git needs"
         );
@@ -537,9 +538,10 @@ mod tests {
             gh_permissions.get("workflows").is_none(),
             "gh does not edit workflows"
         );
-        assert!(
-            Scope::Git.permissions().get("pull_requests").is_none(),
-            "git does not touch pull requests"
+        assert_eq!(
+            Scope::Git.permissions(),
+            serde_json::json!({"contents": "write"}),
+            "git pushes contents alone: no pull requests, no workflow files"
         );
     }
 

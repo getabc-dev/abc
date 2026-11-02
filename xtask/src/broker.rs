@@ -1,17 +1,22 @@
 //! The agent App's token broker, `cargo xtask broker` (D3).
 //!
 //! Agents push and use gh as the getabc-dev-agent App, but must never read the App's private key,
-//! which lasts until it is revoked. The broker is the one process that reads it. The maintainer
-//! runs it on the host from a build of `main` installed outside any checkout (an agent can change
-//! the xtask of a checkout it works in), and it listens on [`SOCKET`] under the home directory.
-//! `cargo xtask vm` forwards that socket into each agent VM over vsock, where [`ENV`] names the
-//! guest end; `cargo xtask git-credential` and `cargo xtask gh` ask it for a token per use.
+//! which lasts until it is revoked. The broker is the one process that reads it. It runs on the
+//! host from a build of `main` installed outside any checkout (an agent can change the xtask of a
+//! checkout it works in; the check is a guard against mistakes, not a control), one broker per
+//! agent VM: `cargo xtask vm start` starts it with the session's name, and it listens on that
+//! session's sockets under [`DIR`]. The token socket is forwarded into the VM over vsock, where
+//! [`ENV`] names the guest end, and `cargo xtask git-credential` and `cargo xtask gh` ask it for a
+//! token per use. The control socket stays on the host: `cargo xtask vm stop` asks the broker
+//! there to revoke every token it minted and to exit. Each line the broker logs names its
+//! session, and it mints at most [`MAX_PER_HOUR`] tokens an hour.
 //!
 //! The protocol is one line each way: the client sends a scope's name (`git` or `gh`), and the
 //! broker answers `token <token>`, a fresh installation token for that scope alone that expires
 //! within the hour, or `error <reason>`, and closes the connection. The key never leaves the
 //! broker and no token is ever logged.
 
+use std::collections::VecDeque;
 use std::ffi::OsString;
 use std::fs;
 use std::io::{BufRead as _, BufReader, Read, Write};
@@ -19,15 +24,21 @@ use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, anyhow, bail};
 
 use crate::app::Scope;
 
-/// The broker's socket, relative to the home directory.
-pub(crate) const SOCKET: &str = ".config/abc/agent-broker/broker.sock";
+/// The brokers' sockets, relative to the home directory.
+pub(crate) const DIR: &str = ".config/abc/agent-broker";
+
+/// The most tokens one session's broker mints in an hour, the life of a token.
+pub(crate) const MAX_PER_HOUR: usize = 120;
+
+/// How long a client waits for the broker to stop, revoking its tokens.
+const STOP_PATIENCE: Duration = Duration::from_secs(60);
 
 /// The variable naming the broker's socket where a client runs: inside an agent VM, the guest end
 /// of the vsock forward.
@@ -47,9 +58,36 @@ const MAX_REQUEST: u64 = 64;
 /// How many reads of a kilobyte the broker makes to drop what is left of a refused request.
 const MAX_DRAIN_READS: usize = 64;
 
-/// The broker's socket for the home directory `home`.
-pub(crate) fn socket(home: &Path) -> PathBuf {
-    home.join(SOCKET)
+/// One session's broker sockets.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Sockets {
+    /// Where the session's VM asks for tokens, forwarded into it.
+    pub(crate) tokens: PathBuf,
+    /// Where the host stops the broker; never forwarded.
+    pub(crate) control: PathBuf,
+}
+
+/// The sockets of session `session`'s broker under the home directory `home`.
+pub(crate) fn sockets(home: &Path, session: &str) -> Sockets {
+    let dir = home.join(DIR);
+    Sockets {
+        tokens: dir.join(format!("{session}.sock")),
+        control: dir.join(format!("{session}.ctl")),
+    }
+}
+
+/// Fails unless `session` is a session's name, fit for a socket's file name.
+pub(crate) fn check_session(session: &str) -> anyhow::Result<()> {
+    let rest = session.strip_prefix("abc-").unwrap_or_default();
+    anyhow::ensure!(
+        !rest.is_empty()
+            && session.len() <= 64
+            && rest
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'),
+        "{session:?} is not a session's name (abc- and lowercase letters, digits or dashes)"
+    );
+    Ok(())
 }
 
 /// A token for `scope` from the broker whose socket [`ENV`] names.
@@ -100,32 +138,140 @@ fn exchange(mut stream: impl Read + Write, scope: Scope) -> anyhow::Result<Strin
     }
 }
 
-/// Serves tokens from `mint` on `socket` until the process ends, noting each request in `log`.
+/// The tokens a broker minted: when, to keep to its hourly limit, and which, to revoke them.
+#[derive(Debug, Default)]
+struct Ledger {
+    recent: VecDeque<Instant>,
+    minted: Vec<String>,
+}
+
+impl Ledger {
+    /// Admits one more token at `now` unless `limit` were minted in the hour before it.
+    fn admit(&mut self, now: Instant, limit: usize) -> anyhow::Result<()> {
+        while self
+            .recent
+            .front()
+            .is_some_and(|&then| now.duration_since(then) >= Duration::from_secs(3600))
+        {
+            self.recent.pop_front();
+        }
+        anyhow::ensure!(
+            self.recent.len() < limit,
+            "{limit} tokens were minted in the last hour, the most a session gets"
+        );
+        self.recent.push_back(now);
+        Ok(())
+    }
+}
+
+/// Serves session `session`'s tokens from `mint`, at most `limit` an hour, on `sockets` until a
+/// client of the control socket says `stop`; then revokes every token it minted with `revoke`,
+/// tells that client how many, and returns. Each request is noted in `log`.
 pub(crate) fn serve(
-    socket: &Path,
+    session: &str,
+    sockets: &Sockets,
     mint: impl Fn(Scope) -> anyhow::Result<String> + Sync,
+    revoke: impl Fn(&str) -> anyhow::Result<()>,
+    limit: usize,
     log: &mut (impl Write + Send),
 ) -> anyhow::Result<()> {
-    let listener = bind(socket)?;
+    let tokens = bind(&sockets.tokens)?;
+    let control = bind(&sockets.control)?;
     writeln!(
         log,
-        "broker: serving agent App tokens on {}",
-        socket.display()
+        "broker {session}: serving agent App tokens on {}",
+        sockets.tokens.display()
     )?;
-    let clients = listener.incoming().map(|client| {
-        let client = client?;
-        client.set_read_timeout(Some(PATIENCE))?;
-        client.set_write_timeout(Some(PATIENCE))?;
-        Ok(client)
-    });
-    answer_all(clients, &mint, &Mutex::new(log), MAX_CLIENTS);
+    let log = Mutex::new(log);
+    let ledger = Mutex::new(Ledger::default());
+    let stopping = AtomicBool::new(false);
+    let metered = |scope: Scope| -> anyhow::Result<String> {
+        ledger
+            .lock()
+            .map_err(|poisoned| anyhow!("the broker's ledger is poisoned: {poisoned}"))?
+            .admit(Instant::now(), limit)?;
+        let token = mint(scope)?;
+        ledger
+            .lock()
+            .map_err(|poisoned| anyhow!("the broker's ledger is poisoned: {poisoned}"))?
+            .minted
+            .push(token.clone());
+        Ok(token)
+    };
+    let mut asker = std::thread::scope(|scope| {
+        scope.spawn(|| {
+            let clients = tokens
+                .incoming()
+                .take_while(|_| !stopping.load(Ordering::SeqCst))
+                .map(|client| {
+                    let client = client?;
+                    client.set_read_timeout(Some(PATIENCE))?;
+                    client.set_write_timeout(Some(PATIENCE))?;
+                    Ok(client)
+                });
+            answer_all(session, clients, &metered, &log, MAX_CLIENTS);
+        });
+        let asker = await_stop(&control);
+        stopping.store(true, Ordering::SeqCst);
+        // Wakes the token loop, which then sees it is stopping.
+        let _woken = UnixStream::connect(&sockets.tokens);
+        asker
+    })?;
+    let minted = std::mem::take(
+        &mut ledger
+            .lock()
+            .map_err(|poisoned| anyhow!("the broker's ledger is poisoned: {poisoned}"))?
+            .minted,
+    );
+    let revoked = minted.iter().filter(|token| revoke(token).is_ok()).count();
+    let summary = format!("revoked {revoked} of {} tokens", minted.len());
+    note_line(&log, &format!("broker {session}: stopped; {summary}"));
+    // The client may be gone; the tokens are revoked either way.
+    let _told = writeln!(asker, "stopped {summary}");
+    for socket in [&sockets.tokens, &sockets.control] {
+        let _removed = fs::remove_file(socket);
+    }
     Ok(())
+}
+
+/// Waits on `control` for a client that says `stop`, refusing anything else, and returns it.
+fn await_stop(control: &UnixListener) -> anyhow::Result<UnixStream> {
+    for client in control.incoming() {
+        let Ok(mut client) = client else { continue };
+        if client.set_read_timeout(Some(PATIENCE)).is_err() {
+            continue;
+        }
+        let mut line = String::new();
+        let read = BufReader::new((&mut client).take(MAX_REQUEST)).read_line(&mut line);
+        if read.is_ok() && line == "stop\n" {
+            return Ok(client);
+        }
+        refuse(&mut client, "the control socket understands only `stop`");
+    }
+    bail!("the broker's control socket closed")
+}
+
+/// Stops the broker whose control socket is `control`, which revokes its tokens; returns what it
+/// says it revoked.
+pub(crate) fn stop(control: &Path) -> anyhow::Result<String> {
+    let mut stream = UnixStream::connect(control)
+        .with_context(|| format!("no broker listens on {}", control.display()))?;
+    stream.set_read_timeout(Some(STOP_PATIENCE))?;
+    stream.write_all(b"stop\n")?;
+    let mut answer = String::new();
+    BufReader::new(stream).read_line(&mut answer)?;
+    answer
+        .trim_end()
+        .strip_prefix("stopped ")
+        .map(str::to_owned)
+        .with_context(|| format!("the broker did not stop: {answer:?}"))
 }
 
 /// Answers each of `clients` with a token from `mint`, each on its own thread and at most `max` at
 /// once, noting each in `log`. A client that fails or comes while `max` are being served is noted
 /// and refused.
 fn answer_all(
+    session: &str,
     clients: impl Iterator<Item = std::io::Result<UnixStream>>,
     mint: &(impl Fn(Scope) -> anyhow::Result<String> + Sync),
     log: &Mutex<&mut (impl Write + Send)>,
@@ -138,6 +284,7 @@ fn answer_all(
                 Ok(client) => client,
                 Err(error) => {
                     note(
+                        session,
                         log,
                         Err(anyhow!(error).context("could not accept a connection")),
                     );
@@ -147,24 +294,33 @@ fn answer_all(
             if serving.fetch_add(1, Ordering::SeqCst) >= max {
                 serving.fetch_sub(1, Ordering::SeqCst);
                 refuse(&mut client, "the broker is busy; try again");
-                note(log, Err(anyhow!("{max} clients are being served already")));
+                note(
+                    session,
+                    log,
+                    Err(anyhow!("{max} clients are being served already")),
+                );
                 continue;
             }
             let serving = &serving;
             scope.spawn(move || {
-                note(log, answer(client, mint));
+                note(session, log, answer(client, mint));
                 serving.fetch_sub(1, Ordering::SeqCst);
             });
         }
     });
 }
 
-/// Notes one client's `outcome` in `log`.
-fn note(log: &Mutex<&mut (impl Write + Send)>, outcome: anyhow::Result<Scope>) {
+/// Notes one client's `outcome` in `log`, naming the session.
+fn note(session: &str, log: &Mutex<&mut (impl Write + Send)>, outcome: anyhow::Result<Scope>) {
     let line = match outcome {
-        Ok(scope) => format!("broker: minted a {} token", scope.name()),
-        Err(error) => format!("broker: refused a request: {error:#}"),
+        Ok(scope) => format!("broker {session}: minted a {} token", scope.name()),
+        Err(error) => format!("broker {session}: refused a request: {error:#}"),
     };
+    note_line(log, &line);
+}
+
+/// Writes `line` to `log`.
+fn note_line(log: &Mutex<&mut (impl Write + Send)>, line: &str) {
     if let Ok(mut log) = log.lock() {
         // With the log gone there is nowhere left to note it; the client got its answer.
         let _noted = writeln!(log, "{line}");
@@ -266,7 +422,10 @@ mod tests {
     use std::path::Path;
     use std::sync::Mutex;
 
-    use super::{SOCKET, answer, answer_all, exchange, request, serve, socket};
+    use super::{
+        DIR, Ledger, Sockets, answer, answer_all, check_session, exchange, request, serve, sockets,
+        stop,
+    };
     use crate::app::Scope;
 
     /// The broker's answer to `request`, with `mint` minting, and the scope it reports.
@@ -348,6 +507,7 @@ mod tests {
         ];
         let mut log = Vec::new();
         answer_all(
+            "abc-w",
             clients.into_iter(),
             &|_| Ok("ghs_secret".to_owned()),
             &Mutex::new(&mut log),
@@ -368,9 +528,9 @@ mod tests {
         assert_eq!(
             lines,
             [
-                "broker: minted a git token",
-                "broker: refused a request: could not accept a connection: accept failed",
-                "broker: refused a request: no scope is named \"root\"",
+                "broker abc-w: minted a git token",
+                "broker abc-w: refused a request: could not accept a connection: accept failed",
+                "broker abc-w: refused a request: no scope is named \"root\"",
             ],
             "every request is noted"
         );
@@ -386,6 +546,7 @@ mod tests {
         let broker = std::thread::spawn(move || {
             let mut log = Vec::new();
             answer_all(
+                "abc-w",
                 vec![Ok(hung_server), Ok(waiting_server)].into_iter(),
                 &|_| Ok("ghs_x".to_owned()),
                 &Mutex::new(&mut log),
@@ -403,7 +564,7 @@ mod tests {
         broker.join().unwrap();
         let log = served.recv().unwrap();
         assert!(
-            log.contains("broker: refused a request: 1 clients are being served already"),
+            log.contains("broker abc-w: refused a request: 1 clients are being served already"),
             "{log}"
         );
     }
@@ -494,60 +655,162 @@ mod tests {
     }
 
     #[test]
-    fn listens_under_the_home_directory() {
+    fn each_session_has_its_own_sockets() {
         assert_eq!(
-            socket(Path::new("/home/a")),
-            Path::new("/home/a").join(SOCKET)
+            sockets(Path::new("/home/a"), "abc-w"),
+            Sockets {
+                tokens: Path::new("/home/a").join(DIR).join("abc-w.sock"),
+                control: Path::new("/home/a").join(DIR).join("abc-w.ctl"),
+            }
         );
+        check_session("abc-s0-microvm").unwrap();
+        for bad in [
+            "abc-",
+            "w",
+            "abc-W",
+            "abc-a/b",
+            "abc-a.sock",
+            &format!("abc-{}", "a".repeat(61)),
+        ] {
+            assert!(check_session(bad).is_err(), "{bad}");
+        }
+        check_session(&format!("abc-{}", "a".repeat(60))).unwrap();
     }
 
     #[test]
-    fn serves_on_a_socket_only_its_owner_reaches() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("agent-broker/b.sock");
-        let served = path.clone();
-        std::thread::spawn(move || {
+    fn keeps_to_its_hourly_limit() {
+        let mut ledger = Ledger::default();
+        let start = std::time::Instant::now();
+        ledger.admit(start, 2).unwrap();
+        ledger.admit(start, 2).unwrap();
+        let error = format!("{:#}", ledger.admit(start, 2).unwrap_err());
+        assert_eq!(
+            error,
+            "2 tokens were minted in the last hour, the most a session gets"
+        );
+        let almost = start + std::time::Duration::from_secs(3599);
+        assert!(ledger.admit(almost, 2).is_err(), "not yet an hour");
+        let later = start + std::time::Duration::from_secs(3600);
+        ledger.admit(later, 2).unwrap();
+        assert_eq!(ledger.recent.len(), 1, "the old ones aged out");
+    }
+
+    /// A broker for session `abc-w` under `dir`, minting `ghs_<scope><n>` at most `limit` an
+    /// hour and recording what it revokes; returns its sockets, the revocations and its thread.
+    fn broker(
+        dir: &Path,
+        limit: usize,
+    ) -> (
+        Sockets,
+        std::sync::Arc<Mutex<Vec<String>>>,
+        std::thread::JoinHandle<String>,
+    ) {
+        let sockets = sockets(dir, "abc-w");
+        let paths = Sockets {
+            tokens: sockets.tokens.clone(),
+            control: sockets.control.clone(),
+        };
+        let revoked = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let record = std::sync::Arc::clone(&revoked);
+        let thread = std::thread::spawn(move || {
+            let count = std::sync::atomic::AtomicUsize::new(0);
+            let mut log = Vec::new();
             serve(
-                &served,
-                |scope| match scope {
-                    Scope::Git => Ok("ghs_git".to_owned()),
-                    Scope::Gh => anyhow::bail!("no gh today"),
+                "abc-w",
+                &paths,
+                |scope| {
+                    let n = count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    match scope {
+                        Scope::Git => Ok(format!("ghs_git{n}")),
+                        Scope::Gh => anyhow::bail!("no gh today"),
+                    }
                 },
-                &mut std::io::sink(),
+                |token| {
+                    record.lock().unwrap().push(token.to_owned());
+                    anyhow::ensure!(token != "ghs_git1", "already gone");
+                    Ok(())
+                },
+                limit,
+                &mut log,
             )
+            .unwrap();
+            String::from_utf8(log).unwrap()
         });
-        while UnixStream::connect(&path).is_err() {
+        while UnixStream::connect(&sockets.control).is_err() {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        assert_eq!(request(&path, Scope::Git).unwrap(), "ghs_git");
-        let refused = format!("{:#}", request(&path, Scope::Gh).unwrap_err());
-        assert!(refused.contains("no gh today"), "{refused}");
-        let mode = |file: &Path| std::fs::metadata(file).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode(&path), 0o600, "the socket");
-        assert_eq!(mode(path.parent().unwrap()), 0o700, "its directory");
-        let again = format!(
-            "{:#}",
-            serve(&path, |_| Ok(String::new()), &mut std::io::sink()).unwrap_err()
-        );
-        assert!(again.contains("already listening"), "{again}");
+        (sockets, revoked, thread)
     }
 
     #[test]
-    fn replaces_a_stale_socket() {
+    fn serves_a_session_then_revokes_its_tokens_on_stop() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("b.sock");
-        drop(std::os::unix::net::UnixListener::bind(&path).unwrap());
-        let served = path.clone();
-        std::thread::spawn(move || {
-            serve(&served, |_| Ok("ghs_x".to_owned()), &mut std::io::sink())
-        });
-        let token = loop {
-            if let Ok(token) = request(&path, Scope::Gh) {
-                break token;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        };
-        assert_eq!(token, "ghs_x");
+        let (sockets, revoked, thread) = broker(dir.path(), 2);
+        assert_eq!(request(&sockets.tokens, Scope::Git).unwrap(), "ghs_git0");
+        assert_eq!(request(&sockets.tokens, Scope::Git).unwrap(), "ghs_git1");
+        let limited = format!("{:#}", request(&sockets.tokens, Scope::Git).unwrap_err());
+        assert!(
+            limited.contains("2 tokens were minted in the last hour"),
+            "{limited}"
+        );
+        let refused = format!("{:#}", request(&sockets.tokens, Scope::Gh).unwrap_err());
+        assert!(
+            refused.contains("tokens were minted"),
+            "the limit counts every ask: {refused}"
+        );
+        let mode = |file: &Path| std::fs::metadata(file).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&sockets.tokens), 0o600, "the token socket");
+        assert_eq!(mode(&sockets.control), 0o600, "the control socket");
+        assert_eq!(
+            mode(sockets.tokens.parent().unwrap()),
+            0o700,
+            "their directory"
+        );
+        let mut wrong = UnixStream::connect(&sockets.control).unwrap();
+        wrong.write_all(b"mint\n").unwrap();
+        let mut said = String::new();
+        wrong.read_to_string(&mut said).unwrap();
+        assert!(said.starts_with("error "), "{said}");
+        assert_eq!(stop(&sockets.control).unwrap(), "revoked 1 of 2 tokens");
+        let log = thread.join().unwrap();
+        assert_eq!(*revoked.lock().unwrap(), ["ghs_git0", "ghs_git1"]);
+        assert!(log.contains("broker abc-w: minted a git token"), "{log}");
+        assert!(
+            log.contains("broker abc-w: stopped; revoked 1 of 2 tokens"),
+            "{log}"
+        );
+        assert!(!log.contains("ghs_"), "no token is logged: {log}");
+        assert!(
+            !sockets.tokens.exists() && !sockets.control.exists(),
+            "sockets removed"
+        );
+        let gone = format!("{:#}", stop(&sockets.control).unwrap_err());
+        assert!(gone.contains("no broker listens"), "{gone}");
+    }
+
+    #[test]
+    fn refuses_a_second_broker_and_replaces_a_stale_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let stale = sockets(dir.path(), "abc-w");
+        std::fs::create_dir_all(stale.tokens.parent().unwrap()).unwrap();
+        drop(std::os::unix::net::UnixListener::bind(&stale.tokens).unwrap());
+        let (sockets, _, thread) = broker(dir.path(), 5);
+        assert_eq!(request(&sockets.tokens, Scope::Git).unwrap(), "ghs_git0");
+        let again = format!(
+            "{:#}",
+            serve(
+                "abc-w",
+                &sockets,
+                |_| Ok(String::new()),
+                |_| Ok(()),
+                1,
+                &mut std::io::sink()
+            )
+            .unwrap_err()
+        );
+        assert!(again.contains("already listening"), "{again}");
+        stop(&sockets.control).unwrap();
+        thread.join().unwrap();
     }
 
     #[test]
@@ -563,15 +826,11 @@ mod tests {
             "an empty value counts as unset: {empty}"
         );
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("b.sock");
-        let served = path.clone();
-        std::thread::spawn(move || {
-            serve(&served, |_| Ok("ghs_v".to_owned()), &mut std::io::sink())
-        });
-        while UnixStream::connect(&path).is_err() {
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
+        let (sockets, _, thread) = broker(dir.path(), 5);
+        let path = sockets.tokens.clone();
         let named = |name: &str| (name == super::ENV).then(|| path.clone().into_os_string());
-        assert_eq!(super::token_from(named, Scope::Gh).unwrap(), "ghs_v");
+        assert_eq!(super::token_from(named, Scope::Git).unwrap(), "ghs_git0");
+        stop(&sockets.control).unwrap();
+        thread.join().unwrap();
     }
 }

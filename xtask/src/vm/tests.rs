@@ -120,7 +120,27 @@ struct World {
     root: PathBuf,
     worktree: PathBuf,
     host: Host,
-    _broker: UnixListener,
+    _home: tempfile::TempDir,
+    _broker: std::thread::JoinHandle<()>,
+}
+
+/// A broker for session `abc-w` under `home` that answers every stop as the real one does.
+fn fake_broker(home: &Path) -> std::thread::JoinHandle<()> {
+    let sockets = crate::broker::sockets(home, "abc-w");
+    std::fs::create_dir_all(sockets.control.parent().unwrap()).unwrap();
+    let control = UnixListener::bind(&sockets.control).unwrap();
+    std::thread::spawn(move || {
+        for client in control.incoming() {
+            let Ok(mut client) = client else { return };
+            let mut line = String::new();
+            let read =
+                std::io::BufRead::read_line(&mut std::io::BufReader::new(&client), &mut line);
+            if read.is_ok() && line == "stop\n" {
+                let _told =
+                    std::io::Write::write_all(&mut client, b"stopped revoked 0 of 0 tokens\n");
+            }
+        }
+    })
 }
 
 fn world(token: &str) -> World {
@@ -164,13 +184,13 @@ fn world(token: &str) -> World {
         )
     };
     script(&security, &body);
-    let socket = root.join("b.sock");
-    let broker = UnixListener::bind(&socket).unwrap();
+    // Socket paths are short on macOS: the home lives under /tmp.
+    let home = tempfile::Builder::new().tempdir_in("/tmp").unwrap();
     let host = Host {
         os: Os::MacOs,
         repo: main,
         state: root.join("state"),
-        broker_socket: socket,
+        home: home.path().to_path_buf(),
         broker_exe: root.join("no-broker"),
         secret: (
             security,
@@ -181,8 +201,10 @@ fn world(token: &str) -> World {
         builder: root.join("container"),
         patience: 3,
     };
+    let broker = fake_broker(&host.home);
     World {
         _dir: dir,
+        _home: home,
         root,
         worktree,
         host,
@@ -262,15 +284,23 @@ fn starts_a_session_with_its_token_and_checks_the_subscription() {
         spec.mounts,
         [
             (world.worktree.clone(), world.worktree.clone()),
-            (world.root.join("state/w/git"), world.root.join("main/.git")),
+            (world.root.join("state/w/git"), PathBuf::from("/abc/git")),
         ]
     );
-    assert_eq!(spec.vsock, (world.root.join("b.sock"), 5000));
+    assert_eq!(
+        spec.vsock,
+        (
+            crate::broker::sockets(&world.host.home, "abc-w").tokens,
+            5000
+        ),
+        "the session's own broker"
+    );
     let env: Vec<String> = spec.env.iter().map(|(k, v)| format!("{k}={v}")).collect();
     for expected in [
         "ABC_VM=1".to_owned(),
         format!("ABC_WORKTREE={}", world.worktree.display()),
-        "ABC_AGENT_BROKER=/run/abc/broker.sock".to_owned(),
+        "ABC_AGENT_BROKER=/run/abc/agent/broker.sock".to_owned(),
+        format!("ABC_GIT_COMMON={}", world.root.join("main/.git").display()),
         "ABC_BROKER_VSOCK_PORT=5000".to_owned(),
         "ABC_TEST_DATABASE_URL=postgres://abc_test@127.0.0.1:5432/postgres".to_owned(),
     ] {
@@ -312,8 +342,39 @@ fn a_running_session_is_reused() {
         ready: true,
         ..Fake::default()
     };
-    start_ok(&world, &backend);
+    let out = start_ok(&world, &backend);
     assert!(backend.started.borrow().is_empty());
+    assert!(out.contains("refreshed only while it is stopped"), "{out}");
+    assert!(
+        !world.root.join("state/w/git").exists(),
+        "the host leaves a running VM's repository alone"
+    );
+}
+
+#[test]
+fn mounts_only_plain_paths_outside_the_guests_system_directories() {
+    for good in ["/Users/m/abc", "/home/m/abc", "/srv/work/abc-x"] {
+        super::check_mount_paths(&[Path::new(good)]).unwrap();
+    }
+    for bad in [
+        "relative/path",
+        "/Users/m/a:b",
+        "/Users/m/a,b",
+        "/Users/m/a=b",
+        "/Users/m/../etc",
+        "/usr/local/bin",
+        "/home/agent/x",
+        "/abc/git",
+        "/run/abc",
+        "/etc",
+        "/x",
+        "/",
+    ] {
+        assert!(
+            super::check_mount_paths(&[Path::new(bad)]).is_err(),
+            "{bad}"
+        );
+    }
 }
 
 #[test]
@@ -359,11 +420,12 @@ fn gives_up_on_a_vm_that_never_gets_ready() {
 #[test]
 fn starts_the_installed_broker_when_none_listens() {
     let mut world = world("t");
-    world.host.broker_socket = world.root.join("silent.sock");
+    let silent = tempfile::Builder::new().tempdir_in("/tmp").unwrap();
+    world.host.home = silent.path().to_path_buf();
     let backend = Fake::default();
     let missing = start_error(&world, &backend);
     assert!(
-        missing.contains("not running and not installed"),
+        missing.contains("the token broker is not installed"),
         "{missing}"
     );
     let marker = world.root.join("started");
@@ -374,7 +436,10 @@ fn starts_the_installed_broker_when_none_listens() {
     world.host.patience = 100;
     let stopped = start_error(&world, &backend);
     assert!(stopped.contains("the token broker stopped"), "{stopped}");
-    assert_eq!(std::fs::read_to_string(marker).unwrap(), "broker\n");
+    assert_eq!(
+        std::fs::read_to_string(marker).unwrap(),
+        "broker --session abc-w\n"
+    );
     script(&world.host.broker_exe, "sleep 30\n");
     world.host.patience = 2;
     let stuck = start_error(&world, &backend);
@@ -528,10 +593,7 @@ fn finds_its_places_on_this_host() {
     let env = |name: &str| (name == "XDG_STATE_HOME").then(|| OsString::from("/xdg/state"));
     let host = Host::this(Path::new("/repo"), Path::new("/home/m"), &env).unwrap();
     assert_eq!(host.state, Path::new("/xdg/state/abc/vm"));
-    assert_eq!(
-        host.broker_socket,
-        Path::new("/home/m/.config/abc/agent-broker/broker.sock")
-    );
+    assert_eq!(host.home, Path::new("/home/m"));
     assert_eq!(
         host.broker_exe,
         Path::new("/home/m/.local/share/abc/broker/bin/xtask")
