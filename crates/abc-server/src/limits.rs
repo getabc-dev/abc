@@ -80,6 +80,11 @@ mod tests {
         assert!(limiter.allow("b"), "another key has its own");
         tokio::time::advance(WINDOW).await;
         assert!(limiter.allow("a"), "a new window, a new quota");
+        assert_eq!(
+            limiter.windows.lock().unwrap().len(),
+            2,
+            "a few keys are kept, not pruned on every request"
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -88,7 +93,8 @@ mod tests {
         for key in 0..PRUNE_AT - 1 {
             assert!(limiter.allow(key), "{key}");
         }
-        tokio::time::advance(WINDOW + Duration::from_secs(1)).await;
+        // Exactly one window later: the old windows have just ended.
+        tokio::time::advance(WINDOW).await;
         assert!(limiter.allow(PRUNE_AT), "a fresh key");
         assert!(limiter.allow(PRUNE_AT + 1), "another, which prunes");
         assert_eq!(
