@@ -8,6 +8,7 @@ mod guard;
 mod hook;
 mod integrity;
 mod mutants;
+mod postgres;
 mod review;
 mod rulesets;
 mod shell;
@@ -255,13 +256,7 @@ fn run(
     } = invocation;
     let env = |name: &str| (invocation.env)(name);
     match task {
-        Task::Check { changed } => Ok(verdict(check::run(
-            root,
-            changed,
-            &tool("cargo-nextest")?,
-            None,
-            report,
-        )?)),
+        Task::Check { changed } => Ok(verdict(check(root, changed, tool, report)?)),
         Task::Coverage { base } => Ok(verdict(coverage::run(
             root,
             &base,
@@ -349,6 +344,27 @@ fn run(
             Ok(ExitCode::from(hook::run(event, &input, &context, report)?))
         }
     }
+}
+
+/// `cargo xtask check` on `root`, with the pinned tools `tool` finds and the warm Postgres.
+fn check(
+    root: &Path,
+    changed: bool,
+    tool: &dyn Fn(&str) -> anyhow::Result<PathBuf>,
+    report: &mut impl Write,
+) -> anyhow::Result<bool> {
+    let postgres = check::Postgres {
+        warm: &postgres::warm,
+        sqlx: &|| tool("cargo-sqlx"),
+    };
+    check::run(
+        root,
+        changed,
+        &tool("cargo-nextest")?,
+        &postgres,
+        None,
+        report,
+    )
 }
 
 /// `cargo xtask integrity`: in CI, for pull request `pr`, with GitHub Actions' variables from

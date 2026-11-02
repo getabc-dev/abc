@@ -111,6 +111,9 @@ pub(crate) fn run(
         fs::remove_dir_all(&results)
             .with_context(|| format!("could not remove {}", results.display()))?;
     }
+    if crate::postgres::needed(root) {
+        crate::postgres::warm(out)?;
+    }
     let diff_file = output.join("changes.diff");
     fs::write(&diff_file, &diff).context("could not write the diff for cargo-mutants")?;
     writeln!(out, "xtask: mutating the changed Rust code")?;

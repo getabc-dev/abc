@@ -108,7 +108,7 @@ watchdog compares the diff with that task and the rules above, and keeps it work
 | --- | --- |
 | `cargo xtask setup [TOOLS]` | Installs the tools pinned in `xtask/tools.toml` into `.tools/`, checking the sha256 of each archive or crate and of the executable. Run it in every new clone or worktree, and after the list changes. It never touches git config. |
 | `cargo xtask doctor [TOOLS]` | Fails unless every pinned tool, or each one named, is installed, matches its pinned sha256 and reports its pinned version. |
-| `cargo xtask check` | Format check, clippy (`--all-targets --locked -D warnings`), nextest, doctests and rustdoc with warnings denied, on the whole workspace. Property tests run with a fixed seed. |
+| `cargo xtask check` | Format check, clippy (`--all-targets --locked -D warnings`), nextest, sqlx's query cache check, doctests and rustdoc with warnings denied, on the whole workspace. Property tests run with a fixed seed. Database tests use the warm Postgres 18 container (below). |
 | `cargo xtask check --changed` | The same, limited to the crates affected by changes since the merge base with the default branch (`upstream/HEAD`, else `origin/HEAD`). |
 | `cargo xtask integrity --base <rev> [--description <file>]` | Lists deleted test files and tests, newly skipped or `should_panic` tests, tests with fewer assertions, and changed gate files since the merge base. In CI it fails on any of them unless an approver listed in `.github/integrity-approvers` at the merge base labelled the PR `integrity-approved` after its last push and last description edit; a run for a description edit treats any earlier label as stale. Each flagged test change also needs a reason in the PR description, label or not (below). |
 | `cargo xtask coverage --base <rev>` | Runs the tests under cargo-llvm-cov and fails unless 90% of the changed, instrumented lines of shipped code are covered, listing the ones that are not. Test code (`#[cfg(test)]` items, test functions, test modules in their own files, `tests/`) does not count. |
@@ -125,6 +125,17 @@ watchdog compares the diff with that task and the rules above, and keeps it work
 
 The gates take `--root <path>` to check another tree with the pinned tools of the checkout xtask
 was built from.
+
+Database tests get a fresh, uniquely named database each (`abc_store::testing::TestDatabase`) on
+the server `ABC_TEST_DATABASE_URL` names. `.cargo/config.toml` sets it to one warm Postgres 18
+container per machine, `abc-postgres` on `127.0.0.1:55432`: the pinned `postgres:18.6` image,
+`--restart unless-stopped`, data on tmpfs, and trust authentication published on loopback only,
+so nothing off the machine can reach it. `check`, `coverage` and `mutants` start it with Docker
+when it is not running; setting `ABC_TEST_DATABASE_URL` points the tests at another server instead,
+and a `DATABASE_URL` is never used. Test databases are dropped when their test ends, and leftovers
+of killed runs (`abc_test_*`, `abc_query_cache_*`) are swept after a day. sqlx's query macros
+always read the committed `.sqlx/` cache (`SQLX_OFFLINE`), and `check` fails when a cache no
+longer matches its queries, saying how to regenerate it.
 
 CI runs `check`, `integrity`, `coverage`, `mutants` (in eight shards, reported as one `Mutants`
 check) and `review` on every pull request, and `cargo xtask tool cargo-deny check`, `cargo xtask

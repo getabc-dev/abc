@@ -97,6 +97,8 @@ pub(crate) struct Tool {
     crate_name: Option<String>,
     /// Lowercase hex sha256 of the `.crate` file, as the crates.io index records it.
     sha256: Option<String>,
+    /// For a crate: the features to build it with, instead of its default features.
+    features: Option<Vec<String>>,
     /// The arguments that make the executable print its version, for cargo subcommands that
     /// expect their own name first. `--version` when absent.
     #[serde(rename = "version-args")]
@@ -304,7 +306,7 @@ impl Tool {
 
     fn source(&self) -> anyhow::Result<Source<'_>> {
         match (&self.url, &self.crate_name, &self.sha256) {
-            (Some(url), None, None) => Ok(Source::Release { url }),
+            (Some(url), None, None) if self.features.is_none() => Ok(Source::Release { url }),
             (None, Some(name), Some(sha256))
                 if self.targets.is_empty()
                     && self.binary.is_none()
@@ -315,7 +317,7 @@ impl Tool {
             }
             _ => bail!(
                 "set either `url` with `targets` for release assets, or `crate` with `sha256` \
-                 alone for a crate built from crates.io"
+                 (and optionally `features`) for a crate built from crates.io"
             ),
         }
     }
@@ -857,8 +859,15 @@ fn build_crate(root: &Path, tool: &Tool, name: &str, archive: &[u8]) -> anyhow::
     tar::Archive::new(GzDecoder::new(archive))
         .unpack(&sources)
         .context("the crate is not a gzipped tarball")?;
-    let status = Command::new(crate::check::cargo())
-        .args(["install", "--locked", "--quiet", "--path"])
+    let mut install = Command::new(crate::check::cargo());
+    install.args(["install", "--locked", "--quiet"]);
+    if let Some(features) = &tool.features {
+        install
+            .args(["--no-default-features", "--features"])
+            .arg(features.join(","));
+    }
+    let status = install
+        .arg("--path")
         .arg(sources.join(format!("{name}-{}", tool.version)))
         .arg("--root")
         .arg(work.join("root"))
@@ -1584,6 +1593,41 @@ targets.aarch64-unknown-linux-gnu = {{ platform = "linux-arm64", sha256 = "{sha2
     }
 
     #[test]
+    fn installs_a_crate_tool_with_only_the_pinned_features() {
+        let root = tempfile::tempdir().unwrap();
+        let archive = tarball(&[
+            (
+                "fake-1.2.3/Cargo.toml",
+                b"[package]\nname = \"fake\"\nversion = \"1.2.3\"\nedition = \"2021\"\n\n[features]\ndefault = [\"wrong\"]\nwrong = []\nright = []\n",
+                0o644,
+            ),
+            (
+                "fake-1.2.3/Cargo.lock",
+                b"version = 3\n\n[[package]]\nname = \"fake\"\nversion = \"1.2.3\"\n",
+                0o644,
+            ),
+            (
+                "fake-1.2.3/src/main.rs",
+                b"fn main() {\n    if cfg!(feature = \"right\") && !cfg!(feature = \"wrong\") {\n        println!(\"fake 1.2.3\");\n    }\n}\n",
+                0o644,
+            ),
+        ]);
+        let text = format!(
+            "{}features = [\"right\"]\n",
+            crate_manifest(&sha256_hex(&archive))
+        );
+        let manifest = Manifest::parse(&text).unwrap();
+        assert_eq!(install_from(root.path(), &manifest, &archive), 1, "built");
+        assert_eq!(
+            only_tool(&manifest)
+                .status(root.path(), Target::MacArm64)
+                .unwrap(),
+            Status::Ready,
+            "built with the pinned feature and without the default one"
+        );
+    }
+
+    #[test]
     fn crate_tools_are_validated() {
         Manifest::parse(&crate_manifest(SHA_A)).unwrap();
         let mixed = crate_manifest(SHA_A).replace("crate =", "url = \"https://x\"\ncrate =");
@@ -1595,6 +1639,14 @@ targets.aarch64-unknown-linux-gnu = {{ platform = "linux-arm64", sha256 = "{sha2
             format!("{:#}", Manifest::parse(&crate_manifest("abc")).unwrap_err())
                 .contains("sha256 must be"),
             "the crate's sha256 is checked"
+        );
+        let release = manifest_text(SHA_A, SHA_B).replace(
+            "[[tool]]\nname = \"fake\"\n",
+            "[[tool]]\nname = \"fake\"\nfeatures = [\"x\"]\n",
+        );
+        assert!(
+            format!("{:#}", Manifest::parse(&release).unwrap_err()).contains("set either `url`"),
+            "features are for crates only"
         );
         for release_only in [
             "binary = \"fake\"",
