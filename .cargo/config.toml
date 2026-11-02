@@ -1,3 +1,13 @@
 [alias]
 # --locked: never rewrite Cargo.lock as a side effect of running a check or a hook.
 xtask = "run --quiet --locked --package xtask --"
+
+[env]
+# sqlx's query macros read the committed query cache (.sqlx/), never a live database, so every
+# build is the same everywhere; `cargo xtask check` keeps the cache current.
+SQLX_OFFLINE = "true"
+# Database tests create a fresh database per test on this server: the warm Postgres 18 container
+# that xtask starts once per machine (D7), or CI's service on the same port. Its own name keeps a
+# developer's DATABASE_URL from ever receiving test databases; setting it in the environment
+# points the tests at another Postgres 18 server.
+ABC_TEST_DATABASE_URL = "postgres://postgres@127.0.0.1:55432/postgres"

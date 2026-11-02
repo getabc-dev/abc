@@ -1,0 +1,18 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO setup_code (singleton, digest, owner_id, workspace_id, expires_at,\n                    changed_at)\n                 VALUES (true, $1, $2, $3, $4, $5)\n                 ON CONFLICT (singleton) DO UPDATE SET digest = EXCLUDED.digest,\n                    owner_id = EXCLUDED.owner_id, workspace_id = EXCLUDED.workspace_id,\n                    expires_at = EXCLUDED.expires_at, changed_at = EXCLUDED.changed_at",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Bytea",
+        "Uuid",
+        "Uuid",
+        "Timestamptz",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "8eabb3050036389770157d4180c9781107a652d40f1cb16a86a850222fab04bd"
+}

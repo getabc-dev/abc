@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE worker SET open_session = NULL, last_session_ended_at = $3, changed_at = $4\n                 WHERE id = $1 AND open_session = $2",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Timestamptz",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "f4ed4cf9de2c351263f9bd758496e732a286437ae40b4734dbf41ed5a328c27c"
+}

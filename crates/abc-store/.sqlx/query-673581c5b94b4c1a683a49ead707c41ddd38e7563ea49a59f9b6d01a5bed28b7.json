@@ -1,0 +1,21 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT EXISTS (SELECT 1 FROM installation) AS \"claimed!\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "claimed!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "673581c5b94b4c1a683a49ead707c41ddd38e7563ea49a59f9b6d01a5bed28b7"
+}

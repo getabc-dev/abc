@@ -3,3 +3,7 @@ allow-unwrap-in-tests = true
 allow-expect-in-tests = true
 allow-panic-in-tests = true
 allow-indexing-slicing-in-tests = true
+# Methods with one sanctioned call site, which expects this lint with its reason.
+disallowed-methods = [
+    { path = "abc_store::Store::issue_setup_code", reason = "only the host operator's `abc server setup-code` mints a setup code; the running server never holds one" },
+]
