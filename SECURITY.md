@@ -28,7 +28,7 @@ Include what you can of:
 - We confirm the issue, fix it on `main` and add a test that fails without the fix.
 - We publish the advisory once the fix has landed, at a time agreed with you, and credit you unless
   you ask us not to.
-- abc is funded by donations and has no bug bounty.
+- abc has no bug bounty.
 
 ## Scope
 
