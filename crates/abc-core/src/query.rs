@@ -243,6 +243,25 @@ pub struct WorkerIdentity {
     pub workspace: WorkspaceId,
 }
 
+/// Whether the server has an owner yet: what the server logs at start. Server only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InstallationStatus;
+query!(
+    InstallationStatus,
+    ReadAction::ViewAsServer,
+    InstallationState,
+    |_s| Scope::Installation
+);
+
+/// The answer to [`InstallationStatus`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstallationState {
+    /// No one has claimed it: `abc server setup-code` gives the operator a code.
+    Unclaimed,
+    /// It has an owner.
+    Claimed,
+}
+
 /// Every worker with an open session, across workspaces: the boot sweep's input. Server only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OpenSessions;

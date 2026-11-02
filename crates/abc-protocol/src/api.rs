@@ -76,10 +76,16 @@ pub enum ApiCode {
     EnrolmentTokenRevoked,
     /// The enrolment token was already used by another machine.
     EnrolmentTokenUsed,
+    /// Another worker already enrolled with this key. Generate a new key and enrol again.
+    WorkerKeyInUse,
 
     // Domain rules.
     /// The token was already redeemed: revoke the worker instead.
     EnrolmentTokenAlreadyRedeemed,
+
+    // Load.
+    /// Too many requests from this source or for this worker. Retry later.
+    RateLimited,
 
     // The server.
     /// The server is starting, draining, or cannot reach its database. Retry.
@@ -90,7 +96,7 @@ pub enum ApiCode {
 
 impl ApiCode {
     /// Every code, for exhaustive tests on both sides of the wire.
-    pub const ALL: [Self; 23] = [
+    pub const ALL: [Self; 25] = [
         Self::MalformedRequest,
         Self::CrossSiteRequest,
         Self::NotFound,
@@ -111,7 +117,9 @@ impl ApiCode {
         Self::EnrolmentTokenExpired,
         Self::EnrolmentTokenRevoked,
         Self::EnrolmentTokenUsed,
+        Self::WorkerKeyInUse,
         Self::EnrolmentTokenAlreadyRedeemed,
+        Self::RateLimited,
         Self::Unavailable,
         Self::Internal,
     ];

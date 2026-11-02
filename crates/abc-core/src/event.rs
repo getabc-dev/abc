@@ -90,7 +90,7 @@ pub struct NegativePosition(i64);
 /// The kinds of stream in the log. The `stream_kind` CHECK constraint in
 /// `0001_event_log.sql` lists the same names. A test reads the constraint from `pg_constraint` and
 /// compares it with `StreamKind::ALL`, so the two cannot drift.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum StreamKind {
     /// The single installation stream: whether the server has been claimed.
     Installation,

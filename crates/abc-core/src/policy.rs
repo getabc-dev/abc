@@ -454,6 +454,12 @@ pub enum DenialReason {
     /// Another key already redeemed the token.
     #[error("the enrolment token was already used")]
     EnrolmentTokenUsed,
+    /// Another enrolled worker already holds the presented key.
+    #[error("another worker already uses this key; generate a new one")]
+    WorkerKeyInUse,
+    /// The worker was revoked.
+    #[error("this worker was revoked")]
+    WorkerRevoked,
 }
 
 #[cfg(test)]

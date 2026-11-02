@@ -171,6 +171,10 @@ pub struct TokenRecord {
 pub struct EnrolFacts {
     /// The token with that digest, if any.
     pub token: Option<TokenRecord>,
+    /// Whether an enrolled worker already holds the presented key: a key names one worker.
+    pub key_in_use: bool,
+    /// Whether the worker the token reserved exists and was revoked.
+    pub reserved_worker_revoked: bool,
 }
 
 /// A redeemable token, or one already redeemed by this same key.
@@ -215,12 +219,19 @@ impl Request for EnrolWorker {
         let Some(record) = &facts.token else {
             return Err(DenialReason::EnrolmentTokenUnknown);
         };
-        // A replay is checked first: a retry after expiry must still get its answer.
+        // A replay is checked first: a retry after expiry must still get its answer, unless the
+        // worker it created has since been revoked.
         let replay = match record.redeemed_by {
-            Some(key) if key.matches(&self.key) => true,
+            Some(key) if key.matches(&self.key) => {
+                if facts.reserved_worker_revoked {
+                    return Err(DenialReason::WorkerRevoked);
+                }
+                true
+            }
             Some(_) => return Err(DenialReason::EnrolmentTokenUsed),
             None if record.revoked => return Err(DenialReason::EnrolmentTokenRevoked),
             None if now >= record.expires_at => return Err(DenialReason::EnrolmentTokenExpired),
+            None if facts.key_in_use => return Err(DenialReason::WorkerKeyInUse),
             None => false,
         };
         Ok(TokenProof {
@@ -441,6 +452,8 @@ mod tests {
     fn facts(record: TokenRecord) -> EnrolFacts {
         EnrolFacts {
             token: Some(record),
+            key_in_use: false,
+            reserved_worker_revoked: false,
         }
     }
 
@@ -524,6 +537,45 @@ mod tests {
     }
 
     #[test]
+    fn a_key_another_worker_holds_is_refused() {
+        let held = EnrolFacts {
+            key_in_use: true,
+            ..facts(record())
+        };
+        assert_eq!(
+            run(&Principal::Anonymous, enrol(key(1)), held, now())
+                .map(|_| ())
+                .unwrap_err(),
+            Outcome::Denied(Denied {
+                action: ActionName::Write(WriteAction::EnrolWorker),
+                reason: DenialReason::WorkerKeyInUse,
+            }),
+            "one key, one worker"
+        );
+    }
+
+    #[test]
+    fn a_replay_for_a_revoked_worker_is_refused() {
+        let gone = EnrolFacts {
+            reserved_worker_revoked: true,
+            ..facts(TokenRecord {
+                redeemed_by: Some(key(1)),
+                ..record()
+            })
+        };
+        assert_eq!(
+            run(&Principal::Anonymous, enrol(key(1)), gone, now())
+                .map(|_| ())
+                .unwrap_err(),
+            Outcome::Denied(Denied {
+                action: ActionName::Write(WriteAction::EnrolWorker),
+                reason: DenialReason::WorkerRevoked,
+            }),
+            "a revoked worker's token no longer answers"
+        );
+    }
+
+    #[test]
     fn unknown_used_revoked_and_expired_tokens_are_refused() {
         let refuse = |facts: EnrolFacts, at: Timestamp| {
             run(&Principal::Anonymous, enrol(key(1)), facts, at)
@@ -537,7 +589,14 @@ mod tests {
             })
         };
         assert_eq!(
-            refuse(EnrolFacts { token: None }, now()),
+            refuse(
+                EnrolFacts {
+                    token: None,
+                    key_in_use: false,
+                    reserved_worker_revoked: false,
+                },
+                now()
+            ),
             reason(DenialReason::EnrolmentTokenUnknown),
             "unknown"
         );
