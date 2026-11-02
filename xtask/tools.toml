@@ -7,12 +7,15 @@
 # changing a version, run `cargo xtask pin` to record the new checksums for every target.
 #
 # `url`, `binary` (the executable's path inside a .tar.gz archive; omitted when the asset is the
-# executable itself) and `checksums` are templates:
+# executable itself), a target's `library` and `checksums` are templates:
 # {version} is the tool's version and {platform} is the target's name in the project's asset file
 # names. `checksums` is where the project publishes its assets' sha256, and `attestations` the
 # GitHub repository whose build attestations list them; `cargo xtask pin` refuses a download that
 # either does not vouch for, and every tool needs at least one, so no pin rests on its first
 # download. zizmor and cargo-shear publish no checksums but attest their release archives.
+# A target's `library` names a shared library in the archive that the executable loads from beside
+# itself; `cargo xtask setup` installs it there once its sha256 matches `library-sha256`, and xtask
+# checks that sha256 as it checks the executable's.
 # Renovate bumps `version` from the GitHub release named in the `url` line right after it, so
 # keep `version` and `url` adjacent and in that order.
 #
