@@ -127,12 +127,15 @@ The gates take `--root <path>` to check another tree with the pinned tools of th
 was built from.
 
 Database tests get a fresh, uniquely named database each (`abc_store::testing::TestDatabase`) on
-the server `DATABASE_URL` names,
-which `.cargo/config.toml` sets to one warm Postgres 18 container per machine
-(`127.0.0.1:55432`). `check`, `coverage` and `mutants` start it with Docker when it is not
-running; a `DATABASE_URL` in the environment points the tests elsewhere instead. sqlx's query
-macros always read the committed `.sqlx/` cache (`SQLX_OFFLINE`), and `check` fails when a cache
-no longer matches its queries, saying how to regenerate it.
+the server `ABC_TEST_DATABASE_URL` names. `.cargo/config.toml` sets it to one warm Postgres 18
+container per machine, `abc-postgres` on `127.0.0.1:55432`: the pinned `postgres:18.6` image,
+`--restart unless-stopped`, data on tmpfs, and trust authentication published on loopback only,
+so nothing off the machine can reach it. `check`, `coverage` and `mutants` start it with Docker
+when it is not running; setting `ABC_TEST_DATABASE_URL` points the tests at another server instead,
+and a `DATABASE_URL` is never used. Test databases are dropped when their test ends, and leftovers
+of killed runs (`abc_test_*`, `abc_query_cache_*`) are swept after a day. sqlx's query macros
+always read the committed `.sqlx/` cache (`SQLX_OFFLINE`), and `check` fails when a cache no
+longer matches its queries, saying how to regenerate it.
 
 CI runs `check`, `integrity`, `coverage`, `mutants` (in eight shards, reported as one `Mutants`
 check) and `review` on every pull request, and `cargo xtask tool cargo-deny check`, `cargo xtask

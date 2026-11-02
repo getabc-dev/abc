@@ -278,10 +278,15 @@ fn query_cache_current(
     target_dir: Option<&Path>,
     out: &mut impl Write,
 ) -> anyhow::Result<bool> {
-    let server = std::env::var("DATABASE_URL").unwrap_or_else(|_| crate::postgres::URL.to_owned());
+    let server = std::env::var(crate::postgres::TEST_DATABASE_URL)
+        .unwrap_or_else(|_| crate::postgres::URL.to_owned());
+    let created = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs());
     let url = crate::postgres::with_database(
         &server,
-        &format!("abc_query_cache_{}", std::process::id()),
+        // Named for its creation time, so a later test sweeps it if a killed check left it behind.
+        &format!("abc_query_cache_{created}_{}", std::process::id()),
     )?;
     let [mut reset, mut prepare, mut drop] =
         crate::postgres::query_cache_check(&(postgres.sqlx)()?, dir, &url);

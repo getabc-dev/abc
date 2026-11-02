@@ -15,7 +15,7 @@ publish = false
 
 [workspace.dependencies]
 anyhow = "1.0.104"
-axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "query", "tokio", "ws", "matched-path", "tracing"] }
+axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "tokio", "ws", "matched-path", "tracing"] }
 base64 = "0.23.1"
 bytes = "1.12.1"
 clap = { version = "4.6.7", features = ["derive"] }

@@ -2,9 +2,10 @@
 //! each crate's committed sqlx query cache matches its queries.
 //!
 //! Database tests (`#[sqlx::test]`) create a fresh database per test on the server that
-//! `DATABASE_URL` names. `.cargo/config.toml` points it at [`URL`], a Postgres 18 container that
+//! `ABC_TEST_DATABASE_URL` names. `.cargo/config.toml` points it at [`URL`], a Postgres 18 container that
 //! [`warm`] starts once per machine and leaves running. CI runs the same image as a service on the
-//! same port. A `DATABASE_URL` set to anything else is the caller's own server, and is left alone.
+//! same port. An `ABC_TEST_DATABASE_URL` set to anything else is the caller's own server, and is
+//! left alone.
 
 use std::io::Write;
 use std::net::{SocketAddr, TcpStream};
@@ -17,8 +18,12 @@ use anyhow::{Context, bail, ensure};
 /// The warm container's address on this machine.
 pub(crate) const ADDRESS: &str = "127.0.0.1:55432";
 
-/// The `DATABASE_URL` `.cargo/config.toml` sets: the warm container's superuser, trusted on
-/// loopback.
+/// The variable database tests read their server from. Not `DATABASE_URL`, so a developer's
+/// own database can never receive test databases.
+pub(crate) const TEST_DATABASE_URL: &str = "ABC_TEST_DATABASE_URL";
+
+/// The `ABC_TEST_DATABASE_URL` `.cargo/config.toml` sets: the warm container's superuser, trusted
+/// on loopback.
 pub(crate) const URL: &str = "postgres://postgres@127.0.0.1:55432/postgres";
 
 /// The warm container's name.
@@ -31,11 +36,11 @@ const IMAGE: &str =
 /// How long a starting container may take to accept connections.
 const STARTUP: Duration = Duration::from_secs(60);
 
-/// Makes sure the database tests have a server: the caller's own `DATABASE_URL`, or the warm
+/// Makes sure the database tests have a server: the caller's own `ABC_TEST_DATABASE_URL`, or the warm
 /// container, started if it is not running.
 pub(crate) fn warm(out: &mut dyn Write) -> anyhow::Result<()> {
     let address: SocketAddr = ADDRESS.parse().context("the warm container's address")?;
-    let database_url = std::env::var("DATABASE_URL").ok();
+    let database_url = std::env::var(TEST_DATABASE_URL).ok();
     ensure_running(
         Path::new("docker"),
         address,
@@ -56,7 +61,7 @@ fn ensure_running(
     if database_url.is_some_and(|url| url != URL) {
         writeln!(
             out,
-            "xtask: database tests use the server DATABASE_URL names"
+            "xtask: database tests use the server ABC_TEST_DATABASE_URL names"
         )?;
         return Ok(());
     }
@@ -75,7 +80,7 @@ fn ensure_running(
         .output()
         .with_context(|| {
             "database tests need Postgres 18: install Docker so xtask can start its warm \
-             container, or set DATABASE_URL to a Postgres 18 server"
+             container, or set ABC_TEST_DATABASE_URL to a Postgres 18 server"
         })?;
     let running = String::from_utf8_lossy(&inspect.stdout).trim() == "true";
     if !inspect.status.success() {
@@ -168,13 +173,29 @@ pub(crate) fn needed(root: &Path) -> bool {
         .is_ok_and(|lock| lock.contains("\nname = \"sqlx\"\n"))
 }
 
-/// `url` with its database replaced by `database`.
+/// `url` with its database replaced by `database`, keeping any query, such as the `host` of a
+/// Unix-socket URL (`postgres://user@/db?host=/run/postgresql`).
 pub(crate) fn with_database(url: &str, database: &str) -> anyhow::Result<String> {
-    let (server, _) = url
-        .rsplit_once('/')
-        .filter(|(server, _)| server.contains("://"))
-        .with_context(|| "DATABASE_URL must name a database, such as postgres://host/postgres")?;
-    Ok(format!("{server}/{database}"))
+    let (base, query) = url
+        .split_once('?')
+        .map_or((url, None), |(base, query)| (base, Some(query)));
+    let authority = base
+        .split_once("://")
+        .map(|(scheme, rest)| {
+            (
+                scheme,
+                rest.split_once('/')
+                    .map_or(rest, |(authority, _)| authority),
+            )
+        })
+        .with_context(|| {
+            format!("{TEST_DATABASE_URL} must be a URL, such as postgres://host/postgres")
+        })?;
+    let (scheme, authority) = authority;
+    Ok(match query {
+        Some(query) => format!("{scheme}://{authority}/{database}?{query}"),
+        None => format!("{scheme}://{authority}/{database}"),
+    })
 }
 
 /// The commands that check the query cache of the crate in `dir`, with cargo-sqlx at `sqlx`: a
@@ -249,7 +270,7 @@ mod tests {
         let docker = docker(dir.path(), "missing", true);
         let (result, out) = run(&docker, closed(), Some("postgres://elsewhere/db"));
         result.unwrap();
-        assert!(out.contains("DATABASE_URL names"), "{out}");
+        assert!(out.contains("ABC_TEST_DATABASE_URL names"), "{out}");
         assert!(calls(dir.path()).is_empty(), "docker is not touched");
     }
 

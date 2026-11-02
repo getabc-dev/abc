@@ -7,6 +7,7 @@ xtask = "run --quiet --locked --package xtask --"
 # build is the same everywhere; `cargo xtask check` keeps the cache current.
 SQLX_OFFLINE = "true"
 # Database tests create a fresh database per test on this server: the warm Postgres 18 container
-# that xtask starts once per machine (D7), or CI's service on the same port. A DATABASE_URL in the
-# environment wins.
-DATABASE_URL = "postgres://postgres@127.0.0.1:55432/postgres"
+# that xtask starts once per machine (D7), or CI's service on the same port. Its own name keeps a
+# developer's DATABASE_URL from ever receiving test databases; setting it in the environment
+# points the tests at another Postgres 18 server.
+ABC_TEST_DATABASE_URL = "postgres://postgres@127.0.0.1:55432/postgres"
