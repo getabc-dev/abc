@@ -17,6 +17,7 @@ mod tests {
             .env_remove("GITHUB_REPOSITORY")
             .env_remove("GITHUB_TOKEN")
             .env_remove("GITHUB_EVENT_PATH")
+            .env_remove("ABC_AGENT_BROKER")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -146,7 +147,7 @@ mod tests {
     }
 
     #[test]
-    fn the_credential_helper_needs_the_app() {
+    fn the_credential_helper_needs_the_broker() {
         let other_host = xtask(
             &["git-credential", "get"],
             "protocol=https\nhost=example.com\n\n",
@@ -159,8 +160,12 @@ mod tests {
             "protocol=https\nhost=github.com\n\n",
             &[],
         );
-        assert_eq!(github.status.code(), Some(1), "no App files, no token");
+        assert_eq!(github.status.code(), Some(1), "no broker, no token");
         assert!(github.stdout.is_empty(), "and nothing for git to use");
-        assert!(stderr(&github).contains("app.json"), "{}", stderr(&github));
+        assert!(
+            stderr(&github).contains("ABC_AGENT_BROKER is not set"),
+            "{}",
+            stderr(&github)
+        );
     }
 }

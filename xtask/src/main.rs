@@ -1,6 +1,7 @@
 //! Repository automation for abc, run as `cargo xtask <command>`.
 
 mod app;
+mod broker;
 mod check;
 mod coverage;
 mod git;
@@ -109,12 +110,19 @@ enum Task {
         /// The operation git asks for: get, store or erase.
         operation: String,
     },
-    /// Run gh as the agent App, with a fresh installation token in `GH_TOKEN`.
+    /// Run gh as the agent App, with a fresh installation token from the broker in `GH_TOKEN`.
     Gh {
         /// Arguments passed to gh.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<OsString>,
     },
+    /// Serve agent App tokens to agent VMs (D3). The one process that reads the App's key. Install
+    /// it from main, outside any checkout: `cargo install --locked --git
+    /// https://github.com/getabc-dev/abc --branch main xtask --root ~/.local/share/abc/broker`;
+    /// It refuses to run from inside a
+    /// checkout, whose xtask an agent may have changed, and listens on
+    /// `~/.config/abc/agent-broker/broker.sock`, which each VM reaches over vsock.
+    Broker,
     /// Have Gemini review the changes since the merge base against AGENTS.md (D8).
     Review {
         /// The revision whose merge base with HEAD the diff starts from.
@@ -295,8 +303,9 @@ fn run(
             git_credential(&operation)?;
             Ok(ExitCode::SUCCESS)
         }
+        Task::Broker => serve_tokens(&std::env::current_exe()?, &user_home(&env)?),
         Task::Gh { args } => app::run_gh(
-            &app::App::load(&app::config_dir()?)?,
+            || broker::token(app::Scope::Gh),
             app::GITHUB_API,
             Path::new("gh"),
             &args,
@@ -393,8 +402,29 @@ fn git_credential(operation: &str) -> anyhow::Result<()> {
         .read_to_string(&mut request)
         .context("could not read git's credential request")?;
     app::credential(operation, &request, &mut io::stdout().lock(), || {
-        app::App::load(&app::config_dir()?)?.token(app::GITHUB_API, app::Scope::Git)
+        broker::token(app::Scope::Git)
     })
+}
+
+/// The user's home directory.
+fn user_home(env: &impl Fn(&str) -> Option<OsString>) -> anyhow::Result<PathBuf> {
+    env("HOME")
+        .filter(|home| !home.is_empty())
+        .map(PathBuf::from)
+        .context("HOME is not set")
+}
+
+/// `cargo xtask broker`, run from `exe`: serves tokens signed with the App's key on the broker's
+/// socket under `home`, refusing to run from a checkout.
+fn serve_tokens(exe: &Path, home: &Path) -> anyhow::Result<ExitCode> {
+    broker::refuse_checkout(exe)?;
+    let app = app::App::load(&app::config_dir()?)?;
+    broker::serve(
+        &broker::socket(home),
+        |scope| app.token(app::GITHUB_API, scope),
+        &mut io::stderr(),
+    )?;
+    Ok(ExitCode::SUCCESS)
 }
 
 /// The repository root: the workspace that contains xtask.

@@ -54,6 +54,21 @@ pub(crate) enum Scope {
 }
 
 impl Scope {
+    /// The scope's name in the token broker's protocol.
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Git => "git",
+            Self::Gh => "gh",
+        }
+    }
+
+    /// The scope named `name` in the token broker's protocol.
+    pub(crate) fn parse(name: &str) -> Option<Self> {
+        [Self::Git, Self::Gh]
+            .into_iter()
+            .find(|scope| scope.name() == name)
+    }
+
     fn permissions(self) -> serde_json::Value {
         match self {
             Self::Git => serde_json::json!({"contents": "write", "workflows": "write"}),
@@ -250,16 +265,16 @@ pub(crate) fn credential(
     Ok(())
 }
 
-/// `cargo xtask gh`: runs `program` (gh) with `args` as `app`, with a token minted from `api` for
-/// this run and revoked when it ends.
+/// `cargo xtask gh`: runs `program` (gh) with `args` as the App, with a token from `mint` for this
+/// run, revoked at `api` when it ends.
 pub(crate) fn run_gh(
-    app: &App,
+    mint: impl FnOnce() -> anyhow::Result<String>,
     api: &str,
     program: &Path,
     args: &[OsString],
     out: &mut impl Write,
 ) -> anyhow::Result<ExitCode> {
-    let token = app.token(api, Scope::Gh)?;
+    let token = mint()?;
     let code = gh(program, args, &token);
     if let Err(error) = revoke(api, &token) {
         writeln!(
@@ -539,7 +554,7 @@ mod tests {
         script(&fake, "[ \"$GH_TOKEN\" = ghs_test ] || exit 3\nexit 4\n");
         let mut out = Vec::new();
         let code = run_gh(
-            &App::load(dir.path()).unwrap(),
+            || App::load(dir.path()).unwrap().token(&url, Scope::Gh),
             &url,
             &fake,
             &["pr".into(), "list".into()],
@@ -572,7 +587,7 @@ mod tests {
         ]);
         let mut warned = Vec::new();
         run_gh(
-            &App::load(dir.path()).unwrap(),
+            || App::load(dir.path()).unwrap().token(&refusing, Scope::Gh),
             &refusing,
             &fake,
             &[],
