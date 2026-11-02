@@ -9,7 +9,9 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
-use abc_server::{LinkTimings, PublicUrl, ServerConfig};
+use abc_core::secret::Secret;
+use abc_server::telemetry::chain;
+use abc_server::{Limits, LinkTimings, PublicUrl, ServerConfig};
 use abc_store::{DatabaseUrl, ExecuteError, Store, StoreOptions};
 use clap::{Parser, Subcommand};
 
@@ -45,11 +47,26 @@ enum ServerAction {
     SetupCode,
 }
 
+/// The variable holding the Postgres URL. It is read from the environment only: a command-line
+/// flag would show the password to anyone who can list processes, and clap would keep a copy.
+const DATABASE_URL: &str = "ABC_DATABASE_URL";
+
+/// The Postgres URL from [`DATABASE_URL`], moved straight into a [`Secret`].
+fn database_url() -> Result<Secret<DatabaseUrl>, Failure> {
+    std::env::var(DATABASE_URL)
+        .ok()
+        .map(DatabaseUrl::new)
+        .ok_or_else(|| {
+            Failure::Config(
+                format!("{DATABASE_URL} must hold the Postgres URL, such as postgres://abc@db/abc")
+                    .into(),
+            )
+        })
+}
+
+/// Database settings. The URL itself comes from `ABC_DATABASE_URL` in the environment.
 #[derive(Debug, clap::Args)]
 struct DatabaseArgs {
-    /// Postgres URL. Errors never repeat it.
-    #[arg(long, env = "ABC_DATABASE_URL", hide_env_values = true)]
-    database_url: String,
     /// How many seconds to keep retrying while Postgres starts.
     #[arg(long, env = "ABC_DATABASE_WAIT", default_value_t = 60)]
     database_wait: u64,
@@ -81,18 +98,6 @@ enum Failure {
     Config(Box<dyn StdError>),
     /// Running failed.
     Run(Box<dyn StdError>),
-}
-
-/// The error and its causes, joined with `: `.
-fn chain(error: &dyn StdError) -> String {
-    let mut text = error.to_string();
-    let mut next = error.source();
-    while let Some(cause) = next {
-        text.push_str(": ");
-        text.push_str(&cause.to_string());
-        next = cause.source();
-    }
-    text
 }
 
 fn main() -> ExitCode {
@@ -136,12 +141,13 @@ async fn serve(server: ServerCommand) -> Result<(), Failure> {
     abc_server::telemetry::init(server.serve.log.as_deref())
         .map_err(|error| config(Box::new(error)))?;
     let settings = ServerConfig {
-        database_url: DatabaseUrl::new(server.database.database_url),
+        database_url: database_url()?,
         database_wait: Duration::from_secs(server.database.database_wait),
         sidecar_socket: server.serve.sidecar_socket,
         ops_addr: server.serve.ops_addr,
         public_url,
         link: LinkTimings::default(),
+        limits: Limits::default(),
     };
     abc_server::run(settings, shutdown_signal())
         .await
@@ -155,14 +161,19 @@ async fn serve(server: ServerCommand) -> Result<(), Failure> {
 /// the code reaches the server's log.
 async fn setup_code(database: &DatabaseArgs) -> Result<(), Failure> {
     let run = |error: Box<dyn StdError>| Failure::Run(error);
-    let url = DatabaseUrl::new(database.database_url.clone());
+    let url = database_url()?;
     let db = abc_store::connect(&url, Duration::from_secs(database.database_wait))
         .await
         .map_err(|error| run(Box::new(error)))?;
     let store = Store::open(db, StoreOptions::production())
         .await
         .map_err(|error| run(Box::new(error)))?;
-    let issued = match store.issue_setup_code().await {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the host operator's CLI is the one place that may mint a setup code"
+    )]
+    let issued = store.issue_setup_code().await;
+    let issued = match issued {
         Ok(issued) => issued,
         // Only an unclaimed server issues setup codes; the reason says so.
         Err(ExecuteError::Denied(denied)) => {

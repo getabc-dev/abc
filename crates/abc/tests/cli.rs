@@ -12,16 +12,9 @@ mod tests {
     use abc_store::testing::Fixture;
     use sqlx::PgPool;
 
-    /// The test database's URL; the container trusts local connections.
+    /// The test database's URL.
     fn url(pool: &PgPool) -> String {
-        let options = pool.connect_options();
-        format!(
-            "postgres://{}@{}:{}/{}",
-            options.get_username(),
-            options.get_host(),
-            options.get_port(),
-            options.get_database().unwrap(),
-        )
+        abc_store::testing::database_url_text(pool, None)
     }
 
     /// `abc` with `args`, a clean environment and the database URL.

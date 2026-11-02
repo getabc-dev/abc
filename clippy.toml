@@ -7,4 +7,5 @@ allow-indexing-slicing-in-tests = true
 # router can never end up on a TCP listener (D4). The two sanctioned call sites expect this lint.
 disallowed-methods = [
     { path = "axum::serve", reason = "serve routers through abc_server::listen, which ties each router to its listener" },
+    { path = "abc_store::Store::issue_setup_code", reason = "only the host operator's `abc server setup-code` mints a setup code; the running server never holds one" },
 ]
