@@ -7,8 +7,12 @@
 //! **CSRF and DNS rebinding.** Identity injected by the proxy is ambient authority, like a cookie:
 //! any web page the user visits can make their browser send requests to the abc URL, and Serve will
 //! attach their identity. So the extractor refuses with `cross_site_request`:
-//! * any request whose `Host` is not the configured public host (a rebinding domain resolves to
-//!   the server but cannot make the browser send the right `Host`);
+//! * any request that does not carry what Serve sends a `unix:` target: `Host: localhost`, the
+//!   public host in `X-Forwarded-Host` and `X-Forwarded-Proto: https`, each once. Serve rewrites
+//!   `Host` to `localhost` and sets both forwarded headers itself, replacing any a client sent
+//!   (`ipn/ipnlocal/serve.go`), so `X-Forwarded-Host` is the `Host` the browser sent and is as
+//!   trustworthy as the identity headers. A rebinding domain resolves to the server but cannot
+//!   make the browser send the public host, so it fails this check;
 //! * for unsafe methods: `Sec-Fetch-Site` present and not `same-origin`, or `Origin` present and
 //!   not the public origin.
 //!
@@ -45,15 +49,42 @@ impl From<TailnetCaller> for Caller {
     }
 }
 
-/// Refuses a request that names another host, or an unsafe one sent from another site.
+/// The `Host` Serve sends to a `unix:` target, whatever host the client named.
+const PROXIED_HOST: &str = "localhost";
+
+/// The header Serve sets to the `Host` the client sent.
+const FORWARDED_HOST_HEADER: &str = "x-forwarded-host";
+
+/// The header Serve sets to `https` for a request that arrived over TLS.
+const FORWARDED_PROTO_HEADER: &str = "x-forwarded-proto";
+
+/// The value of header `name` when the request carries it exactly once.
+fn single<'a>(parts: &'a Parts, name: &str) -> Option<&'a str> {
+    let mut values = parts.headers.get_all(name).iter();
+    match (values.next(), values.next()) {
+        (Some(value), None) => value.to_str().ok(),
+        _ => None,
+    }
+}
+
+/// Refuses a request that did not come through Serve for the public URL, or an unsafe one sent
+/// from another site.
 fn same_origin(parts: &Parts, state: &SidecarState) -> Result<(), ApiError> {
-    let host = parts
-        .headers
-        .get(HOST)
-        .and_then(|value| value.to_str().ok());
-    if !host.is_some_and(|host| host.eq_ignore_ascii_case(state.public_url.host())) {
+    if !single(parts, HOST.as_str()).is_some_and(|host| host.eq_ignore_ascii_case(PROXIED_HOST)) {
+        return Err(ApiError::cross_site(
+            "this request did not come through Tailscale Serve, which sends Host: localhost",
+        ));
+    }
+    if !single(parts, FORWARDED_HOST_HEADER)
+        .is_some_and(|host| host.eq_ignore_ascii_case(state.public_url.host()))
+    {
         return Err(ApiError::cross_site(
             "this request names a host other than the server's public URL",
+        ));
+    }
+    if single(parts, FORWARDED_PROTO_HEADER) != Some("https") {
+        return Err(ApiError::cross_site(
+            "this request did not reach Tailscale Serve over HTTPS",
         ));
     }
     if parts.method.is_safe() {

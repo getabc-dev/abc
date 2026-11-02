@@ -67,7 +67,7 @@ let mut feed = store.feed();                                             // wake
 ```rust
 async fn issue_token(
     State(app): State<SidecarState>,
-    caller: TailnetCaller,          // compiles only on the sidecar router; Host + CSRF guarded
+    caller: TailnetCaller,          // compiles only on the sidecar router; host + CSRF guarded
     origin: RequestOrigin,          // request id = the events' correlation id
     Path(workspace): Path<WorkspaceId>,
     ApiJson(body): ApiJson<IssueTokenRequest>,
@@ -224,8 +224,8 @@ listener.
    why the newtype exists.) `clippy.toml` gains `disallowed-methods = ["axum::serve"]` so nothing
    can serve a router directly.
 3. **Ambient authority is fenced in.** Serve attaches identity to whatever the user's browser
-   sends. The extractor refuses requests whose `Host` is not `ABC_PUBLIC_URL`'s host (DNS
-   rebinding). For unsafe methods it also refuses requests whose `Sec-Fetch-Site` is not
+   sends. The extractor refuses requests whose forwarded host is not `ABC_PUBLIC_URL`'s host (DNS
+   rebinding; see "Serve's forwarded host" below for the headers). For unsafe methods it also refuses requests whose `Sec-Fetch-Site` is not
    `same-origin` or whose `Origin` is not the public origin (CSRF). `ApiJson` requires
    `application/json`, which forces a preflight, and the server answers no preflights.
 4. **No identity means no identity.** A missing header (tagged device, Funnel) is
@@ -521,3 +521,20 @@ Where the code differs from the sketch above, and why:
 - **Enrolment.** A key another worker holds is denied (`worker_key_in_use`, 409); a retry for a
   revoked worker is denied (`worker_revoked`).
 - **Test database** comes from `ABC_TEST_DATABASE_URL`, never `DATABASE_URL`.
+
+### Serve's forwarded host (2 Nov 2026)
+
+The first run of the Tailscale passthrough check reached the socket and was refused with
+`cross_site_request`: Serve does not keep the public `Host` for a `unix:` target. In
+`ipn/ipnlocal/serve.go` at v1.104.4, the pinned image's version, the proxy sets
+`r.Out.Host = "localhost"` for `unix:` targets (around line 1008), then sets `X-Forwarded-Host` to
+the incoming `Host` and `X-Forwarded-Proto` to `https` for a TLS request (around line 1145). It
+uses `Header.Set`, so a value a client sent is replaced, never appended to.
+
+Maintainer decision: on the sidecar socket only, the identity extractor requires `Host: localhost`,
+`X-Forwarded-Host` equal to `ABC_PUBLIC_URL`'s host (compared case-insensitively) and
+`X-Forwarded-Proto: https`, each exactly once. This is the same trust model as the
+`Tailscale-User-*` headers: only Serve can reach the socket, and Serve overwrites what the client
+sent. The rebinding defence still holds, because `X-Forwarded-Host` is the `Host` the browser sent.
+The ops listener and the worker link, which do not read identity, check none of these headers.
+The test harness talks to the socket as Serve does.

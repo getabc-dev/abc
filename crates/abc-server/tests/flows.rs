@@ -101,16 +101,45 @@ mod tests {
         let tokens = format!("/api/workspaces/{workspace}/enrolment-tokens");
         let rebound = Call::get("/api/session")
             .alice()
-            .header("host", "evil.example");
+            .header("x-forwarded-host", "evil.example");
         server
             .refused(rebound, FORBIDDEN, "cross_site_request", "DNS rebinding")
             .await;
         let shouted = Call::get("/api/session")
             .alice()
-            .header("host", "abc.TEST.ts.net");
+            .header("host", "LOCALHOST")
+            .header("x-forwarded-host", "abc.TEST.ts.net");
         server
-            .expect(shouted, OK, "the host compares case-insensitively")
+            .expect(shouted, OK, "hosts compare case-insensitively")
             .await;
+        for (call, why) in [
+            (
+                Call::get("/api/session").header("host", HOST),
+                "the public Host, which Serve never sends to the socket",
+            ),
+            (
+                Call::get("/api/session").without("x-forwarded-host"),
+                "no forwarded host",
+            ),
+            (
+                Call::get("/api/session")
+                    .header("x-forwarded-host", HOST)
+                    .header("x-forwarded-host", HOST),
+                "two forwarded hosts, which Serve never sends",
+            ),
+            (
+                Call::get("/api/session").without("x-forwarded-proto"),
+                "no forwarded protocol",
+            ),
+            (
+                Call::get("/api/session").header("x-forwarded-proto", "http"),
+                "a plain-HTTP request",
+            ),
+        ] {
+            server
+                .refused(call.alice(), FORBIDDEN, "cross_site_request", why)
+                .await;
+        }
         let count = Fixture::new(pool.clone()).await.event_count().await;
         let site = Call::post(&tokens)
             .alice()

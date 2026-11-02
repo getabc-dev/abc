@@ -32,6 +32,9 @@ use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 /// The public URL every test server answers on.
 pub(crate) const HOST: &str = "abc.test.ts.net";
 
+/// The `Host` Serve sends to a `unix:` target.
+pub(crate) const PROXIED_HOST: &str = "localhost";
+
 /// A running server.
 pub(crate) struct Server {
     _dir: tempfile::TempDir,
@@ -225,15 +228,7 @@ impl Server {
     /// Sends `call` and returns the response with its body unread.
     pub(crate) async fn raw(&self, call: Call) -> Response<Incoming> {
         let stream = UnixStream::connect(&self.socket).await.unwrap();
-        let mut builder = Request::builder().method(call.method).uri(&call.path);
-        if !call.headers.iter().any(|(name, _)| name == "host") {
-            builder = builder.header("host", HOST);
-        }
-        for (name, value) in &call.headers {
-            builder = builder.header(name.as_str(), value.as_str());
-        }
-        let body = call.body.map_or_else(Bytes::new, Bytes::from);
-        send(TokioIo::new(stream), builder.body(Full::new(body)).unwrap()).await
+        send(TokioIo::new(stream), call.request()).await
     }
 
     /// Opens the live stream of `workspace` as alice.
@@ -260,9 +255,12 @@ impl Server {
     /// Connects with an `Authorization: Bearer` value, or none; an HTTP refusal is `Err`.
     pub(crate) async fn try_connect(&self, bearer: Option<&str>) -> Result<Link, (u16, Value)> {
         let stream = UnixStream::connect(&self.socket).await.unwrap();
-        let mut request = format!("ws://{HOST}{}", abc_protocol::link::CONNECT_PATH)
+        let mut request = format!("ws://{PROXIED_HOST}{}", abc_protocol::link::CONNECT_PATH)
             .into_client_request()
             .unwrap();
+        for (name, value) in [("x-forwarded-host", HOST), ("x-forwarded-proto", "https")] {
+            request.headers_mut().insert(name, value.parse().unwrap());
+        }
         if let Some(bearer) = bearer {
             request
                 .headers_mut()
@@ -313,15 +311,7 @@ impl Server {
 /// Sends `call` over the socket at `socket` and returns the status and JSON body.
 pub(crate) async fn send_on(socket: &std::path::Path, call: Call) -> (StatusCode, Value) {
     let stream = UnixStream::connect(socket).await.unwrap();
-    let mut builder = Request::builder()
-        .method(call.method)
-        .uri(&call.path)
-        .header("host", HOST);
-    for (name, value) in &call.headers {
-        builder = builder.header(name.as_str(), value.as_str());
-    }
-    let body = call.body.map_or_else(Bytes::new, Bytes::from);
-    let response = send(TokioIo::new(stream), builder.body(Full::new(body)).unwrap()).await;
+    let response = send(TokioIo::new(stream), call.request()).await;
     let status = response.status();
     let bytes = response.into_body().collect().await.unwrap().to_bytes();
     (
@@ -344,6 +334,8 @@ pub(crate) struct Call {
     method: &'static str,
     path: String,
     headers: Vec<(String, String)>,
+    /// Serve's headers this call leaves out.
+    without: Vec<&'static str>,
     body: Option<Vec<u8>>,
 }
 
@@ -365,6 +357,7 @@ impl Call {
             method,
             path: path.to_owned(),
             headers: Vec::new(),
+            without: Vec::new(),
             body: None,
         }
     }
@@ -372,6 +365,34 @@ impl Call {
     pub(crate) fn header(mut self, name: &str, value: &str) -> Self {
         self.headers.push((name.to_owned(), value.to_owned()));
         self
+    }
+
+    /// Leaves out `name`, one of the headers Serve sends.
+    pub(crate) fn without(mut self, name: &'static str) -> Self {
+        self.without.push(name);
+        self
+    }
+
+    /// The request as Tailscale Serve sends it to a `unix:` target: `Host: localhost`, the public
+    /// host in `X-Forwarded-Host` and `X-Forwarded-Proto: https`, unless the call sets or leaves
+    /// out one of them.
+    fn request(self) -> Request<Full<Bytes>> {
+        let mut builder = Request::builder().method(self.method).uri(&self.path);
+        for (name, value) in [
+            ("host", PROXIED_HOST),
+            ("x-forwarded-host", HOST),
+            ("x-forwarded-proto", "https"),
+        ] {
+            let set = self.headers.iter().any(|(header, _)| header == name);
+            if !set && !self.without.contains(&name) {
+                builder = builder.header(name, value);
+            }
+        }
+        for (name, value) in &self.headers {
+            builder = builder.header(name.as_str(), value.as_str());
+        }
+        let body = self.body.map_or_else(Bytes::new, Bytes::from);
+        builder.body(Full::new(body)).unwrap()
     }
 
     /// As `login`, as the sidecar asserts it.

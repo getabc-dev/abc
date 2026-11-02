@@ -57,7 +57,7 @@ pub struct ServerConfig {
     /// `ABC_OPS_ADDR`, default `127.0.0.1:7071`.
     pub ops_addr: SocketAddr,
     /// `ABC_PUBLIC_URL`, such as `https://abc.tail1234.ts.net`: the URL Serve answers on. The
-    /// identity extractor's Host and Origin checks use it.
+    /// identity extractor's forwarded-host and Origin checks use it.
     pub public_url: PublicUrl,
     /// The worker link's handshake, ping and idle timings: the protocol's own unless a test
     /// shortens them.

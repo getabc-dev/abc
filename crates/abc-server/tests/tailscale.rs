@@ -1,7 +1,8 @@
 //! The real Tailscale passthrough (open question 10, opt-in): the pinned `tailscale/tailscale`
 //! image serves `https://<node>.<tailnet>` to `unix:` on the sidecar socket, and a second node
-//! reaches it over the tailnet. It checks that Serve asserts the identity header and keeps the
-//! public `Host`, upgrades the worker WebSocket, and streams SSE without buffering.
+//! reaches it over the tailnet. It checks that Serve asserts the identity header and forwards the
+//! public host (`Host: localhost` with `X-Forwarded-Host`), upgrades the worker WebSocket, and
+//! streams SSE without buffering.
 //!
 //! It needs a real tailnet, so it is ignored unless asked for (`--run-ignored only`), and then
 //! fails unless these are set:
@@ -76,25 +77,33 @@ mod tests {
         );
     }
 
-    /// A TLS connection to `host:443` through the client node's HTTP proxy.
-    async fn tunnel(proxy: u16, host: &str) -> TlsStream<TcpStream> {
-        let mut stream = TcpStream::connect(("127.0.0.1", proxy)).await.unwrap();
+    /// A TLS connection to `host:443` through the client node's HTTP proxy, or why there is none
+    /// yet: until the client node has joined, its proxy resets the connection or refuses the tunnel.
+    async fn tunnel(proxy: u16, host: &str) -> Result<TlsStream<TcpStream>, String> {
+        let mut stream = TcpStream::connect(("127.0.0.1", proxy))
+            .await
+            .map_err(|error| format!("the proxy is not listening: {error}"))?;
         stream
             .write_all(
                 format!("CONNECT {host}:443 HTTP/1.1\r\nHost: {host}:443\r\n\r\n").as_bytes(),
             )
             .await
-            .unwrap();
+            .map_err(|error| format!("the proxy dropped the CONNECT: {error}"))?;
         let mut reader = BufReader::new(stream);
         let mut status = String::new();
-        reader.read_line(&mut status).await.unwrap();
-        assert!(
-            status.contains(" 200"),
-            "the proxy opened a tunnel: {status}"
-        );
+        reader
+            .read_line(&mut status)
+            .await
+            .map_err(|error| format!("the proxy did not answer the CONNECT: {error}"))?;
+        if !status.contains(" 200") {
+            return Err(format!("the proxy refused the tunnel: {status}"));
+        }
         loop {
             let mut line = String::new();
-            reader.read_line(&mut line).await.unwrap();
+            reader
+                .read_line(&mut line)
+                .await
+                .map_err(|error| format!("the proxy's answer broke off: {error}"))?;
             if line == "\r\n" || line.is_empty() {
                 break;
             }
@@ -112,19 +121,21 @@ mod tests {
         TlsConnector::from(Arc::new(tls))
             .connect(name, reader.into_inner())
             .await
-            .unwrap()
+            .map_err(|error| format!("no TLS through the tunnel yet: {error}"))
     }
 
-    /// One HTTP request to `host` through the tailnet.
-    async fn call(
+    /// One HTTP request to `host` through the tailnet, or why it could not be sent.
+    async fn try_call(
         proxy: u16,
         host: &str,
         method: &str,
         path: &str,
         body: Option<Value>,
-    ) -> (StatusCode, Value) {
-        let io = TokioIo::new(tunnel(proxy, host).await);
-        let (mut sender, connection) = hyper::client::conn::http1::handshake(io).await.unwrap();
+    ) -> Result<(StatusCode, Value), String> {
+        let io = TokioIo::new(tunnel(proxy, host).await?);
+        let (mut sender, connection) = hyper::client::conn::http1::handshake(io)
+            .await
+            .map_err(|error| format!("no HTTP handshake: {error}"))?;
         tokio::spawn(connection);
         let mut request = Request::builder()
             .method(method)
@@ -137,13 +148,29 @@ mod tests {
         let response = sender
             .send_request(request.body(Full::new(body)).unwrap())
             .await
-            .unwrap();
+            .map_err(|error| format!("no response: {error}"))?;
         let status = response.status();
-        let bytes = response.into_body().collect().await.unwrap().to_bytes();
-        (
+        let bytes = response
+            .into_body()
+            .collect()
+            .await
+            .map_err(|error| format!("the response broke off: {error}"))?
+            .to_bytes();
+        Ok((
             status,
             serde_json::from_slice(&bytes).unwrap_or(Value::Null),
-        )
+        ))
+    }
+
+    /// One HTTP request to `host` through the tailnet, once the tailnet is up.
+    async fn call(
+        proxy: u16,
+        host: &str,
+        method: &str,
+        path: &str,
+        body: Option<Value>,
+    ) -> (StatusCode, Value) {
+        try_call(proxy, host, method, path, body).await.unwrap()
     }
 
     /// The Serve node, proxying to the socket in `sockets` with the config in `serve_config`, and
@@ -203,21 +230,21 @@ mod tests {
     }
 
     /// `GET /api/session` through the tailnet, retried while the nodes join, DNS settles and the
-    /// first certificate is issued.
-    async fn first_session(proxy: u16, host: &str) -> (StatusCode, Value) {
-        let mut session = (StatusCode::BAD_GATEWAY, Value::Null);
+    /// first certificate is issued; the last answer, or why there was none.
+    async fn first_session(proxy: u16, host: &str) -> Result<(StatusCode, Value), String> {
+        let mut session = Err("no attempt yet".to_owned());
         for _ in 0..90 {
-            let host = host.to_owned();
             let attempt = tokio::time::timeout(
                 Duration::from_secs(10),
-                tokio::spawn(async move { call(proxy, &host, "GET", "/api/session", None).await }),
+                try_call(proxy, host, "GET", "/api/session", None),
             )
             .await;
-            if let Ok(Ok(answer)) = attempt {
-                session = answer;
-                if session.0 == StatusCode::OK {
-                    break;
-                }
+            session = attempt.unwrap_or_else(|_| Err("the attempt timed out".to_owned()));
+            if session
+                .as_ref()
+                .is_ok_and(|(status, _)| *status == StatusCode::OK)
+            {
+                break;
             }
             tokio::time::sleep(Duration::from_secs(2)).await;
         }
@@ -294,11 +321,11 @@ mod tests {
             .port();
         let containers = start_nodes(&key, &node, sockets.path(), serve_config.path(), proxy);
 
-        let session = first_session(proxy, &host).await;
+        let session = first_session(proxy, &host).await.unwrap();
         assert_eq!(
             session.0,
             StatusCode::OK,
-            "Serve reaches the socket, keeping Host: {}",
+            "Serve reaches the socket, forwarding the public host: {}",
             session.1
         );
         assert_eq!(
@@ -308,7 +335,7 @@ mod tests {
         );
         let (workspace, worker_key) = enrolled_worker(&pool, proxy, &host).await;
 
-        let io = TokioIo::new(tunnel(proxy, &host).await);
+        let io = TokioIo::new(tunnel(proxy, &host).await.unwrap());
         let (mut sender, connection) = hyper::client::conn::http1::handshake(io).await.unwrap();
         tokio::spawn(connection);
         let live = Request::get(format!("/api/workspaces/{workspace}/live"))
@@ -329,9 +356,10 @@ mod tests {
         request
             .headers_mut()
             .insert("authorization", bearer.parse().unwrap());
-        let (mut socket, _) = tokio_tungstenite::client_async(request, tunnel(proxy, &host).await)
-            .await
-            .expect("Serve upgrades the WebSocket");
+        let (mut socket, _) =
+            tokio_tungstenite::client_async(request, tunnel(proxy, &host).await.unwrap())
+                .await
+                .expect("Serve upgrades the WebSocket");
         let hello = WorkerMessage::Hello(Hello::new(Version::new(0, 1, 0)));
         socket
             .send(Message::Text(hello.encode().unwrap().into()))

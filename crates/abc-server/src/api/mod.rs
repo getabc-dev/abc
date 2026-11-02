@@ -70,7 +70,8 @@ pub(crate) struct SidecarState {
     pub(crate) store: Store,
     pub(crate) sessions: Sessions,
     /// The server's public tailnet URL (`ABC_PUBLIC_URL`). The identity extractor accepts only
-    /// requests whose `Host` names it (DNS rebinding) and whose `Origin`, if any, equals it (CSRF).
+    /// requests whose `X-Forwarded-Host`, which Serve sets, names it (DNS rebinding) and whose
+    /// `Origin`, if any, equals it (CSRF).
     pub(crate) public_url: PublicUrl,
     pub(crate) link: LinkTimings,
     pub(crate) drain: Drain,
@@ -157,7 +158,8 @@ impl PublicUrl {
         &self.origin
     }
 
-    /// The host clients send in `Host`, with the port when it is not 443.
+    /// The host clients send in `Host`, with the port when it is not 443; Serve forwards it in
+    /// `X-Forwarded-Host`.
     pub(crate) fn host(&self) -> &str {
         &self.host
     }
