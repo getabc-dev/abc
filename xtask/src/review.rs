@@ -11,6 +11,7 @@ use std::fmt::Write as _;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context, bail, ensure};
 use serde::Deserialize;
@@ -215,6 +216,44 @@ pub(crate) fn post_gemini(url: &str, body: &str, key: &str) -> anyhow::Result<(u
     Ok((status, text))
 }
 
+/// How long to wait before each retry when Gemini is busy (HTTP 429 or 5xx) or unreachable: four
+/// attempts over about a minute and a half. Gemini's free tier often answers 503 for a moment;
+/// past the last attempt the review fails closed as before, with the last answer's reason.
+pub(crate) const RETRY_DELAYS: [Duration; 3] = [
+    Duration::from_secs(10),
+    Duration::from_secs(30),
+    Duration::from_secs(60),
+];
+
+/// Whether an attempt is worth repeating: Gemini was busy, failed, or could not be reached.
+fn transient(result: &anyhow::Result<(u16, String)>) -> bool {
+    match result {
+        Ok((status, _)) => *status == 429 || (500..=599).contains(status),
+        Err(_) => true,
+    }
+}
+
+/// `post`, retried after each of `delays` (waited out with `wait`) while the answer is
+/// [`transient`]. The last attempt's result is returned as it is, so a review that never got
+/// through still fails with that attempt's reason.
+pub(crate) fn retrying<'a>(
+    mut post: impl FnMut(&str, &str, &str) -> anyhow::Result<(u16, String)> + 'a,
+    mut wait: impl FnMut(Duration) + 'a,
+    delays: &'a [Duration],
+) -> impl FnMut(&str, &str, &str) -> anyhow::Result<(u16, String)> + 'a {
+    move |url, body, key| {
+        let mut result = post(url, body, key);
+        for delay in delays {
+            if !transient(&result) {
+                break;
+            }
+            wait(*delay);
+            result = post(url, body, key);
+        }
+        result
+    }
+}
+
 /// The verdict as Markdown for the job summary.
 fn summary(verdict: &Verdict) -> String {
     let decision = match (&verdict.verdict, verdict.blocks()) {
@@ -407,10 +446,11 @@ pub(crate) fn run_from(
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::time::Duration;
 
     use super::{
-        Decision, Event, MAX_DIFF_BYTES, MODEL, Plan, Request, body, plan, post_gemini, review,
-        run, run_from, summary,
+        Decision, Event, MAX_DIFF_BYTES, MODEL, Plan, Request, Verdict, body, plan, post_gemini,
+        retrying, review, run, run_from, summary,
     };
     use crate::testing::{git, repository, serve_once};
 
@@ -481,7 +521,7 @@ mod tests {
 
     #[test]
     fn a_blocking_finding_blocks_whatever_the_verdict() {
-        let verdict: super::Verdict = serde_json::from_str(
+        let verdict: Verdict = serde_json::from_str(
             r#"{"verdict": "pass", "findings": [{"severity": "blocking", "file": "a.rs", "line": 1, "title": "t", "detail": "d"}]}"#,
         )
         .unwrap();
@@ -490,7 +530,7 @@ mod tests {
             summary(&verdict).starts_with("## Gemini review: block (a blocking finding"),
             "and says why"
         );
-        let minor: super::Verdict = serde_json::from_str(
+        let minor: Verdict = serde_json::from_str(
             r#"{"verdict": "pass", "findings": [{"severity": "minor", "file": "a.rs", "line": 1, "title": "t", "detail": "d"}]}"#,
         )
         .unwrap();
@@ -625,6 +665,99 @@ mod tests {
                 .contains("refused the request (HTTP 400): bad key"),
             "{rejected}"
         );
+    }
+
+    /// Reviews through [`retrying`] against a Gemini that gives `answers` in turn, returning the
+    /// outcome, how many attempts were made, and the waits between them.
+    fn attempts(
+        answers: Vec<anyhow::Result<(u16, String)>>,
+        delays: &[Duration],
+    ) -> (anyhow::Result<Verdict>, usize, Vec<Duration>) {
+        let calls = std::cell::Cell::new(0_usize);
+        let mut waits = Vec::new();
+        let mut answers = answers.into_iter();
+        let outcome = review(
+            &request("+x"),
+            "test-key",
+            &mut retrying(
+                |_: &str, _: &str, _: &str| {
+                    calls.set(calls.get().saturating_add(1));
+                    answers.next().expect("no more attempts than answers")
+                },
+                |delay| waits.push(delay),
+                delays,
+            ),
+        );
+        (outcome, calls.get(), waits)
+    }
+
+    #[test]
+    fn retries_a_busy_gemini_until_it_answers() {
+        let delays = [
+            Duration::from_secs(1),
+            Duration::from_secs(2),
+            Duration::from_secs(3),
+        ];
+        let (outcome, calls, waits) = attempts(
+            vec![
+                Ok((503, String::new())),
+                Ok((429, String::new())),
+                Err(anyhow::anyhow!("could not reach Gemini")),
+                Ok((200, recorded(PASS))),
+            ],
+            &delays,
+        );
+        assert_eq!(
+            outcome.unwrap().verdict,
+            Decision::Pass,
+            "the fourth attempt's verdict"
+        );
+        assert_eq!(
+            calls, 4,
+            "a 503, a 429 and a network error are each retried"
+        );
+        assert_eq!(waits, delays, "waiting each delay in turn");
+    }
+
+    #[test]
+    fn still_fails_closed_when_gemini_stays_busy() {
+        let delays = [Duration::from_secs(1), Duration::from_secs(2)];
+        let busy = || Ok((503, String::new()));
+        let (outcome, calls, waits) = attempts(vec![busy(), busy(), busy()], &delays);
+        let error = outcome.unwrap_err();
+        assert!(
+            error.to_string().contains("unavailable (HTTP 503)"),
+            "{error}"
+        );
+        assert_eq!(calls, 3, "one attempt plus one per delay, no more");
+        assert_eq!(waits, delays, "no wait after the last attempt");
+
+        let unreachable = || Err(anyhow::anyhow!("could not reach Gemini"));
+        let (offline, offline_calls, _) =
+            attempts(vec![unreachable(), unreachable(), unreachable()], &delays);
+        assert_eq!(
+            offline.unwrap_err().to_string(),
+            "could not reach Gemini",
+            "the last error stands"
+        );
+        assert_eq!(offline_calls, 3, "network errors are retried as often");
+    }
+
+    #[test]
+    fn retries_only_answers_that_may_change() {
+        let delays = [Duration::from_secs(1)];
+        for status in [200, 400, 403, 404, 499, 600] {
+            let (_, calls, waits) = attempts(vec![Ok((status, recorded(PASS)))], &delays);
+            assert_eq!((calls, waits.len()), (1, 0), "HTTP {status} is final");
+        }
+        for status in [429, 500, 599] {
+            let (outcome, calls, _) = attempts(
+                vec![Ok((status, String::new())), Ok((200, recorded(PASS)))],
+                &delays,
+            );
+            assert!(outcome.is_ok(), "HTTP {status} is retried");
+            assert_eq!(calls, 2, "HTTP {status} is retried once here");
+        }
     }
 
     #[test]
