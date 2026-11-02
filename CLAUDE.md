@@ -21,14 +21,13 @@ Claude included.
   reasons, once: a stop that a stop hook already sent back (`stop_hook_active`) is never blocked
   again, and subagents' stops are not judged. With no task recorded it only notes that; if claude
   fails or times out, it steps aside.
-- **The agent App.** In your sessions, `.claude/settings.json` sets git's credential helper for
-  github.com, through `GIT_CONFIG_*` variables, to `cargo xtask git-credential`, after clearing
-  the user's helpers. So git pushes and `cargo xtask gh -- <args>` act as the getabc-dev-agent App,
-  with tokens for this repository alone and the permissions each use needs, minted from
-  `~/.config/abc/agent-app/` (`app.json` with `client_id`, `installation_id` and optionally
-  `repository`, default `abc`; and `private-key.pem`, which must be mode 600). The user's own
-  terminal keeps the user's credentials. Do not use the user's gh login for changes on GitHub.
-- **Denied:** `gh auth token`, `gh auth status --show-token`, `security find-*-password`, and
-  reading `~/.config/gh/` or `~/.config/abc/agent-app/`. Credentials are not yours to read.
+- **Agent VMs.** Sessions run in a microVM per worktree (`cargo xtask vm`, D37). You see only
+  this worktree and a git repository holding its branch and `origin/main`; the network reaches
+  only `xtask/vm/egress-allow.txt`; Postgres 18 runs in the VM on 127.0.0.1 as `abc_test`
+  (`ABC_TEST_DATABASE_URL` is set). git pushes and `cargo xtask gh -- <args>` act as the
+  getabc-dev-agent App, with a token per use from the host's broker (`ABC_AGENT_BROKER`), scoped
+  to this repository and the permissions each use needs. Claude Code here runs on the
+  maintainer's subscription token only; the VM refuses any API key or other route, before every
+  tool call too.
 - Run `cargo xtask setup` once in a new clone or worktree so the hooks find their tools.
 - pstack skills are typed as `/pstack:<skill>`.

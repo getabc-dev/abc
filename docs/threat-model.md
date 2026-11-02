@@ -73,28 +73,58 @@ leave the user's machines for GitHub and the model providers.
 
 ## Today: abc's own development
 
-Status: **Open**. Until abc can build itself, the maintainer builds it with Claude Code sessions on
-a laptop. This section covers that setup, not the product.
+Status: **Mitigated in part**. Until abc can build itself, the maintainer builds it with Claude
+Code sessions on a macOS laptop, each in a microVM of its own (D37). This section covers that
+setup, not the product.
 
-- The getabc-dev-agent App's private key lives in `~/.config/abc/agent-app/` on the laptop.
-- Agent sessions mint App tokens through `cargo xtask git-credential` and `cargo xtask gh`. They run
-  without a sandbox, as the maintainer's user, and the maintainer's own gh login is on the same
-  machine.
-- `.claude/settings.json` denies the Read tool on `~/.config/abc/agent-app/` and `~/.config/gh/`,
-  and denies `gh auth token` and `security find-*-password`. Bash can still read the key, because
-  the git guard catches accidents only. A prompt-injected session can therefore mint tokens with
-  all of the App's permissions: contents, pull requests and workflows write.
-- The `main` ruleset bounds what those tokens can do: nothing merges without a code owner's
-  approval after the last push, and the admin bypass works only through a pull request. Within
-  that bound, a session can still push any other branch and open or change pull requests. It can
-  also add or edit workflows on a branch, and workflows that run from this repository's branches
-  get its secrets, such as `GEMINI_API_KEY`.
-- The maintainer's gh login is a repository admin. A session that reads it can act as the
-  maintainer, and the ruleset does not bound that.
+- **The VM boundary.** `cargo xtask vm` runs each session in a microsandbox VM (libkrun on
+  Hypervisor.framework, KVM on Linux), pinned by sha256 in `xtask/tools.toml`. The VM mounts the
+  worktree, read-write at its own path, and the session's own git repository, which holds only
+  the worktree's branch and `origin/main`; nothing else of the host's files. The maintainer's
+  home, SSH and GPG keys, keychains, gh login, the App's key, other worktrees and the main clone,
+  with its config and hooks, are not in the VM. Inside, the agent runs as uid 1000 with no
+  capabilities and no_new_privs, and the image has no setuid programs.
+- **Egress.** microsandbox enforces a deny-by-default policy on the host: DNS, and TCP 443 to the
+  hosts in `xtask/vm/egress-allow.txt`, matched by the TLS server name. The host machine, its
+  loopback and LAN services (the colima Docker API among them), other VMs and cloud metadata are
+  unreachable. Matching by server name does not stop domain fronting, and the allowed hosts
+  include GitHub, so a session can still send data out through them.
+- **GitHub as the App.** The getabc-dev-agent App's key lives in `~/.config/abc/agent-app/` on the
+  laptop and only `cargo xtask broker` reads it. The maintainer installs the broker from `main`
+  outside any checkout, and it refuses to run from one. It listens on
+  `~/.config/abc/agent-broker/broker.sock` (owner only), which microsandbox forwards into each VM
+  over vsock: the VM has no network path to the host. It serves each client on its own thread,
+  eight at once at most, with a five-second timeout, and logs no token. Sessions get a token per
+  use, for this repository alone, with the permissions that use needs. Within the `main`
+  ruleset's bound (nothing merges without a code owner's approval after the last push), a session
+  can push other branches, open or change pull requests, and add or edit workflows on a branch,
+  which then run with this repository's secrets, such as `GEMINI_API_KEY`.
+- **Postgres** runs inside the VM, on 127.0.0.1, with its data in memory. The agent connects as
+  `abc_test`, which may create databases but is no superuser, so it cannot run programs as the
+  server (`COPY ... TO PROGRAM`); the superuser is reachable only by the postgres OS user.
+- **Claude Code on the subscription only.** The maintainer's `claude setup-token` token stays in
+  their keychain; `cargo xtask vm start` pipes it into the VM's memory (`/run/abc`, a tmpfs), so
+  it never appears in an argument, the VM's configuration or a log. The launcher passes no API
+  key or other route, and the VM's own xtask refuses API keys, auth tokens, key helpers, custom
+  endpoints and cloud providers before the agent user starts, before each session and before each
+  tool call; `start` fails unless `claude auth status` reports the subscription token. Commands
+  the agent runs can read the token, as they can wherever the agent's own `claude` runs.
+- **Hooks** run inside the VM with the session, so code an agent wrote never runs on the host
+  through them. The maintainer runs `cargo xtask vm` from the main clone only; xtask refuses to
+  run it from a linked worktree, whose xtask an agent may have changed.
 
-Mitigation candidates: run sessions in Claude Code's Bash sandbox with reads of
-`~/.config/abc/agent-app/` and `~/.config/gh/` denied; move the App key off the laptop so sessions
-only ever receive tokens; keep an admin login out of agent sessions.
+Open:
+
+- microsandbox writes the output of everything run in a VM, the interactive Claude Code session
+  included, to `exec.log` on the host while the VM exists. `stop` deletes the VM and its logs;
+  until then, a secret a session prints sits in that file, readable by the maintainer's user.
+- microsandbox is beta, and its releases break compatibility. The pin, a state directory per
+  version and sessions that hold only caches bound the damage of an upgrade; a flaw in libkrun or
+  in microsandbox's network stack would cross the boundary.
+- Code from an agent's worktree, run from the maintainer's own terminal, runs with the
+  maintainer's full access. Review it first, or run it in a session.
+- The billing check before each tool call runs from the worktree's hook script, which the agent
+  can edit; the checks before the VM and each session start run from the image, which it cannot.
 
 ## Boundaries and threats
 
@@ -149,7 +179,7 @@ or bubblewrap with seccomp on Linux. The agent needs network access to its model
 
 | STRIDE | Threat | Mitigation | Rule | Status |
 | --- | --- | --- | --- | --- |
-| Elevation of privilege | A prompt-injected agent reads or writes outside its change: other repositories, `~/.ssh`, other worktrees. | The sandbox exposes only the change's worktree. Anything else needs a folder grant: scoped, time-limited or task-limited, revocable and logged. | I3 | Planned |
+| Elevation of privilege | A prompt-injected agent reads or writes outside its change: other repositories, `~/.ssh`, other worktrees. | The sandbox exposes only the change's worktree. Anything else needs a folder grant: scoped, time-limited or task-limited, revocable and logged. | I3 | Built (abc's development, microVMs); Planned (product) |
 | Elevation of privilege | Code the agent wrote runs outside the sandbox, for example when the worker runs builds, tests or repository hooks on it. | Every command on agent-written code runs inside the sandbox. | I3 | Planned |
 | Elevation of privilege | The agent reaches local sockets: the ssh agent, Docker, the `tailscaled` local API. | The sandbox denies them unless a grant allows one. | I3 | Planned |
 | Information disclosure | Production secrets reach the agent through environment variables or files. | The worker starts agents with a clean environment; production secrets never enter it. | I2 | Planned |
