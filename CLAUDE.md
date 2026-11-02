@@ -6,8 +6,8 @@ Claude included.
 ## Claude Code notes
 
 - **Sandbox.** Your Bash commands run in Claude Code's sandbox (`sandbox` in
-  `.claude/settings.json`), and you cannot run one outside it. They cannot read `~/.config/gh/`,
-  `~/.config/abc/agent-app/`, the keychains or `~/.ssh/`; they write only inside the checkout and
+  `.claude/settings.json`), and you cannot run one outside it. They cannot read the user's
+  credentials (see **Denied**); they write only inside the checkout and
   the sandbox's temporary directory; they reach only GitHub, crates.io, the Rust toolchain's and
   the pinned tools' download hosts, and the agent App's token broker. `~/.cargo` is read-only: if
   a build needs a crate that is not downloaded yet, ask the user to run `cargo fetch`. Never use
@@ -41,7 +41,9 @@ Claude included.
   `repository`, default `abc`; and `private-key.pem`, which must be mode 600). If the broker is not
   running, ask the user to start it. The user's own terminal keeps the user's credentials. Do not
   use the user's gh login for changes on GitHub.
-- **Denied:** `gh auth token`, `gh auth status --show-token`, `security find-*-password`, and
-  reading `~/.config/gh/` or `~/.config/abc/agent-app/`. Credentials are not yours to read.
+- **Denied:** reading the user's credentials (`permissions.deny` lists them: SSH and GPG keys, the
+  keychains, browser profiles, `~/.config/gh/`, `~/.config/abc/agent-app/`, cloud, registry and AI
+  tools' tokens, shell histories), with the Read tool or any command; and `gh auth token`,
+  `gh auth status --show-token` and `security find-*-password`. Credentials are not yours to read.
 - Run `cargo xtask setup` once in a new clone or worktree so the hooks find their tools.
 - pstack skills are typed as `/pstack:<skill>`.

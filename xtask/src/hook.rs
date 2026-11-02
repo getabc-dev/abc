@@ -882,8 +882,14 @@ mod tests {
             assert_eq!(stop["command"], stop_command, "{event} runs the check");
             assert_eq!(stop["timeout"], 900, "{event} is time-boxed");
         }
+        let bash_denies: Vec<&serde_json::Value> = settings["permissions"]["deny"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|rule| rule.as_str().unwrap().starts_with("Bash("))
+            .collect();
         assert_eq!(
-            settings["permissions"]["deny"],
+            serde_json::json!(bash_denies),
             serde_json::json!([
                 "Bash(gh auth token)",
                 "Bash(gh auth token *)",
@@ -893,12 +899,11 @@ mod tests {
                 "Bash(gh auth status -t)",
                 "Bash(gh auth status -t *)",
                 "Bash(gh auth status * -t*)",
-                "Read(~/.config/gh/**)",
-                "Read(~/.config/abc/agent-app/**)",
                 "Bash(security find-generic-password *)",
                 "Bash(security find-internet-password *)"
             ]),
-            "agents cannot read the user's GitHub credentials (D3)"
+            "commands that print credentials are refused by name too, as accident-catchers: a \
+             script gets past them, and the sandbox's read denies are what hold (D3)"
         );
         assert_eq!(
             settings["env"],
@@ -1089,16 +1094,81 @@ mod tests {
                 "{key} would open local services, the Docker socket or the keychain"
             );
         }
+        assert!(
+            sandbox.get("filesystem").is_none(),
+            "writes stay at Claude Code's default, the checkout; reads are denied below"
+        );
+        let read_denies: Vec<&str> = settings["permissions"]["deny"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|rule| rule.as_str().unwrap())
+            .filter(|rule| rule.starts_with("Read("))
+            .collect();
+        assert!(
+            read_denies.contains(&format!("Read(~/{}/**)", crate::app::CONFIG_DIR).as_str()),
+            "the App's key"
+        );
         assert_eq!(
-            sandbox["filesystem"],
-            serde_json::json!({"denyRead": [
-                "~/.config/gh",
-                format!("~/{}", crate::app::CONFIG_DIR),
-                "~/Library/Keychains",
-                "~/.ssh"
-            ]}),
-            "the user's gh login, the App's key, the keychains gh and git keep tokens in, and SSH \
-             keys are unreadable; writes stay at Claude Code's default, the checkout"
+            read_denies,
+            [
+                "Read(~/.ssh/**)",
+                "Read(~/.gnupg/**)",
+                "Read(~/Library/Keychains/**)",
+                "Read(~/Library/Cookies/**)",
+                "Read(~/Library/Safari/**)",
+                "Read(~/Library/Application Support/Google/**)",
+                "Read(~/Library/Application Support/Chromium/**)",
+                "Read(~/Library/Application Support/BraveSoftware/**)",
+                "Read(~/Library/Application Support/Arc/**)",
+                "Read(~/Library/Application Support/Microsoft Edge/**)",
+                "Read(~/Library/Application Support/Vivaldi/**)",
+                "Read(~/Library/Application Support/com.operasoftware.Opera/**)",
+                "Read(~/Library/Application Support/Firefox/**)",
+                "Read(~/Library/Application Support/Mozilla/**)",
+                "Read(~/.config/gh/**)",
+                "Read(~/.config/abc/agent-app/**)",
+                "Read(~/.aws/**)",
+                "Read(~/.azure/**)",
+                "Read(~/.config/gcloud/**)",
+                "Read(~/.kube/**)",
+                "Read(~/.docker/**)",
+                "Read(~/.colima/**)",
+                "Read(~/.terraform.d/**)",
+                "Read(~/.supabase/**)",
+                "Read(~/.codex/**)",
+                "Read(~/.gemini/**)",
+                "Read(~/.copilot/**)",
+                "Read(~/.mcp-auth/**)",
+                "Read(~/.factory/**)",
+                "Read(~/.config/anthropic/**)",
+                "Read(~/.config/amp/**)",
+                "Read(~/.config/opencode/**)",
+                "Read(~/.config/devin/**)",
+                "Read(~/.config/elevenlabs/**)",
+                "Read(~/.config/code-server/**)",
+                "Read(~/.logfire/**)",
+                "Read(~/.zsh_sessions/**)",
+                "Read(~/.netrc)",
+                "Read(~/.git-credentials)",
+                "Read(~/.config/git/credentials)",
+                "Read(~/.npmrc)",
+                "Read(~/.yarnrc)",
+                "Read(~/.yarnrc.yml)",
+                "Read(~/.pypirc)",
+                "Read(~/.gem/credentials)",
+                "Read(~/.cargo/credentials)",
+                "Read(~/.cargo/credentials.toml)",
+                "Read(~/.claude.json)",
+                "Read(~/.claude/.credentials.json)",
+                "Read(~/.zsh_history)",
+                "Read(~/.bash_history)",
+                "Read(~/.python_history)",
+                "Read(~/.node_repl_history)"
+            ],
+            "the Read tool and, through Claude Code's sandbox, every command are denied the user's \
+             credentials: SSH and GPG keys, the keychains and browser profiles, the gh login and \
+             the App's key, cloud, registry and AI tools' tokens, and shell histories"
         );
         assert_eq!(
             sandbox["network"]["allowedDomains"],

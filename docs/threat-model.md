@@ -78,15 +78,28 @@ Code sessions on a macOS laptop. This section covers that setup, not the product
 
 - The getabc-dev-agent App's private key lives in `~/.config/abc/agent-app/` on the laptop. Only
   the token broker, `cargo xtask broker`, reads it. The maintainer runs the broker outside Claude
-  Code from a build of `main` installed with `cargo install`, never from a checkout agents work
-  in, since agents can change xtask there. Sessions ask it for an installation token per use over
+  Code from a build of `main` installed with `cargo install`; it refuses to start from inside a git
+  checkout, where agents can change xtask. It serves each client on its own thread, eight at once
+  at most, and waits two seconds for a request, so a client that hangs cannot stall the others. Sessions ask it for an installation token per use over
   `~/.config/abc/agent-broker/broker.sock`; the key never reaches them.
+- `.claude/settings.json` denies reads of the user's credentials: SSH and GPG keys, the keychains,
+  browser profiles and cookies, the gh login (`~/.config/gh/`), the App's directory, cloud,
+  container, registry and AI tools' tokens, `~/.claude.json` and shell histories. One list of
+  `Read` deny rules covers both Claude Code's Read tool, which runs outside the sandbox, and every
+  sandboxed command, since Claude Code turns those rules into the sandbox's own read denies. A
+  symlink to a denied file, or another spelling of its path, is denied too.
+- The keychains are closed at the file level: Claude Code's sandbox always allows its commands to
+  reach the keychain service (`com.apple.SecurityServer`), and no setting removes that, so the
+  denied `~/Library/Keychains` is what keeps `security` and `git credential-osxkeychain` from the
+  gh token and git's stored passwords. The session's `GIT_CONFIG_*` variables also reset git's
+  credential helpers for github.com, the system's osxkeychain included, to the broker's.
+- Commands that print credentials (`gh auth token`, `security find-*-password`) are also refused
+  by name. A script gets past those rules; they catch accidents, and the read denies hold.
 - Every Bash command in a session runs in Claude Code's sandbox, and the model cannot rerun one
-  outside it. The sandbox denies reads of the maintainer's gh login (`~/.config/gh/`), the App's
-  directory, the keychains, where gh and git keep tokens, and `~/.ssh/`. It allows writes only
-  inside the checkout and its temporary directory, connections only to GitHub, crates.io, the Rust
-  toolchain's and the pinned tools' download hosts, and the broker's socket. Sessions never reach
-  Docker, whose daemon would mount the whole home directory for them, or other local services.
+  outside it. It allows writes only inside the checkout and its temporary directory, connections
+  only to GitHub, crates.io, the Rust toolchain's and the pinned tools' download hosts, and the
+  broker's socket. Sessions never reach Docker, whose daemon would mount the whole home directory
+  for them, or other local services.
 - Claude Code runs hooks outside its sandbox. The hooks run repository code, which agents can
   change, only through `.claude/hooks/jail.sh`, a macOS Seatbelt profile with the sandbox's
   limits and no network. Only the watchdog's `claude -p` runs outside it, with no tools. Writes to
@@ -99,11 +112,12 @@ Code sessions on a macOS laptop. This section covers that setup, not the product
 
 Open:
 
-- Sessions can read the rest of the home directory, including other tools' credentials, and can
-  send what they read to GitHub, which they must reach, or through the certificate checks of
-  macOS's trustd, which gh needs (`enableWeakerNetworkIsolation`).
-- Claude Code's file tools run outside the sandbox. Permission rules and Claude Code's protected
-  paths bound them, not the operating system.
+- The deny list names known credential stores; it cannot deny the whole home directory, since
+  checkouts live inside it. A tool that keeps a token somewhere else stays readable, and sessions
+  can send what they read to GitHub, which they must reach, or through the certificate checks of
+  macOS's trustd, which gh needs (`enableWeakerNetworkIsolation`). Add new stores to the list.
+- Claude Code's file tools run outside the sandbox. The `Read` deny rules, permission rules and
+  Claude Code's protected paths bound them, not the operating system.
 - Code from an agent's checkout, run from the maintainer's own terminal, runs with the
   maintainer's full access. Review it first, or run it in a session.
 - Sessions need macOS; elsewhere the jail refuses and every Bash call is blocked.

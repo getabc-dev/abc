@@ -176,13 +176,6 @@ mod tests {
     }
 
     #[test]
-    fn the_broker_needs_the_app() {
-        let broker = xtask(&["broker"], "", &[]);
-        assert_eq!(broker.status.code(), Some(1), "no App files, no broker");
-        assert!(stderr(&broker).contains("app.json"), "{}", stderr(&broker));
-    }
-
-    #[test]
     fn the_watchdog_judges_claudes_answer() {
         let answer =
             |result: &str| serde_json::json!({"type": "result", "result": result}).to_string();

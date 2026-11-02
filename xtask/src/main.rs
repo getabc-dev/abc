@@ -172,7 +172,8 @@ enum Task {
     /// Run it yourself, outside Claude Code, from a build of main that no agent can change, never
     /// from a checkout agents work in. Install it with `cargo install --locked --git
     /// https://github.com/getabc-dev/abc --branch main xtask --root ~/.local/share/abc/broker`,
-    /// then run `~/.local/share/abc/broker/bin/xtask broker`. It reads `~/.config/abc/agent-app/`
+    /// then run `~/.local/share/abc/broker/bin/xtask broker`. It refuses to start from inside a git
+    /// checkout. It reads `~/.config/abc/agent-app/`
     /// and listens on `~/.config/abc/agent-broker/broker.sock`, the one socket agents' sandboxed
     /// commands may reach. Reinstall it when main changes it.
     Broker,
@@ -318,7 +319,7 @@ fn run(
         )?)),
         Task::GitCredential { operation } => git_credential(&operation),
         Task::Gh { args } => gh_as_app(&args, report),
-        Task::Broker => serve_tokens(&app::config_dir()?, &broker::socket()?, report),
+        Task::Broker => run_broker(),
         Task::Watchdog => Ok(ExitCode::from(watchdog::verdict(
             &stdin("claude's answer")?,
             report,
@@ -409,9 +410,27 @@ fn integrity(
     integrity::run(root, base, pull_request.as_ref(), &event, report)
 }
 
-/// `cargo xtask broker`: loads the App from `config` and serves its tokens on `socket` until the
-/// process ends.
-fn serve_tokens(config: &Path, socket: &Path, log: &mut impl Write) -> anyhow::Result<ExitCode> {
+/// `cargo xtask broker`, from this executable, with the App and socket in their places under the
+/// home directory, logging to stderr, which every client's thread may write.
+fn run_broker() -> anyhow::Result<ExitCode> {
+    serve_tokens(
+        &std::env::current_exe().context("could not find the running executable")?,
+        &app::config_dir()?,
+        &broker::socket()?,
+        &mut io::stderr(),
+    )
+}
+
+/// The broker, run from `exe`: loads the App from `config` and serves its tokens on
+/// `socket` until the process ends. It refuses before reading the key when `exe` lies inside a
+/// checkout.
+fn serve_tokens(
+    exe: &Path,
+    config: &Path,
+    socket: &Path,
+    log: &mut (impl Write + Send),
+) -> anyhow::Result<ExitCode> {
+    broker::refuse_checkout(exe)?;
     let app = app::App::load(config)?;
     let agent = ureq::Agent::new_with_defaults();
     broker::serve(
@@ -831,7 +850,20 @@ mod tests {
         let config = temp.path().join("agent-app");
         fs::create_dir_all(&config).unwrap();
         let socket = temp.path().join("agent-broker/broker.sock");
-        let missing = serve_tokens(&config, &socket, &mut Vec::new()).unwrap_err();
+        let installed = temp.path().join("install/bin/xtask");
+        let checkout = crate::testing::repository(&temp.path().join("checkout"));
+        let inside = serve_tokens(
+            &checkout.join("target/debug/xtask"),
+            &config,
+            &socket,
+            &mut Vec::new(),
+        )
+        .unwrap_err();
+        assert!(
+            format!("{inside:#}").contains("outside any checkout"),
+            "a build in a checkout never reads the key: {inside:#}"
+        );
+        let missing = serve_tokens(&installed, &config, &socket, &mut Vec::new()).unwrap_err();
         assert!(format!("{missing:#}").contains("app.json"), "{missing:#}");
         assert!(!socket.exists(), "no App, no socket");
         fs::write(
@@ -845,7 +877,7 @@ mod tests {
         let (sender, outcome) = std::sync::mpsc::channel();
         let listening = socket.clone();
         std::thread::spawn(move || {
-            let result = serve_tokens(&config, &listening, &mut Vec::new());
+            let result = serve_tokens(&installed, &config, &listening, &mut Vec::new());
             sender
                 .send(result.map_err(|error| format!("{error:#}")))
                 .unwrap();

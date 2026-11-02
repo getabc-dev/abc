@@ -16,9 +16,11 @@ use std::io::{BufRead as _, BufReader, Read, Write};
 use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use anyhow::{Context as _, bail};
+use anyhow::{Context as _, anyhow, bail};
 
 use crate::app::Scope;
 
@@ -26,8 +28,12 @@ use crate::app::Scope;
 /// commands to connect to this path and to no other socket.
 pub(crate) const SOCKET: &str = ".config/abc/agent-broker/broker.sock";
 
-/// How long the broker waits for a client to send its request or take its answer.
-const PATIENCE: Duration = Duration::from_secs(10);
+/// How long the broker waits for a client to send its one-line request or take its answer.
+const PATIENCE: Duration = Duration::from_secs(2);
+
+/// How many clients the broker serves at once; more are refused until one finishes, so clients
+/// that hang can hold up at most this many connections, each for at most [`PATIENCE`].
+const MAX_CLIENTS: usize = 8;
 
 /// The longest request line a client can send; longer ones are refused.
 const MAX_REQUEST: u64 = 64;
@@ -75,8 +81,8 @@ fn exchange(mut stream: impl Read + Write, scope: Scope) -> anyhow::Result<Strin
 /// Serves tokens from `mint` on `socket` until the process ends, noting each request in `log`.
 pub(crate) fn serve(
     socket: &Path,
-    mint: impl Fn(Scope) -> anyhow::Result<String>,
-    log: &mut impl Write,
+    mint: impl Fn(Scope) -> anyhow::Result<String> + Sync,
+    log: &mut (impl Write + Send),
 ) -> anyhow::Result<()> {
     let listener = bind(socket)?;
     writeln!(
@@ -90,24 +96,72 @@ pub(crate) fn serve(
         client.set_write_timeout(Some(PATIENCE))?;
         Ok(client)
     });
-    answer_all(clients, mint, log)
+    answer_all(clients, mint, log, MAX_CLIENTS);
+    Ok(())
 }
 
-/// Answers each of `clients` in turn with a token from `mint`, noting each in `log`. A client that
-/// fails is noted and the next one served.
-fn answer_all<S: Read + Write>(
+/// Answers each of `clients` with a token from `mint`, each on its own thread and at most `max` at
+/// once, noting each in `log`. A client that fails or comes while `max` are being served is noted
+/// and refused.
+fn answer_all<S: Read + Write + Send>(
     clients: impl Iterator<Item = std::io::Result<S>>,
-    mint: impl Fn(Scope) -> anyhow::Result<String>,
-    log: &mut impl Write,
-) -> anyhow::Result<()> {
-    for client in clients {
-        let outcome = client
-            .context("could not accept a connection")
-            .and_then(|client| answer(client, &mint));
-        match outcome {
-            Ok(scope) => writeln!(log, "broker: minted a {} token", scope.name())?,
-            Err(error) => writeln!(log, "broker: refused a request: {error:#}")?,
+    mint: impl Fn(Scope) -> anyhow::Result<String> + Sync,
+    log: &mut (impl Write + Send),
+    max: usize,
+) {
+    let log = Mutex::new(log);
+    let serving = AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        for client in clients {
+            let mut client = match client {
+                Ok(client) => client,
+                Err(error) => {
+                    note(
+                        &log,
+                        Err(anyhow!(error).context("could not accept a connection")),
+                    );
+                    continue;
+                }
+            };
+            if serving.fetch_add(1, Ordering::SeqCst) >= max {
+                serving.fetch_sub(1, Ordering::SeqCst);
+                // The client may be gone; the refusal is noted either way.
+                let _sent = writeln!(client, "error the broker is busy; try again");
+                note(&log, Err(anyhow!("{max} clients are being served already")));
+                continue;
+            }
+            let (mint, log, serving) = (&mint, &log, &serving);
+            scope.spawn(move || {
+                note(log, answer(client, mint));
+                serving.fetch_sub(1, Ordering::SeqCst);
+            });
         }
+    });
+}
+
+/// Notes one client's `outcome` in `log`.
+fn note(log: &Mutex<&mut (impl Write + Send)>, outcome: anyhow::Result<Scope>) {
+    let line = match outcome {
+        Ok(scope) => format!("broker: minted a {} token\n", scope.name()),
+        Err(error) => format!("broker: refused a request: {error:#}\n"),
+    };
+    if let Ok(mut log) = log.lock() {
+        // With the log gone there is nowhere left to note it; the client got its answer.
+        let _noted = log.write_all(line.as_bytes());
+    }
+}
+
+/// Refuses to serve from `exe` when it lies inside a git checkout, where agents may have changed
+/// the code it was built from. The broker runs from a build of `main` installed outside any
+/// checkout, as `cargo xtask broker --help` says.
+pub(crate) fn refuse_checkout(exe: &Path) -> anyhow::Result<()> {
+    if let Some(checkout) = exe.ancestors().find(|dir| dir.join(".git").exists()) {
+        bail!(
+            "the broker holds the App's key, so it runs only from a build of main installed \
+             outside any checkout (see `cargo xtask broker --help`); {} is inside the checkout {}",
+            exe.display(),
+            checkout.display()
+        );
     }
     Ok(())
 }
@@ -239,14 +293,16 @@ mod tests {
         assert!(outcome.contains("401"), "{outcome}");
     }
 
+    /// A connected pair: the client's end, which has sent `request`, and the broker's.
+    fn client(request: &'static [u8]) -> (UnixStream, UnixStream) {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        client.write_all(request).unwrap();
+        client.shutdown(std::net::Shutdown::Write).unwrap();
+        (client, server)
+    }
+
     #[test]
-    fn serves_one_client_after_another_and_logs_no_token() {
-        let client = |request: &'static [u8]| {
-            let (mut client, server) = UnixStream::pair().unwrap();
-            client.write_all(request).unwrap();
-            client.shutdown(std::net::Shutdown::Write).unwrap();
-            (client, server)
-        };
+    fn serves_every_client_and_logs_no_token() {
         let (mut first, first_server) = client(b"git\n");
         let (mut second, second_server) = client(b"root\n");
         let clients = vec![
@@ -259,8 +315,8 @@ mod tests {
             clients.into_iter(),
             |_| Ok("ghs_secret".to_owned()),
             &mut log,
-        )
-        .unwrap();
+            2,
+        );
         let mut reply = String::new();
         first.read_to_string(&mut reply).unwrap();
         assert_eq!(
@@ -271,14 +327,72 @@ mod tests {
         second.read_to_string(&mut reply).unwrap();
         assert!(reply.starts_with("error "), "the last was refused: {reply}");
         let log = String::from_utf8(log).unwrap();
+        let mut lines: Vec<&str> = log.lines().collect();
+        lines.sort_unstable();
         assert_eq!(
-            log,
-            "broker: minted a git token\n\
-             broker: refused a request: could not accept a connection: accept failed\n\
-             broker: refused a request: no scope is named \"root\"\n",
+            lines,
+            [
+                "broker: minted a git token",
+                "broker: refused a request: could not accept a connection: accept failed",
+                "broker: refused a request: no scope is named \"root\"",
+            ],
             "every request is noted"
         );
         assert!(!log.contains("ghs_secret"), "and no token ever");
+    }
+
+    #[test]
+    fn a_hung_client_holds_up_only_its_own_connection() {
+        // A client that connects and never sends its request.
+        let (hung, hung_server) = UnixStream::pair().unwrap();
+        let (mut waiting, waiting_server) = client(b"git\n");
+        let (sender, served) = std::sync::mpsc::channel();
+        let broker = std::thread::spawn(move || {
+            let mut log = Vec::new();
+            answer_all(
+                vec![Ok(hung_server), Ok(waiting_server)].into_iter(),
+                |_| Ok("ghs_x".to_owned()),
+                &mut log,
+                1,
+            );
+            sender.send(String::from_utf8(log).unwrap()).unwrap();
+        });
+        let mut reply = String::new();
+        waiting.read_to_string(&mut reply).unwrap();
+        assert_eq!(
+            reply, "error the broker is busy; try again\n",
+            "past the limit a client is refused at once, not queued behind the hung one"
+        );
+        drop(hung);
+        broker.join().unwrap();
+        let log = served.recv().unwrap();
+        assert!(
+            log.contains("broker: refused a request: 1 clients are being served already"),
+            "{log}"
+        );
+        assert!(
+            log.contains("the request is not one line"),
+            "the hung client: {log}"
+        );
+    }
+
+    #[test]
+    fn refuses_to_run_from_a_checkout() {
+        let temp = tempfile::tempdir().unwrap();
+        let installed = temp.path().join("install/bin/xtask");
+        assert!(
+            super::refuse_checkout(&installed).is_ok(),
+            "an install root"
+        );
+        let checkout = temp.path().join("abc");
+        std::fs::create_dir_all(&checkout).unwrap();
+        std::fs::write(checkout.join(".git"), "gitdir: elsewhere\n").unwrap();
+        let built = checkout.join("target/debug/xtask");
+        let error = format!("{:#}", super::refuse_checkout(&built).unwrap_err());
+        assert!(
+            error.contains("installed outside any checkout") && error.contains("abc"),
+            "a worktree's .git file counts too: {error}"
+        );
     }
 
     #[test]

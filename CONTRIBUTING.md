@@ -101,8 +101,11 @@ If you work with Claude Code, the committed `.claude/settings.json` applies to y
 [CLAUDE.md](CLAUDE.md) for the details. These parts affect contributors:
 
 - **The sandbox.** Every Bash command runs in Claude Code's sandbox, with no way to rerun it
-  outside. It cannot read your gh login, your keychains or `~/.ssh/`, write outside the checkout,
-  or reach hosts other than GitHub, crates.io and the toolchain's and pinned tools' downloads.
+  outside. Neither it nor Claude's Read tool can read your credentials: SSH and GPG keys, the
+  keychains, browser profiles, your gh login, cloud, registry and AI tools' tokens and shell
+  histories, as listed in `permissions.deny`. If yours live elsewhere, add them in
+  `.claude/settings.local.json`. It cannot write outside the checkout, or reach hosts other than
+  GitHub, crates.io and the toolchain's and pinned tools' downloads.
   `~/.cargo` is read-only in it, so run `cargo fetch` yourself when a change adds a crate. Agents
   never use Docker. Sessions need macOS for now: the hooks run repository code only under macOS
   Seatbelt, and elsewhere every Bash call is blocked.
