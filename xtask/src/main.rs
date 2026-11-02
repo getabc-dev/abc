@@ -312,7 +312,9 @@ fn run(
             &base,
             &env,
             report,
-            &mut review::post_gemini,
+            &mut |url: &str, body: &str, key: &str| {
+                review::post_gemini(&review::gemini_agent(), url, body, key)
+            },
         )?)),
         Task::GitCredential { operation } => git_credential(&operation),
         Task::Gh { args } => gh_as_app(&args, report),

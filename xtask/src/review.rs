@@ -195,9 +195,9 @@ pub(crate) fn review(
     })
 }
 
-/// Sends a request to Gemini, returning the status and body whatever the status.
-pub(crate) fn post_gemini(url: &str, body: &str, key: &str) -> anyhow::Result<(u16, String)> {
-    post_gemini_with(&gemini_config().build().into(), url, body, key)
+/// The agent that talks to Gemini.
+pub(crate) fn gemini_agent() -> ureq::Agent {
+    gemini_config().build().into()
 }
 
 /// How the agent that talks to Gemini is configured: every status is read, none raised.
@@ -205,8 +205,8 @@ fn gemini_config() -> ureq::config::ConfigBuilder<ureq::typestate::AgentScope> {
     ureq::Agent::config_builder().http_status_as_error(false)
 }
 
-/// [`post_gemini`] through `agent`.
-fn post_gemini_with(
+/// Sends a request to Gemini through `agent`, returning the status and body whatever the status.
+pub(crate) fn post_gemini(
     agent: &ureq::Agent,
     url: &str,
     body: &str,
@@ -394,7 +394,8 @@ fn review_changes(
 }
 
 /// [`run`], with the event, the key and the job summary's path read from GitHub Actions'
-/// variables through `lookup`, posting to Gemini with `post` ([`post_gemini`] for real).
+/// variables through `lookup`, posting to Gemini with `post` ([`post_gemini`] through
+/// [`gemini_agent`] for real).
 pub(crate) fn run_from(
     root: &Path,
     base: &str,
@@ -420,8 +421,8 @@ mod tests {
     use std::fs;
 
     use super::{
-        Decision, Event, MAX_DIFF_BYTES, MODEL, Plan, Request, body, gemini_config, plan,
-        post_gemini_with, review, run, run_from, summary,
+        Decision, Event, MAX_DIFF_BYTES, MODEL, Plan, Request, body, gemini_agent, gemini_config,
+        plan, post_gemini, review, run, run_from, summary,
     };
     use crate::testing::{fake_http, git, repository};
 
@@ -733,7 +734,7 @@ mod tests {
     fn posts_to_gemini_with_the_key_in_a_header() {
         let (agent, server) =
             fake_http(gemini_config(), vec![(429, r#"{"error": {"code": 429}}"#)]);
-        let (status, body) = post_gemini_with(
+        let (status, body) = post_gemini(
             &agent,
             "https://gemini.test/v1beta/models/m:generateContent",
             "{}",
@@ -752,6 +753,10 @@ mod tests {
         );
         assert!(request.contains("x-goog-api-key: test-key"), "{request}");
         assert!(!request.contains("key=test-key"), "never in the URL");
+        assert!(
+            !gemini_agent().config().http_status_as_error(),
+            "the real agent reads every status too"
+        );
     }
 
     #[test]
