@@ -73,6 +73,53 @@ pub(crate) fn diff(root: &Path, commit: &str, context: u32) -> anyhow::Result<St
     )
 }
 
+/// The pathspec attribute that marks a generated file in `.gitattributes`.
+pub(crate) const GENERATED: &str = "linguist-generated";
+
+/// The diff from `commit` to the working tree without generated files, and the generated files it
+/// left out. Which files are generated comes from `.gitattributes` as it was at `commit`, never
+/// from the working tree, so a change cannot hide its own code by marking it generated.
+pub(crate) fn reviewable_diff(
+    root: &Path,
+    commit: &str,
+    context: u32,
+) -> anyhow::Result<(String, Vec<String>)> {
+    let attr_source = format!("--attr-source={commit}");
+    let diff = git(
+        root,
+        &[
+            &attr_source,
+            "-c",
+            "core.quotePath=false",
+            "diff",
+            "--no-color",
+            "--no-ext-diff",
+            "-M",
+            &format!("-U{context}"),
+            commit,
+            "--",
+            ".",
+            &format!(":(exclude,attr:{GENERATED})"),
+        ],
+    )?;
+    let generated = git(
+        root,
+        &[
+            &attr_source,
+            "-c",
+            "core.quotePath=false",
+            "diff",
+            "--no-ext-diff",
+            "-M",
+            "--name-only",
+            commit,
+            "--",
+            &format!(":(attr:{GENERATED})"),
+        ],
+    )?;
+    Ok((diff, generated.lines().map(str::to_owned).collect()))
+}
+
 /// The content of `path` at `revision`, or `None` when the file did not exist there.
 pub(crate) fn show(root: &Path, revision: &str, path: &str) -> anyhow::Result<Option<String>> {
     let output = Command::new("git")
@@ -190,7 +237,9 @@ mod tests {
     use std::collections::BTreeSet;
     use std::fs;
 
-    use super::{Change, added_lines, changes, diff, merge_base, parse_name_status, show};
+    use super::{
+        Change, added_lines, changes, diff, merge_base, parse_name_status, reviewable_diff, show,
+    };
     use crate::testing::{git, repository};
 
     #[test]
@@ -234,6 +283,47 @@ mod tests {
             "every status maps to its paths"
         );
         assert!(parse_name_status("M\0").is_err(), "a status needs a path");
+    }
+
+    #[test]
+    fn leaves_out_files_generated_at_the_merge_base_only() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = repository(&temp.path().join("repo"));
+        fs::write(repo.join(".gitattributes"), "gen/** linguist-generated\n").unwrap();
+        git(&repo, &["add", "--all"]);
+        git(&repo, &["commit", "--quiet", "-m", "base"]);
+        git(&repo, &["branch", "base"]);
+        fs::create_dir_all(repo.join("gen")).unwrap();
+        fs::write(repo.join("gen/cache.json"), "{\"generated\": true}\n").unwrap();
+        fs::write(repo.join("src.rs"), "fn hidden() {}\n").unwrap();
+        // The change tries to hide its own code by marking it generated too.
+        fs::write(
+            repo.join(".gitattributes"),
+            "gen/** linguist-generated\nsrc.rs linguist-generated\n",
+        )
+        .unwrap();
+        git(&repo, &["add", "--all"]);
+        git(&repo, &["commit", "--quiet", "-m", "change"]);
+
+        let base = merge_base(&repo, "base").unwrap();
+        let (text, generated) = reviewable_diff(&repo, &base, 3).unwrap();
+        assert_eq!(
+            generated,
+            ["gen/cache.json"],
+            "the generated file is listed"
+        );
+        assert!(
+            !text.contains("\"generated\": true"),
+            "its content is left out"
+        );
+        assert!(
+            text.contains("+fn hidden() {}"),
+            "a file the change itself marks generated is still reviewed"
+        );
+        assert!(
+            text.contains("+src.rs linguist-generated"),
+            "and so is the change to .gitattributes"
+        );
     }
 
     #[test]

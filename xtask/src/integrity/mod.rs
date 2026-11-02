@@ -30,10 +30,11 @@ use crate::git;
 /// The gate files: whatever decides what passes. CODEOWNERS patterns, the single list both the
 /// check and `.github/CODEOWNERS` follow: a trailing `/` covers a directory, anything else is one
 /// file, both from the repository root.
-pub(crate) const GATES: [&str; 14] = [
+pub(crate) const GATES: [&str; 15] = [
     "/.cargo/",
     "/.claude/settings.json",
     "/.config/",
+    "/.gitattributes",
     "/.github/",
     "/.gitleaks.toml",
     "/AGENTS.md",

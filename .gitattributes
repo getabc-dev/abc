@@ -1,0 +1,7 @@
+# Generated files. The Gemini review leaves their content out of the diff it reads and lists them
+# instead (xtask/src/review.rs); GitHub collapses them in diffs. The review reads this file as it
+# was at the merge base, so a pull request cannot hide its own code by marking it generated, and
+# this file is a gate file.
+Cargo.lock linguist-generated
+**/.sqlx/** linguist-generated
+web/src/generated/** linguist-generated

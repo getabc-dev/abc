@@ -4,6 +4,7 @@
 /.cargo/                  @snehilvj
 /.claude/settings.json    @snehilvj
 /.config/                 @snehilvj
+/.gitattributes           @snehilvj
 /.github/                 @snehilvj
 /.gitleaks.toml           @snehilvj
 /AGENTS.md                @snehilvj
