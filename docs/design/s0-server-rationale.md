@@ -500,3 +500,24 @@ Where the code differs from the sketch above, and why:
 - **Open question 10.** The Tailscale `unix:` passthrough check needs a tailnet auth key. Its
   harness is opt-in (see `crates/abc-server/tests/tailscale.rs`); until it has run, the
   passthrough of WebSocket upgrades and unbuffered SSE through the pinned image is unverified.
+
+### After review (2 Nov 2026)
+
+- **Randomness.** Each request seeds a `ChaCha20` generator from an `Entropy` source; the OS source
+  fails with a typed error (`StoreError::Entropy`) instead of panicking. Session, request and
+  boot-sweep ids come from the store's generator.
+- **Anonymous pre-check.** An anonymous command whose own capability already fails is refused
+  after one read, before it queues for the head lock; the full check still runs under the lock.
+- **Scoped wake-ups.** The commit notification names its workspace and streams; live streams follow
+  their workspace and worker sessions their worker's stream. A session subscribes before its start
+  is recorded, and every ping re-checks revocation.
+- **Limits.** 64 KiB WebSocket messages, four sockets and 30 session starts a minute per worker,
+  20 enrolment attempts a minute per source (`ServerConfig::limits`).
+- **One server per database** is enforced with a session advisory lock held for the process's
+  life. The socket directory must belong to the server's user, and a live socket is never deleted.
+- **Setup codes.** `IssueSetupCode` is not `Executable`; `Store::issue_setup_code` runs it and
+  `clippy.toml` disallows that method outside the CLI. `Store::is_claimed` became the
+  `InstallationStatus` query (`ViewAsServer`).
+- **Enrolment.** A key another worker holds is denied (`worker_key_in_use`, 409); a retry for a
+  revoked worker is denied (`worker_revoked`).
+- **Test database** comes from `ABC_TEST_DATABASE_URL`, never `DATABASE_URL`.
