@@ -157,8 +157,8 @@ cargo xtask vm stop ../abc-my-change     # revokes its tokens; --purge also drop
 from what it passes, and the VM refuses to start, or to run a session or a tool call, if one
 appears in its environment or in a Claude Code settings file. To rotate the token, replace the
 keychain item and restart the session; revoke old tokens in your claude.ai settings. A
-setup-token token lasts about a year. Only Claude Code gets it in the VM: builds, tests and
-shells there do not.
+setup-token token lasts about a year. In the VM only Claude Code gets it, though the commands
+Claude Code runs inherit it; shells you open with `cargo xtask vm shell <worktree> bash` do not.
 
 Agents push only `agent/<topic>` branches, and never tags or workflow changes: GitHub's rulesets
 refuse the App the rest. Apply `.github/rulesets/` with `cargo xtask rulesets apply` (your own gh

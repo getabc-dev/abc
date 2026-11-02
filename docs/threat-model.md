@@ -123,10 +123,8 @@ setup, not the product.
 - **Claude Code on the subscription only.** The maintainer's `claude setup-token` token, valid for
   about a year, stays in their keychain; `cargo xtask vm start` pipes it into the VM's memory
   (`/run/abc`, a tmpfs) in a file only root can read, so it never appears in an argument, the
-  VM's configuration or a log. Only a `claude` process started through `agent-exec` gets it, with
-  Claude Code told to strip it from the commands it runs (`CLAUDE_CODE_SUBPROCESS_ENV_SCRUB`), so
-  builds, tests and shells do not see it; a determined agent can still read the memory of its own
-  `claude` process. The launcher passes no API key or other route, and the VM's own xtask refuses
+  VM's configuration or a log. Only a `claude` process started through `agent-exec` gets it; shells and other commands entered
+  that way do not. The commands Claude Code runs inherit it (see Open). The launcher passes no API key or other route, and the VM's own xtask refuses
   API keys, auth tokens, key helpers, custom endpoints, cloud providers and `CLAUDE_CONFIG_DIR`,
   in the environment and in every settings file Claude Code reads (managed settings and their
   drop-ins included), before the agent user starts and before each session; `start` fails unless
@@ -150,6 +148,11 @@ Open:
   in microsandbox's network stack would cross the boundary.
 - Code from an agent's worktree, run from the maintainer's own terminal, runs with the
   maintainer's full access. Review it first, or run it in a session.
+- The commands Claude Code runs (builds, tests, the Bash tool) inherit the subscription token.
+  Claude Code strips it from them only under its bubblewrap isolation
+  (`CLAUDE_CODE_SUBPROCESS_ENV_SCRUB`), which on Linux leaves empty placeholder files such as
+  `package.json`, `.npmrc` and `.env` in the worktree, where agents would commit them; it is off
+  until that is solved.
 - The check before each tool call runs from the worktree's hook script, which the agent can edit,
   so it is a tripwire; so is `claude --settings <file>`, which names a settings file no check can
   see in advance. The checks before the VM and each session start run from the image.
