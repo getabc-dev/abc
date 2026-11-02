@@ -1,0 +1,134 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT w.id, a.display_name, w.hostname, w.os, w.arch, w.build,\n                  w.open_session IS NOT NULL AS \"online!\", w.enrolled_at,\n                  GREATEST(w.last_session_started_at, w.last_session_ended_at) AS last_seen_at,\n                  w.revoked_at IS NOT NULL AS \"revoked!\", w.changed_at\n           FROM worker w JOIN actor a ON a.id = w.id\n           WHERE w.workspace_id = $1 AND w.changed_at > $2\n           ORDER BY w.enrolled_at, w.id",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "worker",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "display_name",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "actor",
+            "name": "display_name"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "hostname",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "worker",
+            "name": "hostname"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "os",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "worker",
+            "name": "os"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "arch",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "worker",
+            "name": "arch"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "build",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "worker",
+            "name": "build"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "online!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 7,
+        "name": "enrolled_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "worker",
+            "name": "enrolled_at"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "last_seen_at",
+        "type_info": "Timestamptz",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 9,
+        "name": "revoked!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 10,
+        "name": "changed_at",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "worker",
+            "name": "changed_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      null,
+      false,
+      null,
+      null,
+      false
+    ]
+  },
+  "hash": "828b4d5eead52039ec7d0577268ae2ae3e4563ba5828379a1e1a943157a4aaa5"
+}

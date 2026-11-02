@@ -19,8 +19,9 @@
 # A tool with no verifiable release build is built from crates.io instead: `crate` names the
 # crate and `sha256` pins its .crate file, which `cargo xtask pin` checks against the crates.io
 # index. `cargo xtask setup` builds it with `cargo install --locked` and records the executable's
-# sha256 beside it, which xtask checks whenever it runs the tool. Renovate bumps `version` from
-# crates.io; keep `version` before `crate`, with only comments between them.
+# sha256 beside it, which xtask checks whenever it runs the tool. `features`, when given, replaces
+# the crate's default features. Renovate bumps `version` from crates.io; keep `version` before
+# `crate`, with only comments between them.
 
 [[tool]]
 name = "cargo-nextest"
@@ -109,3 +110,14 @@ version = "27.1.0"
 crate = "cargo-mutants"
 version-args = ["mutants", "--version"]
 sha256 = "07072e7bcdeb425d5e5fdbfd9f15a2c749e23cb2edf5ef40aee5876760ae1cf9"
+
+[[tool]]
+name = "cargo-sqlx"
+version = "0.9.0"
+# sqlx publishes no release builds, so it is built from crates.io with its lockfile: Postgres over
+# rustls only, so no OpenSSL or bundled SQLite is built. `cargo xtask check` runs `sqlx prepare
+# --check` with it to keep each crate's committed query cache (.sqlx/) current.
+crate = "sqlx-cli"
+version-args = ["sqlx", "--version"]
+sha256 = "93ef3857a4a0b48fcbf536b77a9122a35c7631686f2ccfbc75e616335771e8d0"
+features = ["postgres", "rustls"]

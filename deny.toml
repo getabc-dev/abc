@@ -48,8 +48,17 @@ deny = [
 # { crate = "name@version", reason = "held back by ...; drop when ..." }
 skip = [
     # Added 2026-11-01 with abc-core and abc-protocol (S0 PR 3); review at each bump of their holders.
-    { crate = "syn@2", reason = "held back by proc-macro crates on syn 2 (ts-rs-macros, zeroize_derive); drop when they move to syn 3" },
+    { crate = "syn@2", reason = "held back by proc-macro crates on syn 2 (ts-rs-macros, zeroize_derive, sqlx-macros, tracing-attributes); drop when they move to syn 3" },
     { crate = "getrandom@0.2", reason = "held back by ring, through rustls and xtask; drop when ring moves to getrandom 0.4" },
+    # Added 2026-11-01 with sqlx 0.9.0 (S0 PR 3); review at each sqlx bump.
+    { crate = "sha2@0.10", reason = "held back by sqlx-core (SCRAM auth); drop when sqlx moves to sha2 0.11" },
+    { crate = "digest@0.10", reason = "held back by sha2 0.10, through sqlx-core; drop with sha2@0.10" },
+    { crate = "block-buffer@0.10", reason = "held back by sha2 0.10, through sqlx-core; drop with sha2@0.10" },
+    { crate = "crypto-common@0.1", reason = "held back by sha2 0.10, through sqlx-core; drop with sha2@0.10" },
+    { crate = "cpufeatures@0.2", reason = "held back by sha2 0.10, through sqlx-core; drop with sha2@0.10" },
+    { crate = "base64@0.22", reason = "held back by sqlx-core and sqlx-postgres; drop when sqlx moves to base64 0.23" },
+    { crate = "hashlink@0.11", reason = "held back by sqlx-core; drop when sqlx moves to hashlink 0.12" },
+    { crate = "hashbrown@0.16", reason = "held back by sqlx-core and hashlink 0.11; drop with hashlink@0.11" },
 ]
 
 [sources]

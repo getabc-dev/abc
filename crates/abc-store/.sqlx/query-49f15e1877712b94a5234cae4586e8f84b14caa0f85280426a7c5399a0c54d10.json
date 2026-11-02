@@ -1,0 +1,170 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT position, id, recorded_at, workspace_id, stream_kind, stream_id, stream_seq,\n                schema_version, actor_kind, actor_id, correlation_id, causation_id, payload\n         FROM event ORDER BY position",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "position",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "event",
+            "name": "position"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "event",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "recorded_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "event",
+            "name": "recorded_at"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "workspace_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "event",
+            "name": "workspace_id"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "stream_kind",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "event",
+            "name": "stream_kind"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "stream_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "event",
+            "name": "stream_id"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "stream_seq",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "event",
+            "name": "stream_seq"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "schema_version",
+        "type_info": "Int2",
+        "origin": {
+          "Table": {
+            "table": "event",
+            "name": "schema_version"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "actor_kind",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "event",
+            "name": "actor_kind"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "actor_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "event",
+            "name": "actor_id"
+          }
+        }
+      },
+      {
+        "ordinal": 10,
+        "name": "correlation_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "event",
+            "name": "correlation_id"
+          }
+        }
+      },
+      {
+        "ordinal": 11,
+        "name": "causation_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "event",
+            "name": "causation_id"
+          }
+        }
+      },
+      {
+        "ordinal": 12,
+        "name": "payload",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "event",
+            "name": "payload"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      true,
+      false
+    ]
+  },
+  "hash": "49f15e1877712b94a5234cae4586e8f84b14caa0f85280426a7c5399a0c54d10"
+}

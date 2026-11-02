@@ -80,6 +80,10 @@ struct Package {
     library: bool,
     /// Directories of the packages it depends on by path, in any dependency section.
     path_dependencies: Vec<PathBuf>,
+    /// Whether it depends on sqlx in any section, so its tests need Postgres.
+    database: bool,
+    /// Whether it commits a sqlx query cache (`.sqlx/`) that must match its queries.
+    query_cache: bool,
 }
 
 /// A step of the check that failed, with what to do about it.
@@ -88,6 +92,36 @@ struct Failure {
     fix: &'static str,
 }
 
+/// How the check reaches Postgres.
+pub(crate) struct Postgres<'a> {
+    /// Makes sure the database tests have a server (`crate::postgres::warm`).
+    pub(crate) warm: &'a dyn Fn(&mut dyn Write) -> anyhow::Result<()>,
+    /// The cargo-sqlx executable, resolved only when a query cache is checked.
+    pub(crate) sqlx: &'a dyn Fn() -> anyhow::Result<PathBuf>,
+}
+
+/// What the crates in scope need from Postgres.
+struct Database {
+    /// Some crate's tests use the database.
+    tests: bool,
+    /// The directories of the crates whose query cache is checked.
+    caches: Vec<PathBuf>,
+}
+
+impl Database {
+    /// Whether anything in scope needs a running server.
+    fn needs_server(&self) -> bool {
+        self.tests || !self.caches.is_empty()
+    }
+}
+
+/// How to bring a stale query cache up to date.
+const QUERY_CACHE_FIX: &str = "regenerate the crate's .sqlx/ against a migrated database: \
+    `cargo xtask tool cargo-sqlx sqlx database reset -y --source crates/<crate>/migrations \
+    --database-url postgres://postgres@127.0.0.1:55432/abc_prepare`, then `cargo xtask --root \
+    crates/<crate> tool cargo-sqlx sqlx prepare --database-url \
+    postgres://postgres@127.0.0.1:55432/abc_prepare -- --all-targets --all-features --locked`";
+
 /// Runs the check from `root` and reports whether it passed. With `changed`, clippy and the tests
 /// cover only the crates that the changes since the merge base with the default branch can affect.
 /// Builds go to `target_dir` when given, and wherever cargo is configured to otherwise.
@@ -95,23 +129,47 @@ pub(crate) fn run(
     root: &Path,
     changed: bool,
     nextest: &Path,
+    postgres: &Postgres<'_>,
     target_dir: Option<&Path>,
     out: &mut impl Write,
 ) -> anyhow::Result<bool> {
-    let scope = if changed {
-        affected(&workspace_packages(root)?, &changed_files(root)?)
+    let (scope, packages) = if changed {
+        let packages = workspace_packages(root)?;
+        (affected(&packages, &changed_files(root)?), Some(packages))
     } else {
-        Scope::Workspace
+        (Scope::Workspace, None)
     };
-    run_scope(root, &scope, nextest, target_dir, out)
+    run_scope(root, &scope, nextest, packages, postgres, target_dir, out)
 }
 
-/// Runs each step on `scope` from `root`, with the cargo-nextest executable at `nextest`, building
-/// into `target_dir` when given and wherever cargo is configured to otherwise.
+/// What the crates of `scope` among `packages` need from Postgres.
+fn database(root: &Path, scope: &Scope, packages: &[Package]) -> Database {
+    let in_scope: Vec<&Package> = packages
+        .iter()
+        .filter(|package| match scope {
+            Scope::Workspace => true,
+            Scope::Packages { names, .. } => names.contains(&package.name),
+        })
+        .collect();
+    Database {
+        tests: in_scope.iter().any(|package| package.database),
+        caches: in_scope
+            .iter()
+            .filter(|package| package.query_cache)
+            .map(|package| root.join(&package.dir))
+            .collect(),
+    }
+}
+
+/// Runs each step on `scope` from `root`, with the cargo-nextest executable at `nextest` and
+/// Postgres reached through `postgres`, building into `target_dir` when given and wherever cargo is configured
+/// to otherwise. `packages` are the workspace's, when already read.
 fn run_scope(
     root: &Path,
     scope: &Scope,
     nextest: &Path,
+    packages: Option<Vec<Package>>,
+    postgres: &Postgres<'_>,
     target_dir: Option<&Path>,
     out: &mut impl Write,
 ) -> anyhow::Result<bool> {
@@ -142,6 +200,15 @@ fn run_scope(
             "warnings",
         ]);
         if step(root, target_dir, out, &mut clippy)? {
+            // Clippy passed, so the workspace's metadata reads.
+            let packages = match packages {
+                Some(packages) => packages,
+                None => workspace_packages(root)?,
+            };
+            let database = database(root, scope, &packages);
+            if database.needs_server() {
+                (postgres.warm)(out)?;
+            }
             if !step(root, target_dir, out, &mut test_command(nextest, scope))? {
                 failures.push(Failure {
                     step: "tests",
@@ -162,6 +229,14 @@ fn run_scope(
                     out,
                     "xtask: no affected crate has a library; skipping doctests"
                 )?;
+            }
+            for dir in &database.caches {
+                if !query_cache_current(root, dir, postgres, target_dir, out)? {
+                    failures.push(Failure {
+                        step: "query cache",
+                        fix: QUERY_CACHE_FIX,
+                    });
+                }
             }
             let mut docs = Command::new(cargo());
             docs.args(["doc", "--no-deps"])
@@ -192,6 +267,33 @@ fn run_scope(
         writeln!(out, "  {}: {}", failure.step, failure.fix)?;
     }
     Ok(false)
+}
+
+/// Whether the query cache of the crate in `dir` matches its queries, checked against a fresh
+/// database of its own that is dropped afterwards.
+fn query_cache_current(
+    root: &Path,
+    dir: &Path,
+    postgres: &Postgres<'_>,
+    target_dir: Option<&Path>,
+    out: &mut impl Write,
+) -> anyhow::Result<bool> {
+    let server = std::env::var(crate::postgres::TEST_DATABASE_URL)
+        .unwrap_or_else(|_| crate::postgres::URL.to_owned());
+    let created = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs());
+    let url = crate::postgres::with_database(
+        &server,
+        // Named for its creation time, so a later test sweeps it if a killed check left it behind.
+        &format!("abc_query_cache_{created}_{}", std::process::id()),
+    )?;
+    let [mut reset, mut prepare, mut drop] =
+        crate::postgres::query_cache_check(&(postgres.sqlx)()?, dir, &url);
+    let current =
+        step(root, target_dir, out, &mut reset)? && step(root, target_dir, out, &mut prepare)?;
+    step(root, target_dir, out, &mut drop)?;
+    Ok(current)
 }
 
 /// The nextest run for `scope`, with property tests seeded by [`PROPTEST_RNG_SEED`].
@@ -227,8 +329,10 @@ fn step(
         .map(|arg| arg.to_string_lossy().into_owned())
         .collect();
     writeln!(out, "xtask: {program} {}", args.join(" "))?;
+    if command.get_current_dir().is_none() {
+        command.current_dir(root);
+    }
     let status = command
-        .current_dir(root)
         .status()
         .with_context(|| format!("could not run {program}"))?;
     Ok(status.success())
@@ -255,6 +359,7 @@ struct MetadataTarget {
 
 #[derive(Deserialize)]
 struct MetadataDependency {
+    name: String,
     path: Option<PathBuf>,
 }
 
@@ -296,11 +401,18 @@ fn workspace_packages(root: &Path) -> anyhow::Result<Vec<Package>> {
                     .iter()
                     .any(|kind| ["lib", "rlib", "proc-macro"].contains(&kind.as_str()))
             });
+            let database = package
+                .dependencies
+                .iter()
+                .any(|dependency| dependency.name == "sqlx");
+            let query_cache = root.join(&dir).join(".sqlx").is_dir();
             Ok(Package {
                 name: package.name.clone(),
                 dir,
                 library,
                 path_dependencies,
+                database,
+                query_cache,
             })
         })
         .collect()
@@ -378,6 +490,8 @@ mod tests {
 
     use tempfile::TempDir;
 
+    use std::collections::BTreeSet;
+
     use super::{PROPTEST_RNG_SEED, Package, Scope, affected, changed_since, run, test_command};
     use crate::git::default_branch;
     use crate::testing::{git, repository};
@@ -389,6 +503,8 @@ mod tests {
             dir: PathBuf::from(dir),
             library,
             path_dependencies: path_dependencies.iter().map(PathBuf::from).collect(),
+            database: false,
+            query_cache: false,
         }
     }
 
@@ -428,6 +544,69 @@ mod tests {
             names: names.iter().map(|name| (*name).to_owned()).collect(),
             libraries,
         }
+    }
+
+    #[test]
+    fn crates_in_scope_decide_what_postgres_is_needed_for() {
+        let mut store = package("store", "crates/store", true, &[]);
+        store.database = true;
+        store.query_cache = true;
+        let mut server = package("server", "crates/server", true, &["crates/store"]);
+        server.database = true;
+        let plain = package("plain", "crates/plain", true, &[]);
+        let packages = vec![store, server, plain];
+        let root = Path::new("/repo");
+        let all = super::database(root, &Scope::Workspace, &packages);
+        assert!(all.tests, "the workspace has database tests");
+        assert_eq!(
+            all.caches,
+            [PathBuf::from("/repo/crates/store")],
+            "one query cache"
+        );
+        assert!(all.needs_server(), "so it needs a server");
+        let only_plain = super::database(root, &packages_scope(&["plain"]), &packages);
+        assert!(!only_plain.tests, "a crate without sqlx needs no database");
+        assert!(only_plain.caches.is_empty(), "and has no cache");
+        assert!(!only_plain.needs_server(), "nor a server");
+        let server_only = super::database(root, &packages_scope(&["server"]), &packages);
+        assert!(server_only.tests, "the server's tests use the database");
+        assert!(server_only.caches.is_empty(), "but it keeps no cache");
+        assert!(server_only.needs_server(), "and need a server");
+        let cache_only = super::Database {
+            tests: false,
+            caches: vec![PathBuf::from("/repo/crates/store")],
+        };
+        assert!(
+            cache_only.needs_server(),
+            "checking a cache needs a server too"
+        );
+    }
+
+    fn packages_scope(names: &[&str]) -> Scope {
+        Scope::Packages {
+            names: names.iter().map(|name| (*name).to_owned()).collect(),
+            libraries: BTreeSet::new(),
+        }
+    }
+
+    #[test]
+    fn metadata_reads_which_crates_use_sqlx_and_keep_a_query_cache() {
+        let root = crate::repo_root().unwrap();
+        let packages = super::workspace_packages(&root).unwrap();
+        let find = |name: &str| {
+            packages
+                .iter()
+                .find(|package| package.name == name)
+                .unwrap()
+        };
+        assert!(
+            find("abc-store").database && find("abc-store").query_cache,
+            "the store"
+        );
+        assert!(
+            !find("abc-core").database,
+            "the core never touches a database"
+        );
     }
 
     #[test]
@@ -618,6 +797,18 @@ mod tests {
     /// `CARGO_TARGET_DIR` nor a configured target dir is shared, and returns whether it passed and
     /// what it printed.
     fn check_fixture(name: &str, lib: &str) -> (bool, String) {
+        let fixture = fixture(name, lib);
+        let no_postgres = |_: &mut dyn std::io::Write| anyhow::bail!("fixtures use no database");
+        let no_sqlx = || anyhow::bail!("fixtures keep no query cache");
+        let postgres = super::Postgres {
+            warm: &no_postgres,
+            sqlx: &no_sqlx,
+        };
+        check_in(&fixture, &postgres)
+    }
+
+    /// Runs the whole check on `fixture` with Postgres reached through `postgres`.
+    fn check_in(fixture: &TempDir, postgres: &super::Postgres<'_>) -> (bool, String) {
         let repo = crate::repo_root().unwrap();
         let nextest = Manifest::load(&repo)
             .unwrap()
@@ -625,11 +816,71 @@ mod tests {
             .unwrap()
             .installed(&repo)
             .unwrap();
-        let fixture = fixture(name, lib);
         let target_dir = fixture.path().join("target");
         let mut out = Vec::new();
-        let passed = run(fixture.path(), false, &nextest, Some(&target_dir), &mut out).unwrap();
+        let passed = run(
+            fixture.path(),
+            false,
+            &nextest,
+            postgres,
+            Some(&target_dir),
+            &mut out,
+        )
+        .unwrap();
         (passed, String::from_utf8(out).unwrap())
+    }
+
+    /// Checks a fixture that keeps a query cache, with a fake cargo-sqlx whose `prepare` exits
+    /// with `prepare_status`; returns whether the check passed, what it printed, whether it
+    /// started the server, and the fake's calls.
+    fn check_query_cache(name: &str, prepare_status: u8) -> (bool, String, bool, String) {
+        let fixture = fixture(name, CLEAN);
+        fs::create_dir(fixture.path().join(".sqlx")).unwrap();
+        let tools = tempfile::tempdir().unwrap();
+        let sqlx = tools.path().join("cargo-sqlx");
+        let log = tools.path().join("calls");
+        crate::testing::script(
+            &sqlx,
+            &format!(
+                "echo \"$2 $3\" >> {}\ncase \"$2\" in\n  prepare) exit {prepare_status} ;;\n  *) exit 0 ;;\nesac\n",
+                log.display()
+            ),
+        );
+        let warmed = std::cell::Cell::new(false);
+        let warm = |_: &mut dyn std::io::Write| {
+            warmed.set(true);
+            Ok(())
+        };
+        let resolve = || Ok(sqlx.clone());
+        let postgres = super::Postgres {
+            warm: &warm,
+            sqlx: &resolve,
+        };
+        let (passed, out) = check_in(&fixture, &postgres);
+        let calls = fs::read_to_string(&log).unwrap_or_default();
+        (passed, out, warmed.get(), calls)
+    }
+
+    #[test]
+    fn a_current_query_cache_passes_against_a_fresh_database() {
+        let (passed, out, warmed, calls) = check_query_cache("cache-current", 0);
+        assert!(passed, "{out}");
+        assert!(warmed, "the server was started for the cache check");
+        assert_eq!(
+            calls, "database reset\nprepare --check\ndatabase drop\n",
+            "a fresh database, the check, then cleanup"
+        );
+    }
+
+    #[test]
+    fn a_stale_query_cache_fails_and_says_how_to_regenerate_it() {
+        let (passed, out, _, calls) = check_query_cache("cache-stale", 1);
+        assert!(!passed, "{out}");
+        assert!(out.contains("query cache: regenerate"), "{out}");
+        assert!(
+            calls.ends_with("database drop\n"),
+            "the database is dropped anyway: {calls}"
+        );
     }
 
     #[test]

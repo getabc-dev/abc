@@ -1,0 +1,24 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT COALESCE(MAX(stream_seq), 0) + 1 AS \"next!\"\n                   FROM event WHERE stream_kind = $1 AND stream_id = $2",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "next!",
+        "type_info": "Int4",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "8618e51bbba57315e8695a97409c847f0d34aaa657378c8508fac3d9262cbb84"
+}

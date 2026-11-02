@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE enrolment_token SET revoked_at = $2, changed_at = $3 WHERE id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Timestamptz",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "fd9e8d829fd8286fedf1ddc29d5bf65de9eb30115b555b632933ec0f1b692308"
+}

@@ -8,6 +8,7 @@ mod guard;
 mod hook;
 mod integrity;
 mod mutants;
+mod postgres;
 mod review;
 mod rulesets;
 mod shell;
@@ -255,13 +256,7 @@ fn run(
     } = invocation;
     let env = |name: &str| (invocation.env)(name);
     match task {
-        Task::Check { changed } => Ok(verdict(check::run(
-            root,
-            changed,
-            &tool("cargo-nextest")?,
-            None,
-            report,
-        )?)),
+        Task::Check { changed } => Ok(verdict(check(root, changed, tool, report)?)),
         Task::Coverage { base } => Ok(verdict(coverage::run(
             root,
             &base,
@@ -349,6 +344,27 @@ fn run(
             Ok(ExitCode::from(hook::run(event, &input, &context, report)?))
         }
     }
+}
+
+/// `cargo xtask check` on `root`, with the pinned tools `tool` finds and the warm Postgres.
+fn check(
+    root: &Path,
+    changed: bool,
+    tool: &dyn Fn(&str) -> anyhow::Result<PathBuf>,
+    report: &mut impl Write,
+) -> anyhow::Result<bool> {
+    let postgres = check::Postgres {
+        warm: &postgres::warm,
+        sqlx: &|| tool("cargo-sqlx"),
+    };
+    check::run(
+        root,
+        changed,
+        &tool("cargo-nextest")?,
+        &postgres,
+        None,
+        report,
+    )
 }
 
 /// `cargo xtask integrity`: in CI, for pull request `pr`, with GitHub Actions' variables from
@@ -584,6 +600,44 @@ mod tests {
         );
         assert_eq!(verdict(true), ExitCode::SUCCESS, "a passing gate");
         assert_eq!(verdict(false), ExitCode::FAILURE, "a failing gate");
+    }
+
+    #[test]
+    fn check_passes_a_clean_workspace() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        fs::create_dir_all(home.join("tools")).unwrap();
+        fake_tools(&home.join("tools"));
+        let root = temp.path().join("root");
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"fixture-dispatch\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[workspace]\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("Cargo.lock"),
+            "version = 4\n\n[[package]]\nname = \"fixture-dispatch\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        fs::copy(
+            repo_root().unwrap().join("rust-toolchain.toml"),
+            root.join("rust-toolchain.toml"),
+        )
+        .unwrap();
+        fs::write(
+            root.join("src/lib.rs"),
+            "//! A fixture crate.\n\n/// Adds one.\n#[must_use]\npub fn add_one(value: u32) -> u32 {\n    value.saturating_add(1)\n}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            dispatch(Task::Check { changed: false }, &home, &root, &|_: &str| {
+                None
+            })
+            .unwrap(),
+            ExitCode::SUCCESS,
+            "check passes a clean workspace with the pinned nextest it finds"
+        );
     }
 
     #[test]

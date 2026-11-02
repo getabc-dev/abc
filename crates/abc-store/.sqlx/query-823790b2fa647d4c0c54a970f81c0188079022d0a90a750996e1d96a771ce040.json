@@ -1,0 +1,18 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE worker SET open_session = $2, last_session_started_at = $3, build = $4,\n                    changed_at = $5\n                 WHERE id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Timestamptz",
+        "Text",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "823790b2fa647d4c0c54a970f81c0188079022d0a90a750996e1d96a771ce040"
+}
