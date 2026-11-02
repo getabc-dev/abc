@@ -41,7 +41,7 @@ struct Cli {
 }
 
 /// What `cargo xtask rulesets` does.
-#[derive(Debug, Subcommand)]
+#[derive(Clone, Copy, Debug, Subcommand)]
 enum RulesetAction {
     /// Check .github/rulesets/main.json against the CI workflows.
     Check,
@@ -328,29 +328,8 @@ fn run(
             &args,
             report,
         ),
-        Task::Rulesets { action } => {
-            match action {
-                RulesetAction::Check => {
-                    rulesets::check(root)?;
-                    writeln!(report, "rulesets: {} matches CI", rulesets::RULESET)?;
-                }
-                RulesetAction::Apply => {
-                    rulesets::apply(root, Path::new("gh"), &mut io::stdout().lock())?;
-                }
-            }
-            Ok(ExitCode::SUCCESS)
-        }
-        Task::Work { action } => {
-            match action {
-                TaskAction::Set { text } => task::set(root, &text)?,
-                TaskAction::Show => match task::read(root)? {
-                    Some(text) => writeln!(io::stdout().lock(), "{text}")?,
-                    None => writeln!(report, "no task recorded")?,
-                },
-                TaskAction::Clear => task::clear(root)?,
-            }
-            Ok(ExitCode::SUCCESS)
-        }
+        Task::Rulesets { action } => run_rulesets(action, root, report),
+        Task::Work { action } => run_task(action, root, report),
         Task::Setup { tools: only } => {
             tools::setup(home, &only, &mut io::stdout().lock())?;
             Ok(ExitCode::SUCCESS)
@@ -410,6 +389,38 @@ fn integrity(
     let payload = pr.and_then(|_| env("GITHUB_EVENT_PATH").map(PathBuf::from));
     let event = integrity::event(description, payload)?;
     integrity::run(root, base, pull_request.as_ref(), &event, report)
+}
+
+/// `cargo xtask rulesets`: checks the rulesets in `root` against CI, or applies them with the
+/// user's own gh.
+fn run_rulesets(
+    action: RulesetAction,
+    root: &Path,
+    report: &mut impl Write,
+) -> anyhow::Result<ExitCode> {
+    match action {
+        RulesetAction::Check => {
+            rulesets::check(root)?;
+            writeln!(report, "rulesets: {} matches CI", rulesets::RULESET)?;
+        }
+        RulesetAction::Apply => {
+            rulesets::apply(root, Path::new("gh"), &mut io::stdout().lock())?;
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `cargo xtask task`: records, prints or forgets the task in `root`.
+fn run_task(action: TaskAction, root: &Path, report: &mut impl Write) -> anyhow::Result<ExitCode> {
+    match action {
+        TaskAction::Set { text } => task::set(root, &text)?,
+        TaskAction::Show => match task::read(root)? {
+            Some(text) => writeln!(io::stdout().lock(), "{text}")?,
+            None => writeln!(report, "no task recorded")?,
+        },
+        TaskAction::Clear => task::clear(root)?,
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 /// `cargo xtask git-credential`: answers git's request on stdin with an App token on stdout.

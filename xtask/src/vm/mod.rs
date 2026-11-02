@@ -196,6 +196,8 @@ pub(crate) struct Host {
     pub(crate) builder: PathBuf,
     /// How long to wait for a VM, in tries a fifth of a second apart.
     pub(crate) patience: u32,
+    /// Guest directories no mount may cover: [`RESERVED`].
+    pub(crate) reserved: Vec<PathBuf>,
 }
 
 impl Host {
@@ -221,6 +223,7 @@ impl Host {
             secret: (PathBuf::from(program), args),
             builder: PathBuf::from(os.builder()),
             patience: 150,
+            reserved: RESERVED.iter().map(PathBuf::from).collect(),
         })
     }
 }
@@ -342,7 +345,7 @@ fn start(
     out: &mut impl Write,
 ) -> anyhow::Result<()> {
     let token = subscription_token(host)?;
-    check_mount_paths(&[&session.worktree, &session.common])?;
+    check_mount_paths(&[&session.worktree, &session.common], &host.reserved)?;
     let sockets = crate::broker::sockets(&host.home, &session.name);
     ensure_broker(host, &session.name, &sockets)?;
     if backend.is_running(&session.name)? {
@@ -517,7 +520,7 @@ const RESERVED: [&str; 17] = [
 /// Fails unless each of `paths` can be mounted at its own path in the guest: absolute, plain,
 /// free of the separators microsandbox's mount syntax uses, and clear of the guest's system
 /// directories.
-fn check_mount_paths(paths: &[&Path]) -> anyhow::Result<()> {
+fn check_mount_paths(paths: &[&Path], reserved: &[PathBuf]) -> anyhow::Result<()> {
     for path in paths {
         let text = path
             .to_str()
@@ -534,7 +537,7 @@ fn check_mount_paths(paths: &[&Path]) -> anyhow::Result<()> {
              ':', ',' or '='"
         );
         ensure!(
-            !RESERVED.iter().any(|reserved| path.starts_with(reserved)),
+            !reserved.iter().any(|dir| path.starts_with(dir)),
             "{text} cannot be mounted in an agent VM: it lies in a guest system directory"
         );
     }

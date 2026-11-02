@@ -144,11 +144,7 @@ fn fake_broker(home: &Path) -> std::thread::JoinHandle<()> {
 }
 
 fn world(token: &str) -> World {
-    // Not under /tmp: on Linux the temporary directory is a guest system directory, which a
-    // session's worktree may not be.
-    let target = crate::repo_root().unwrap().join("target");
-    std::fs::create_dir_all(&target).unwrap();
-    let dir = tempfile::Builder::new().tempdir_in(target).unwrap();
+    let dir = tempfile::tempdir().unwrap();
     let root = dir.path().canonicalize().unwrap();
     let main = repository(&root.join("main"));
     git(
@@ -204,6 +200,9 @@ fn world(token: &str) -> World {
         ),
         builder: root.join("container"),
         patience: 3,
+        // Scratch worktrees live in the system's temporary directory, which the production policy
+        // reserves on Linux; the policy itself is tested on its own.
+        reserved: Vec::new(),
     };
     let broker = fake_broker(&host.home);
     World {
@@ -355,10 +354,30 @@ fn a_running_session_is_reused() {
     );
 }
 
+/// The reserved guest directories this host refuses to mount over.
+fn production() -> Vec<PathBuf> {
+    Host::this(Path::new("/repo"), Path::new("/home/m"), &none)
+        .unwrap()
+        .reserved
+}
+
+#[test]
+fn refuses_to_start_a_worktree_in_a_reserved_directory() {
+    let mut world = world("t");
+    world.host.reserved = vec![world.root.clone()];
+    let backend = subscribed();
+    let error = start_error(&world, &backend);
+    assert!(
+        error.contains("lies in a guest system directory"),
+        "{error}"
+    );
+    assert!(backend.started.borrow().is_empty(), "nothing starts");
+}
+
 #[test]
 fn mounts_only_plain_paths_outside_the_guests_system_directories() {
     for good in ["/Users/m/abc", "/home/m/abc", "/srv/work/abc-x"] {
-        super::check_mount_paths(&[Path::new(good)]).unwrap();
+        super::check_mount_paths(&[Path::new(good)], &production()).unwrap();
     }
     for bad in [
         "relative/path",
@@ -375,7 +394,7 @@ fn mounts_only_plain_paths_outside_the_guests_system_directories() {
         "/",
     ] {
         assert!(
-            super::check_mount_paths(&[Path::new(bad)]).is_err(),
+            super::check_mount_paths(&[Path::new(bad)], &production()).is_err(),
             "{bad}"
         );
     }
