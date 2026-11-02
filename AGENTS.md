@@ -32,9 +32,10 @@ override any default habit of keeping changes small or safe.
 
 ## AI writes all the code
 
-- **A1 ·** Agents write 100% of the code and tests; people decide and review. Choose languages,
-  libraries and patterns for what makes agent-written code correct and verifiable: strict static
-  types, exhaustive checks, fast deterministic tests, clear machine-readable errors. Human
+- **A1 ·** The maintainers build abc with agents writing 100% of the code and tests; people decide
+  and review. Contributions from any author are welcome and pass the same gates and review. Choose
+  languages, libraries and patterns for what makes agent-written code correct and verifiable: strict
+  static types, exhaustive checks, fast deterministic tests, clear machine-readable errors. Human
   familiarity, typing effort and verbosity are not costs.
 
 ## Production grade
@@ -65,7 +66,8 @@ Code must uphold these. Changing one needs an explicit decision in the product b
 - **I2 ·** Production secrets never reach dev environments, agents, logs or PR artifacts.
 - **I3 ·** An agent can touch only its change's code and environment. Anything else needs a folder
   grant from the user: scoped, time-limited or task-limited, revocable and logged.
-- **I4 ·** Every action records its actor, a person or an agent. Everything belongs to a workspace.
+- **I4 ·** Every action records its actor: a person, an agent, an enrolled worker or the server
+  itself. Everything belongs to a workspace.
   Every request passes through one permission check. v1 serves one person per server, but no code
   assumes a single user.
 - **I5 ·** Monitors and integrations use read-only scopes unless writing is their purpose.
