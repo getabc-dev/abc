@@ -26,7 +26,8 @@ Claude included.
   only `xtask/vm/egress-allow.txt`; Postgres 18 runs in the VM on 127.0.0.1 as `abc_test`
   (`ABC_TEST_DATABASE_URL` is set). git pushes and `cargo xtask gh -- <args>` act as the
   getabc-dev-agent App, with a token per use from the host's broker (`ABC_AGENT_BROKER`), scoped
-  to this repository and the permissions each use needs. Claude Code here runs on the
+  to this repository and the permissions each use needs. Push only `agent/<topic>` branches;
+  GitHub refuses the App any other branch, any tag and any workflow change. Claude Code here runs on the
   maintainer's subscription token only; the VM refuses any API key or other route, before every
   tool call too.
 - Run `cargo xtask setup` once in a new clone or worktree so the hooks find their tools.

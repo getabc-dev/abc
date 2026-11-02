@@ -119,13 +119,13 @@ what the VM keeps out and what it does not.
 It needs macOS on Apple silicon with Apple's [`container`](https://github.com/apple/container) to
 build the image (`brew install container`, then `container system start`), or Linux with KVM
 (`/dev/kvm` readable and writable) and Docker or Podman. Run every `cargo xtask vm` command from
-your main clone, never from a worktree an agent works in: they run on the host with your access,
-and xtask refuses to run them from a linked worktree.
+your main clone, never from a worktree an agent works in: they run on the host with your access.
+xtask refuses to run them from a linked worktree, which prevents the mistake but is no control.
 
 Once:
 
 ```sh
-# The token broker, from main, outside any checkout (it refuses to run from one):
+# The token broker, from main, outside any checkout (`vm start` starts one per session):
 cargo install --locked --git https://github.com/getabc-dev/abc --branch main xtask \
   --root ~/.local/share/abc/broker
 # The App's files, readable by you alone: app.json ({"client_id": ..., "installation_id": ...})
@@ -144,19 +144,25 @@ Paste the token at the prompt, never on the command line. Rebuild the image when
 Per session:
 
 ```sh
-git worktree add ../abc-my-change -b my-change origin/main
+git worktree add ../abc-my-change -b agent/my-change origin/main
 cargo xtask vm start ../abc-my-change    # starts the broker if needed; a few seconds
 cargo xtask vm shell ../abc-my-change    # Claude Code as the agent; add `bash` for a shell
 cargo xtask vm auth ../abc-my-change     # how Claude Code is signed in, without secrets
 cargo xtask vm sync ../abc-my-change     # move the worktree's branch to the VM's commits
-cargo xtask vm stop ../abc-my-change     # add --purge to drop its volumes and git repository
+cargo xtask vm stop ../abc-my-change     # revokes its tokens; --purge also drops its volumes
 ```
 
 `start` refuses unless `claude auth status` in the VM reports the subscription token
 (`authMethod` `oauth_token`). The launcher strips `ANTHROPIC_API_KEY` and every other API route
 from what it passes, and the VM refuses to start, or to run a session or a tool call, if one
 appears in its environment or in a Claude Code settings file. To rotate the token, replace the
-keychain item and restart the session; revoke old tokens in your claude.ai settings.
+keychain item and restart the session; revoke old tokens in your claude.ai settings. A
+setup-token token lasts about a year. Only Claude Code gets it in the VM: builds, tests and
+shells there do not.
+
+Agents push only `agent/<topic>` branches, and never tags or workflow changes: GitHub's rulesets
+refuse the App the rest. Apply `.github/rulesets/` with `cargo xtask rulesets apply` (your own gh
+login) when they change.
 
 microsandbox writes the output of every command run in a VM, the Claude Code session included, to
 `exec.log` under `~/.local/share/abc/msb/<version>/sandboxes/<name>/logs/` while the VM exists;
