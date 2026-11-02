@@ -1,0 +1,96 @@
+;; The macOS Seatbelt profile `jail.sh` runs repository code under when a Claude Code hook runs it.
+;;
+;; Hooks run outside Claude Code's sandbox, and the code they build and run (xtask, the tests) is
+;; code agents can edit. This profile holds that code to what agents' own sandboxed commands may
+;; do, so a hook never lends it the user's full access:
+;;
+;; - it reads everything except the user's GitHub credentials, the agent App's private key, the
+;;   keychains and SSH keys;
+;; - it writes only the checkout (CLAUDE_PROJECT_DIR) and a fresh temporary directory, never the
+;;   files Claude Code or git load configuration and code from;
+;; - it reaches no network, no Unix socket and no other process's services beyond the few the
+;;   system needs to run a program.
+;;
+;; The rules start from sandbox-runtime's macOS profile, Claude Code's own sandbox
+;; (https://github.com/anthropics/sandbox-runtime, Apache-2.0), without its keychain services.
+;; In Seatbelt the last matching rule wins.
+;;
+;; Parameters: ROOT, the checkout; HOME, the user's home; TMP, the jail's temporary directory;
+;; SHARE, a directory the hook reads back afterwards (TMP when there is none). All are real paths,
+;; without symbolic links.
+
+(version 1)
+(deny default)
+
+; Processes, confined to this sandbox.
+(allow process-exec)
+(allow process-fork)
+(allow process-info* (target same-sandbox))
+(allow signal (target same-sandbox))
+(allow mach-priv-task-port (target same-sandbox))
+
+; What the system needs to run a program. No keychain (com.apple.SecurityServer,
+; com.apple.securityd.xpc), Launch Services, Apple Events or launchd jobs.
+(allow user-preference-read)
+(allow mach-lookup
+  (global-name "com.apple.audio.systemsoundserver")
+  (global-name "com.apple.distributed_notifications@Uv3")
+  (global-name "com.apple.FontObjectsServer")
+  (global-name "com.apple.fonts")
+  (global-name "com.apple.logd")
+  (global-name "com.apple.PowerManagement.control")
+  (global-name "com.apple.system.logger")
+  (global-name "com.apple.system.notification_center")
+  (global-name "com.apple.system.opendirectoryd.libinfo")
+  (global-name "com.apple.system.opendirectoryd.membership")
+  (global-name "com.apple.bsd.dirhelper"))
+(allow ipc-posix-shm)
+(allow ipc-posix-sem)
+(allow iokit-get-properties)
+(allow sysctl-read)
+(allow system-socket (require-all (socket-domain AF_SYSTEM) (socket-protocol 2)))
+; Unix socket pairs between the jail's own processes. Binding or connecting to a socket path needs
+; network-bind or network-outbound, which nothing here allows.
+(allow system-socket (socket-domain AF_UNIX))
+(allow file-ioctl
+  (literal "/dev/null")
+  (literal "/dev/zero")
+  (literal "/dev/random")
+  (literal "/dev/urandom")
+  (literal "/dev/dtracehelper")
+  (literal "/dev/tty"))
+
+; Reads: everything but credentials.
+(allow file-read*)
+(deny file-read*
+  (subpath (string-append (param "HOME") "/.config/gh"))
+  (subpath (string-append (param "HOME") "/.config/abc/agent-app"))
+  (subpath (string-append (param "HOME") "/Library/Keychains"))
+  (subpath (string-append (param "HOME") "/.ssh"))
+  (subpath "/Library/Keychains"))
+
+; Writes: the checkout and the jail's own directories.
+(allow file-write*
+  (subpath (param "ROOT"))
+  (literal "/dev/null")
+  (literal "/dev/tty")
+  (literal "/dev/dtracehelper")
+  (regex #"^/dev/fd/"))
+; Not Claude Code's settings, hooks and the like, except its worktrees, nor git's own directory.
+(deny file-write*
+  (subpath (string-append (param "ROOT") "/.claude"))
+  (subpath (string-append (param "ROOT") "/.git")))
+(allow file-write* (subpath (string-append (param "ROOT") "/.claude/worktrees")))
+; Nor, anywhere in the checkout or its worktrees, a file that configures or runs code outside the
+; jail: Claude Code's settings, hooks, skills, agents and commands, MCP servers, git's hooks and
+; configuration, and editor tasks.
+(deny file-write*
+  (regex #"/\.claude/(settings[^/]*\.json|hooks|skills|agents|commands|workflows)(/|$)")
+  (regex #"/\.mcp\.json$")
+  (regex #"/\.git/(hooks|config)(/|$)")
+  (regex #"/\.git$")
+  (regex #"/\.(vscode|idea)(/|$)")
+  (regex #"/\.envrc$"))
+(allow file-write*
+  (subpath (param "TMP"))
+  (subpath (param "SHARE")))

@@ -7,13 +7,13 @@ mod tests {
     use std::process::{Command, Output, Stdio};
 
     /// Runs the xtask binary with `args`, `stdin` and extra environment `env`, isolated from the
-    /// caller's GitHub Actions variables and App files.
+    /// caller's GitHub Actions variables, App files and token broker by a home of its own.
     fn xtask(args: &[&str], stdin: &str, env: &[(&str, &Path)]) -> Output {
-        let config = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
         let mut command = Command::new(env!("CARGO_BIN_EXE_xtask"));
         command
             .args(args)
-            .env("XDG_CONFIG_HOME", config.path())
+            .env("HOME", home.path())
             .env_remove("GITHUB_REPOSITORY")
             .env_remove("GITHUB_TOKEN")
             .env_remove("GITHUB_EVENT_PATH")
@@ -159,8 +159,49 @@ mod tests {
             "protocol=https\nhost=github.com\n\n",
             &[],
         );
-        assert_eq!(github.status.code(), Some(1), "no App files, no token");
+        assert_eq!(github.status.code(), Some(1), "no broker, no token");
         assert!(github.stdout.is_empty(), "and nothing for git to use");
-        assert!(stderr(&github).contains("app.json"), "{}", stderr(&github));
+        assert!(
+            stderr(&github).contains("token broker"),
+            "{}",
+            stderr(&github)
+        );
+    }
+
+    #[test]
+    fn gh_runs_only_with_a_token_from_the_broker() {
+        let gh = xtask(&["gh", "--", "auth", "status"], "", &[]);
+        assert_eq!(gh.status.code(), Some(1), "no broker, no gh");
+        assert!(stderr(&gh).contains("token broker"), "{}", stderr(&gh));
+    }
+
+    #[test]
+    fn the_broker_needs_the_app() {
+        let broker = xtask(&["broker"], "", &[]);
+        assert_eq!(broker.status.code(), Some(1), "no App files, no broker");
+        assert!(stderr(&broker).contains("app.json"), "{}", stderr(&broker));
+    }
+
+    #[test]
+    fn the_watchdog_judges_claudes_answer() {
+        let answer =
+            |result: &str| serde_json::json!({"type": "result", "result": result}).to_string();
+        let on_track = xtask(
+            &["watchdog"],
+            &answer(r#"{"on_track": true, "reasons": []}"#),
+            &[],
+        );
+        assert_eq!(on_track.status.code(), Some(0), "{}", stderr(&on_track));
+        let drifted = xtask(
+            &["watchdog"],
+            &answer(r#"{"on_track": false, "reasons": ["off task (S1)"]}"#),
+            &[],
+        );
+        assert_eq!(drifted.status.code(), Some(2), "keeps the agent working");
+        assert!(
+            stderr(&drifted).contains("off task (S1)"),
+            "{}",
+            stderr(&drifted)
+        );
     }
 }

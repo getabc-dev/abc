@@ -6,6 +6,36 @@
     "GIT_CONFIG_KEY_1": "credential.https://github.com.helper",
     "GIT_CONFIG_VALUE_1": "!cargo xtask git-credential"
   },
+  "sandbox": {
+    "enabled": true,
+    "failIfUnavailable": true,
+    "allowUnsandboxedCommands": false,
+    "enableWeakerNetworkIsolation": true,
+    "filesystem": {
+      "denyRead": [
+        "~/.config/gh",
+        "~/.config/abc/agent-app",
+        "~/Library/Keychains",
+        "~/.ssh"
+      ]
+    },
+    "network": {
+      "allowedDomains": [
+        "github.com",
+        "api.github.com",
+        "objects.githubusercontent.com",
+        "release-assets.githubusercontent.com",
+        "crates.io",
+        "index.crates.io",
+        "static.crates.io",
+        "static.rust-lang.org",
+        "api.osv.dev"
+      ],
+      "allowUnixSockets": [
+        "~/.config/abc/agent-broker/broker.sock"
+      ]
+    }
+  },
   "permissions": {
     "deny": [
       "Bash(gh auth token)",
@@ -20,6 +50,9 @@
       "Read(~/.config/abc/agent-app/**)",
       "Bash(security find-generic-password *)",
       "Bash(security find-internet-password *)"
+    ],
+    "ask": [
+      "Edit(/.claude/**)"
     ]
   },
   "hooks": {
@@ -29,7 +62,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "if [ -f \"$CLAUDE_PROJECT_DIR/xtask/hooks/pre-tool-use.sh\" ]; then sh \"$CLAUDE_PROJECT_DIR/xtask/hooks/pre-tool-use.sh\"; else echo \"xtask hook: $CLAUDE_PROJECT_DIR has no xtask/hooks/pre-tool-use.sh; the git guard is off\" >&2; fi",
+            "command": "if [ -f \"$CLAUDE_PROJECT_DIR/.claude/hooks/jail.sh\" ] && [ -f \"$CLAUDE_PROJECT_DIR/xtask/hooks/pre-tool-use.sh\" ]; then cd \"$CLAUDE_PROJECT_DIR\" && sh .claude/hooks/jail.sh sh xtask/hooks/pre-tool-use.sh; else echo \"xtask hook: $CLAUDE_PROJECT_DIR has no .claude/hooks/jail.sh or xtask/hooks/pre-tool-use.sh; the git guard is off\" >&2; fi",
             "timeout": 300
           }
         ]
@@ -40,7 +73,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "if [ -f \"$CLAUDE_PROJECT_DIR/xtask/Cargo.toml\" ]; then cd \"$CLAUDE_PROJECT_DIR\" && cargo xtask hook stop 1>&2 || { echo 'xtask stop hook: keep working; see stderr'; exit 2; }; else echo \"xtask hook: $CLAUDE_PROJECT_DIR has no xtask; no checks run\" >&2; fi",
+            "command": "if [ -f \"$CLAUDE_PROJECT_DIR/.claude/hooks/stop.sh\" ] && [ -f \"$CLAUDE_PROJECT_DIR/xtask/Cargo.toml\" ]; then sh \"$CLAUDE_PROJECT_DIR/.claude/hooks/stop.sh\"; else echo \"xtask hook: $CLAUDE_PROJECT_DIR has no .claude/hooks/stop.sh or xtask; no checks run\" >&2; fi",
             "timeout": 900,
             "statusMessage": "cargo xtask check --changed"
           }
@@ -53,7 +86,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "if [ -f \"$CLAUDE_PROJECT_DIR/xtask/Cargo.toml\" ]; then cd \"$CLAUDE_PROJECT_DIR\" && cargo xtask hook stop 1>&2 || { echo 'xtask stop hook: keep working; see stderr'; exit 2; }; else echo \"xtask hook: $CLAUDE_PROJECT_DIR has no xtask; no checks run\" >&2; fi",
+            "command": "if [ -f \"$CLAUDE_PROJECT_DIR/.claude/hooks/stop.sh\" ] && [ -f \"$CLAUDE_PROJECT_DIR/xtask/Cargo.toml\" ]; then sh \"$CLAUDE_PROJECT_DIR/.claude/hooks/stop.sh\"; else echo \"xtask hook: $CLAUDE_PROJECT_DIR has no .claude/hooks/stop.sh or xtask; no checks run\" >&2; fi",
             "timeout": 900,
             "statusMessage": "cargo xtask check --changed"
           }

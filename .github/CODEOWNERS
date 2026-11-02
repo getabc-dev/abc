@@ -2,6 +2,7 @@
 # xtask/src/integrity/mod.rs, which a test checks. Changing one needs the owner's review (D5),
 # and the Integrity check flags it.
 /.cargo/                  @snehilvj
+/.claude/hooks/           @snehilvj
 /.claude/settings.json    @snehilvj
 /.config/                 @snehilvj
 /.gitattributes           @snehilvj

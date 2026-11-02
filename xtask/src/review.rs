@@ -197,10 +197,21 @@ pub(crate) fn review(
 
 /// Sends a request to Gemini, returning the status and body whatever the status.
 pub(crate) fn post_gemini(url: &str, body: &str, key: &str) -> anyhow::Result<(u16, String)> {
-    let agent: ureq::Agent = ureq::Agent::config_builder()
-        .http_status_as_error(false)
-        .build()
-        .into();
+    post_gemini_with(&gemini_config().build().into(), url, body, key)
+}
+
+/// How the agent that talks to Gemini is configured: every status is read, none raised.
+fn gemini_config() -> ureq::config::ConfigBuilder<ureq::typestate::AgentScope> {
+    ureq::Agent::config_builder().http_status_as_error(false)
+}
+
+/// [`post_gemini`] through `agent`.
+fn post_gemini_with(
+    agent: &ureq::Agent,
+    url: &str,
+    body: &str,
+    key: &str,
+) -> anyhow::Result<(u16, String)> {
     let mut response = agent
         .post(url)
         .header("x-goog-api-key", key)
@@ -409,10 +420,10 @@ mod tests {
     use std::fs;
 
     use super::{
-        Decision, Event, MAX_DIFF_BYTES, MODEL, Plan, Request, body, plan, post_gemini, review,
-        run, run_from, summary,
+        Decision, Event, MAX_DIFF_BYTES, MODEL, Plan, Request, body, gemini_config, plan,
+        post_gemini_with, review, run, run_from, summary,
     };
-    use crate::testing::{git, repository, serve_once};
+    use crate::testing::{fake_http, git, repository};
 
     fn request(diff: &str) -> Request {
         Request {
@@ -720,9 +731,11 @@ mod tests {
 
     #[test]
     fn posts_to_gemini_with_the_key_in_a_header() {
-        let (url, server) = serve_once("429 Too Many Requests", r#"{"error": {"code": 429}}"#);
-        let (status, body) = post_gemini(
-            &format!("{url}/v1beta/models/m:generateContent"),
+        let (agent, server) =
+            fake_http(gemini_config(), vec![(429, r#"{"error": {"code": 429}}"#)]);
+        let (status, body) = post_gemini_with(
+            &agent,
+            "https://gemini.test/v1beta/models/m:generateContent",
             "{}",
             "test-key",
         )
@@ -732,7 +745,7 @@ mod tests {
             (429, r#"{"error": {"code": 429}}"#),
             "any status is read, not raised"
         );
-        let request = server.join().unwrap();
+        let request = server.taken().remove(0);
         assert!(
             request.starts_with("POST /v1beta/models/m:generateContent HTTP/1.1"),
             "{request}"

@@ -4,6 +4,10 @@
 //! in an hour, never with the user's own credentials. Signing a token request takes the App's
 //! client ID, its installation ID and its private key, kept outside the repository in
 //! `~/.config/abc/agent-app/` (`app.json` and `private-key.pem`, which only its owner may read).
+//! Agents never read the key: `.claude/settings.json` denies that directory to their sandboxed
+//! commands, and only the token broker ([`crate::broker`]), which the user runs outside the
+//! sandbox, loads it. Agents ask the broker for tokens instead.
+//!
 //! A token is minted for every use, scoped to the one repository and the fewest permissions that
 //! use needs, and goes only where it is needed: to git through the credential-helper protocol, or
 //! to `gh` in `GH_TOKEN`, revoked once gh exits. It is never printed or logged.
@@ -54,6 +58,21 @@ pub(crate) enum Scope {
 }
 
 impl Scope {
+    /// The scope's name in the broker's protocol.
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::Git => "git",
+            Self::Gh => "gh",
+        }
+    }
+
+    /// The scope named `name`, if any.
+    pub(crate) fn parse(name: &str) -> Option<Self> {
+        [Self::Git, Self::Gh]
+            .into_iter()
+            .find(|scope| scope.name() == name)
+    }
+
     fn permissions(self) -> serde_json::Value {
         match self {
             Self::Git => serde_json::json!({"contents": "write", "workflows": "write"}),
@@ -85,19 +104,22 @@ impl std::fmt::Debug for App {
     }
 }
 
-/// Where the App's files live: `$XDG_CONFIG_HOME/abc/agent-app`, else `~/.config/abc/agent-app`.
+/// Where the App's files live: `~/.config/abc/agent-app`, whatever `XDG_CONFIG_HOME` says, since
+/// that is the path `.claude/settings.json` denies to agents.
 pub(crate) fn config_dir() -> anyhow::Result<PathBuf> {
-    config_dir_from(|name| std::env::var_os(name))
+    config_dir_from(std::env::var_os("HOME"))
 }
 
-/// [`config_dir`], with the environment read through `lookup`.
-fn config_dir_from(lookup: impl Fn(&str) -> Option<OsString>) -> anyhow::Result<PathBuf> {
-    let base = match lookup("XDG_CONFIG_HOME") {
-        Some(dir) if !dir.is_empty() => PathBuf::from(dir),
-        _ => PathBuf::from(lookup("HOME").context("HOME is not set")?).join(".config"),
-    };
-    Ok(base.join("abc/agent-app"))
+/// [`config_dir`] for the home directory `home`.
+fn config_dir_from(home: Option<OsString>) -> anyhow::Result<PathBuf> {
+    let home = home
+        .filter(|home| !home.is_empty())
+        .context("HOME is not set")?;
+    Ok(PathBuf::from(home).join(CONFIG_DIR))
 }
+
+/// The App's directory, relative to the home directory.
+pub(crate) const CONFIG_DIR: &str = ".config/abc/agent-app";
 
 impl App {
     /// Reads `app.json` and `private-key.pem` from `dir`.
@@ -159,9 +181,14 @@ impl App {
         Ok(format!("{message}.{}", URL_SAFE_NO_PAD.encode(signature)))
     }
 
-    /// A fresh installation token from the GitHub API at `api`, valid for an hour, for the App's
-    /// one repository with the permissions `scope` needs.
-    pub(crate) fn token(&self, api: &str, scope: Scope) -> anyhow::Result<String> {
+    /// A fresh installation token from the GitHub API at `api`, reached through `agent`, valid
+    /// for an hour, for the App's one repository with the permissions `scope` needs.
+    pub(crate) fn token(
+        &self,
+        agent: &ureq::Agent,
+        api: &str,
+        scope: Scope,
+    ) -> anyhow::Result<String> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .context("the clock is before 1970")?
@@ -170,7 +197,8 @@ impl App {
             "{api}/app/installations/{}/access_tokens",
             self.installation_id
         );
-        let mut response = ureq::post(&url)
+        let mut response = agent
+            .post(&url)
             .header("Authorization", &format!("Bearer {}", self.jwt(now)?))
             .header("Accept", "application/vnd.github+json")
             .header("X-GitHub-Api-Version", "2022-11-28")
@@ -250,18 +278,19 @@ pub(crate) fn credential(
     Ok(())
 }
 
-/// `cargo xtask gh`: runs `program` (gh) with `args` as `app`, with a token minted from `api` for
-/// this run and revoked when it ends.
+/// `cargo xtask gh`: runs `program` (gh) with `args` as the App, with a token from `mint` for
+/// this run, revoked through `agent` at `api` when it ends.
 pub(crate) fn run_gh(
-    app: &App,
+    mint: impl FnOnce() -> anyhow::Result<String>,
+    agent: &ureq::Agent,
     api: &str,
     program: &Path,
     args: &[OsString],
     out: &mut impl Write,
 ) -> anyhow::Result<ExitCode> {
-    let token = app.token(api, Scope::Gh)?;
+    let token = mint()?;
     let code = gh(program, args, &token);
-    if let Err(error) = revoke(api, &token) {
+    if let Err(error) = revoke(agent, api, &token) {
         writeln!(
             out,
             "xtask gh: could not revoke the token; it expires within the hour: {error:#}"
@@ -271,8 +300,9 @@ pub(crate) fn run_gh(
 }
 
 /// Revokes the installation `token` at `api`.
-fn revoke(api: &str, token: &str) -> anyhow::Result<()> {
-    ureq::delete(&format!("{api}/installation/token"))
+fn revoke(agent: &ureq::Agent, api: &str, token: &str) -> anyhow::Result<()> {
+    agent
+        .delete(&format!("{api}/installation/token"))
         .header("Authorization", &format!("Bearer {token}"))
         .header("Accept", "application/vnd.github+json")
         .header("X-GitHub-Api-Version", "2022-11-28")
@@ -282,11 +312,15 @@ fn revoke(api: &str, token: &str) -> anyhow::Result<()> {
 }
 
 /// Runs `gh` (the user's GitHub CLI, from `PATH`) with `args`, acting as the App through
-/// `GH_TOKEN`.
+/// `GH_TOKEN`. gh gets an empty configuration directory of its own: the user's `~/.config/gh/` is
+/// unreadable in agent sessions, gh refuses to start without its configuration, and the App needs
+/// nothing from it.
 fn gh(program: &Path, args: &[OsString], token: &str) -> anyhow::Result<ExitCode> {
+    let config = tempfile::tempdir().context("could not make a configuration directory for gh")?;
     let status = Command::new(program)
         .args(args)
         .env("GH_TOKEN", token)
+        .env("GH_CONFIG_DIR", config.path())
         .env_remove("GITHUB_TOKEN")
         .status()
         .with_context(|| format!("could not run {}", program.display()))?;
@@ -303,7 +337,7 @@ mod tests {
     use ring::signature::{RSA_PKCS1_2048_8192_SHA256, UnparsedPublicKey};
 
     use super::{App, Scope, config_dir_from, credential, gh, parse_key, run_gh};
-    use crate::testing::{script, serve, serve_once};
+    use crate::testing::{fake_http, script};
 
     const KEY: &str = include_str!("../testdata/agent-app-test-key.pem");
 
@@ -316,30 +350,24 @@ mod tests {
     }
 
     #[test]
-    fn finds_the_config_under_xdg_or_home() {
-        let lookup = |xdg: Option<&'static str>| {
-            move |name: &str| match name {
-                "XDG_CONFIG_HOME" => xdg.map(Into::into),
-                "HOME" => Some("/home/a".into()),
-                _ => None,
-            }
-        };
+    fn finds_the_config_under_home_whatever_xdg_says() {
         assert_eq!(
-            config_dir_from(lookup(Some("/xdg"))).unwrap(),
-            Path::new("/xdg/abc/agent-app"),
-            "XDG_CONFIG_HOME first"
-        );
-        assert_eq!(
-            config_dir_from(lookup(Some(""))).unwrap(),
+            config_dir_from(Some("/home/a".into())).unwrap(),
             Path::new("/home/a/.config/abc/agent-app"),
-            "an empty XDG_CONFIG_HOME is unset"
+            "the path the sandbox denies, so XDG_CONFIG_HOME cannot move the key out of its reach"
         );
-        assert_eq!(
-            config_dir_from(lookup(None)).unwrap(),
-            Path::new("/home/a/.config/abc/agent-app"),
-            "else ~/.config"
-        );
-        assert!(config_dir_from(|_| None).is_err(), "no HOME");
+        assert!(config_dir_from(Some("".into())).is_err(), "an empty HOME");
+        assert!(config_dir_from(None).is_err(), "no HOME");
+    }
+
+    #[test]
+    fn names_each_scope_for_the_broker() {
+        for scope in [Scope::Git, Scope::Gh] {
+            assert_eq!(Scope::parse(scope.name()), Some(scope), "{scope:?}");
+        }
+        assert_eq!(Scope::Git.name(), "git");
+        assert_eq!(Scope::Gh.name(), "gh");
+        assert_eq!(Scope::parse("admin"), None, "no other scope");
     }
 
     /// An App configuration in a temporary directory, with the test key.
@@ -427,17 +455,20 @@ mod tests {
 
     #[test]
     fn requests_an_installation_token() {
-        let (url, server) = serve_once(
-            "201 Created",
-            r#"{"token": "ghs_test", "expires_at": "2026-11-01T11:00:00Z"}"#,
+        let (agent, server) = fake_http(
+            ureq::Agent::config_builder(),
+            vec![(
+                201,
+                r#"{"token": "ghs_test", "expires_at": "2026-11-01T11:00:00Z"}"#,
+            )],
         );
         let dir = app_dir();
         let token = App::load(dir.path())
             .unwrap()
-            .token(&url, Scope::Git)
+            .token(&agent, "https://api.github.test", Scope::Git)
             .unwrap();
         assert_eq!(token, "ghs_test", "the token from the response");
-        let request = server.join().unwrap();
+        let request = server.taken().remove(0);
         let body: serde_json::Value =
             serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
         assert_eq!(
@@ -494,7 +525,7 @@ mod tests {
         let fake = dir.path().join("gh");
         fs::write(
             &fake,
-            "#!/bin/sh\n[ \"$GH_TOKEN\" = ghs_test ] && [ -z \"$GITHUB_TOKEN\" ] && [ \"$1\" = pr ] || exit 3\n",
+            "#!/bin/sh\n[ \"$GH_TOKEN\" = ghs_test ] && [ -z \"$GITHUB_TOKEN\" ] && [ \"$1\" = pr ] || exit 3\n[ -d \"$GH_CONFIG_DIR\" ] && [ -z \"$(ls -A \"$GH_CONFIG_DIR\")\" ] || exit 5\n[ \"$GH_CONFIG_DIR\" != \"$HOME/.config/gh\" ] || exit 6\n",
         )
         .unwrap();
         fs::set_permissions(&fake, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
@@ -507,7 +538,7 @@ mod tests {
         assert_eq!(
             code,
             std::process::ExitCode::SUCCESS,
-            "gh saw the App's token and arguments"
+            "gh saw the App's token, its arguments and an empty configuration of its own"
         );
     }
 
@@ -530,17 +561,15 @@ mod tests {
 
     #[test]
     fn runs_gh_with_a_token_it_revokes_afterwards() {
-        let (url, server) = serve(vec![
-            ("201 Created", r#"{"token": "ghs_test"}"#),
-            ("204 No Content", ""),
-        ]);
-        let dir = app_dir();
+        let (agent, server) = fake_http(ureq::Agent::config_builder(), vec![(204, "")]);
+        let dir = tempfile::tempdir().unwrap();
         let fake = dir.path().join("gh");
         script(&fake, "[ \"$GH_TOKEN\" = ghs_test ] || exit 3\nexit 4\n");
         let mut out = Vec::new();
         let code = run_gh(
-            &App::load(dir.path()).unwrap(),
-            &url,
+            || Ok("ghs_test".to_owned()),
+            &agent,
+            "https://api.github.test",
             &fake,
             &["pr".into(), "list".into()],
             &mut out,
@@ -548,43 +577,49 @@ mod tests {
         .unwrap();
         assert_eq!(code, std::process::ExitCode::from(4), "gh's exit code");
         assert!(out.is_empty(), "no warning");
-        let requests = server.join().unwrap();
+        let requests = server.taken();
+        assert_eq!(requests.len(), 1, "only the revocation: {requests:?}");
         assert!(
-            requests[0].starts_with("POST /app/installations/42/access_tokens"),
+            requests[0].starts_with("DELETE /installation/token HTTP/1.1"),
             "{requests:?}"
         );
         assert!(
-            requests[0].contains("\"pull_requests\":\"write\""),
-            "{requests:?}"
-        );
-        assert!(
-            requests[1].starts_with("DELETE /installation/token HTTP/1.1"),
-            "{requests:?}"
-        );
-        assert!(
-            requests[1].contains("authorization: Bearer ghs_test"),
+            requests[0].contains("authorization: Bearer ghs_test"),
             "revoked with itself: {requests:?}"
         );
 
-        let (refusing, refusing_server) = serve(vec![
-            ("201 Created", r#"{"token": "ghs_test"}"#),
-            ("500 Internal Server Error", "{}"),
-        ]);
+        let (refusing, refusing_server) =
+            fake_http(ureq::Agent::config_builder(), vec![(500, "{}")]);
         let mut warned = Vec::new();
         run_gh(
-            &App::load(dir.path()).unwrap(),
+            || Ok("ghs_test".to_owned()),
             &refusing,
+            "https://api.github.test",
             &fake,
             &[],
             &mut warned,
         )
         .unwrap();
-        refusing_server.join().unwrap();
+        assert_eq!(refusing_server.taken().len(), 1, "the revocation was tried");
         assert!(
             String::from_utf8(warned)
                 .unwrap()
                 .contains("could not revoke the token"),
             "a failed revocation is reported"
+        );
+
+        let error = run_gh(
+            || anyhow::bail!("the broker is not running"),
+            &agent,
+            "https://api.github.test",
+            &fake,
+            &[],
+            &mut Vec::new(),
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("the broker is not running"),
+            "without a token gh never runs: {error}"
         );
     }
 }

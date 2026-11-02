@@ -1,4 +1,5 @@
-//! Helpers for tests that need real git repositories.
+//! Helpers for tests: real git repositories, an HTTP server that never leaves the process, and
+//! scripts.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -46,81 +47,72 @@ pub(crate) fn repository(path: &Path) -> PathBuf {
     path.canonicalize().unwrap()
 }
 
-/// Serves one HTTP request on a local port with `status` (such as `201 Created`) and `body`, and
-/// returns the server's base URL and a handle that yields the request it received.
-pub(crate) fn serve_once(
-    status: &'static str,
-    body: &'static str,
-) -> (String, std::thread::JoinHandle<String>) {
-    let (url, server) = serve(vec![(status, body)]);
-    (
-        url,
-        std::thread::spawn(move || server.join().unwrap().remove(0)),
-    )
+/// The requests a [`fake_http`] agent has received, each as HTTP/1.1 text: the request line, the
+/// headers its caller set (names in lowercase, as ureq sends them) and the body.
+#[derive(Clone)]
+pub(crate) struct Requests(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+impl Requests {
+    /// The requests so far, in order.
+    pub(crate) fn taken(&self) -> Vec<String> {
+        self.0.lock().unwrap().clone()
+    }
 }
 
-/// Serves one HTTP request per response in `responses`, in order, on a local port, and returns
-/// the server's base URL and a handle that yields the requests it received.
-pub(crate) fn serve(
-    responses: Vec<(&'static str, &'static str)>,
-) -> (String, std::thread::JoinHandle<Vec<String>>) {
-    use std::io::{Read as _, Write as _};
+/// An agent built from `config` whose requests never leave the process: each one is recorded and
+/// answered with the next of `responses` (a status such as 201, and a JSON body). A 4xx or 5xx
+/// answer is an error when the configuration says so, as it would be from a real server. Tests
+/// need no port, so they pass inside Claude Code's sandbox, which forbids binding one.
+pub(crate) fn fake_http(
+    config: ureq::config::ConfigBuilder<ureq::typestate::AgentScope>,
+    responses: Vec<(u16, &'static str)>,
+) -> (ureq::Agent, Requests) {
+    use std::fmt::Write as _;
+    use std::io::Read as _;
+    use std::sync::{Arc, Mutex, OnceLock};
 
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let url = format!("http://{}", listener.local_addr().unwrap());
-    let server = std::thread::spawn(move || {
-        // A request that never comes fails the test instead of hanging it.
-        listener.set_nonblocking(true).unwrap();
-        let started = std::time::Instant::now();
-        let mut requests = Vec::new();
-        for (status, body) in responses {
-            let mut stream = loop {
-                match listener.accept() {
-                    Ok((stream, _)) => break stream,
-                    Err(error)
-                        if error.kind() == std::io::ErrorKind::WouldBlock
-                            && started.elapsed() < std::time::Duration::from_secs(10) =>
-                    {
-                        std::thread::sleep(std::time::Duration::from_millis(10));
-                    }
-                    Err(error) => panic!("no request arrived: {error}"),
-                }
-            };
-            stream.set_nonblocking(false).unwrap();
-            let mut request = Vec::new();
-            let mut buffer = [0_u8; 8192];
-            loop {
-                let read = stream.read(&mut buffer).unwrap();
-                request.extend_from_slice(&buffer[..read]);
-                let text = String::from_utf8_lossy(&request);
-                if let Some((head, rest)) = text.split_once("\r\n\r\n") {
-                    let length = head
-                        .lines()
-                        .find_map(|line| {
-                            let (name, value) = line.split_once(':')?;
-                            name.eq_ignore_ascii_case("content-length")
-                                .then(|| value.trim().parse::<usize>().ok())?
-                        })
-                        .unwrap_or(0);
-                    if rest.len() >= length {
-                        break;
-                    }
-                }
-                if read == 0 {
-                    break;
-                }
-            }
-            write!(
-                stream,
-                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            )
-            .unwrap();
-            requests.push(String::from_utf8(request).unwrap());
+    let requests = Requests(Arc::new(Mutex::new(Vec::new())));
+    let recorded = requests.clone();
+    let queue = Mutex::new(std::collections::VecDeque::from(responses));
+    let status_as_error = Arc::new(OnceLock::new());
+    let raises = Arc::clone(&status_as_error);
+    let answer = move |request: ureq::http::Request<ureq::SendBody<'_>>,
+                       _next: ureq::middleware::MiddlewareNext<'_>|
+          -> Result<ureq::http::Response<ureq::Body>, ureq::Error> {
+        let (parts, sent) = request.into_parts();
+        let mut text = format!(
+            "{} {} HTTP/1.1\r\n",
+            parts.method,
+            parts.uri.path_and_query().map_or("/", |path| path.as_str())
+        );
+        for (name, value) in &parts.headers {
+            write!(text, "{name}: {}\r\n", value.to_str().unwrap()).unwrap();
         }
-        requests
-    });
-    (url, server)
+        text.push_str("\r\n");
+        sent.into_reader().read_to_string(&mut text).unwrap();
+        recorded.0.lock().unwrap().push(text);
+        let (status, body) = queue
+            .lock()
+            .unwrap()
+            .pop_front()
+            .expect("a response for every request");
+        if status >= 400 && *raises.get().unwrap() {
+            return Err(ureq::Error::StatusCode(status));
+        }
+        Ok(ureq::http::Response::builder()
+            .status(status)
+            .body(
+                ureq::Body::builder()
+                    .mime_type("application/json")
+                    .data(body),
+            )
+            .unwrap())
+    };
+    let agent: ureq::Agent = config.middleware(answer).build().into();
+    status_as_error
+        .set(agent.config().http_status_as_error())
+        .unwrap();
+    (agent, requests)
 }
 
 /// Writes an executable shell script at `path`.

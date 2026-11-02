@@ -10,6 +10,13 @@
 //!   repository, so the checkout is held to its own toolchain, tools and gate;
 //! - does nothing when the directory is in no repository, or in a different one.
 //!
+//! Hooks run outside Claude Code's sandbox, so `.claude/settings.json` never runs this code
+//! directly: it runs it through `.claude/hooks/jail.sh`, which holds it to the sandbox's limits
+//! (no credentials, writes only to the session's checkout and a temporary directory, no network).
+//! A hook can therefore act only in a worktree inside that checkout, such as Claude Code's own in
+//! `.claude/worktrees/`. The stop hook's watchdog needs the user's claude login, so
+//! `.claude/hooks/stop.sh` runs claude outside the jail on the prompt this hook writes.
+//!
 //! Claude Code cancels a hook at its `timeout` in `.claude/settings.json`: 300 seconds for
 //! `PreToolUse` and 900 for `Stop`. A timed-out hook renders no decision, so the tool call runs or
 //! the agent stops. The guard builds in `target/hook`, so it never waits on the agent's cargo lock.
@@ -68,20 +75,20 @@ pub(crate) struct Context {
     delegated: bool,
     /// The cargo that runs another checkout's xtask.
     cargo: PathBuf,
-    /// The claude that runs the stop hook's watchdog.
-    claude: PathBuf,
+    /// Where the stop hook writes the watchdog's prompt, when `.claude/hooks/stop.sh` asks for one.
+    watchdog_prompt: Option<PathBuf>,
     /// Whether this hook runs inside the watchdog's own claude session, where it must do nothing.
     inside_watchdog: bool,
 }
 
 impl Context {
-    pub(crate) fn from_env(own_root: PathBuf) -> Self {
+    pub(crate) fn from_env(own_root: PathBuf, watchdog_prompt: Option<PathBuf>) -> Self {
         Self {
             own_root,
             project_dir: std::env::var_os("CLAUDE_PROJECT_DIR").map(PathBuf::from),
             delegated: std::env::var_os(DELEGATED).is_some(),
             cargo: PathBuf::from("cargo"),
-            claude: PathBuf::from("claude"),
+            watchdog_prompt,
             inside_watchdog: std::env::var_os(watchdog::GUARD).is_some(),
         }
     }
@@ -190,11 +197,10 @@ fn act(event: Event, input: &str, context: &Context, out: &mut impl Write) -> an
                     None,
                     out,
                 )? {
-                    if fields.watched() {
-                        watchdog::check(&context.own_root, &context.claude, watchdog::TIMEOUT, out)
-                    } else {
-                        Ok(0)
+                    if let (true, Some(file)) = (fields.watched(), &context.watchdog_prompt) {
+                        watchdog::prepare(&context.own_root, file, out)?;
                     }
+                    Ok(0)
                 } else {
                     Ok(1)
                 }
@@ -216,7 +222,13 @@ fn act(event: Event, input: &str, context: &Context, out: &mut impl Write) -> an
                 context.own_root.display(),
                 root.display()
             );
-            delegate(&context.cargo, &root, event, input)
+            delegate(
+                &context.cargo,
+                &root,
+                event,
+                context.watchdog_prompt.as_deref(),
+                input,
+            )
         }
         Location::Elsewhere(reason) => {
             if event == Event::Stop {
@@ -303,10 +315,22 @@ fn git_in(dir: &Path) -> Command {
     command
 }
 
-/// Hands the hook to the checkout at `root`, which runs it with its own xtask and toolchain.
-fn delegate(cargo: &Path, root: &Path, event: Event, input: &str) -> anyhow::Result<u8> {
+/// Hands the hook to the checkout at `root`, which runs it with its own xtask and toolchain, and
+/// writes any watchdog prompt to `watchdog_prompt`.
+fn delegate(
+    cargo: &Path,
+    root: &Path,
+    event: Event,
+    watchdog_prompt: Option<&Path>,
+    input: &str,
+) -> anyhow::Result<u8> {
     let mut child = Command::new(cargo)
         .args(["xtask", "hook", event.name()])
+        .args(
+            watchdog_prompt
+                .into_iter()
+                .flat_map(|file| [OsStr::new("--watchdog-prompt"), file.as_os_str()]),
+        )
         .current_dir(root)
         // Let the checkout's rust-toolchain.toml choose the toolchain, not the one running here.
         .env_remove("RUSTUP_TOOLCHAIN")
@@ -373,7 +397,7 @@ mod tests {
             project_dir: project_dir.map(Path::to_path_buf),
             delegated: false,
             cargo: PathBuf::from("cargo"),
-            claude: PathBuf::from("claude"),
+            watchdog_prompt: None,
             inside_watchdog: false,
         }
     }
@@ -837,11 +861,11 @@ mod tests {
         let guard = &hooks["PreToolUse"][0]["hooks"][0];
         assert_eq!(
             guard["command"],
-            "if [ -f \"$CLAUDE_PROJECT_DIR/xtask/hooks/pre-tool-use.sh\" ]; then sh \"$CLAUDE_PROJECT_DIR/xtask/hooks/pre-tool-use.sh\"; else echo \"xtask hook: $CLAUDE_PROJECT_DIR has no xtask/hooks/pre-tool-use.sh; the git guard is off\" >&2; fi",
-            "the guard runs the hook script"
+            "if [ -f \"$CLAUDE_PROJECT_DIR/.claude/hooks/jail.sh\" ] && [ -f \"$CLAUDE_PROJECT_DIR/xtask/hooks/pre-tool-use.sh\" ]; then cd \"$CLAUDE_PROJECT_DIR\" && sh .claude/hooks/jail.sh sh xtask/hooks/pre-tool-use.sh; else echo \"xtask hook: $CLAUDE_PROJECT_DIR has no .claude/hooks/jail.sh or xtask/hooks/pre-tool-use.sh; the git guard is off\" >&2; fi",
+            "the guard runs the hook script in the jail"
         );
         assert_eq!(guard["timeout"], 300, "the guard is time-boxed");
-        let stop_command = "if [ -f \"$CLAUDE_PROJECT_DIR/xtask/Cargo.toml\" ]; then cd \"$CLAUDE_PROJECT_DIR\" && cargo xtask hook stop 1>&2 || { echo 'xtask stop hook: keep working; see stderr'; exit 2; }; else echo \"xtask hook: $CLAUDE_PROJECT_DIR has no xtask; no checks run\" >&2; fi";
+        let stop_command = "if [ -f \"$CLAUDE_PROJECT_DIR/.claude/hooks/stop.sh\" ] && [ -f \"$CLAUDE_PROJECT_DIR/xtask/Cargo.toml\" ]; then sh \"$CLAUDE_PROJECT_DIR/.claude/hooks/stop.sh\"; else echo \"xtask hook: $CLAUDE_PROJECT_DIR has no .claude/hooks/stop.sh or xtask; no checks run\" >&2; fi";
         for event in ["Stop", "SubagentStop"] {
             let stop = &hooks[event][0]["hooks"][0];
             assert_eq!(stop["command"], stop_command, "{event} runs the check");
@@ -1008,6 +1032,370 @@ mod tests {
         assert!(
             format!("{error:#}").contains("could not read the Stop hook input"),
             "{error:#}"
+        );
+    }
+
+    /// The project's Claude Code settings.
+    fn settings() -> serde_json::Value {
+        serde_json::from_str(
+            &fs::read_to_string(crate::repo_root().unwrap().join(".claude/settings.json")).unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn settings_sandbox_every_agent_command() {
+        let settings = settings();
+        let sandbox = &settings["sandbox"];
+        assert_eq!(sandbox["enabled"], true, "agents' commands run sandboxed");
+        assert_eq!(
+            sandbox["failIfUnavailable"], true,
+            "a session without the sandbox does not start"
+        );
+        assert_eq!(
+            sandbox["allowUnsandboxedCommands"], false,
+            "no escape hatch: the model cannot rerun a command outside the sandbox"
+        );
+        assert_eq!(
+            sandbox["enableWeakerNetworkIsolation"], true,
+            "gh, a Go program, verifies TLS through macOS's trustd; without it `cargo xtask gh` \
+             fails, and a sandboxed command can already send anything to GitHub"
+        );
+        for key in [
+            "excludedCommands",
+            "autoAllowBashIfSandboxed",
+            "enableWeakerNestedSandbox",
+        ] {
+            assert!(sandbox.get(key).is_none(), "{key} stays at its default");
+        }
+        for key in [
+            "allowAllUnixSockets",
+            "allowLocalBinding",
+            "allowMachLookup",
+        ] {
+            assert!(
+                sandbox["network"].get(key).is_none(),
+                "{key} would open local services, the Docker socket or the keychain"
+            );
+        }
+        assert_eq!(
+            sandbox["filesystem"],
+            serde_json::json!({"denyRead": [
+                "~/.config/gh",
+                format!("~/{}", crate::app::CONFIG_DIR),
+                "~/Library/Keychains",
+                "~/.ssh"
+            ]}),
+            "the user's gh login, the App's key, the keychains gh and git keep tokens in, and SSH \
+             keys are unreadable; writes stay at Claude Code's default, the checkout"
+        );
+        assert_eq!(
+            sandbox["network"]["allowedDomains"],
+            serde_json::json!([
+                "github.com",
+                "api.github.com",
+                "objects.githubusercontent.com",
+                "release-assets.githubusercontent.com",
+                "crates.io",
+                "index.crates.io",
+                "static.crates.io",
+                "static.rust-lang.org",
+                "api.osv.dev"
+            ]),
+            "GitHub, crates, the toolchain and the pinned tools' downloads, nothing else"
+        );
+        assert_eq!(
+            settings["permissions"]["ask"],
+            serde_json::json!(["Edit(/.claude/**)"]),
+            "the user approves every edit to the settings and the jail"
+        );
+    }
+
+    /// The trusted hook scripts in `.claude/hooks/`.
+    fn trusted_script(name: &str) -> PathBuf {
+        crate::repo_root().unwrap().join(".claude/hooks").join(name)
+    }
+
+    /// Whether this process may apply a Seatbelt profile: false on other systems and inside a
+    /// sandbox, such as Claude Code's or the jail itself.
+    fn can_apply_seatbelt() -> bool {
+        Command::new("/usr/bin/sandbox-exec")
+            .args([
+                "-p",
+                "(version 1)(deny default)(allow process-exec)(allow file-read*)",
+            ])
+            .arg("/usr/bin/true")
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+
+    #[test]
+    fn the_jail_confines_repository_code_or_refuses_to_run_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        for secret in [
+            ".config/gh/hosts.yml",
+            ".config/abc/agent-app/private-key.pem",
+            "Library/Keychains/login.keychain-db",
+            ".ssh/id_ed25519",
+        ] {
+            let path = home.join(secret);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, "secret").unwrap();
+        }
+        let project = temp.path().join("project");
+        fs::create_dir_all(project.join(".claude/worktrees/feature/.claude")).unwrap();
+        fs::create_dir_all(project.join(".git/hooks")).unwrap();
+        let share = temp.path().join("share");
+        fs::create_dir_all(&share).unwrap();
+        let scratch = temp.path().join("scratch");
+        fs::create_dir_all(&scratch).unwrap();
+        let probe = "for secret in .config/gh/hosts.yml .config/abc/agent-app/private-key.pem \
+                     Library/Keychains/login.keychain-db .ssh/id_ed25519; do \
+                       cat \"$HOME/$secret\" >/dev/null 2>&1 && echo \"read $secret\"; done; \
+                     for file in \"$CLAUDE_PROJECT_DIR/built\" \"$CLAUDE_PROJECT_DIR/.claude/worktrees/feature/built\" \
+                       \"$TMPDIR/scratch\" \"$SHARE/answer\"; do \
+                       touch \"$file\" 2>/dev/null && echo \"wrote ${file##*/}\"; done; \
+                     for file in \"$HOME/.zshrc\" \"$CLAUDE_PROJECT_DIR/.claude/settings.json\" \
+                       \"$CLAUDE_PROJECT_DIR/.claude/hooks\" \"$CLAUDE_PROJECT_DIR/.git/hooks/pre-push\" \
+                       \"$CLAUDE_PROJECT_DIR/.claude/worktrees/feature/.claude/settings.json\" \
+                       \"$CLAUDE_PROJECT_DIR/.mcp.json\" \"$CLAUDE_PROJECT_DIR/.vscode\"; do \
+                       touch \"$file\" 2>/dev/null && echo \"wrote $file\"; done; \
+                     echo ran";
+        let output = Command::new("sh")
+            .arg(trusted_script("jail.sh"))
+            .args(["--share".as_ref(), share.as_os_str()])
+            .args(["sh", "-c", probe])
+            .env("HOME", &home)
+            .env("TMPDIR", &scratch)
+            .env("CLAUDE_PROJECT_DIR", &project)
+            .env("SHARE", share.canonicalize().unwrap())
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        if can_apply_seatbelt() {
+            assert_eq!(output.status.code(), Some(0), "{stdout}{stderr}");
+            assert_eq!(
+                stdout, "wrote built\nwrote built\nwrote scratch\nwrote answer\nran\n",
+                "no credential read, and writes only to the checkout, its worktrees' code, the \
+                 jail's temporary directory and the shared one: {stderr}"
+            );
+        } else {
+            assert_eq!(output.status.code(), Some(2), "{stdout}{stderr}");
+            assert!(stdout.is_empty(), "nothing ran unconfined: {stdout}");
+            assert!(
+                stderr.starts_with("abc jail: ") && stderr.contains("the command did not run"),
+                "{stderr}"
+            );
+        }
+        assert_eq!(
+            fs::read_dir(&scratch).unwrap().count(),
+            0,
+            "the jail removed its temporary directory"
+        );
+    }
+
+    #[test]
+    fn the_jail_refuses_without_a_project_or_a_command() {
+        let refusal = |args: &[&str], project: Option<&str>| {
+            let mut command = Command::new("sh");
+            command.arg(trusted_script("jail.sh")).args(args);
+            match project {
+                Some(project) => command.env("CLAUDE_PROJECT_DIR", project),
+                None => command.env_remove("CLAUDE_PROJECT_DIR"),
+            };
+            let output = command.output().unwrap();
+            (
+                output.status.code(),
+                String::from_utf8(output.stdout).unwrap(),
+                String::from_utf8(output.stderr).unwrap(),
+            )
+        };
+        for (args, project) in [
+            (&["echo", "ran"][..], None),
+            (&["echo", "ran"][..], Some("/nonexistent/abc")),
+            (&[][..], Some("/")),
+            (
+                &["--share", "/nonexistent/share", "echo", "ran"][..],
+                Some("/"),
+            ),
+            (&["--share", "/"][..], Some("/")),
+        ] {
+            let (code, stdout, stderr) = refusal(args, project);
+            assert_eq!(code, Some(2), "{args:?} {project:?}: {stderr}");
+            assert!(stdout.is_empty(), "{args:?} {project:?}: nothing ran");
+            assert!(stderr.starts_with("abc jail: "), "{stderr}");
+        }
+    }
+
+    /// A copy of `stop.sh` in `dir/.claude/hooks`, beside a jail that runs its command as it is,
+    /// and fake `cargo` and `claude` in `dir/bin`. The fake cargo writes the watchdog's prompt when
+    /// `PROMPT` is set and exits `CHECK` for the check; for the verdict it records claude's answer
+    /// and exits `VERDICT`. The fake claude records its arguments, environment and prompt and runs
+    /// `CLAUDE`.
+    fn stop_hook(dir: &Path) -> PathBuf {
+        let hooks = dir.join(".claude/hooks");
+        fs::create_dir_all(&hooks).unwrap();
+        let stop = hooks.join("stop.sh");
+        fs::copy(trusted_script("stop.sh"), &stop).unwrap();
+        fs::write(
+            hooks.join("jail.sh"),
+            "[ \"$1\" = --share ] && shift 2\n\"$@\"\n",
+        )
+        .unwrap();
+        let bin = dir.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        crate::testing::script(
+            &bin.join("cargo"),
+            "case \"$2 $3\" in\n\
+             'hook stop') cat >/dev/null; [ -n \"$PROMPT\" ] && printf %s \"$PROMPT\" > \"$5\"; exit \"${CHECK:-0}\" ;;\n\
+             'watchdog ') cat > \"$OUT/answer\"; exit \"${VERDICT:-0}\" ;;\n\
+             esac\nexit 99\n",
+        );
+        crate::testing::script(
+            &bin.join("claude"),
+            "printf '%s\\n' \"$@\" > \"$OUT/arguments\"\nprintf %s \"$ABC_WATCHDOG\" > \"$OUT/guard\"\n\
+             cat > \"$OUT/prompt\"\neval \"$CLAUDE\"\n",
+        );
+        stop
+    }
+
+    /// Runs the stop hook in `dir` with the hook input `{}`, the fakes' settings in `vars`, and
+    /// returns its exit code, stdout and stderr.
+    fn run_stop(dir: &Path, vars: &[(&str, &str)]) -> (Option<i32>, String, String) {
+        let stop = stop_hook(dir);
+        let path = format!(
+            "{}:{}",
+            dir.join("bin").display(),
+            std::env::var("PATH").unwrap()
+        );
+        let mut child = Command::new("sh")
+            .arg(stop)
+            .env("PATH", path)
+            .env("CLAUDE_PROJECT_DIR", dir)
+            .env("OUT", dir)
+            .envs(vars.iter().copied())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        super::feed(&mut child, "{}").unwrap();
+        let output = child.wait_with_output().unwrap();
+        (
+            output.status.code(),
+            String::from_utf8(output.stdout).unwrap(),
+            String::from_utf8(output.stderr).unwrap(),
+        )
+    }
+
+    #[test]
+    fn the_stop_hook_keeps_an_agent_working_while_the_check_fails() {
+        let temp = tempfile::tempdir().unwrap();
+        let (code, stdout, stderr) = run_stop(temp.path(), &[("CHECK", "1"), ("PROMPT", "p")]);
+        assert_eq!(code, Some(2), "{stderr}");
+        assert_eq!(stdout, "xtask stop hook: keep working; see stderr\n");
+        assert!(
+            !temp.path().join("arguments").exists(),
+            "no watchdog while the check fails"
+        );
+        let (passed, _, passed_err) = run_stop(temp.path(), &[]);
+        assert_eq!(passed, Some(0), "{passed_err}");
+        assert!(
+            !temp.path().join("arguments").exists(),
+            "no prompt, no watchdog"
+        );
+    }
+
+    #[test]
+    fn the_stop_hook_asks_claude_outside_the_jail_with_nothing_to_act_with() {
+        let temp = tempfile::tempdir().unwrap();
+        let answer = r#"{"result": "{\"on_track\": true, \"reasons\": []}"}"#;
+        let claude = format!("printf '%s' '{answer}'");
+        let (code, _, stderr) = run_stop(
+            temp.path(),
+            &[("PROMPT", "Judge this."), ("CLAUDE", &claude)],
+        );
+        assert_eq!(code, Some(0), "{stderr}");
+        let arguments = fs::read_to_string(temp.path().join("arguments")).unwrap();
+        assert_eq!(
+            arguments,
+            "-p\n--model\nhaiku\n--output-format\njson\n--settings\n{\"disableAllHooks\": true}\n\
+             --tools\n\n--strict-mcp-config\n",
+            "the cheapest model, no hooks, no tools, no MCP servers"
+        );
+        assert_eq!(
+            fs::read_to_string(temp.path().join("guard")).unwrap(),
+            "1",
+            "ABC_WATCHDOG stops its session's own stop hook"
+        );
+        assert_eq!(
+            fs::read_to_string(temp.path().join("prompt")).unwrap(),
+            "Judge this.",
+            "the prompt the jailed check wrote"
+        );
+        assert_eq!(
+            fs::read_to_string(temp.path().join("answer")).unwrap(),
+            answer,
+            "the answer goes back into the jail to be judged"
+        );
+        let (drifted, _, drifted_err) = run_stop(
+            temp.path(),
+            &[
+                ("PROMPT", "Judge this."),
+                ("CLAUDE", &claude),
+                ("VERDICT", "2"),
+            ],
+        );
+        assert_eq!(
+            drifted,
+            Some(2),
+            "a drift keeps the agent working: {drifted_err}"
+        );
+        let (unjudged, _, unjudged_err) = run_stop(
+            temp.path(),
+            &[
+                ("PROMPT", "Judge this."),
+                ("CLAUDE", &claude),
+                ("VERDICT", "101"),
+            ],
+        );
+        assert_eq!(unjudged, Some(0), "{unjudged_err}");
+        assert!(
+            unjudged_err.contains("could not judge claude's answer"),
+            "{unjudged_err}"
+        );
+    }
+
+    #[test]
+    fn the_stop_hook_steps_aside_when_claude_fails_or_is_slow() {
+        let temp = tempfile::tempdir().unwrap();
+        let (failed, _, stderr) = run_stop(
+            temp.path(),
+            &[("PROMPT", "Judge this."), ("CLAUDE", "exit 1")],
+        );
+        assert_eq!(failed, Some(0), "{stderr}");
+        assert!(stderr.contains("claude failed"), "{stderr}");
+        assert!(!temp.path().join("answer").exists(), "nothing to judge");
+        let started = std::time::Instant::now();
+        let (slow, _, slow_err) = run_stop(
+            temp.path(),
+            &[
+                ("PROMPT", "Judge this."),
+                ("CLAUDE", "exec sleep 30"),
+                ("ABC_WATCHDOG_SECONDS", "1"),
+            ],
+        );
+        assert_eq!(slow, Some(0), "{slow_err}");
+        assert!(
+            slow_err.contains("took longer than 1 seconds"),
+            "{slow_err}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(20),
+            "claude was stopped at the deadline"
         );
     }
 }

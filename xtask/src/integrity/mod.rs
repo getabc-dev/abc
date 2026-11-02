@@ -30,8 +30,9 @@ use crate::git;
 /// The gate files: whatever decides what passes. CODEOWNERS patterns, the single list both the
 /// check and `.github/CODEOWNERS` follow: a trailing `/` covers a directory, anything else is one
 /// file, both from the repository root.
-pub(crate) const GATES: [&str; 15] = [
+pub(crate) const GATES: [&str; 16] = [
     "/.cargo/",
+    "/.claude/hooks/",
     "/.claude/settings.json",
     "/.config/",
     "/.gitattributes",
@@ -154,8 +155,9 @@ pub(crate) fn run(
     event: &Event,
     out: &mut impl Write,
 ) -> anyhow::Result<bool> {
+    let agent = ureq::Agent::new_with_defaults();
     run_with(root, base, pull_request, event, out, &mut |url, token| {
-        approval::github_get(url, token)
+        approval::github_get(&agent, url, token)
     })
 }
 

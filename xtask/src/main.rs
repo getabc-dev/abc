@@ -1,6 +1,7 @@
 //! Repository automation for abc, run as `cargo xtask <command>`.
 
 mod app;
+mod broker;
 mod check;
 mod coverage;
 mod git;
@@ -103,12 +104,13 @@ enum Task {
         #[arg(long)]
         description: Option<PathBuf>,
     },
-    /// git's credential helper: answers `get` for github.com with an agent App token on stdout.
+    /// git's credential helper: answers `get` for github.com with an agent App token from the
+    /// broker on stdout.
     GitCredential {
         /// The operation git asks for: get, store or erase.
         operation: String,
     },
-    /// Run gh as the agent App, with a fresh installation token in `GH_TOKEN`.
+    /// Run gh as the agent App, with a fresh installation token from the broker in `GH_TOKEN`.
     Gh {
         /// Arguments passed to gh.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -157,7 +159,23 @@ enum Task {
         /// The hook event.
         #[arg(value_enum)]
         event: hook::Event,
+        /// For stop: when the check passes and the main agent stops, write the watchdog's prompt
+        /// here, for `.claude/hooks/stop.sh` to give claude.
+        #[arg(long, value_name = "FILE")]
+        watchdog_prompt: Option<PathBuf>,
     },
+    /// Judge claude's JSON answer to the watchdog's prompt, from stdin. Exit code 2 keeps the
+    /// agent working.
+    Watchdog,
+    /// Serve agent App tokens to agent sessions on a Unix socket, holding the App's private key.
+    ///
+    /// Run it yourself, outside Claude Code, from a build of main that no agent can change, never
+    /// from a checkout agents work in. Install it with `cargo install --locked --git
+    /// https://github.com/getabc-dev/abc --branch main xtask --root ~/.local/share/abc/broker`,
+    /// then run `~/.local/share/abc/broker/bin/xtask broker`. It reads `~/.config/abc/agent-app/`
+    /// and listens on `~/.config/abc/agent-broker/broker.sock`, the one socket agents' sandboxed
+    /// commands may reach. Reinstall it when main changes it.
+    Broker,
 }
 
 fn main() -> ExitCode {
@@ -296,17 +314,13 @@ fn run(
             report,
             &mut review::post_gemini,
         )?)),
-        Task::GitCredential { operation } => {
-            git_credential(&operation)?;
-            Ok(ExitCode::SUCCESS)
-        }
-        Task::Gh { args } => app::run_gh(
-            &app::App::load(&app::config_dir()?)?,
-            app::GITHUB_API,
-            Path::new("gh"),
-            &args,
+        Task::GitCredential { operation } => git_credential(&operation),
+        Task::Gh { args } => gh_as_app(&args, report),
+        Task::Broker => serve_tokens(report),
+        Task::Watchdog => Ok(ExitCode::from(watchdog::verdict(
+            &stdin("claude's answer")?,
             report,
-        ),
+        )?)),
         Task::Rulesets { action } => {
             match action {
                 RulesetAction::Check => {
@@ -340,15 +354,28 @@ fn run(
             Ok(ExitCode::SUCCESS)
         }
         Task::Tool { name, args } => tools::run(&tool(&name)?, root, &args),
-        Task::Hook { event } => {
-            let mut input = String::new();
-            io::stdin()
-                .read_to_string(&mut input)
-                .context("could not read the hook input from stdin")?;
-            let context = hook::Context::from_env(home.clone());
-            Ok(ExitCode::from(hook::run(event, &input, &context, report)?))
+        Task::Hook {
+            event,
+            watchdog_prompt,
+        } => {
+            let context = hook::Context::from_env(home.clone(), watchdog_prompt);
+            Ok(ExitCode::from(hook::run(
+                event,
+                &stdin("the hook input")?,
+                &context,
+                report,
+            )?))
         }
     }
+}
+
+/// Everything on stdin, which holds `what`.
+fn stdin(what: &str) -> anyhow::Result<String> {
+    let mut text = String::new();
+    io::stdin()
+        .read_to_string(&mut text)
+        .with_context(|| format!("could not read {what} from stdin"))?;
+    Ok(text)
 }
 
 /// `cargo xtask integrity`: in CI, for pull request `pr`, with GitHub Actions' variables from
@@ -370,15 +397,40 @@ fn integrity(
     integrity::run(root, base, pull_request.as_ref(), &event, report)
 }
 
-/// `cargo xtask git-credential`: answers git's request on stdin with an App token on stdout.
-fn git_credential(operation: &str) -> anyhow::Result<()> {
-    let mut request = String::new();
-    io::stdin()
-        .read_to_string(&mut request)
-        .context("could not read git's credential request")?;
-    app::credential(operation, &request, &mut io::stdout().lock(), || {
-        app::App::load(&app::config_dir()?)?.token(app::GITHUB_API, app::Scope::Git)
-    })
+/// `cargo xtask broker`: loads the App and serves its tokens until the process ends.
+fn serve_tokens(log: &mut impl Write) -> anyhow::Result<ExitCode> {
+    let app = app::App::load(&app::config_dir()?)?;
+    let agent = ureq::Agent::new_with_defaults();
+    broker::serve(
+        &broker::socket()?,
+        |scope| app.token(&agent, app::GITHUB_API, scope),
+        log,
+    )?;
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `cargo xtask gh`: runs gh with `args` as the App, with a token from the broker.
+fn gh_as_app(args: &[OsString], report: &mut impl Write) -> anyhow::Result<ExitCode> {
+    app::run_gh(
+        || broker::request(&broker::socket()?, app::Scope::Gh),
+        &ureq::Agent::new_with_defaults(),
+        app::GITHUB_API,
+        Path::new("gh"),
+        args,
+        report,
+    )
+}
+
+/// `cargo xtask git-credential`: answers git's request on stdin with an App token from the broker
+/// on stdout.
+fn git_credential(operation: &str) -> anyhow::Result<ExitCode> {
+    app::credential(
+        operation,
+        &stdin("git's credential request")?,
+        &mut io::stdout().lock(),
+        || broker::request(&broker::socket()?, app::Scope::Git),
+    )?;
+    Ok(ExitCode::SUCCESS)
 }
 
 /// The repository root: the workspace that contains xtask.

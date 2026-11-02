@@ -213,9 +213,10 @@ fn decide(
     }
 }
 
-/// GETs `url` from GitHub's REST API with `token`.
-pub(super) fn github_get(url: &str, token: &str) -> anyhow::Result<Vec<u8>> {
-    let mut response = ureq::get(url)
+/// GETs `url` from GitHub's REST API with `token`, through `agent`.
+pub(super) fn github_get(agent: &ureq::Agent, url: &str, token: &str) -> anyhow::Result<Vec<u8>> {
+    let mut response = agent
+        .get(url)
         .header("Authorization", &format!("Bearer {token}"))
         .header("Accept", "application/vnd.github+json")
         .header("X-GitHub-Api-Version", "2022-11-28")
@@ -230,7 +231,7 @@ pub(super) fn github_get(url: &str, token: &str) -> anyhow::Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::{PullRequest, TimelineItem, approved, approvers, decide, github_get};
-    use crate::testing::serve_once;
+    use crate::testing::fake_http;
 
     fn events(json: &str) -> Vec<TimelineItem> {
         serde_json::from_str(json).unwrap()
@@ -359,24 +360,26 @@ mod tests {
 
     #[test]
     fn calls_the_github_api_with_the_token() {
-        let (url, server) = serve_once("200 OK", r#"{"ok": true}"#);
+        let (agent, server) = fake_http(
+            ureq::Agent::config_builder(),
+            vec![(200, r#"{"ok": true}"#), (404, "{}")],
+        );
         assert_eq!(
-            github_get(&format!("{url}/x"), "secret").unwrap(),
+            github_get(&agent, "https://api.github.test/x", "secret").unwrap(),
             br#"{"ok": true}"#,
             "body"
         );
-        let request = server.join().unwrap();
+        let request = server.taken().remove(0);
         assert!(request.starts_with("GET /x HTTP/1.1"), "{request}");
         assert!(
             request.contains("authorization: Bearer secret"),
             "{request}"
         );
-        let (missing, refused) = serve_once("404 Not Found", "{}");
         assert!(
-            github_get(&format!("{missing}/y"), "secret").is_err(),
+            github_get(&agent, "https://api.github.test/y", "secret").is_err(),
             "a 404 is an error"
         );
-        refused.join().unwrap();
+        assert_eq!(server.taken().len(), 2, "the 404 was asked for");
     }
 
     #[test]
