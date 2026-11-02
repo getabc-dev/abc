@@ -318,7 +318,7 @@ fn run(
         )?)),
         Task::GitCredential { operation } => git_credential(&operation),
         Task::Gh { args } => gh_as_app(&args, report),
-        Task::Broker => serve_tokens(report),
+        Task::Broker => serve_tokens(&app::config_dir()?, &broker::socket()?, report),
         Task::Watchdog => Ok(ExitCode::from(watchdog::verdict(
             &stdin("claude's answer")?,
             report,
@@ -409,12 +409,13 @@ fn integrity(
     integrity::run(root, base, pull_request.as_ref(), &event, report)
 }
 
-/// `cargo xtask broker`: loads the App and serves its tokens until the process ends.
-fn serve_tokens(log: &mut impl Write) -> anyhow::Result<ExitCode> {
-    let app = app::App::load(&app::config_dir()?)?;
+/// `cargo xtask broker`: loads the App from `config` and serves its tokens on `socket` until the
+/// process ends.
+fn serve_tokens(config: &Path, socket: &Path, log: &mut impl Write) -> anyhow::Result<ExitCode> {
+    let app = app::App::load(config)?;
     let agent = ureq::Agent::new_with_defaults();
     broker::serve(
-        &broker::socket()?,
+        socket,
         |scope| app.token(&agent, app::GITHUB_API, scope),
         log,
     )?;
@@ -466,7 +467,7 @@ mod tests {
     use std::process::ExitCode;
 
     use super::{
-        Cli, Invocation, RulesetAction, Task, TaskAction, repo_root, run, run_hook,
+        Cli, Invocation, RulesetAction, Task, TaskAction, repo_root, run, run_hook, serve_tokens,
         usage_exit_code, verdict,
     };
     use crate::testing::{git, repository_with_change, script};
@@ -820,5 +821,49 @@ mod tests {
             String::from_utf8(out).unwrap().contains("--force"),
             "and says why"
         );
+    }
+
+    #[test]
+    fn the_broker_loads_the_app_before_it_listens() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temp = tempfile::tempdir().unwrap();
+        let config = temp.path().join("agent-app");
+        fs::create_dir_all(&config).unwrap();
+        let socket = temp.path().join("agent-broker/broker.sock");
+        let missing = serve_tokens(&config, &socket, &mut Vec::new()).unwrap_err();
+        assert!(format!("{missing:#}").contains("app.json"), "{missing:#}");
+        assert!(!socket.exists(), "no App, no socket");
+        fs::write(
+            config.join("app.json"),
+            r#"{"client_id": "Iv23test", "installation_id": 42}"#,
+        )
+        .unwrap();
+        let key = config.join("private-key.pem");
+        fs::write(&key, include_str!("../testdata/agent-app-test-key.pem")).unwrap();
+        fs::set_permissions(&key, fs::Permissions::from_mode(0o600)).unwrap();
+        let (sender, outcome) = std::sync::mpsc::channel();
+        let listening = socket.clone();
+        std::thread::spawn(move || {
+            let result = serve_tokens(&config, &listening, &mut Vec::new());
+            sender
+                .send(result.map_err(|error| format!("{error:#}")))
+                .unwrap();
+        });
+        let started = std::time::Instant::now();
+        while !socket.exists() {
+            if let Ok(result) = outcome.try_recv() {
+                // Claude Code's sandbox and the hooks' jail forbid binding a socket.
+                let error = result.unwrap_err();
+                assert!(error.contains("could not listen"), "{error}");
+                return;
+            }
+            assert!(
+                started.elapsed().as_secs() < 10,
+                "the broker never listened"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(outcome.try_recv().is_err(), "it keeps serving");
     }
 }
