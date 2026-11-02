@@ -603,6 +603,44 @@ mod tests {
     }
 
     #[test]
+    fn check_passes_a_clean_workspace() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        fs::create_dir_all(home.join("tools")).unwrap();
+        fake_tools(&home.join("tools"));
+        let root = temp.path().join("root");
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"fixture-dispatch\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[workspace]\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("Cargo.lock"),
+            "version = 4\n\n[[package]]\nname = \"fixture-dispatch\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        fs::copy(
+            repo_root().unwrap().join("rust-toolchain.toml"),
+            root.join("rust-toolchain.toml"),
+        )
+        .unwrap();
+        fs::write(
+            root.join("src/lib.rs"),
+            "//! A fixture crate.\n\n/// Adds one.\n#[must_use]\npub fn add_one(value: u32) -> u32 {\n    value.saturating_add(1)\n}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            dispatch(Task::Check { changed: false }, &home, &root, &|_: &str| {
+                None
+            })
+            .unwrap(),
+            ExitCode::SUCCESS,
+            "check passes a clean workspace with the pinned nextest it finds"
+        );
+    }
+
+    #[test]
     fn a_real_invocation_reads_this_checkout_and_the_environment() {
         let here = Invocation::new(None).unwrap();
         assert_eq!(
