@@ -11,6 +11,7 @@ use std::fmt::Write as _;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context, bail, ensure};
 use serde::Deserialize;
@@ -171,8 +172,14 @@ pub(crate) fn review(
     let (status, answer) = post(&url, &body(request).to_string(), key)?;
     match status {
         200 => {}
-        429 => bail!("Gemini quota exhausted, re-run after it resets"),
-        500..=599 => bail!("Gemini is unavailable (HTTP {status}); re-run later"),
+        429 => bail!(
+            "Gemini quota exhausted, re-run after it resets: {}",
+            google_reason(&answer)
+        ),
+        500..=599 => bail!(
+            "Gemini is unavailable (HTTP {status}): {}; re-run later",
+            google_reason(&answer)
+        ),
         _ => bail!(
             "Gemini refused the request (HTTP {status}): {}",
             answer.chars().take(500).collect::<String>()
@@ -195,6 +202,38 @@ pub(crate) fn review(
     })
 }
 
+/// Google's own explanation of a failed request: the error's status and message from its JSON
+/// body, with the retry delay it suggests when it gives one, or the start of the raw body when the
+/// body is not Google's error format. Without it a 503 reads as "down" when Google said why.
+fn google_reason(answer: &str) -> String {
+    let Ok(body) = serde_json::from_str::<serde_json::Value>(answer) else {
+        let raw: String = answer.trim().chars().take(300).collect();
+        return if raw.is_empty() {
+            "no explanation in the response".to_owned()
+        } else {
+            raw
+        };
+    };
+    let field = |name: &str| body.pointer(&format!("/error/{name}"));
+    let status = field("status")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("UNKNOWN");
+    let message = field("message")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("no message");
+    let retry = field("details")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|details| {
+            details
+                .iter()
+                .find_map(|detail| detail.get("retryDelay").and_then(serde_json::Value::as_str))
+        });
+    match retry {
+        Some(delay) => format!("{status}: {message} (Google suggests retrying in {delay})"),
+        None => format!("{status}: {message}"),
+    }
+}
+
 /// Sends a request to Gemini, returning the status and body whatever the status.
 pub(crate) fn post_gemini(url: &str, body: &str, key: &str) -> anyhow::Result<(u16, String)> {
     let agent: ureq::Agent = ureq::Agent::config_builder()
@@ -213,6 +252,44 @@ pub(crate) fn post_gemini(url: &str, body: &str, key: &str) -> anyhow::Result<(u
         .read_to_string()
         .context("could not read Gemini's response")?;
     Ok((status, text))
+}
+
+/// How long to wait before each retry when Gemini is busy (HTTP 429 or 5xx) or unreachable: four
+/// attempts over about a minute and a half. Gemini's free tier often answers 503 for a moment;
+/// past the last attempt the review fails closed as before, with the last answer's reason.
+pub(crate) const RETRY_DELAYS: [Duration; 3] = [
+    Duration::from_secs(10),
+    Duration::from_secs(30),
+    Duration::from_secs(60),
+];
+
+/// Whether an attempt is worth repeating: Gemini was busy, failed, or could not be reached.
+fn transient(result: &anyhow::Result<(u16, String)>) -> bool {
+    match result {
+        Ok((status, _)) => *status == 429 || (500..=599).contains(status),
+        Err(_) => true,
+    }
+}
+
+/// `post`, retried after each of `delays` (waited out with `wait`) while the answer is
+/// [`transient`]. The last attempt's result is returned as it is, so a review that never got
+/// through still fails with that attempt's reason.
+pub(crate) fn retrying<'a>(
+    mut post: impl FnMut(&str, &str, &str) -> anyhow::Result<(u16, String)> + 'a,
+    mut wait: impl FnMut(Duration) + 'a,
+    delays: &'a [Duration],
+) -> impl FnMut(&str, &str, &str) -> anyhow::Result<(u16, String)> + 'a {
+    move |url, body, key| {
+        let mut result = post(url, body, key);
+        for delay in delays {
+            if !transient(&result) {
+                break;
+            }
+            wait(*delay);
+            result = post(url, body, key);
+        }
+        result
+    }
 }
 
 /// The verdict as Markdown for the job summary.
@@ -407,10 +484,11 @@ pub(crate) fn run_from(
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::time::Duration;
 
     use super::{
-        Decision, Event, MAX_DIFF_BYTES, MODEL, Plan, Request, body, plan, post_gemini, review,
-        run, run_from, summary,
+        Decision, Event, MAX_DIFF_BYTES, MODEL, Plan, Request, Verdict, body, plan, post_gemini,
+        retrying, review, run, run_from, summary,
     };
     use crate::testing::{git, repository, serve_once};
 
@@ -481,7 +559,7 @@ mod tests {
 
     #[test]
     fn a_blocking_finding_blocks_whatever_the_verdict() {
-        let verdict: super::Verdict = serde_json::from_str(
+        let verdict: Verdict = serde_json::from_str(
             r#"{"verdict": "pass", "findings": [{"severity": "blocking", "file": "a.rs", "line": 1, "title": "t", "detail": "d"}]}"#,
         )
         .unwrap();
@@ -490,7 +568,7 @@ mod tests {
             summary(&verdict).starts_with("## Gemini review: block (a blocking finding"),
             "and says why"
         );
-        let minor: super::Verdict = serde_json::from_str(
+        let minor: Verdict = serde_json::from_str(
             r#"{"verdict": "pass", "findings": [{"severity": "minor", "file": "a.rs", "line": 1, "title": "t", "detail": "d"}]}"#,
         )
         .unwrap();
@@ -600,8 +678,8 @@ mod tests {
         .unwrap_err();
         assert_eq!(
             error.to_string(),
-            "Gemini quota exhausted, re-run after it resets",
-            "the reason"
+            "Gemini quota exhausted, re-run after it resets: RESOURCE_EXHAUSTED: no message",
+            "the reason, with Google's status"
         );
         let down = review(
             &request("+x"),
@@ -625,6 +703,152 @@ mod tests {
                 .contains("refused the request (HTTP 400): bad key"),
             "{rejected}"
         );
+    }
+
+    /// Reviews through [`retrying`] against a Gemini that gives `answers` in turn, returning the
+    /// outcome, how many attempts were made, and the waits between them.
+    fn attempts(
+        answers: Vec<anyhow::Result<(u16, String)>>,
+        delays: &[Duration],
+    ) -> (anyhow::Result<Verdict>, usize, Vec<Duration>) {
+        let calls = std::cell::Cell::new(0_usize);
+        let mut waits = Vec::new();
+        let mut answers = answers.into_iter();
+        let outcome = review(
+            &request("+x"),
+            "test-key",
+            &mut retrying(
+                |_: &str, _: &str, _: &str| {
+                    calls.set(calls.get().saturating_add(1));
+                    answers.next().expect("no more attempts than answers")
+                },
+                |delay| waits.push(delay),
+                delays,
+            ),
+        );
+        (outcome, calls.get(), waits)
+    }
+
+    #[test]
+    fn says_what_google_said_when_it_fails() {
+        let overloaded = r#"{"error": {"code": 503, "message": "The model is overloaded. Please try again later.", "status": "UNAVAILABLE"}}"#;
+        let error = review(
+            &request("+x"),
+            "test-key",
+            &mut answering(503, overloaded.to_owned()),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Gemini is unavailable (HTTP 503): UNAVAILABLE: The model is overloaded. Please try \
+             again later.; re-run later",
+            "Google's status and message, not a guess"
+        );
+        let limited = r#"{"error": {"code": 429, "message": "Quota exceeded", "status": "RESOURCE_EXHAUSTED", "details": [{"@type": "type.googleapis.com/google.rpc.QuotaFailure"}, {"@type": "type.googleapis.com/google.rpc.RetryInfo", "retryDelay": "37s"}]}}"#;
+        let quota = review(
+            &request("+x"),
+            "test-key",
+            &mut answering(429, limited.to_owned()),
+        )
+        .unwrap_err();
+        assert!(
+            quota
+                .to_string()
+                .ends_with("RESOURCE_EXHAUSTED: Quota exceeded (Google suggests retrying in 37s)"),
+            "the retry delay Google suggests: {quota}"
+        );
+        let gateway = review(
+            &request("+x"),
+            "test-key",
+            &mut answering(502, "<html>Bad Gateway</html>".to_owned()),
+        )
+        .unwrap_err();
+        assert_eq!(
+            gateway.to_string(),
+            "Gemini is unavailable (HTTP 502): <html>Bad Gateway</html>; re-run later",
+            "a body that is not Google's error format is quoted"
+        );
+        let silent = review(
+            &request("+x"),
+            "test-key",
+            &mut answering(500, String::new()),
+        )
+        .unwrap_err();
+        assert!(
+            silent
+                .to_string()
+                .contains("no explanation in the response"),
+            "an empty body says so: {silent}"
+        );
+    }
+
+    #[test]
+    fn retries_a_busy_gemini_until_it_answers() {
+        let delays = [
+            Duration::from_secs(1),
+            Duration::from_secs(2),
+            Duration::from_secs(3),
+        ];
+        let (outcome, calls, waits) = attempts(
+            vec![
+                Ok((503, String::new())),
+                Ok((429, String::new())),
+                Err(anyhow::anyhow!("could not reach Gemini")),
+                Ok((200, recorded(PASS))),
+            ],
+            &delays,
+        );
+        assert_eq!(
+            outcome.unwrap().verdict,
+            Decision::Pass,
+            "the fourth attempt's verdict"
+        );
+        assert_eq!(
+            calls, 4,
+            "a 503, a 429 and a network error are each retried"
+        );
+        assert_eq!(waits, delays, "waiting each delay in turn");
+    }
+
+    #[test]
+    fn still_fails_closed_when_gemini_stays_busy() {
+        let delays = [Duration::from_secs(1), Duration::from_secs(2)];
+        let busy = || Ok((503, String::new()));
+        let (outcome, calls, waits) = attempts(vec![busy(), busy(), busy()], &delays);
+        let error = outcome.unwrap_err();
+        assert!(
+            error.to_string().contains("unavailable (HTTP 503)"),
+            "{error}"
+        );
+        assert_eq!(calls, 3, "one attempt plus one per delay, no more");
+        assert_eq!(waits, delays, "no wait after the last attempt");
+
+        let unreachable = || Err(anyhow::anyhow!("could not reach Gemini"));
+        let (offline, offline_calls, _) =
+            attempts(vec![unreachable(), unreachable(), unreachable()], &delays);
+        assert_eq!(
+            offline.unwrap_err().to_string(),
+            "could not reach Gemini",
+            "the last error stands"
+        );
+        assert_eq!(offline_calls, 3, "network errors are retried as often");
+    }
+
+    #[test]
+    fn retries_only_answers_that_may_change() {
+        let delays = [Duration::from_secs(1)];
+        for status in [200, 400, 403, 404, 499, 600] {
+            let (_, calls, waits) = attempts(vec![Ok((status, recorded(PASS)))], &delays);
+            assert_eq!((calls, waits.len()), (1, 0), "HTTP {status} is final");
+        }
+        for status in [429, 500, 599] {
+            let (outcome, calls, _) = attempts(
+                vec![Ok((status, String::new())), Ok((200, recorded(PASS)))],
+                &delays,
+            );
+            assert!(outcome.is_ok(), "HTTP {status} is retried");
+            assert_eq!(calls, 2, "HTTP {status} is retried once here");
+        }
     }
 
     #[test]
