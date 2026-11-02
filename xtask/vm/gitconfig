@@ -1,0 +1,7 @@
+# git in the agent VM: github.com credentials are agent App tokens from the host's token broker
+# (`abc-xtask git-credential`, the image's own xtask), never anything stored in the VM.
+[credential "https://github.com"]
+	helper =
+	helper = "!abc-xtask git-credential"
+[safe]
+	directory = *

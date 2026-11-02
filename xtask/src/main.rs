@@ -17,6 +17,7 @@ mod task;
 #[cfg(test)]
 mod testing;
 mod tools;
+mod vm;
 mod watchdog;
 
 use std::ffi::OsString;
@@ -119,10 +120,15 @@ enum Task {
     /// Serve agent App tokens to agent VMs (D3). The one process that reads the App's key. Install
     /// it from main, outside any checkout: `cargo install --locked --git
     /// https://github.com/getabc-dev/abc --branch main xtask --root ~/.local/share/abc/broker`;
-    /// It refuses to run from inside a
+    /// `cargo xtask vm start` starts it when it is not running. It refuses to run from inside a
     /// checkout, whose xtask an agent may have changed, and listens on
     /// `~/.config/abc/agent-broker/broker.sock`, which each VM reaches over vsock.
     Broker,
+    /// Run agent sessions in microVMs, one per worktree (D37). Run it from the main clone.
+    Vm {
+        #[command(subcommand)]
+        action: vm::Action,
+    },
     /// Have Gemini review the changes since the merge base against AGENTS.md (D8).
     Review {
         /// The revision whose merge base with HEAD the diff starts from.
@@ -304,6 +310,7 @@ fn run(
             Ok(ExitCode::SUCCESS)
         }
         Task::Broker => serve_tokens(&std::env::current_exe()?, &user_home(&env)?),
+        Task::Vm { action } => run_vm(action, home, &env, report),
         Task::Gh { args } => app::run_gh(
             || broker::token(app::Scope::Gh),
             app::GITHUB_API,
@@ -425,6 +432,26 @@ fn serve_tokens(exe: &Path, home: &Path) -> anyhow::Result<ExitCode> {
         &mut io::stderr(),
     )?;
     Ok(ExitCode::SUCCESS)
+}
+
+/// `cargo xtask vm`: the billing check inside a VM, or a session command on the host, from the
+/// main clone `repo`.
+fn run_vm(
+    action: vm::Action,
+    repo: &Path,
+    env: &impl Fn(&str) -> Option<OsString>,
+    report: &mut impl Write,
+) -> anyhow::Result<ExitCode> {
+    if matches!(action, vm::Action::Billing) {
+        vm::billing(env)?;
+        return Ok(ExitCode::SUCCESS);
+    }
+    vm::refuse_linked_worktree(repo)?;
+    let home = user_home(env)?;
+    let host = vm::Host::this(repo, &home, env)?;
+    vm::require_kvm(host.os, Path::new("/dev/kvm"))?;
+    let msb = vm::microsandbox(tools::pinned(repo, "msb")?, &home, env)?;
+    vm::run(action, &host, &msb, env, report)
 }
 
 /// The repository root: the workspace that contains xtask.
