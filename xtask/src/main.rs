@@ -289,7 +289,11 @@ fn run(
             &base,
             &env,
             report,
-            &mut review::post_gemini,
+            &mut review::retrying(
+                review::post_gemini,
+                std::thread::sleep,
+                &review::RETRY_DELAYS,
+            ),
         )?)),
         Task::GitCredential { operation } => {
             git_credential(&operation)?;
