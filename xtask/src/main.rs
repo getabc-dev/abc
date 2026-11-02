@@ -793,7 +793,8 @@ mod tests {
 
     #[test]
     fn a_hook_runs_on_the_input_it_is_given() {
-        let root = repo_root().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let root = crate::testing::repository(&temp.path().join("repo"));
         let input = serde_json::json!({
             "cwd": root,
             "tool_name": "Bash",
