@@ -14,7 +14,7 @@ use anyhow::{Context as _, bail, ensure};
 
 /// Environment variables that point Claude Code at an API account, a custom endpoint or a cloud
 /// provider.
-pub(crate) const FORBIDDEN_ENV: [&str; 12] = [
+pub(crate) const FORBIDDEN_ENV: [&str; 13] = [
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_AUTH_TOKEN",
     "ANTHROPIC_BASE_URL",
@@ -27,6 +27,8 @@ pub(crate) const FORBIDDEN_ENV: [&str; 12] = [
     "CLAUDE_CODE_USE_VERTEX",
     "CLAUDE_CODE_USE_FOUNDRY",
     "CLAUDE_CODE_API_KEY_HELPER_TTL_MS",
+    // Moves Claude Code's settings and credentials somewhere this check does not read.
+    "CLAUDE_CONFIG_DIR",
 ];
 
 /// Settings keys, anywhere in a settings file, that give Claude Code a credential other than the
@@ -41,15 +43,39 @@ const FORBIDDEN_KEYS: [&str; 4] = [
 /// The `authMethod` that `claude auth status` reports for a `claude setup-token` token.
 pub(crate) const SUBSCRIPTION_TOKEN: &str = "oauth_token";
 
-/// The settings files Claude Code reads for a session in `worktree` with home `home`.
-pub(crate) fn settings_files(home: &Path, worktree: &Path) -> Vec<PathBuf> {
-    vec![
-        PathBuf::from("/etc/claude-code/managed-settings.json"),
+/// Where managed settings live on Linux: a file, and a directory of drop-ins.
+const MANAGED: &str = "/etc/claude-code";
+
+/// The settings files Claude Code reads for a session in `worktree` with home `home`, managed
+/// settings under `managed` included. `claude --settings <file>` names one more, which no check
+/// before a run can see; the check before each tool call is a tripwire for it.
+pub(crate) fn settings_files(managed: &Path, home: &Path, worktree: &Path) -> Vec<PathBuf> {
+    let mut files = vec![managed.join("managed-settings.json")];
+    if let Ok(entries) = std::fs::read_dir(managed.join("managed-settings.d")) {
+        let mut drop_ins: Vec<PathBuf> = entries
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "json")
+            })
+            .collect();
+        drop_ins.sort();
+        files.extend(drop_ins);
+    }
+    files.extend([
         home.join(".claude/settings.json"),
+        home.join(".claude/settings.local.json"),
         home.join(".claude.json"),
         worktree.join(".claude/settings.json"),
         worktree.join(".claude/settings.local.json"),
-    ]
+    ]);
+    files
+}
+
+/// The managed settings directory of this machine.
+pub(crate) fn managed() -> &'static Path {
+    Path::new(MANAGED)
 }
 
 /// Fails, naming each finding, unless nothing in the environment `env` or in `files` (those that
@@ -178,6 +204,7 @@ pub(crate) fn subscription(output: &str) -> anyhow::Result<Status> {
 mod tests {
     use std::ffi::OsString;
     use std::fs;
+    use std::path::Path;
 
     use super::{check, settings_files, subscription};
 
@@ -260,13 +287,28 @@ mod tests {
 
     #[test]
     fn reads_the_files_claude_code_reads() {
-        let files = settings_files("/home/agent".as_ref(), "/w".as_ref());
+        let dir = tempfile::tempdir().unwrap();
+        let managed = dir.path();
+        fs::create_dir_all(managed.join("managed-settings.d")).unwrap();
+        for name in ["20-b.json", "10-a.json", "notes.txt"] {
+            fs::write(managed.join("managed-settings.d").join(name), "{}").unwrap();
+        }
+        let files: Vec<_> = settings_files(managed, "/home/agent".as_ref(), "/w".as_ref())
+            .into_iter()
+            .map(|file| {
+                file.strip_prefix(managed)
+                    .map_or_else(|_| file.clone(), Path::to_path_buf)
+            })
+            .collect();
         let shown: Vec<_> = files.iter().map(|f| f.display().to_string()).collect();
         assert_eq!(
             shown,
             [
-                "/etc/claude-code/managed-settings.json",
+                "managed-settings.json",
+                "managed-settings.d/10-a.json",
+                "managed-settings.d/20-b.json",
                 "/home/agent/.claude/settings.json",
+                "/home/agent/.claude/settings.local.json",
                 "/home/agent/.claude.json",
                 "/w/.claude/settings.json",
                 "/w/.claude/settings.local.json",

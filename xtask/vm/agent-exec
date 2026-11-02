@@ -1,14 +1,18 @@
 #!/bin/sh
 # Runs a command in the agent VM as the agent: uid 1000, no capabilities and no way to gain any
 # (no_new_privs; the image has no setuid programs). Sessions enter as root, so each goes through
-# this. It refuses unless Claude Code can use only the subscription token, which it hands to the
-# command from the VM's memory, where `cargo xtask vm start` piped it.
+# this. It refuses unless Claude Code can use only the subscription token. Only a `claude` command
+# gets the token, from the root-only file `cargo xtask vm start` piped into the VM's memory, and
+# Claude Code is told to strip it from the commands it runs (CLAUDE_CODE_SUBPROCESS_ENV_SCRUB), so
+# builds, tests and shells never see it.
 set -eu
 abc-xtask vm billing
 cd "${ABC_WORKTREE:-/}"
-if [ -r /run/abc/claude-token ]; then
+unset CLAUDE_CODE_OAUTH_TOKEN
+if [ "${1:-}" = claude ] && [ -r /run/abc/claude-token ]; then
   CLAUDE_CODE_OAUTH_TOKEN=$(cat /run/abc/claude-token)
   export CLAUDE_CODE_OAUTH_TOKEN
+  export CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1
 fi
 exec setpriv --reuid agent --regid agent --init-groups --inh-caps=-all --bounding-set=-all \
   --no-new-privs -- env HOME=/home/agent USER=agent LOGNAME=agent "$@"

@@ -57,9 +57,10 @@ pub(crate) fn run_args(spec: &Spec) -> Vec<OsString> {
     args.push(spec.name.clone().into());
     args.extend(["--cpus".into(), spec.cpus.to_string().into()]);
     args.extend(["--memory".into(), spec.memory.clone().into()]);
-    // Deny by default; DNS, and HTTPS to the allowed hosts, matched by the TLS server name
-    // (without intercepting TLS, which would put a CA of microsandbox's in the guest).
-    args.extend(["--net-default", "deny", "--net-rule", "allow@dns"].map(OsString::from));
+    // Deny by default; HTTPS to the allowed hosts, matched by the TLS server name (without
+    // intercepting TLS, which would put a CA of microsandbox's in the guest). With no DNS rule,
+    // microsandbox's resolver answers only for the allowed hosts.
+    args.extend(["--net-default", "deny"].map(OsString::from));
     for host in &spec.egress {
         args.extend(["--net-rule".into(), format!("allow@{host}:tcp:443").into()]);
     }
@@ -235,7 +236,7 @@ mod tests {
         assert_eq!(
             args.join(" "),
             "run --detach --quiet --name abc-w --cpus 6 --memory 6G --net-default deny \
-             --net-rule allow@dns --net-rule allow@github.com:tcp:443 \
+             --net-rule allow@github.com:tcp:443 \
              --net-rule allow@*.githubusercontent.com:tcp:443 --net-strict=false \
              --mount-dir /w:/w:uid=1000,gid=1000 --mount-named abc-w-target:/w/target:kind=disk,size=40G \
              --tmpfs /run/abc --vsock /h/b.sock:5000 --env ABC_VM=1 abc-agent:latest"
