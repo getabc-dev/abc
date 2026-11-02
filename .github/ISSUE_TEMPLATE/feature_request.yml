@@ -1,0 +1,32 @@
+name: Feature request
+description: Suggest a change to what abc does.
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for the idea. Describe the problem first; the best solution may differ from the first one that comes to mind.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What are you trying to do, and what gets in the way today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal
+      description: What you would like abc to do.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives
+      description: Other approaches you considered, and why they fall short.
+  - type: textarea
+    id: invariants
+    attributes:
+      label: Product invariants
+      description: Does this touch any of the product invariants (I1 to I6) in AGENTS.md, such as credentials, secrets, agent access or the PR artifact? If so, how?
