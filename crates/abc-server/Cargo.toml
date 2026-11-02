@@ -1,0 +1,48 @@
+[package]
+name = "abc-server"
+description = "abc's HTTP, WebSocket and SSE server: listeners and the trust each carries."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# Deliberately no sqlx: abc-server can reach data only through abc_store::Store.
+[dependencies]
+abc-core = { path = "../abc-core" }
+abc-protocol = { path = "../abc-protocol" }
+abc-store = { path = "../abc-store" }
+axum.workspace = true
+bytes.workspace = true
+futures.workspace = true
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_path_to_error.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+ts-rs.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+abc-store = { path = "../abc-store", features = ["testing"] }
+http-body-util.workspace = true
+hyper = { workspace = true, features = ["client", "http1"] }
+hyper-util.workspace = true
+# Only for the opt-in Tailscale passthrough test (tests/tailscale.rs), which speaks TLS to Serve.
+rustls.workspace = true
+semver.workspace = true
+# Only for inspecting the test database.
+sqlx.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
+tokio-rustls.workspace = true
+tokio-tungstenite.workspace = true
+webpki-roots.workspace = true
+
+[lints]
+workspace = true

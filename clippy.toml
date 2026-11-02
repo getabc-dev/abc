@@ -3,7 +3,9 @@ allow-unwrap-in-tests = true
 allow-expect-in-tests = true
 allow-panic-in-tests = true
 allow-indexing-slicing-in-tests = true
-# Methods with one sanctioned call site, which expects this lint with its reason.
+# Routers are served only through abc-server's listener newtypes, so the identity-carrying sidecar
+# router can never end up on a TCP listener (D4). The two sanctioned call sites expect this lint.
 disallowed-methods = [
+    { path = "axum::serve", reason = "serve routers through abc_server::listen, which ties each router to its listener" },
     { path = "abc_store::Store::issue_setup_code", reason = "only the host operator's `abc server setup-code` mints a setup code; the running server never holds one" },
 ]

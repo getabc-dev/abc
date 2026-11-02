@@ -1,0 +1,62 @@
+name: Tailscale
+
+# The real Tailscale passthrough check (crates/abc-server/tests/tailscale.rs): the pinned
+# tailscale/tailscale image serving the sidecar socket over a tailnet. It needs a tailnet auth key,
+# so it runs only on a pull request a maintainer labels `tailscale-check`, and again on each push
+# while the label stays. Only someone with triage access can add the label, and pull requests from
+# forks receive no secrets, so the job fails there instead of skipping. The job runs in the
+# `tailscale` environment: a maintainer can require approval for every run there, so no pushed code
+# reaches the key unseen. It is not a required check, so it never blocks the merge queue.
+
+on:
+  pull_request:
+    types: [labeled, synchronize, reopened]
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  passthrough:
+    name: Tailscale passthrough
+    if: contains(github.event.pull_request.labels.*.name, 'tailscale-check')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: tailscale
+    permissions:
+      contents: read
+    services:
+      postgres:
+        image: postgres:18.6@sha256:3a4264520e121176619f54ff867d12774bc81e95e7b84db58d63bccdb6144b81
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 127.0.0.1:55432:5432
+        options: >-
+          --health-cmd "pg_isready --host 127.0.0.1"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the pinned Rust toolchain
+        run: rustup toolchain install --no-self-update
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Install the pinned tools
+        run: cargo xtask setup cargo-nextest
+      - name: Check the installed tools against their pins
+        run: cargo xtask doctor cargo-nextest
+      - name: Tailscale passthrough check
+        run: >-
+          cargo xtask tool cargo-nextest nextest run --locked -p abc-server --run-ignored only
+          -E 'test(serve_passes_identity_websockets_and_unbuffered_sse_to_the_unix_socket)'
+        env:
+          ABC_TAILSCALE_AUTHKEY: ${{ secrets.ABC_TAILSCALE_AUTHKEY }}
+          ABC_TAILSCALE_TAILNET: ${{ secrets.ABC_TAILSCALE_TAILNET }}
