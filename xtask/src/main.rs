@@ -193,7 +193,8 @@ fn main() -> ExitCode {
         Ok(invocation) => invocation,
         Err(error) => return report_error(&error),
     };
-    match run(cli.command, &invocation, &mut io::stderr().lock()) {
+    // Not a held lock: the broker's threads write to stderr too, and would wait on it forever.
+    match run(cli.command, &invocation, &mut io::stderr()) {
         Ok(code) => code,
         Err(error) => match writeln!(io::stderr().lock(), "error: {error:#}") {
             // With stderr gone there is nowhere left to report; the exit code still fails.
