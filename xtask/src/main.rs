@@ -487,8 +487,8 @@ mod tests {
     use std::process::ExitCode;
 
     use super::{
-        Cli, Invocation, RulesetAction, Task, TaskAction, repo_root, run, run_broker, run_hook,
-        serve_tokens, usage_exit_code, verdict,
+        Cli, Invocation, RulesetAction, Task, TaskAction, current_exe, repo_root, run, run_broker,
+        run_hook, serve_tokens, usage_exit_code, verdict,
     };
     use crate::testing::{git, repository_with_change, script};
 
@@ -904,5 +904,12 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         assert!(outcome.try_recv().is_err(), "it keeps serving");
+    }
+
+    #[test]
+    fn the_broker_checks_the_executable_that_is_running() {
+        let exe = current_exe().unwrap();
+        assert!(exe.is_absolute(), "{}", exe.display());
+        assert!(exe.is_file(), "the test binary itself: {}", exe.display());
     }
 }
