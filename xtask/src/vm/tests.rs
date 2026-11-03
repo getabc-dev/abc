@@ -252,6 +252,20 @@ fn stop_session(world: &World, backend: &Fake, purge: bool) {
     act(world, backend, stop).0.unwrap();
 }
 
+#[test]
+fn a_purge_reports_state_it_cannot_delete() {
+    let mut world = world("t");
+    let file = world.root.join("not-a-directory");
+    std::fs::write(&file, "").unwrap();
+    world.host.state = file;
+    let stop = Action::Stop {
+        worktree: world.worktree.clone(),
+        purge: true,
+    };
+    let error = format!("{:#}", act(&world, &subscribed(), stop).0.unwrap_err());
+    assert!(error.starts_with("could not delete "), "{error}");
+}
+
 /// A VM that gets ready and reports the subscription token.
 fn subscribed() -> Fake {
     Fake {

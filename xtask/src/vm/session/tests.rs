@@ -396,3 +396,17 @@ fn a_detached_worktree_gets_its_commit_but_no_sync() {
     let error = format!("{:#}", session.sync().unwrap_err());
     assert!(error.contains("on no branch"), "{error}");
 }
+
+#[test]
+fn what_cannot_be_inspected_is_an_error_not_a_missing_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("file");
+    fs::write(&file, "").unwrap();
+    // Beneath a regular file, a path is not missing but cannot be looked at.
+    let beneath = file.join("sub");
+    let inspect = format!("{:#}", super::plain_dir(&beneath).unwrap_err());
+    assert!(inspect.starts_with("could not inspect "), "{inspect}");
+    let remove = format!("{:#}", super::remove_any(&beneath).unwrap_err());
+    assert!(remove.starts_with("could not remove "), "{remove}");
+    super::remove_any(&dir.path().join("missing")).unwrap();
+}
