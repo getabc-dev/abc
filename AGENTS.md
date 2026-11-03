@@ -115,7 +115,7 @@ watchdog compares the diff with that task and the rules above, and keeps it work
 | `cargo xtask mutants --base <rev> [--jobs N] [--shard k/n]` | Runs cargo-mutants on the Rust lines changed since the merge base, or one shard of them, and fails on any missed mutant: a change to the code that no test notices. A mutant whose tests hang counts as caught. |
 | `cargo xtask review --base <rev>` | Gemini reviews the diff, the PR's title and description against this file as it stands at the merge base. Runs in CI; it blocks on a `block` verdict or any blocking finding, and fails closed on quota, size and missing-key errors. |
 | `cargo xtask task set "<text>"` / `show` / `clear` | Records, prints or forgets the current task in `.abc/task.md` (not committed), for the watchdog. |
-| `cargo xtask task blocked "<text>"` | Declares the task BLOCKED in `.abc/blocked.md`: what is missing and what was tried. The next Stop logs it in `.abc/blocked-log.md` and asks the watchdog whether the blocker is outside the agent's control; if so, or on a second declaration, the stop is allowed with this handoff (D39). |
+| `cargo xtask task blocked "<text>"` | Declares the task BLOCKED in `.abc/blocked.md`: what is missing and what was tried. The next Stop logs it in `.abc/blocked-log.md` and asks the watchdog whether the blocker is outside the agent's control; if so, or after 5 blocked stops in a row, the stop is allowed with this handoff, and otherwise it is sent back and counted (D39). |
 | `cargo xtask gh -- <args>` | Runs gh as the agent App with a token from the broker, revoked when gh exits. Agents create, merge and change things on GitHub only through this; the guard blocks plain `gh pr create`, `gh pr merge` and `gh api` writes. |
 | `cargo xtask git-credential <op>` | git's credential helper for github.com in agent VMs (`xtask/vm/gitconfig`): it answers with an agent App token from the broker. Never run it yourself. |
 | `cargo xtask broker --session <name>` | Started by `cargo xtask vm start`, one per session, from a build of main installed outside any checkout: serves that agent VM's App tokens, at most 120 an hour, and revokes them all when the session stops; the one process that reads the App's key. |
@@ -164,10 +164,10 @@ changes no tests.
 ```
 
 The gate files are the files that decide what passes: CI and rulesets (`.github/`), cargo, lint,
-toolchain and tool configuration, `Cargo.toml` and `Cargo.lock` (the fuzz workspace's too, with
-`fuzz/deny.toml`), the agent settings, this file and `CLAUDE.md`, and all of `xtask/`. `GATES` in
-`xtask/src/integrity/mod.rs` lists them, and a test keeps `.github/CODEOWNERS` identical. A change
-to one needs the integrity approval and a code owner's review.
+toolchain and tool configuration, `Cargo.toml` and `Cargo.lock`, the agent settings, this file
+and `CLAUDE.md`, and all of `xtask/`. `GATES` in `xtask/src/integrity/mod.rs` lists them, and a
+test keeps `.github/CODEOWNERS` identical. A change to one needs the integrity approval and a code
+owner's review.
 
 **Break glass.** The ruleset's one bypass lets a repository admin merge a pull request without
 its checks or reviews; GitHub logs every use. Use it only when a gate itself is broken and
