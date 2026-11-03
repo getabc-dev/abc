@@ -32,7 +32,7 @@ pub fn env(trust: Trust, timings: Timings, wall: Arc<dyn WallClock>) -> Env {
 pub fn trust(root: rustls::pki_types::CertificateDer<'static>) -> Result<Trust, rustls::Error> {
     let mut roots = rustls::RootCertStore::empty();
     roots.add(root)?;
-    Trust::with_roots(roots)
+    Trust::verified_by(|builder| Ok(builder.with_root_certificates(roots)))
 }
 
 /// Timings short enough for tests: the same shape as production's, in tens of milliseconds.

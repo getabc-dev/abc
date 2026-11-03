@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/*", "crates/abc-protocol/fuzz", "xtask"]
+members = ["crates/*", "xtask"]
 # Crates that `cargo xtask setup` builds into .tools/ are never part of the workspace.
 exclude = [".tools"]
 
@@ -26,7 +26,6 @@ http-body-util = "0.1.5"
 hyper = "1.12.0"
 hyper-util = { version = "0.1.21", features = ["tokio"] }
 insta = "1.49.0"
-libfuzzer-sys = "0.4.13"
 proptest = { version = "1.12.0", default-features = false, features = ["std"] }
 rand = { version = "0.10.3", default-features = false, features = ["sys_rng", "std"] }
 # The worker test harness's TLS certificates, made at run time: a committed private key would be a
@@ -42,6 +41,8 @@ ring = "0.17.14"
 # getuid and uname for the worker, with no unsafe code of our own.
 rustix = "1.1.6"
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
+# The worker's certificate verification: what the operating system trusts (decision W4).
+rustls-platform-verifier = "0.7.1"
 sha2 = "0.11.1"
 sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "tls-rustls-ring-webpki", "postgres", "macros", "migrate", "uuid", "time", "json"] }
 subtle = "2.6.1"
