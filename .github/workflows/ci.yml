@@ -43,11 +43,16 @@ jobs:
       - name: Install the pinned Rust toolchain
         run: rustup toolchain install --no-self-update
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          # xtask is a workspace of its own, built into the root's target/ (.cargo/config.toml).
+          workspaces: |
+            . -> target
+            xtask -> ../target
       - name: Install the pinned tools
-        run: cargo xtask setup cargo-nextest cargo-sqlx
+        run: cargo xtask setup cargo-nextest cargo-sqlx shellcheck
       - name: Check the installed tools against their pins
-        run: cargo xtask doctor cargo-nextest cargo-sqlx
-      - name: Format, clippy, tests, query caches, doctests and docs
+        run: cargo xtask doctor cargo-nextest cargo-sqlx shellcheck
+      - name: Format, clippy, tests, query caches, doctests, docs and shell scripts, in both workspaces
         run: cargo xtask check
 
   dependencies:
@@ -63,6 +68,11 @@ jobs:
       - name: Install the pinned Rust toolchain
         run: rustup toolchain install --no-self-update
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          # xtask is a workspace of its own, built into the root's target/ (.cargo/config.toml).
+          workspaces: |
+            . -> target
+            xtask -> ../target
       - name: Install the pinned tools
         run: cargo xtask setup cargo-deny cargo-shear osv-scanner
       - name: Check the installed tools against their pins
@@ -71,12 +81,16 @@ jobs:
         run: cargo xtask tool cargo-deny check
       - name: Advisories, licences, bans and sources of the fuzz workspace
         run: cargo xtask tool cargo-deny --manifest-path fuzz/Cargo.toml --config fuzz/deny.toml --locked check
+      - name: Advisories, licences, bans and sources of the xtask workspace
+        run: cargo xtask tool cargo-deny --manifest-path xtask/Cargo.toml --config xtask/deny.toml --locked check
       - name: Unused dependencies
         run: cargo xtask tool cargo-shear --deny-warnings --locked
       - name: Unused dependencies of the fuzz workspace
         run: cargo xtask tool cargo-shear --deny-warnings --locked fuzz
+      - name: Unused dependencies of the xtask workspace
+        run: cargo xtask tool cargo-shear --deny-warnings --locked xtask
       - name: Known vulnerabilities (OSV)
-        run: cargo xtask tool osv-scanner scan source --lockfile Cargo.lock --lockfile fuzz/Cargo.lock
+        run: cargo xtask tool osv-scanner scan source --lockfile Cargo.lock --lockfile fuzz/Cargo.lock --lockfile xtask/Cargo.lock
 
   scans:
     name: Secrets and workflows
@@ -93,6 +107,11 @@ jobs:
       - name: Install the pinned Rust toolchain
         run: rustup toolchain install --no-self-update
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          # xtask is a workspace of its own, built into the root's target/ (.cargo/config.toml).
+          workspaces: |
+            . -> target
+            xtask -> ../target
       - name: Install the pinned tools
         run: cargo xtask setup zizmor pinact gitleaks
       - name: Check the installed tools against their pins
@@ -147,6 +166,11 @@ jobs:
       - name: Install the pull request's Rust toolchain
         run: rustup toolchain install --no-self-update
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          # xtask is a workspace of its own, built into the root's target/ (.cargo/config.toml).
+          workspaces: |
+            . -> target
+            xtask -> ../target
       - name: Install the pinned cargo-nextest the pull request's tests use
         run: cargo xtask setup cargo-nextest
       - name: 90% of changed lines covered
@@ -194,6 +218,11 @@ jobs:
       - name: Install the pull request's Rust toolchain
         run: rustup toolchain install --no-self-update
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          # xtask is a workspace of its own, built into the root's target/ (.cargo/config.toml).
+          workspaces: |
+            . -> target
+            xtask -> ../target
       - name: Install the pinned cargo-nextest the pull request's tests use
         run: cargo xtask setup cargo-nextest
       - name: No missed mutants in this shard of the changed code
