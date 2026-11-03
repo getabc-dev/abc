@@ -61,6 +61,12 @@ enum TaskAction {
     Show,
     /// Forget the recorded task.
     Clear,
+    /// Declare the task BLOCKED when it cannot be finished: the next stop is allowed and the stop
+    /// hook prints this handoff.
+    Blocked {
+        /// What is missing and what was tried.
+        text: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -420,6 +426,7 @@ fn run_task(action: TaskAction, root: &Path, report: &mut impl Write) -> anyhow:
             None => writeln!(report, "no task recorded")?,
         },
         TaskAction::Clear => task::clear(root)?,
+        TaskAction::Blocked { text } => task::block(root, &text)?,
     }
     Ok(ExitCode::SUCCESS)
 }

@@ -7,7 +7,7 @@ Claude included.
 
 - **Hooks** live in `.claude/settings.json` and act in the checkout you are working in, worktrees
   included. Stop and SubagentStop run `cargo xtask hook stop`: first `cargo xtask check --changed`,
-  then, for the main agent's Stop, the watchdog. While either fails, you keep working. Read-only subagents (Explore, Plan and
+  then, for the main agent's Stop, the watchdog. While either fails, you keep working, but a stop can end honestly (D39): PASS, FAIL or BLOCKED. If the task cannot be finished, run `cargo xtask task blocked "<what is missing, what was tried>"`; the next Stop is allowed, the hook prints that handoff, and the watchdog does not override it. After 5 blocked stops in a row with no declaration, the hook lets the stop through, says so on stderr and records it in `.abc/stop-backstop.md`. The count lives in `.abc/` and resets when `check` passes or a new task is set. Read-only subagents (Explore, Plan and
   the like) and Claude Code's internal agents are exempt. A PreToolUse hook on Bash and Monitor
   runs `xtask/hooks/pre-tool-use.sh`, and through it `cargo xtask hook pre-tool-use`, which catches
   accidental force pushes, git or gh commands it cannot read, and gh changes made as the user;

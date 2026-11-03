@@ -29,7 +29,7 @@ use std::process::{Command, Stdio};
 use anyhow::{Context as _, bail, ensure};
 use serde::Deserialize;
 
-use crate::{check, guard, tools, watchdog};
+use crate::{check, guard, task, tools, watchdog};
 
 /// The `PreToolUse` hook script. A checkout without it predates these hooks, so its xtask cannot
 /// take a hook over.
@@ -181,28 +181,25 @@ fn act(event: Event, input: &str, context: &Context, out: &mut impl Write) -> an
     match location {
         Location::Here => match event {
             Event::PreToolUse => guard(input, out),
-            // Exit 1 when the check fails; the hook command turns any failure into a block.
-            Event::Stop => {
-                if check::run(
-                    &context.own_root,
-                    true,
-                    &tools::pinned(&context.own_root, "cargo-nextest")?,
-                    &check::Postgres {
-                        warm: &crate::postgres::warm,
-                        sqlx: &|| tools::pinned(&context.own_root, "cargo-sqlx"),
-                    },
-                    None,
-                    out,
-                )? {
-                    if fields.watched() {
-                        watchdog::check(&context.own_root, &context.claude, watchdog::TIMEOUT, out)
-                    } else {
-                        Ok(0)
-                    }
-                } else {
-                    Ok(1)
-                }
-            }
+            Event::Stop => stop(
+                &context.own_root,
+                fields.watched(),
+                out,
+                |out| {
+                    check::run(
+                        &context.own_root,
+                        true,
+                        &tools::pinned(&context.own_root, "cargo-nextest")?,
+                        &check::Postgres {
+                            warm: &crate::postgres::warm,
+                            sqlx: &|| tools::pinned(&context.own_root, "cargo-sqlx"),
+                        },
+                        None,
+                        out,
+                    )
+                },
+                |out| watchdog::check(&context.own_root, &context.claude, watchdog::TIMEOUT, out),
+            ),
         },
         // GitHub is the gate, so a checkout that cannot take the hook is noted, never locked out.
         Location::Worktree(root) if !root.join(HOOK_SCRIPT).is_file() => {
@@ -229,6 +226,53 @@ fn act(event: Event, input: &str, context: &Context, out: &mut impl Write) -> an
             Ok(0)
         }
     }
+}
+
+/// How many stops in a row the stop hook blocks before it lets one through anyway.
+const MAX_BLOCKED_STOPS: u32 = 5;
+
+/// The stop hook: PASS, FAIL or BLOCKED (D39), so a run that can never go green still ends.
+///
+/// - A BLOCKED declaration (`cargo xtask task blocked`) lets this stop through and prints the
+///   handoff; neither the check nor the watchdog overrides it.
+/// - Otherwise `check` decides. A pass resets the count of blocked stops and, when `watched`,
+///   hands over to the watchdog; a failure returns 1, which keeps the agent working.
+/// - After [`MAX_BLOCKED_STOPS`] blocked stops in a row the stop goes through anyway, says so on
+///   `out` and is recorded in `.abc/stop-backstop.md`.
+fn stop<W: Write>(
+    root: &Path,
+    watched: bool,
+    out: &mut W,
+    check: impl FnOnce(&mut W) -> anyhow::Result<bool>,
+    watchdog: impl FnOnce(&mut W) -> anyhow::Result<u8>,
+) -> anyhow::Result<u8> {
+    if let Some(declaration) = task::take_blocked(root)? {
+        task::reset_blocked_stops(root)?;
+        writeln!(
+            out,
+            "xtask stop hook: BLOCKED, stop allowed. Handoff:\n{declaration}"
+        )?;
+        return Ok(0);
+    }
+    if check(out)? {
+        task::reset_blocked_stops(root)?;
+        return if watched { watchdog(out) } else { Ok(0) };
+    }
+    let blocked = task::blocked_stops(root)?;
+    if blocked >= MAX_BLOCKED_STOPS {
+        task::reset_blocked_stops(root)?;
+        task::record_backstop(root, blocked)?;
+        writeln!(
+            out,
+            "xtask stop hook: the check failed and {blocked} stops in a row were blocked with no \
+             BLOCKED declaration, so this stop is allowed; recorded in {}. Next time declare it: \
+             cargo xtask task blocked \"<what is missing, what was tried>\"",
+            task::BACKSTOP
+        )?;
+        return Ok(0);
+    }
+    task::count_blocked_stop(root)?;
+    Ok(1)
 }
 
 fn guard(input: &str, out: &mut impl Write) -> anyhow::Result<u8> {
@@ -908,6 +952,90 @@ mod tests {
             "subagents have no task of their own"
         );
         assert!(!fields("{}").watched(), "an unnamed event is not watched");
+    }
+
+    /// Runs the stop decision with a check that says `passes`, counting the watchdog's calls.
+    fn stop_with(root: &Path, passes: bool, watched: bool) -> (u8, String, bool) {
+        let mut out = Vec::new();
+        let mut watchdog_ran = false;
+        let code = super::stop(
+            root,
+            watched,
+            &mut out,
+            |_| Ok(passes),
+            |_| {
+                watchdog_ran = true;
+                Ok(0)
+            },
+        )
+        .unwrap();
+        (code, String::from_utf8(out).unwrap(), watchdog_ran)
+    }
+
+    #[test]
+    fn a_passing_stop_goes_to_the_watchdog_when_watched() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(stop_with(dir.path(), true, true), (0, String::new(), true));
+        assert_eq!(
+            stop_with(dir.path(), true, false),
+            (0, String::new(), false)
+        );
+    }
+
+    #[test]
+    fn a_failing_stop_is_blocked_until_the_check_passes() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(stop_with(dir.path(), false, true).0, 1, "fail");
+        assert_eq!(crate::task::blocked_stops(dir.path()).unwrap(), 1);
+        assert_eq!(stop_with(dir.path(), false, true).0, 1, "fail again");
+        assert_eq!(crate::task::blocked_stops(dir.path()).unwrap(), 2);
+        assert_eq!(stop_with(dir.path(), true, false).0, 0, "then pass");
+        assert_eq!(crate::task::blocked_stops(dir.path()).unwrap(), 0, "reset");
+    }
+
+    #[test]
+    fn a_blocked_declaration_ends_the_stop_without_check_or_watchdog() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::task::block(dir.path(), "no network; tried twice").unwrap();
+        let mut out = Vec::new();
+        let code = super::stop(
+            dir.path(),
+            true,
+            &mut out,
+            |_| panic!("the check must not run"),
+            |_| panic!("the watchdog must not run"),
+        )
+        .unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert_eq!(code, 0);
+        assert!(
+            out.contains("BLOCKED") && out.contains("no network; tried twice"),
+            "{out}"
+        );
+        assert_eq!(
+            stop_with(dir.path(), false, true).0,
+            1,
+            "it covered one stop"
+        );
+    }
+
+    #[test]
+    fn the_backstop_lets_the_sixth_blocked_stop_through_and_records_it() {
+        let dir = tempfile::tempdir().unwrap();
+        for _ in 0..5 {
+            assert_eq!(stop_with(dir.path(), false, true).0, 1);
+        }
+        let (code, out, watchdog_ran) = stop_with(dir.path(), false, true);
+        assert_eq!(code, 0, "{out}");
+        assert!(!watchdog_ran);
+        assert!(out.contains("5 stops in a row"), "{out}");
+        let note = fs::read_to_string(dir.path().join(crate::task::BACKSTOP)).unwrap();
+        assert!(note.contains("after 5 blocked stops"), "{note}");
+        assert_eq!(
+            stop_with(dir.path(), false, true).0,
+            1,
+            "the count starts over"
+        );
     }
 
     #[test]
