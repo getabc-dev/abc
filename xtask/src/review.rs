@@ -18,15 +18,15 @@ use serde::Deserialize;
 
 use crate::git;
 
-/// The model, pinned: Gemini's newest stable Flash model with a free tier.
+/// The model, pinned: Gemini's newest stable Flash model, on the project's paid key.
 pub(crate) const MODEL: &str = "gemini-3.8-flash";
 
 /// Gemini's API.
 const ENDPOINT: &str = "https://generativelanguage.googleapis.com/v1beta/models";
 
-/// The largest diff sent for review, in bytes: about 100,000 tokens. With AGENTS.md and the reply
-/// it stays inside the free tier's per-minute token budget, and a larger change is more than one
-/// review can weigh carefully; split it instead.
+/// The largest diff sent for review, in bytes: about 100,000 tokens. A larger change is more than
+/// one review can weigh carefully, so it is split instead; `cargo xtask check` applies the same
+/// limit before a change reaches CI.
 pub(crate) const MAX_DIFF_BYTES: usize = 400_000;
 
 /// What the review is about.
@@ -308,8 +308,9 @@ fn post_within(url: &str, body: &str, key: &str, limit: Duration) -> anyhow::Res
 }
 
 /// How long to wait before each retry when Gemini is busy (HTTP 429 or 5xx) or unreachable: four
-/// attempts over about a minute and a half. Gemini's free tier often answers 503 for a moment;
-/// past the last attempt the review fails closed as before, with the last answer's reason.
+/// attempts over about a minute and a half. Gemini answers 503 for a moment when the model is in
+/// high demand; past the last attempt the review fails closed as before, with the last answer's
+/// reason.
 pub(crate) const RETRY_DELAYS: [Duration; 3] = [
     Duration::from_secs(10),
     Duration::from_secs(30),
