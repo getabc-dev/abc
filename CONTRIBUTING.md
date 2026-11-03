@@ -56,8 +56,10 @@ cargo xtask setup
 Before you open a PR, run the gate locally:
 
 ```sh
-cargo fmt --all              # fix formatting; the gate only checks it
-cargo xtask check            # format check, clippy, tests, doctests and rustdoc on the workspace
+cargo fmt --all              # fix formatting; the gate only checks it (and xtask's:
+                             # cargo fmt --all --manifest-path xtask/Cargo.toml)
+cargo xtask check            # format, clippy, tests, doctests and rustdoc on both workspaces,
+                             # and shellcheck on the shell scripts
 cargo xtask check --changed  # the same, limited to the crates your change affects
 ```
 

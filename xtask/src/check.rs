@@ -1,27 +1,105 @@
 //! `cargo xtask check`: the format, lint and test gate that agents' stop hooks and CI share.
+//!
+//! It covers the repository's two Cargo workspaces, the main one and xtask's own (`xtask/`), and
+//! lints its shell scripts with the pinned shellcheck. The fuzz workspace is `cargo xtask fuzz`'s.
 
 use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use anyhow::{Context, ensure};
 use serde::Deserialize;
 
 use crate::git::{default_branch, git};
 
-/// Root files whose change can affect every crate.
-const WORKSPACE_FILES: [&str; 5] = [
-    "Cargo.toml",
-    "Cargo.lock",
-    "rust-toolchain.toml",
-    "clippy.toml",
-    "rustfmt.toml",
-];
+/// Root files whose change can affect every crate of every workspace.
+const SHARED_FILES: [&str; 3] = ["rust-toolchain.toml", "clippy.toml", "rustfmt.toml"];
 
 /// Root directories whose change can affect every crate: cargo and nextest configuration.
-const WORKSPACE_DIRS: [&str; 2] = [".cargo", ".config"];
+const SHARED_DIRS: [&str; 2] = [".cargo", ".config"];
+
+/// A Cargo workspace of the repository.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Workspace {
+    /// The directory of its root manifest, relative to the repository root; empty for the main
+    /// workspace.
+    dir: &'static str,
+    /// Files outside its crates, beside [`SHARED_FILES`], whose change can affect all of them.
+    files: &'static [&'static str],
+}
+
+/// The main workspace: the crates abc ships.
+pub(crate) const MAIN: Workspace = Workspace {
+    dir: "",
+    files: &["Cargo.toml", "Cargo.lock"],
+};
+
+/// xtask's own workspace. Its tests compare its lints with the main workspace's manifest.
+pub(crate) const XTASK: Workspace = Workspace {
+    dir: "xtask",
+    files: &["Cargo.toml"],
+};
+
+/// The shell scripts of the repository, which shellcheck lints.
+pub(crate) const SCRIPTS: [&str; 3] = [
+    "xtask/hooks/hook.sh",
+    "xtask/vm/entrypoint.sh",
+    "xtask/vm/agent-exec",
+];
+
+/// What the check covers.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Tree<'a> {
+    pub(crate) workspaces: &'a [Workspace],
+    /// Shell scripts, relative to the root.
+    pub(crate) scripts: &'a [&'a str],
+}
+
+/// This repository: both workspaces and every script.
+pub(crate) const REPOSITORY: Tree<'static> = Tree {
+    workspaces: &[MAIN, XTASK],
+    scripts: &SCRIPTS,
+};
+
+impl Workspace {
+    /// The directory of its root manifest, relative to the repository root; empty for the main
+    /// workspace.
+    pub(crate) const fn dir(self) -> &'static str {
+        self.dir
+    }
+
+    /// The arguments that point cargo at this workspace from the repository root.
+    pub(crate) fn manifest_args(self) -> Vec<String> {
+        if self.dir.is_empty() {
+            Vec::new()
+        } else {
+            vec![
+                "--manifest-path".to_owned(),
+                format!("{}/Cargo.toml", self.dir),
+            ]
+        }
+    }
+
+    /// How the workspace is named in the check's findings.
+    fn label(self) -> String {
+        if self.dir.is_empty() {
+            String::new()
+        } else {
+            format!(" ({}/)", self.dir)
+        }
+    }
+
+    /// Whether a change to `path` can affect every crate of the workspace.
+    fn affected_by(self, path: &Path) -> bool {
+        SHARED_FILES
+            .iter()
+            .chain(self.files)
+            .any(|file| path == Path::new(file))
+            || SHARED_DIRS.iter().any(|dir| path.starts_with(dir))
+    }
+}
 
 /// The seed for property tests run by the check, so a run can be repeated exactly. Plain
 /// `cargo test` keeps proptest's random seed and explores new cases.
@@ -71,7 +149,7 @@ fn package_args(names: &BTreeSet<String>) -> Vec<String> {
         .collect()
 }
 
-/// A workspace member, with paths relative to the workspace root.
+/// A workspace member, with paths relative to the repository root.
 #[derive(Debug)]
 struct Package {
     name: String,
@@ -88,8 +166,34 @@ struct Package {
 
 /// A step of the check that failed, with what to do about it.
 struct Failure {
-    step: &'static str,
-    fix: &'static str,
+    step: String,
+    fix: String,
+}
+
+impl Failure {
+    fn new(step: &str, workspace: Workspace, fix: &str) -> Self {
+        Self {
+            step: format!("{step}{}", workspace.label()),
+            fix: fix.to_owned(),
+        }
+    }
+}
+
+/// The pinned tools the check runs.
+#[derive(Debug)]
+pub(crate) struct Tools {
+    pub(crate) nextest: PathBuf,
+    pub(crate) shellcheck: PathBuf,
+}
+
+impl Tools {
+    /// The tools pinned in the checkout at `home`.
+    pub(crate) fn pinned(home: &Path) -> anyhow::Result<Self> {
+        Ok(Self {
+            nextest: crate::tools::pinned(home, "cargo-nextest")?,
+            shellcheck: crate::tools::pinned(home, "shellcheck")?,
+        })
+    }
 }
 
 /// How the check reaches Postgres.
@@ -122,13 +226,26 @@ const QUERY_CACHE_FIX: &str = "regenerate the crate's .sqlx/ against a migrated 
     crates/<crate> tool cargo-sqlx sqlx prepare --database-url \
     postgres://postgres@127.0.0.1:55432/abc_prepare -- --all-targets --all-features --locked`";
 
-/// Runs the check from `root` and reports whether it passed. With `changed`, clippy and the tests
-/// cover only the crates that the changes since the merge base with the default branch can affect.
-/// Builds go to `target_dir` when given, and wherever cargo is configured to otherwise.
+/// Where a check's steps run and build.
+struct Run<'a, W> {
+    root: &'a Path,
+    tools: &'a Tools,
+    postgres: &'a Postgres<'a>,
+    /// Builds go here when given, and wherever cargo is configured to otherwise.
+    target_dir: Option<&'a Path>,
+    out: &'a mut W,
+    failures: Vec<Failure>,
+}
+
+/// Runs the check of `tree` from `root` and reports whether it passed. With `changed`, clippy and
+/// the tests cover only the crates that the changes since the merge base with the default branch
+/// can affect. Builds go to `target_dir` when given, and wherever cargo is configured to
+/// otherwise. Every step's output goes to `out`.
 pub(crate) fn run(
     root: &Path,
+    tree: Tree<'_>,
     changed: bool,
-    nextest: &Path,
+    tools: &Tools,
     postgres: &Postgres<'_>,
     target_dir: Option<&Path>,
     out: &mut impl Write,
@@ -136,13 +253,40 @@ pub(crate) fn run(
     if !review_size(root, out)? {
         return Ok(false);
     }
-    let (scope, packages) = if changed {
-        let packages = workspace_packages(root)?;
-        (affected(&packages, &changed_files(root)?), Some(packages))
+    let changed_files = if changed {
+        Some(changed_files(root)?)
     } else {
-        (Scope::Workspace, None)
+        None
     };
-    run_scope(root, &scope, nextest, packages, postgres, target_dir, out)
+    let mut run = Run {
+        root,
+        tools,
+        postgres,
+        target_dir,
+        out,
+        failures: Vec::new(),
+    };
+    run.shellcheck(tree.scripts)?;
+    for &workspace in tree.workspaces {
+        let (scope, packages) = match &changed_files {
+            Some(files) => {
+                let packages = workspace_packages(root, workspace)?;
+                (affected(workspace, &packages, files), Some(packages))
+            }
+            None => (Scope::Workspace, None),
+        };
+        run.workspace(workspace, &scope, packages)?;
+    }
+    let Run { failures, .. } = run;
+    if failures.is_empty() {
+        writeln!(out, "xtask check: passed")?;
+        return Ok(true);
+    }
+    writeln!(out, "xtask check: failed")?;
+    for failure in failures {
+        writeln!(out, "  {}: {}", failure.step, failure.fix)?;
+    }
+    Ok(false)
 }
 
 /// Whether the changes since the merge base with the default branch fit the Gemini review's
@@ -191,146 +335,197 @@ fn database(root: &Path, scope: &Scope, packages: &[Package]) -> Database {
     }
 }
 
-/// Runs each step on `scope` from `root`, with the cargo-nextest executable at `nextest` and
-/// Postgres reached through `postgres`, building into `target_dir` when given and wherever cargo is configured
-/// to otherwise. `packages` are the workspace's, when already read.
-fn run_scope(
-    root: &Path,
-    scope: &Scope,
-    nextest: &Path,
-    packages: Option<Vec<Package>>,
-    postgres: &Postgres<'_>,
-    target_dir: Option<&Path>,
-    out: &mut impl Write,
-) -> anyhow::Result<bool> {
-    let mut failures = Vec::new();
-    if !step(
-        root,
-        target_dir,
-        out,
-        Command::new(cargo()).args(["fmt", "--all", "--check"]),
-    )? {
-        failures.push(Failure {
-            step: "format",
-            fix: "run `cargo fmt --all`",
-        });
-    }
-    if scope.is_empty() {
-        writeln!(
-            out,
-            "xtask: no crate is affected by the changes; skipping clippy, tests and docs"
-        )?;
-    } else {
-        let mut clippy = Command::new(cargo());
-        clippy.arg("clippy").args(scope.cargo_args()).args([
-            "--all-targets",
-            "--locked",
-            "--",
-            "-D",
-            "warnings",
-        ]);
-        if step(root, target_dir, out, &mut clippy)? {
-            // Clippy passed, so the workspace's metadata reads.
-            let packages = match packages {
-                Some(packages) => packages,
-                None => workspace_packages(root)?,
-            };
-            let database = database(root, scope, &packages);
-            if database.needs_server() {
-                (postgres.warm)(out)?;
-            }
-            if !step(root, target_dir, out, &mut test_command(nextest, scope))? {
-                failures.push(Failure {
-                    step: "tests",
-                    fix: "fix the cause of each failing test above; never skip or weaken a test",
-                });
-            }
-            if let Some(args) = scope.doc_test_args() {
-                let mut doc_tests = Command::new(cargo());
-                doc_tests.args(["test", "--doc"]).args(args).arg("--locked");
-                if !step(root, target_dir, out, &mut doc_tests)? {
-                    failures.push(Failure {
-                        step: "doctests",
-                        fix: "fix each failing example above; examples are tests too",
-                    });
-                }
-            } else {
-                writeln!(
-                    out,
-                    "xtask: no affected crate has a library; skipping doctests"
-                )?;
-            }
-            for dir in &database.caches {
-                if !query_cache_current(root, dir, postgres, target_dir, out)? {
-                    failures.push(Failure {
-                        step: "query cache",
-                        fix: QUERY_CACHE_FIX,
-                    });
-                }
-            }
-            let mut docs = Command::new(cargo());
-            docs.args(["doc", "--no-deps"])
-                .args(scope.cargo_args())
-                .arg("--locked")
-                .env("RUSTDOCFLAGS", "-D warnings");
-            if !step(root, target_dir, out, &mut docs)? {
-                failures.push(Failure {
-                    step: "docs",
-                    fix: "fix each rustdoc warning above, such as a broken intra-doc link",
-                });
-            }
-        } else {
-            failures.push(Failure {
-                step: "clippy",
-                fix: "fix each finding above (tests and docs run once clippy passes); silence a \
-                      lint only with #[expect(lint, reason = \"...\")] when the code is right",
+impl<W: Write> Run<'_, W> {
+    /// Lints `scripts` with shellcheck, which follows what they source.
+    fn shellcheck(&mut self, scripts: &[&str]) -> anyhow::Result<()> {
+        if scripts.is_empty() {
+            return Ok(());
+        }
+        let mut shellcheck = Command::new(&self.tools.shellcheck);
+        shellcheck.args(["--external-sources", "--"]).args(scripts);
+        if !self.step(&mut shellcheck)? {
+            self.failures.push(Failure {
+                step: "shellcheck".to_owned(),
+                fix: "fix each finding above; disable a check only with a `# shellcheck \
+                      disable=SC<code>` comment that says why the script is right"
+                    .to_owned(),
             });
         }
+        Ok(())
     }
 
-    if failures.is_empty() {
-        writeln!(out, "xtask check: passed")?;
-        return Ok(true);
+    /// Runs each step on `scope` of `workspace`. `packages` are the workspace's, when already
+    /// read.
+    fn workspace(
+        &mut self,
+        workspace: Workspace,
+        scope: &Scope,
+        packages: Option<Vec<Package>>,
+    ) -> anyhow::Result<()> {
+        let manifest = workspace.manifest_args();
+        let mut format = Command::new(cargo());
+        format.args(["fmt", "--all", "--check"]).args(&manifest);
+        if !self.step(&mut format)? {
+            let command: Vec<&str> = ["cargo", "fmt", "--all"]
+                .into_iter()
+                .chain(manifest.iter().map(String::as_str))
+                .collect();
+            let fix = format!("run `{}`", command.join(" "));
+            self.failures.push(Failure::new("format", workspace, &fix));
+        }
+        if scope.is_empty() {
+            writeln!(
+                self.out,
+                "xtask: no crate of the workspace{} is affected by the changes; skipping clippy, \
+                 tests and docs",
+                workspace.label()
+            )?;
+            return Ok(());
+        }
+        let mut clippy = Command::new(cargo());
+        clippy
+            .arg("clippy")
+            .args(&manifest)
+            .args(scope.cargo_args())
+            .args(["--all-targets", "--locked", "--", "-D", "warnings"]);
+        if !self.step(&mut clippy)? {
+            self.failures.push(Failure::new(
+                "clippy",
+                workspace,
+                "fix each finding above (tests and docs run once clippy passes); silence a lint \
+                 only with #[expect(lint, reason = \"...\")] when the code is right",
+            ));
+            return Ok(());
+        }
+        // Clippy passed, so the workspace's metadata reads.
+        let packages = match packages {
+            Some(packages) => packages,
+            None => workspace_packages(self.root, workspace)?,
+        };
+        let database = database(self.root, scope, &packages);
+        if database.needs_server() {
+            (self.postgres.warm)(self.out)?;
+        }
+        if !self.step(&mut test_command(&self.tools.nextest, workspace, scope))? {
+            self.failures.push(Failure::new(
+                "tests",
+                workspace,
+                "fix the cause of each failing test above; never skip or weaken a test",
+            ));
+        }
+        // A workspace of binaries alone, such as xtask's, has no doctests to run.
+        let doc_tests = if packages.iter().any(|package| package.library) {
+            scope.doc_test_args()
+        } else {
+            None
+        };
+        if let Some(args) = doc_tests {
+            let mut doc_tests = Command::new(cargo());
+            doc_tests
+                .args(["test", "--doc"])
+                .args(&manifest)
+                .args(args)
+                .arg("--locked");
+            if !self.step(&mut doc_tests)? {
+                self.failures.push(Failure::new(
+                    "doctests",
+                    workspace,
+                    "fix each failing example above; examples are tests too",
+                ));
+            }
+        } else {
+            writeln!(
+                self.out,
+                "xtask: no affected crate of the workspace{} has a library; skipping doctests",
+                workspace.label()
+            )?;
+        }
+        for dir in &database.caches {
+            if !self.query_cache_current(dir)? {
+                self.failures
+                    .push(Failure::new("query cache", workspace, QUERY_CACHE_FIX));
+            }
+        }
+        let mut docs = Command::new(cargo());
+        docs.args(["doc", "--no-deps"])
+            .args(&manifest)
+            .args(scope.cargo_args())
+            .arg("--locked")
+            .env("RUSTDOCFLAGS", "-D warnings");
+        if !self.step(&mut docs)? {
+            self.failures.push(Failure::new(
+                "docs",
+                workspace,
+                "fix each rustdoc warning above, such as a broken intra-doc link",
+            ));
+        }
+        Ok(())
     }
-    writeln!(out, "xtask check: failed")?;
-    for failure in failures {
-        writeln!(out, "  {}: {}", failure.step, failure.fix)?;
+
+    /// Whether the query cache of the crate in `dir` matches its queries, checked against a fresh
+    /// database of its own that is dropped afterwards.
+    fn query_cache_current(&mut self, dir: &Path) -> anyhow::Result<bool> {
+        let server = std::env::var(crate::postgres::TEST_DATABASE_URL)
+            .unwrap_or_else(|_| crate::postgres::URL.to_owned());
+        let created = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| since.as_secs());
+        let url = crate::postgres::with_database(
+            &server,
+            // Named for its creation time, so a later test sweeps it if a killed check left it
+            // behind.
+            &format!("abc_query_cache_{created}_{}", std::process::id()),
+        )?;
+        let [mut reset, mut prepare, mut drop] =
+            crate::postgres::query_cache_check(&(self.postgres.sqlx)()?, dir, &url);
+        let current = self.step(&mut reset)? && self.step(&mut prepare)?;
+        self.step(&mut drop)?;
+        Ok(current)
     }
-    Ok(false)
+
+    /// Runs one step from the repository root, building into the run's target directory when it
+    /// has one, and reports whether it passed. The step's output, stdout and stderr together, goes
+    /// to the run's `out`: a hook's stdout carries only its answer, and the agent reads why a
+    /// step failed from what the hook says.
+    fn step(&mut self, command: &mut Command) -> anyhow::Result<bool> {
+        if let Some(dir) = self.target_dir {
+            command.env("CARGO_TARGET_DIR", dir);
+        }
+        let program = command.get_program().to_string_lossy().into_owned();
+        let args: Vec<String> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        writeln!(self.out, "xtask: {program} {}", args.join(" "))?;
+        if command.get_current_dir().is_none() {
+            command.current_dir(self.root);
+        }
+        let (mut output, writer) = std::io::pipe().context("could not open a pipe")?;
+        command
+            .stdin(Stdio::null())
+            .stdout(writer.try_clone().context("could not share a pipe")?)
+            .stderr(writer);
+        let spawned = command.spawn();
+        // The command holds the pipe's write ends until they are replaced; let them go, so the
+        // copy below ends when the step and whatever it started are done.
+        command.stdout(Stdio::null()).stderr(Stdio::null());
+        let mut child = spawned.with_context(|| format!("could not run {program}"))?;
+        std::io::copy(&mut output, self.out)
+            .with_context(|| format!("could not pass on what {program} printed"))?;
+        let status = child
+            .wait()
+            .with_context(|| format!("could not wait for {program}"))?;
+        Ok(status.success())
+    }
 }
 
-/// Whether the query cache of the crate in `dir` matches its queries, checked against a fresh
-/// database of its own that is dropped afterwards.
-fn query_cache_current(
-    root: &Path,
-    dir: &Path,
-    postgres: &Postgres<'_>,
-    target_dir: Option<&Path>,
-    out: &mut impl Write,
-) -> anyhow::Result<bool> {
-    let server = std::env::var(crate::postgres::TEST_DATABASE_URL)
-        .unwrap_or_else(|_| crate::postgres::URL.to_owned());
-    let created = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |since| since.as_secs());
-    let url = crate::postgres::with_database(
-        &server,
-        // Named for its creation time, so a later test sweeps it if a killed check left it behind.
-        &format!("abc_query_cache_{created}_{}", std::process::id()),
-    )?;
-    let [mut reset, mut prepare, mut drop] =
-        crate::postgres::query_cache_check(&(postgres.sqlx)()?, dir, &url);
-    let current =
-        step(root, target_dir, out, &mut reset)? && step(root, target_dir, out, &mut prepare)?;
-    step(root, target_dir, out, &mut drop)?;
-    Ok(current)
-}
-
-/// The nextest run for `scope`, with property tests seeded by [`PROPTEST_RNG_SEED`].
-fn test_command(nextest: &Path, scope: &Scope) -> Command {
+/// The nextest run for `scope` of `workspace`, with property tests seeded by
+/// [`PROPTEST_RNG_SEED`].
+fn test_command(nextest: &Path, workspace: Workspace, scope: &Scope) -> Command {
     let mut command = Command::new(nextest);
     command
         .args(["nextest", "run"])
+        .args(workspace.manifest_args())
         .args(scope.cargo_args())
         .arg("--locked")
         .env("PROPTEST_RNG_SEED", PROPTEST_RNG_SEED);
@@ -340,32 +535,6 @@ fn test_command(nextest: &Path, scope: &Scope) -> Command {
 /// Cargo as chosen by `cargo xtask`, so every step uses the pinned toolchain.
 pub(crate) fn cargo() -> OsString {
     std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into())
-}
-
-/// Runs one step from the repository root, building into `target_dir` when given, and reports
-/// whether it passed.
-fn step(
-    root: &Path,
-    target_dir: Option<&Path>,
-    out: &mut impl Write,
-    command: &mut Command,
-) -> anyhow::Result<bool> {
-    if let Some(dir) = target_dir {
-        command.env("CARGO_TARGET_DIR", dir);
-    }
-    let program = command.get_program().to_string_lossy().into_owned();
-    let args: Vec<String> = command
-        .get_args()
-        .map(|arg| arg.to_string_lossy().into_owned())
-        .collect();
-    writeln!(out, "xtask: {program} {}", args.join(" "))?;
-    if command.get_current_dir().is_none() {
-        command.current_dir(root);
-    }
-    let status = command
-        .status()
-        .with_context(|| format!("could not run {program}"))?;
-    Ok(status.success())
 }
 
 #[derive(Deserialize)]
@@ -393,15 +562,18 @@ struct MetadataDependency {
     path: Option<PathBuf>,
 }
 
-fn workspace_packages(root: &Path) -> anyhow::Result<Vec<Package>> {
+/// The members of `workspace` in the repository at `root`, with paths relative to `root`.
+fn workspace_packages(root: &Path, workspace: Workspace) -> anyhow::Result<Vec<Package>> {
     let output = Command::new(cargo())
         .args(["metadata", "--format-version", "1", "--no-deps", "--locked"])
+        .args(workspace.manifest_args())
         .current_dir(root)
         .output()
         .context("could not run cargo metadata")?;
     ensure!(
         output.status.success(),
-        "cargo metadata failed: {}",
+        "cargo metadata{} failed: {}",
+        workspace.label(),
         String::from_utf8_lossy(&output.stderr).trim()
     );
     let metadata: Metadata =
@@ -409,7 +581,7 @@ fn workspace_packages(root: &Path) -> anyhow::Result<Vec<Package>> {
     let relative = |path: &Path| {
         path.strip_prefix(&metadata.workspace_root)
             .ok()
-            .map(Path::to_path_buf)
+            .map(|inside| Path::new(workspace.dir).join(inside))
     };
     metadata
         .packages
@@ -470,14 +642,12 @@ fn changed_since(root: &Path, base: &str) -> anyhow::Result<Vec<PathBuf>> {
         .collect())
 }
 
-/// The crates whose lints or tests the changed files can affect: the crates containing them and
-/// every crate that depends on those, directly or not.
-fn affected(packages: &[Package], changed: &[PathBuf]) -> Scope {
+/// The crates of `workspace`, its members being `packages`, whose lints or tests the changed files
+/// can affect: the crates containing them and every crate that depends on those, directly or not.
+fn affected(workspace: Workspace, packages: &[Package], changed: &[PathBuf]) -> Scope {
     let mut names = BTreeSet::new();
     for path in changed {
-        if WORKSPACE_FILES.iter().any(|file| path == Path::new(file))
-            || WORKSPACE_DIRS.iter().any(|dir| path.starts_with(dir))
-        {
+        if workspace.affected_by(path) {
             return Scope::Workspace;
         }
         let owner = packages
@@ -523,7 +693,8 @@ mod tests {
     use std::collections::BTreeSet;
 
     use super::{
-        PROPTEST_RNG_SEED, Package, Scope, affected, changed_since, review_size, run, test_command,
+        MAIN, PROPTEST_RNG_SEED, Package, Scope, Tools, Tree, XTASK, affected, changed_since,
+        review_size, run, test_command,
     };
     use crate::git::default_branch;
     use crate::testing::{git, repository};
@@ -556,13 +727,18 @@ mod tests {
                 false,
                 &["crates/abc-protocol"],
             ),
-            package("xtask", "xtask", false, &[]),
         ]
     }
 
     fn scope_for(changed: &[&str]) -> Scope {
         let changed: Vec<PathBuf> = changed.iter().map(PathBuf::from).collect();
-        affected(&workspace(), &changed)
+        affected(MAIN, &workspace(), &changed)
+    }
+
+    /// The scope of xtask's own workspace for `changed`.
+    fn xtask_scope_for(changed: &[&str]) -> Scope {
+        let changed: Vec<PathBuf> = changed.iter().map(PathBuf::from).collect();
+        affected(XTASK, &[package("xtask", "xtask", false, &[])], &changed)
     }
 
     /// The scope naming `names`, with their libraries taken from [`workspace`].
@@ -624,7 +800,7 @@ mod tests {
     #[test]
     fn metadata_reads_which_crates_use_sqlx_and_keep_a_query_cache() {
         let root = crate::repo_root().unwrap();
-        let packages = super::workspace_packages(&root).unwrap();
+        let packages = super::workspace_packages(&root, MAIN).unwrap();
         let find = |name: &str| {
             packages
                 .iter()
@@ -660,14 +836,66 @@ mod tests {
             "nothing depends on abc"
         );
         assert_eq!(
-            scope_for(&["xtask/tools.toml"]),
-            packages(&["xtask"]),
-            "any file in a crate counts"
+            scope_for(&["xtask/src/main.rs"]),
+            packages(&[]),
+            "xtask is a workspace of its own"
         );
         assert_eq!(
             scope_for(&["fuzz/fuzz_targets/decode.rs"]),
             packages(&[]),
             "the fuzz workspace is not a member; `cargo xtask fuzz` lints it"
+        );
+    }
+
+    #[test]
+    fn xtask_is_checked_for_its_own_files_and_the_main_manifest() {
+        let xtask = Scope::Packages {
+            names: BTreeSet::from(["xtask".to_owned()]),
+            libraries: BTreeSet::new(),
+        };
+        assert_eq!(
+            xtask_scope_for(&["xtask/tools.toml"]),
+            xtask,
+            "any file in the crate counts"
+        );
+        assert_eq!(
+            xtask_scope_for(&["xtask/Cargo.lock"]),
+            xtask,
+            "its own lockfile is in it"
+        );
+        for file in ["Cargo.toml", "rust-toolchain.toml", ".cargo/config.toml"] {
+            assert_eq!(
+                xtask_scope_for(&[file]),
+                Scope::Workspace,
+                "{file}: its tests compare its lints with the main manifest's, and the toolchain \
+                 and cargo configuration are shared"
+            );
+        }
+        assert!(
+            xtask_scope_for(&["Cargo.lock", "crates/abc-server/Cargo.toml"]).is_empty(),
+            "the main workspace's crates and lockfile are not xtask's"
+        );
+    }
+
+    #[test]
+    fn xtask_metadata_reads_from_its_own_workspace() {
+        let root = crate::repo_root().unwrap();
+        let packages = super::workspace_packages(&root, XTASK).unwrap();
+        let names: Vec<(&str, &Path)> = packages
+            .iter()
+            .map(|package| (package.name.as_str(), package.dir.as_path()))
+            .collect();
+        assert_eq!(
+            names,
+            [("xtask", Path::new("xtask"))],
+            "one crate, its directory relative to the repository root"
+        );
+        assert!(
+            super::workspace_packages(&root, MAIN)
+                .unwrap()
+                .iter()
+                .all(|package| package.name != "xtask"),
+            "and not a member of the main workspace"
         );
     }
 
@@ -954,10 +1182,19 @@ mod tests {
             .unwrap();
         let target_dir = fixture.path().join("target");
         let mut out = Vec::new();
+        let tools = Tools {
+            nextest,
+            shellcheck: crate::tools::pinned(&repo, "shellcheck").unwrap(),
+        };
+        let tree = Tree {
+            workspaces: &[MAIN],
+            scripts: &[],
+        };
         let passed = run(
             fixture.path(),
+            tree,
             false,
-            &nextest,
+            &tools,
             postgres,
             Some(&target_dir),
             &mut out,
@@ -1016,6 +1253,95 @@ mod tests {
         assert!(
             calls.ends_with("database drop\n"),
             "the database is dropped anyway: {calls}"
+        );
+    }
+
+    /// Runs only the shellcheck step on `scripts` of `dir`.
+    fn shellcheck_in(dir: &Path, scripts: &[&str]) -> (bool, String) {
+        let repo = crate::repo_root().unwrap();
+        let tools = Tools {
+            nextest: PathBuf::from("unused"),
+            shellcheck: crate::tools::pinned(&repo, "shellcheck").unwrap(),
+        };
+        let unused = |_: &mut dyn std::io::Write| anyhow::bail!("no database");
+        let no_sqlx = || anyhow::bail!("no query cache");
+        let postgres = super::Postgres {
+            warm: &unused,
+            sqlx: &no_sqlx,
+        };
+        let tree = Tree {
+            workspaces: &[],
+            scripts,
+        };
+        let mut out = Vec::new();
+        let passed = run(dir, tree, false, &tools, &postgres, None, &mut out).unwrap();
+        (passed, String::from_utf8(out).unwrap())
+    }
+
+    #[test]
+    fn a_shellcheck_finding_fails_and_a_clean_script_passes() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("run.sh"), "#!/bin/sh\necho $1\n").unwrap();
+        let (passed, out) = shellcheck_in(dir.path(), &["run.sh"]);
+        assert!(!passed, "{out}");
+        assert!(out.contains("SC2086"), "the finding is shown: {out}");
+        assert!(out.contains("  shellcheck: fix each finding"), "{out}");
+        fs::write(dir.path().join("run.sh"), "#!/bin/sh\necho \"$1\"\n").unwrap();
+        let (clean, said) = shellcheck_in(dir.path(), &["run.sh"]);
+        assert!(clean, "{said}");
+    }
+
+    #[test]
+    fn the_repositorys_scripts_are_all_listed() {
+        let root = crate::repo_root().unwrap();
+        let listed = git(
+            &root,
+            &[
+                "ls-files",
+                "--cached",
+                "--others",
+                "--exclude-standard",
+                "xtask/hooks",
+                "xtask/vm",
+            ],
+        );
+        let scripts: BTreeSet<&str> = listed
+            .lines()
+            .filter(|file| {
+                fs::read_to_string(root.join(file)).is_ok_and(|text| text.starts_with("#!/bin/sh"))
+            })
+            .collect();
+        assert_eq!(
+            scripts,
+            super::SCRIPTS.into_iter().collect::<BTreeSet<_>>(),
+            "shellcheck lints every shell script"
+        );
+    }
+
+    #[test]
+    fn the_xtask_workspace_is_reached_by_its_manifest() {
+        assert_eq!(
+            XTASK.manifest_args(),
+            ["--manifest-path", "xtask/Cargo.toml"],
+            "from the repository root"
+        );
+        assert!(
+            MAIN.manifest_args().is_empty(),
+            "the main workspace is the root's"
+        );
+        let command = test_command(Path::new("cargo-nextest"), XTASK, &Scope::Workspace);
+        let args: Vec<&OsStr> = command.get_args().collect();
+        assert_eq!(
+            args,
+            [
+                "nextest",
+                "run",
+                "--manifest-path",
+                "xtask/Cargo.toml",
+                "--workspace",
+                "--locked"
+            ],
+            "nextest runs xtask's own tests"
         );
     }
 
@@ -1094,7 +1420,7 @@ mod tests {
             "a binary-only crate has no doctests"
         );
         assert_eq!(
-            packages(&["xtask"]).doc_test_args(),
+            packages(&["abc"]).doc_test_args(),
             None,
             "nothing to doctest"
         );
@@ -1102,7 +1428,7 @@ mod tests {
 
     #[test]
     fn property_tests_run_with_a_fixed_seed() {
-        let command = test_command(Path::new("cargo-nextest"), &Scope::Workspace);
+        let command = test_command(Path::new("cargo-nextest"), MAIN, &Scope::Workspace);
         let seed = command
             .get_envs()
             .find(|(name, _)| *name == "PROPTEST_RNG_SEED")
@@ -1122,8 +1448,8 @@ mod tests {
             "the whole workspace"
         );
         assert_eq!(
-            packages(&["abc", "xtask"]).cargo_args(),
-            ["-p", "abc", "-p", "xtask"],
+            packages(&["abc", "abc-worker"]).cargo_args(),
+            ["-p", "abc", "-p", "abc-worker"],
             "one -p per crate"
         );
     }

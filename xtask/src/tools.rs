@@ -90,6 +90,11 @@ pub(crate) struct Tool {
     /// The GitHub repository whose build attestations must list each archive's sha256, as
     /// `owner/repo`, for projects that attest their releases.
     attestations: Option<String>,
+    /// URL template of the GitHub API's view of the release, whose asset digests (the sha256
+    /// GitHub records as each asset is uploaded) must list each archive's sha256; for projects
+    /// that publish neither checksums nor attestations.
+    #[serde(rename = "release-digests")]
+    release_digests: Option<String>,
     #[serde(default)]
     targets: BTreeMap<Target, Asset>,
     /// The crates.io crate to build the tool from, instead of release assets.
@@ -240,29 +245,13 @@ impl Tool {
                 .is_some_and(|url| url.starts_with("https://")),
             "the url must use https"
         );
-        ensure!(
-            self.checksums.is_some() || self.attestations.is_some(),
-            "needs `checksums` or `attestations`: no tool's pin may rest on its first download"
-        );
-        if let Some(repository) = &self.attestations {
-            ensure!(
-                repository.split_once('/').is_some_and(
-                    |(owner, repo)| is_safe_name(owner) && repo.split('.').all(is_safe_name)
-                ),
-                "attestations {repository:?} must be an owner/repo GitHub repository"
-            );
-        }
-        if let Some(checksums) = &self.checksums {
-            ensure!(
-                checksums.starts_with("https://"),
-                "the checksums url must use https"
-            );
-        }
+        self.validate_vouchers()?;
         for target in Target::ALL {
             let asset = self.asset(target)?;
             ensure!(
-                is_safe_name(&asset.platform),
-                "{target}: platform {:?} must be ASCII letters, digits, '-' or '_'",
+                asset.platform.split('.').all(is_safe_name),
+                "{target}: platform {:?} must be ASCII letters, digits, '-' or '_', in parts \
+                 joined by '.'",
                 asset.platform
             );
             for (field, value) in [
@@ -280,15 +269,19 @@ impl Tool {
                 .as_ref()
                 .map(|template| self.render(template, asset))
                 .unwrap_or_default();
-            let checksums = self
-                .checksums
-                .as_ref()
-                .map(|template| self.render(template, asset))
-                .unwrap_or_default();
+            let render = |template: &Option<String>| {
+                template
+                    .as_ref()
+                    .map(|template| self.render(template, asset))
+                    .unwrap_or_default()
+            };
+            let checksums = render(&self.checksums);
+            let release = render(&self.release_digests);
             for (field, value) in [
                 ("url", &url),
                 ("binary", &binary),
                 ("checksums", &checksums),
+                ("release-digests", &release),
             ] {
                 ensure!(
                     !value.contains(['{', '}']),
@@ -306,6 +299,38 @@ impl Tool {
                 "{target}: binary must not be empty; omit it when the asset is the executable"
             );
             self.validate_library(target, asset)?;
+        }
+        Ok(())
+    }
+
+    /// Checks what vouches for a release tool's downloads: at least one source, each well formed.
+    fn validate_vouchers(&self) -> anyhow::Result<()> {
+        ensure!(
+            self.checksums.is_some()
+                || self.attestations.is_some()
+                || self.release_digests.is_some(),
+            "needs `checksums`, `attestations` or `release-digests`: no tool's pin may rest on its \
+             first download"
+        );
+        if let Some(release) = &self.release_digests {
+            ensure!(
+                release.starts_with("https://api.github.com/repos/"),
+                "release-digests must be a release in the GitHub API, https://api.github.com/repos/..."
+            );
+        }
+        if let Some(repository) = &self.attestations {
+            ensure!(
+                repository.split_once('/').is_some_and(
+                    |(owner, repo)| is_safe_name(owner) && repo.split('.').all(is_safe_name)
+                ),
+                "attestations {repository:?} must be an owner/repo GitHub repository"
+            );
+        }
+        if let Some(checksums) = &self.checksums {
+            ensure!(
+                checksums.starts_with("https://"),
+                "the checksums url must use https"
+            );
         }
         Ok(())
     }
@@ -357,7 +382,8 @@ impl Tool {
                 if self.targets.is_empty()
                     && self.binary.is_none()
                     && self.checksums.is_none()
-                    && self.attestations.is_none() =>
+                    && self.attestations.is_none()
+                    && self.release_digests.is_none() =>
             {
                 Ok(Source::Crate { name, sha256 })
             }
@@ -718,6 +744,12 @@ fn pin_text(
                     .with_context(|| format!("{} {} on {target}", tool.name, tool.version))?;
                 sources.push(format!("attested on GitHub by {repository}"));
             }
+            if let Some(template) = &tool.release_digests {
+                let release_url = tool.render(template, asset);
+                check_release_digest(&release_url, &url, &sha256, &mut published, fetch)
+                    .with_context(|| format!("{} {} on {target}", tool.name, tool.version))?;
+                sources.push("matches the digest GitHub recorded on upload".to_owned());
+            }
             let binary_sha256 = sha256_hex(&tool.executable_in(&archive, asset)?);
             let state = if sha256 == asset.sha256 && binary_sha256 == asset.binary_sha256 {
                 "same"
@@ -777,6 +809,58 @@ fn check_published(
     ensure!(
         expected == sha256,
         "the download's sha256 is {sha256}, but {checksums_url} publishes {expected}"
+    );
+    Ok(())
+}
+
+/// A release as the GitHub API shows it: its assets, each with the digest GitHub recorded.
+#[derive(Deserialize)]
+struct Release {
+    assets: Vec<ReleaseAsset>,
+}
+
+#[derive(Deserialize)]
+struct ReleaseAsset {
+    name: String,
+    /// `sha256:<hex>`; absent for assets uploaded before GitHub recorded digests.
+    digest: Option<String>,
+}
+
+/// Requires the release at `release_url`, fetched once into `published`, to record `sha256` as
+/// the digest of the asset at `url`.
+fn check_release_digest(
+    release_url: &str,
+    url: &str,
+    sha256: &str,
+    published: &mut BTreeMap<String, String>,
+    fetch: &mut impl FnMut(&str) -> anyhow::Result<Vec<u8>>,
+) -> anyhow::Result<()> {
+    if !published.contains_key(release_url) {
+        let release = String::from_utf8(fetch(release_url)?)
+            .with_context(|| format!("{release_url} is not text"))?;
+        published.insert(release_url.to_owned(), release);
+    }
+    let release: Release = serde_json::from_str(
+        published
+            .get(release_url)
+            .context("the release was fetched above")?,
+    )
+    .with_context(|| format!("{release_url} did not answer with a release"))?;
+    let file_name = url.rsplit('/').next().unwrap_or(url);
+    let digest = release
+        .assets
+        .iter()
+        .find(|asset| asset.name == file_name)
+        .with_context(|| format!("{release_url} has no asset {file_name}"))?
+        .digest
+        .as_deref()
+        .with_context(|| format!("{release_url} records no digest for {file_name}"))?;
+    let expected = digest
+        .strip_prefix("sha256:")
+        .with_context(|| format!("{release_url} records {digest} for {file_name}, not a sha256"))?;
+    ensure!(
+        expected == sha256,
+        "the download's sha256 is {sha256}, but {release_url} records {expected}"
     );
     Ok(())
 }
@@ -1867,12 +1951,111 @@ targets.aarch64-unknown-linux-gnu = {{ platform = "linux-arm64", sha256 = "{sha2
     }
 
     #[test]
+    fn pin_requires_the_digest_github_recorded_for_the_release_asset() {
+        let archive = tarball(&[("fake-1.2.3/fake", SCRIPT, 0o755)]);
+        let text = manifest_text(SHA_A, SHA_B).replace(
+            "attestations = \"example/fake\"\n",
+            "release-digests = \"https://api.github.com/repos/example/fake/releases/tags/v{version}\"\n",
+        );
+        let release_url = "https://api.github.com/repos/example/fake/releases/tags/v1.2.3";
+        let release = |digest: &str| {
+            serde_json::json!({
+                "assets": [
+                    { "name": "fake-1.2.3-mac.tar.gz", "digest": digest },
+                    { "name": "fake-1.2.3-linux-x64.tar.gz", "digest": digest },
+                    { "name": "fake-1.2.3-linux-arm64.tar.gz", "digest": digest },
+                    { "name": "fake-1.2.3.zip", "digest": null },
+                ]
+            })
+            .to_string()
+            .into_bytes()
+        };
+        let recorded = format!("sha256:{}", sha256_hex(&archive));
+        let asked = std::cell::RefCell::new(Vec::new());
+        let mut out = Vec::new();
+        let mut fetch = |url: &str| {
+            asked.borrow_mut().push(url.to_owned());
+            Ok(if url == release_url {
+                release(&recorded)
+            } else {
+                archive.clone()
+            })
+        };
+        pin_text(&text, &mut out, &mut fetch).unwrap();
+        assert_eq!(
+            asked
+                .borrow()
+                .iter()
+                .filter(|url| *url == release_url)
+                .count(),
+            1,
+            "the release is read once: {:?}",
+            asked.borrow()
+        );
+        assert!(
+            String::from_utf8(out)
+                .unwrap()
+                .contains("matches the digest GitHub recorded on upload"),
+            "and reported as verified"
+        );
+        for (answer, expected) in [
+            (
+                release(&format!("sha256:{SHA_A}")),
+                format!("records {SHA_A}"),
+            ),
+            (release("md5:abc"), "not a sha256".to_owned()),
+            (
+                br#"{"assets":[]}"#.to_vec(),
+                "has no asset fake-1.2.3-mac.tar.gz".to_owned(),
+            ),
+            (
+                br#"{"assets":[{"name":"fake-1.2.3-mac.tar.gz","digest":null}]}"#.to_vec(),
+                "records no digest".to_owned(),
+            ),
+            (
+                b"not json".to_vec(),
+                "did not answer with a release".to_owned(),
+            ),
+        ] {
+            let mut wrong = |url: &str| {
+                Ok(if url == release_url {
+                    answer.clone()
+                } else {
+                    archive.clone()
+                })
+            };
+            let error = pin_text(&text, &mut Vec::new(), &mut wrong).unwrap_err();
+            assert!(
+                format!("{error:#}").contains(&expected),
+                "{expected}: {error:#}"
+            );
+        }
+        let elsewhere = text.replace("https://api.github.com/repos/", "https://example.com/");
+        let refused = format!("{:#}", Manifest::parse(&elsewhere).unwrap_err());
+        assert!(refused.contains("a release in the GitHub API"), "{refused}");
+    }
+
+    #[test]
+    fn a_platform_may_have_dotted_parts_but_no_empty_one() {
+        let dotted = manifest_text(SHA_A, SHA_B).replace("\"linux-x64\"", "\"linux.x86_64\"");
+        assert!(
+            Manifest::parse(&dotted).is_ok(),
+            "shellcheck names its assets so"
+        );
+        for platform in ["\"..\"", "\"linux..x64\"", "\".linux\"", "\"linux/x64\""] {
+            let bad = manifest_text(SHA_A, SHA_B).replace("\"linux-x64\"", platform);
+            let error = format!("{:#}", Manifest::parse(&bad).unwrap_err());
+            assert!(error.contains("joined by '.'"), "{platform}: {error}");
+        }
+    }
+
+    #[test]
     fn every_tool_needs_a_way_to_verify_its_pin() {
         let unverifiable =
             manifest_text(SHA_A, SHA_B).replace("attestations = \"example/fake\"\n", "");
         let missing = format!("{:#}", Manifest::parse(&unverifiable).unwrap_err());
         assert!(
-            missing.contains("needs `checksums` or `attestations`"),
+            missing.contains("needs `checksums`, `attestations` or `release-digests`"),
             "{missing}"
         );
         let malformed = manifest_text(SHA_A, SHA_B).replace("\"example/fake\"", "\"example\"");

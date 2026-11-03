@@ -13,7 +13,7 @@ use std::process::Command;
 
 use anyhow::{Context, ensure};
 
-use crate::check::PROPTEST_RNG_SEED;
+use crate::check::{self, PROPTEST_RNG_SEED};
 use crate::git;
 use crate::integrity::{self, TestCode};
 use crate::tools;
@@ -21,14 +21,15 @@ use crate::tools;
 /// The share of changed, instrumented lines the tests must run.
 pub(crate) const THRESHOLD_PERCENT: u64 = 90;
 
-/// Where cargo-llvm-cov writes the lcov report, relative to the repository root.
-const LCOV: &str = "target/coverage/lcov.info";
+/// Where cargo-llvm-cov writes the lcov reports, one per workspace, relative to the repository
+/// root.
+const LCOV_DIR: &str = "target/coverage";
 
 /// Hit counts by line, by file relative to the repository root.
 type Hits = BTreeMap<String, BTreeMap<u32, u64>>;
 
-/// Runs the tests under coverage, with the cargo-llvm-cov and cargo-nextest executables given,
-/// and checks the lines changed since the merge base with `base`.
+/// Runs the tests of every workspace under coverage, with the cargo-llvm-cov and cargo-nextest
+/// executables given, and checks the lines changed since the merge base with `base`.
 pub(crate) fn run(
     root: &Path,
     base: &str,
@@ -36,29 +37,44 @@ pub(crate) fn run(
     nextest: &Path,
     out: &mut impl Write,
 ) -> anyhow::Result<bool> {
-    let lcov = root.join(LCOV);
-    if let Some(dir) = lcov.parent() {
-        fs::create_dir_all(dir).with_context(|| format!("could not create {}", dir.display()))?;
-    }
+    let dir = root.join(LCOV_DIR);
+    fs::create_dir_all(&dir).with_context(|| format!("could not create {}", dir.display()))?;
     if crate::postgres::needed(root) {
         crate::postgres::warm(out)?;
     }
-    writeln!(out, "xtask: running the tests under coverage")?;
-    let status = Command::new(llvm_cov)
-        .args(["llvm-cov", "nextest", "--workspace", "--locked", "--lcov"])
-        .arg("--output-path")
-        .arg(&lcov)
-        .env("PATH", tools::path_with(nextest)?)
-        .env("PROPTEST_RNG_SEED", PROPTEST_RNG_SEED)
-        .current_dir(root)
-        .status()
-        .context("could not run cargo-llvm-cov")?;
-    ensure!(
-        status.success(),
-        "the tests failed under coverage; run `cargo xtask check` and fix them first"
-    );
-    let report =
-        fs::read_to_string(&lcov).with_context(|| format!("could not read {}", lcov.display()))?;
+    let mut report = String::new();
+    for &workspace in check::REPOSITORY.workspaces {
+        let name = if workspace.dir().is_empty() {
+            "main"
+        } else {
+            workspace.dir()
+        };
+        let lcov = dir.join(format!("{name}.lcov.info"));
+        writeln!(
+            out,
+            "xtask: running the tests of the {name} workspace under coverage"
+        )?;
+        let status = Command::new(llvm_cov)
+            .args(["llvm-cov", "nextest"])
+            .args(workspace.manifest_args())
+            .args(["--workspace", "--locked", "--lcov"])
+            .arg("--output-path")
+            .arg(&lcov)
+            .env("PATH", tools::path_with(nextest)?)
+            .env("PROPTEST_RNG_SEED", PROPTEST_RNG_SEED)
+            .current_dir(root)
+            .status()
+            .context("could not run cargo-llvm-cov")?;
+        ensure!(
+            status.success(),
+            "the tests of the {name} workspace failed under coverage; run `cargo xtask check` and \
+             fix them first"
+        );
+        report.push_str(
+            &fs::read_to_string(&lcov)
+                .with_context(|| format!("could not read {}", lcov.display()))?,
+        );
+    }
     let commit = git::merge_base(root, base)?;
     let changed = without_tests(root, git::added_lines(&git::diff(root, &commit, 0)?))?;
     let measured = measure(&changed, &parse_lcov(&report, root));
@@ -447,9 +463,41 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("the tests failed under coverage"),
+                .contains("the tests of the main workspace failed under coverage"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn measures_the_xtask_workspace_from_its_own_run() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = repository_with_change(
+            &temp.path().join("repo"),
+            &[("xtask/src/b.rs", "fn b() {}\nfn c() {}\n")],
+        );
+        let nextest = temp.path().join("cargo-nextest");
+        let llvm_cov = temp.path().join("cargo-llvm-cov");
+        script(
+            &llvm_cov,
+            "manifest=main\nwhile [ $# -gt 0 ]; do case \"$1\" in --output-path) out=$2 ;; --manifest-path) manifest=$2 ;; esac; shift; done\nif [ \"$manifest\" = xtask/Cargo.toml ]; then printf 'SF:%s/xtask/src/b.rs\\nDA:1,1\\nDA:2,0\\nend_of_record\\n' \"$PWD\" > \"$out\"; else printf 'SF:%s/src/a.rs\\nDA:1,1\\nend_of_record\\n' \"$PWD\" > \"$out\"; fi\n",
+        );
+        let mut out = Vec::new();
+        let passed = run(&repo, "base", &llvm_cov, &nextest, &mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(!passed, "xtask's uncovered line counts: {text}");
+        assert!(text.contains("not covered: xtask/src/b.rs:2"), "{text}");
+        assert!(
+            text.contains("the tests of the main workspace")
+                && text.contains("the tests of the xtask workspace"),
+            "{text}"
+        );
+        for report in ["main", "xtask"] {
+            assert!(
+                repo.join(format!("target/coverage/{report}.lcov.info"))
+                    .is_file(),
+                "a report per workspace: {report}"
+            );
+        }
     }
 
     #[test]

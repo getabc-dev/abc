@@ -1,0 +1,54 @@
+# cargo-deny policy for xtask's workspace: run with `cargo xtask tool cargo-deny --manifest-path
+# xtask/Cargo.toml --config xtask/deny.toml --locked check`. The same policy as the main
+# workspace's deny.toml, over xtask/Cargo.lock; only the licences and the skips differ, because
+# cargo-deny fails on any it does not encounter.
+
+[graph]
+# The platforms abc is built on; dependencies only other platforms pull in are not checked.
+targets = [
+    "aarch64-apple-darwin",
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+]
+all-features = true
+
+[advisories]
+yanked = "deny"
+unmaintained = "all"
+unsound = "all"
+unused-ignored-advisory = "deny"
+# Every ignore is a table with a `reason` that names the date it expires, and is removed by then:
+# { id = "RUSTSEC-YYYY-NNNN", reason = "why it does not affect abc; expires YYYY-MM-DD" }
+ignore = []
+
+[licenses]
+# The approved licences that deny.toml lists, as far as this graph uses them; an unused entry fails
+# the check.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "0BSD",
+    "Unicode-3.0",
+    "CDLA-Permissive-2.0",
+]
+unused-allowed-license = "deny"
+
+[bans]
+multiple-versions = "deny"
+wildcards = "deny"
+deny = [
+    { crate = "openssl-sys", reason = "abc uses rustls; OpenSSL drags in a system C library", use-instead = "rustls" },
+]
+# Every skip names the crates holding the old version back:
+# { crate = "name@version", reason = "held back by ...; drop when ..." }
+skip = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
