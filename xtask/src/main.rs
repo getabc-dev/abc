@@ -61,8 +61,8 @@ enum TaskAction {
     Show,
     /// Forget the recorded task.
     Clear,
-    /// Declare the task BLOCKED when it cannot be finished: the next stop is allowed and the stop
-    /// hook prints this handoff.
+    /// Declare the task BLOCKED when what stops it is outside your control. The main agent's next
+    /// stop asks the watchdog once whether it is, then lets the stop through with this handoff.
     Blocked {
         /// What is missing and what was tried.
         text: String,
@@ -181,9 +181,10 @@ enum Task {
         /// The hook event.
         #[arg(value_enum)]
         event: hook::Event,
-        /// For `pre-tool-use`: judge the command by the guard's rules alone, without locating the
-        /// agent's checkout and handing over to its xtask. The agent VM runs its installed xtask
-        /// this way, so the guard never depends on a build of the checkout.
+        /// Act without locating the agent's checkout and handing over to its xtask: `pre-tool-use`
+        /// judges the command by the guard's rules alone, and `stop` runs on the session's project
+        /// directory (`CLAUDE_PROJECT_DIR`) with its pinned tools. The agent VM runs its installed
+        /// xtask this way, so neither hook depends on a build of the checkout.
         #[arg(long)]
         standalone: bool,
     },
@@ -358,7 +359,13 @@ fn run(
                 .read_to_string(&mut input)
                 .context("could not read the hook input from stdin")?;
             let context = hook::Context::from_env(home.clone(), standalone);
-            Ok(ExitCode::from(hook::run(event, &input, &context, report)?))
+            Ok(ExitCode::from(hook::run(
+                event,
+                &input,
+                &context,
+                report,
+                &mut io::stdout().lock(),
+            )?))
         }
     }
 }
