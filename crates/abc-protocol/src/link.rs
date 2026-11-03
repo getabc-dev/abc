@@ -7,10 +7,11 @@
 //!       -> server pings every PING_INTERVAL; no pong for IDLE_TIMEOUT closes the session
 //! ```
 //!
-//! Reconnect (worker side, PR 4): full-jitter backoff from 0.5 s, doubling up to 30 s, reset after a
-//! session that lived longer than a minute. Reconnect immediately when the network changes after
-//! sleep. A newer session supersedes an older one for the same worker, so a half-open socket left
-//! from before sleep never blocks the reconnect.
+//! The worker always dials; the server never connects to a worker. A worker holds at most one
+//! link. When it ends, the worker decides from the close code (or the HTTP refusal) whether to
+//! dial again after a backoff or to stop because a person has to act (`abc_worker`'s policy). A
+//! newer session supersedes an older one for the same worker, so a half-open socket left from
+//! before sleep never blocks the reconnect.
 
 use std::time::Duration;
 
@@ -26,7 +27,11 @@ pub const PING_INTERVAL: Duration = Duration::from_secs(20);
 /// A session with no pong for this long is closed as timed out (the laptop slept).
 pub const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// Application close codes (4000 to 4999). The worker branches on them.
+/// The largest message or frame either side accepts; both sides enforce it.
+pub const MAX_MESSAGE: usize = 64 * 1024;
+
+/// Application close codes (4000 to 4999). The worker branches on them; any other code, 1000
+/// included, means "dial again after a backoff".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CloseCode {
     /// The worker did not send `Hello` in time. Retry.
@@ -80,6 +85,11 @@ impl CloseCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_message_is_at_most_64_kib() {
+        assert_eq!(MAX_MESSAGE, 65_536, "both ends enforce this one number");
+    }
 
     #[test]
     fn close_codes_round_trip_and_are_application_codes() {

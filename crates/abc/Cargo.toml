@@ -1,6 +1,6 @@
 [package]
 name = "abc"
-description = "The abc binary: `abc server` and `abc server setup-code`."
+description = "The abc binary: `abc server`, `abc server setup-code`, `abc worker` and `abc worker enrol`."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -19,9 +19,12 @@ abc-platform = { path = "../abc-platform" }
 abc-protocol = { path = "../abc-protocol" }
 abc-server = { path = "../abc-server" }
 abc-store = { path = "../abc-store" }
+abc-worker = { path = "../abc-worker" }
 clap = { workspace = true, features = ["env"] }
+semver.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
 abc-store = { path = "../abc-store", features = ["testing"] }

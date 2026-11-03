@@ -1,0 +1,56 @@
+[package]
+name = "abc-worker"
+description = "The abc worker: enrols once, keeps its key, and holds a dial-out link to the server."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# No sqlx and no axum: the worker reaches the server only over the wire, and S0's worker records
+# no events of its own, so its SQLite outbox arrives with the first one.
+[dependencies]
+abc-core = { path = "../abc-core" }
+abc-platform = { path = "../abc-platform" }
+abc-protocol = { path = "../abc-protocol" }
+bytes.workspace = true
+futures.workspace = true
+http-body-util.workspace = true
+hyper = { workspace = true, features = ["client", "http1"] }
+hyper-util.workspace = true
+rand = { workspace = true, features = ["chacha"] }
+rustix = { workspace = true, features = ["process", "system"] }
+rustls.workspace = true
+semver.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-rustls.workspace = true
+tokio-tungstenite.workspace = true
+toml_edit.workspace = true
+tracing.workspace = true
+webpki-roots.workspace = true
+zeroize.workspace = true
+
+[features]
+# Test support (`abc_worker::testing`): trust in a test CA, short timings, a wall clock the test
+# moves. Enabled only through dev-dependencies, which resolver 3 keeps out of the shipped binary.
+testing = []
+
+[dev-dependencies]
+abc-worker = { path = ".", features = ["testing"] }
+abc-server = { path = "../abc-server" }
+abc-store = { path = "../abc-store", features = ["testing"] }
+proptest.workspace = true
+rcgen = { workspace = true }
+# Only for inspecting the test database.
+sqlx.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
+tracing-subscriber.workspace = true
+uuid.workspace = true
+
+[lints]
+workspace = true
