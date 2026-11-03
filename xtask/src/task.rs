@@ -23,8 +23,8 @@ pub(crate) const BACKSTOP: &str = ".abc/stop-backstop.md";
 /// The kept log of every BLOCKED declaration and what the stop hook did with it.
 pub(crate) const BLOCKED_LOG: &str = ".abc/blocked-log.md";
 
-/// Present once the watchdog has sent a BLOCKED declaration back, so the next one is not judged.
-const JUDGED: &str = ".abc/blocked-judged";
+/// The directory of the blocked-stop counts of subagents, one file per agent.
+const SUBAGENT_STOPS: &str = ".abc/subagent-stops";
 
 /// Creates the directory `path` is in.
 fn create_parent(path: &Path) -> anyhow::Result<()> {
@@ -96,7 +96,12 @@ pub(crate) fn set(root: &Path, text: &str) -> anyhow::Result<()> {
     );
     write(root, TASK, &format!("{}\n", text.trim()))?;
     remove(root, BLOCKED)?;
-    reset_blocked_stops(root)
+    reset_blocked_stops(root)?;
+    match fs::remove_dir_all(root.join(SUBAGENT_STOPS)) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("could not remove {SUBAGENT_STOPS}")),
+    }
 }
 
 /// Declares the task BLOCKED: what is missing and what was tried. The next stop is allowed and
@@ -116,39 +121,70 @@ pub(crate) fn take_blocked(root: &Path) -> anyhow::Result<Option<String>> {
     Ok(declaration.map(|text| text.trim().to_owned()))
 }
 
-/// How many stops in a row the stop hook has blocked.
-pub(crate) fn blocked_stops(root: &Path) -> anyhow::Result<u32> {
-    match read_file(root, STOPS)? {
+/// How many stops in a row `file` counts.
+fn count_in(root: &Path, file: &str) -> anyhow::Result<u32> {
+    match read_file(root, file)? {
         None => Ok(0),
         Some(text) => text
             .trim()
             .parse()
-            .with_context(|| format!("{STOPS} holds {:?}, not a count", text.trim())),
+            .with_context(|| format!("{file} holds {:?}, not a count", text.trim())),
     }
+}
+
+/// Counts one more stop in `file` and returns the new count.
+fn count_up(root: &Path, file: &str) -> anyhow::Result<u32> {
+    let count = count_in(root, file)?.saturating_add(1);
+    write(root, file, &format!("{count}\n"))?;
+    Ok(count)
+}
+
+/// How many stops in a row the stop hook has blocked.
+pub(crate) fn blocked_stops(root: &Path) -> anyhow::Result<u32> {
+    count_in(root, STOPS)
 }
 
 /// Counts one more blocked stop and returns the new count.
 pub(crate) fn count_blocked_stop(root: &Path) -> anyhow::Result<u32> {
-    let count = blocked_stops(root)?.saturating_add(1);
-    write(root, STOPS, &format!("{count}\n"))?;
-    Ok(count)
+    count_up(root, STOPS)
 }
 
-/// Forgets the blocked stops and that a declaration was sent back: `check` passed, a declaration
-/// was accepted, a new task began, or the backstop fired.
+/// Forgets the blocked stops: `check` passed, a declaration was accepted, a new task began, or the
+/// backstop fired.
 pub(crate) fn reset_blocked_stops(root: &Path) -> anyhow::Result<()> {
-    remove(root, STOPS)?;
-    remove(root, JUDGED)
+    remove(root, STOPS)
 }
 
-/// Whether the watchdog already sent a declaration back since the blocked stops were last reset.
-pub(crate) fn blocked_judged(root: &Path) -> bool {
-    root.join(JUDGED).exists()
+/// The count file of the subagent `agent`. Every character but ASCII letters, digits, `-` and `_`
+/// becomes `_`, so an id can name no other path; `stop.sh` makes the same name.
+fn subagent_file(agent: &str) -> String {
+    let name: String = agent
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let name = if name.is_empty() { "subagent" } else { &name };
+    format!("{SUBAGENT_STOPS}/{name}")
 }
 
-/// Records that the watchdog sent a declaration back, so the next one is not judged.
-pub(crate) fn mark_blocked_judged(root: &Path) -> anyhow::Result<()> {
-    write(root, JUDGED, "")
+/// How many stops in a row the stop hook has blocked for the subagent `agent`.
+pub(crate) fn subagent_stops(root: &Path, agent: &str) -> anyhow::Result<u32> {
+    count_in(root, &subagent_file(agent))
+}
+
+/// Counts one more blocked stop of the subagent `agent` and returns the new count.
+pub(crate) fn count_subagent_stop(root: &Path, agent: &str) -> anyhow::Result<u32> {
+    count_up(root, &subagent_file(agent))
+}
+
+/// Forgets the blocked stops of the subagent `agent`: its check passed or its backstop fired.
+pub(crate) fn reset_subagent_stops(root: &Path, agent: &str) -> anyhow::Result<()> {
+    remove(root, &subagent_file(agent))
 }
 
 /// Appends a BLOCKED declaration and what the stop hook did with it to the kept log.
@@ -187,9 +223,9 @@ pub(crate) fn clear(root: &Path) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        BLOCKED, BLOCKED_LOG, TASK, block, blocked_judged, blocked_stops, clear,
-        count_blocked_stop, log_blocked, mark_blocked_judged, read, record_backstop,
-        reset_blocked_stops, set, take_blocked,
+        BLOCKED, BLOCKED_LOG, TASK, block, blocked_stops, clear, count_blocked_stop,
+        count_subagent_stop, log_blocked, read, record_backstop, reset_blocked_stops,
+        reset_subagent_stops, set, subagent_stops, take_blocked,
     };
 
     #[test]
@@ -229,16 +265,47 @@ mod tests {
     }
 
     #[test]
-    fn a_sent_back_declaration_is_remembered_until_the_count_resets() {
+    fn each_subagent_counts_apart_from_the_others_and_the_main_agent() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(!blocked_judged(dir.path()));
-        mark_blocked_judged(dir.path()).unwrap();
-        assert!(blocked_judged(dir.path()));
-        reset_blocked_stops(dir.path()).unwrap();
-        assert!(!blocked_judged(dir.path()), "a reset forgets it");
-        mark_blocked_judged(dir.path()).unwrap();
+        assert_eq!(subagent_stops(dir.path(), "a1").unwrap(), 0);
+        assert_eq!(count_subagent_stop(dir.path(), "a1").unwrap(), 1);
+        assert_eq!(count_subagent_stop(dir.path(), "a1").unwrap(), 2);
+        assert_eq!(count_subagent_stop(dir.path(), "b2").unwrap(), 1);
+        assert_eq!(
+            blocked_stops(dir.path()).unwrap(),
+            0,
+            "not the main agent's"
+        );
+        reset_subagent_stops(dir.path(), "a1").unwrap();
+        reset_subagent_stops(dir.path(), "a1").unwrap();
+        assert_eq!(subagent_stops(dir.path(), "a1").unwrap(), 0);
+        assert_eq!(
+            subagent_stops(dir.path(), "b2").unwrap(),
+            1,
+            "b2 is its own"
+        );
+        count_subagent_stop(dir.path(), "../../escape").unwrap();
+        count_subagent_stop(dir.path(), "").unwrap();
+        count_subagent_stop(dir.path(), "x-y_1").unwrap();
+        let names: Vec<_> = std::fs::read_dir(dir.path().join(".abc/subagent-stops"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        assert!(
+            names.contains(&"______escape".to_owned())
+                && names.contains(&"subagent".to_owned())
+                && names.contains(&"x-y_1".to_owned()),
+            "an id names no other path: {names:?}"
+        );
+        assert!(!dir.path().join("escape").exists());
         set(dir.path(), "next").unwrap();
-        assert!(!blocked_judged(dir.path()), "so does a new task");
+        assert!(
+            !dir.path().join(".abc/subagent-stops").exists(),
+            "a new task forgets them"
+        );
+        set(dir.path(), "and again").unwrap();
+        std::fs::write(dir.path().join(".abc/subagent-stops"), "not a directory").unwrap();
+        assert!(set(dir.path(), "cannot forget them").is_err());
     }
 
     #[test]
