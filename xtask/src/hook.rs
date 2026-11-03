@@ -24,7 +24,7 @@
 use std::ffi::OsStr;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 
 use anyhow::{Context as _, bail, ensure};
 use serde::Deserialize;
@@ -323,24 +323,11 @@ fn delegate(cargo: &Path, root: &Path, event: Event, input: &str) -> anyhow::Res
         .stdin(Stdio::piped())
         .spawn()
         .with_context(|| format!("could not run cargo xtask in {}", root.display()))?;
-    feed(&mut child, input).context("could not pass the hook input on")?;
+    tools::feed(&mut child, &mut input.as_bytes()).context("could not pass the hook input on")?;
     let status = child
         .wait()
         .context("could not wait for the delegated hook")?;
     Ok(tools::status_code(status))
-}
-
-/// Writes `input` to `child`'s stdin and closes it. A child that exits without reading its input,
-/// such as a hook that only prints a note or a checkout whose xtask fails to build, closes the
-/// pipe first; its exit status then decides the outcome, so a broken pipe is not an error.
-fn feed(child: &mut Child, input: &str) -> std::io::Result<()> {
-    let Some(mut stdin) = child.stdin.take() else {
-        return Ok(());
-    };
-    match stdin.write_all(input.as_bytes()) {
-        Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
-        written => written,
-    }
 }
 
 #[cfg(test)]
@@ -627,7 +614,8 @@ mod tests {
             .stdin(Stdio::piped())
             .spawn()
             .unwrap();
-        super::feed(&mut child, &input).unwrap();
+        let taken = crate::tools::feed(&mut child, &mut input.as_bytes()).unwrap();
+        assert!(!taken, "the child took none of it");
         assert_eq!(
             child.wait().unwrap().code(),
             Some(3),
@@ -657,7 +645,7 @@ mod tests {
             .stdout(Stdio::null())
             .spawn()
             .unwrap_or_else(|error| panic!("{shell} must be installed: {error}"));
-        super::feed(&mut child, input).unwrap();
+        crate::tools::feed(&mut child, &mut input.as_bytes()).unwrap();
         let output = child.wait_with_output().unwrap();
         (
             output.status.code(),
@@ -823,7 +811,7 @@ mod tests {
                 command.env_remove("ABC_VM");
             }
             let mut child = command.spawn().unwrap();
-            super::feed(&mut child, input).unwrap();
+            crate::tools::feed(&mut child, &mut input.as_bytes()).unwrap();
             let output = child.wait_with_output().unwrap();
             (
                 output.status.code(),

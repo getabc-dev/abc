@@ -8,7 +8,7 @@ use std::fs::{self, Permissions};
 use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
-use std::process::{Command, ExitCode, ExitStatus};
+use std::process::{Child, Command, ExitCode, ExitStatus};
 
 use anyhow::{Context, bail, ensure};
 use flate2::read::GzDecoder;
@@ -864,6 +864,22 @@ pub(crate) fn status_code(status: ExitStatus) -> u8 {
         .unwrap_or(1)
 }
 
+/// Writes `input` to `child`'s piped stdin and closes it, saying whether the child took all of it.
+/// A child that exits without reading its input, such as a hook that only prints a note or a
+/// command that fails at once, closes the pipe first; its exit status then decides the outcome, so
+/// a broken pipe is not an error.
+pub(crate) fn feed(child: &mut Child, input: &mut dyn Read) -> std::io::Result<bool> {
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| std::io::Error::other("the child's input is not piped"))?;
+    match std::io::copy(input, &mut stdin) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
 fn download(url: &str) -> anyhow::Result<Vec<u8>> {
     let mut response = ureq::get(url)
         .call()
@@ -1178,6 +1194,27 @@ mod tests {
         published_sha256, remove_other_versions, report, reports_version, set_pin, setup,
         sha256_hex,
     };
+
+    /// Input that cannot be read.
+    struct Unreadable;
+
+    impl std::io::Read for Unreadable {
+        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("the disk is gone"))
+        }
+    }
+
+    #[test]
+    fn feeding_reports_input_that_cannot_be_read() {
+        let mut child = std::process::Command::new("cat")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let error = super::feed(&mut child, &mut Unreadable).unwrap_err();
+        assert_eq!(error.to_string(), "the disk is gone");
+        assert!(child.wait().unwrap().success(), "its stdin was closed");
+    }
 
     const SHA_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const SHA_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";

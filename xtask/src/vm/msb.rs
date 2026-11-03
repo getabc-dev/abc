@@ -2,7 +2,7 @@
 //! own per version, since microsandbox is beta and its releases break compatibility.
 
 use std::ffi::OsString;
-use std::io::{Read, Write as _};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Output, Stdio};
 
@@ -117,11 +117,9 @@ impl Backend for Msb {
             .stderr(Stdio::piped())
             .spawn()
             .with_context(|| format!("could not run {}", self.exe.display()))?;
-        if let Some(mut input) = child.stdin.take() {
-            input
-                .write_all(stdin)
-                .context("could not write to the command in the VM")?;
-        }
+        // A command that exits without reading its input still reports its own outcome.
+        crate::tools::feed(&mut child, &mut &stdin[..])
+            .context("could not write to the command in the VM")?;
         child
             .wait_with_output()
             .context("could not wait for the command in the VM")
@@ -176,9 +174,8 @@ impl Backend for Msb {
             .stderr(Stdio::piped())
             .spawn()
             .with_context(|| format!("could not run {}", self.exe.display()))?;
-        let mut input = child.stdin.take().context("msb load took no input")?;
-        std::io::copy(archive, &mut input).context("could not pass the image to msb load")?;
-        drop(input);
+        let taken = crate::tools::feed(&mut child, archive)
+            .context("could not pass the image to msb load")?;
         let output = child
             .wait_with_output()
             .context("could not wait for msb load")?;
@@ -187,6 +184,7 @@ impl Backend for Msb {
             "msb load failed: {}",
             String::from_utf8_lossy(&output.stderr).trim()
         );
+        ensure!(taken, "msb load exited before reading the whole image");
         Ok(())
     }
 }
@@ -321,6 +319,25 @@ mod tests {
         missing.exec("a", &[], b"").unwrap_err();
         missing.attach("a", &[]).unwrap_err();
         assert!(missing.load_image(&mut &b""[..], "t").is_err());
+    }
+
+    #[test]
+    fn a_child_that_stops_reading_reports_its_own_outcome() {
+        // A megabyte overflows any pipe buffer, so the write meets the closed pipe for certain.
+        let big = vec![b'x'; 1 << 20];
+        let dir = tempfile::tempdir().unwrap();
+        let failing = fake(dir.path(), "echo 'bad archive' >&2\nexit 1\n");
+        let failed = format!("{:#}", failing.load_image(&mut &big[..], "t").unwrap_err());
+        assert_eq!(failed, "msb load failed: bad archive");
+        let output = failing.exec("abc-w", &[], &big).unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "the command's status, not EPIPE"
+        );
+        let quitting = fake(dir.path(), "exit 0\n");
+        let short = format!("{:#}", quitting.load_image(&mut &big[..], "t").unwrap_err());
+        assert_eq!(short, "msb load exited before reading the whole image");
     }
 
     #[test]
