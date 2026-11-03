@@ -66,25 +66,28 @@ compile_error!("abc workers run on aarch64 and x86_64");
 ///
 /// # Errors
 ///
-/// [`RunError`]; [`RunError::exit_code`] tells the binary which code to exit with.
+/// [`RunError`]: the home or the enrolment needs fixing, or the server said stop.
 pub async fn run(
     home: &WorkerHome,
     env: &Env,
     shutdown: impl Future<Output = ()>,
 ) -> Result<(), RunError> {
     let held = home.lock()?;
-    let record = held.load()?.ok_or(RunError::NotEnrolled)?;
-    let enrolled = record.enrolled.ok_or(RunError::NotEnrolled)?;
+    let current = held
+        .load()?
+        .and_then(|record| record.current)
+        .ok_or(RunError::NotEnrolled)?;
+    let (key, enrolled) = (current.key, current.worker);
     let span = tracing::info_span!(
         "worker",
         worker = %enrolled.worker,
         workspace = %enrolled.workspace,
-        server = %record.server,
+        server = %key.server,
     );
     tracing::Instrument::instrument(
         async {
             tracing::info!(name = enrolled.name.as_str(), "starting");
-            let result = supervisor::supervise(env, &record.server, &record.key, shutdown).await;
+            let result = supervisor::supervise(env, &key.server, &key.key, shutdown).await;
             if result.is_ok() {
                 tracing::info!("stopped");
             }
@@ -102,8 +105,9 @@ pub async fn run(
 pub enum IfEnrolled {
     /// Refuse with [`EnrolError::AlreadyEnrolled`].
     Refuse,
-    /// Discard the old key and enrol as a new worker (`--replace`). The old worker stays on the
-    /// server, offline, until its owner revokes it.
+    /// Enrol as a new worker with a new key (`--replace`), switching to it only once the server
+    /// has answered: until then, and if the new enrolment fails, the old one stays in use. The old
+    /// worker stays on the server, offline, until its owner revokes it.
     Replace,
 }
 
@@ -131,7 +135,7 @@ pub struct Env {
 }
 
 impl Env {
-    /// The public web PKI's roots, the protocol's timings, the system clock and jitter seeded from
+    /// What the operating system trusts, the protocol's timings, the system clock and jitter seeded from
     /// the operating system, for a worker of release `build`.
     ///
     /// # Errors
@@ -139,7 +143,7 @@ impl Env {
     /// [`EnvError`] when the operating system cannot seed the jitter or TLS cannot be set up.
     pub fn production(build: semver::Version) -> Result<Self, EnvError> {
         Ok(Self {
-            trust: Trust::public()?,
+            trust: Trust::platform()?,
             timings: Timings::production(),
             wall: Arc::new(SystemClock),
             jitter: Jitter::from_seed(SystemEntropy.seed()?),
@@ -159,33 +163,44 @@ pub enum EnvError {
     Tls(#[from] rustls::Error),
 }
 
-/// Which certificates may name the server. The worker trusts the public web PKI only: Tailscale
-/// Serve presents a Let's Encrypt certificate for `<node>.<tailnet>.ts.net`, and verifying it for
-/// the enrolled URL's host is how the worker knows it reached its own server before it sends its
-/// key (threat model B3). There is deliberately no option to trust another CA or to skip TLS.
+/// Which certificates may name the server. The worker trusts what the operating system trusts,
+/// through `rustls-platform-verifier`: the Security framework's trust evaluation on macOS, and on
+/// Linux the system's CA bundle checked by webpki. Tailscale Serve presents a Let's Encrypt
+/// certificate for `<node>.<tailnet>.ts.net`, and verifying it for the enrolled URL's host is how
+/// the worker knows it reached its own server before it sends its key (threat model B3). The OS's
+/// store, not a list compiled into the binary, so a CA that joins the web PKI after a release (as
+/// Let's Encrypt's Gen Y roots do) is trusted when the OS ships it (decision W4). There is
+/// deliberately no option to trust another CA or to skip TLS; only the `testing` feature can.
 #[derive(Clone)]
 pub struct Trust {
     config: Arc<rustls::ClientConfig>,
 }
 
 impl Trust {
-    /// The public web PKI (`webpki-roots`).
+    /// What the operating system trusts.
     ///
     /// # Errors
     ///
-    /// [`rustls::Error`] if the TLS configuration cannot be built.
-    pub fn public() -> Result<Self, rustls::Error> {
-        let mut roots = rustls::RootCertStore::empty();
-        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        Self::with_roots(roots)
+    /// [`rustls::Error`] if the TLS configuration cannot be built, or on Linux if the system has no
+    /// CA certificates to load.
+    pub fn platform() -> Result<Self, rustls::Error> {
+        Self::verified_by(rustls_platform_verifier::BuilderVerifierExt::with_platform_verifier)
     }
 
-    fn with_roots(roots: rustls::RootCertStore) -> Result<Self, rustls::Error> {
+    /// A client configuration whose server certificates `verify` checks: HTTP/1.1, ring, and
+    /// rustls's safe protocol versions.
+    fn verified_by(
+        verify: impl FnOnce(
+            rustls::ConfigBuilder<rustls::ClientConfig, rustls::WantsVerifier>,
+        ) -> Result<
+            rustls::ConfigBuilder<rustls::ClientConfig, rustls::client::WantsClientCert>,
+            rustls::Error,
+        >,
+    ) -> Result<Self, rustls::Error> {
         let provider = Arc::new(rustls::crypto::ring::default_provider());
-        let mut config = rustls::ClientConfig::builder_with_provider(provider)
-            .with_safe_default_protocol_versions()?
-            .with_root_certificates(roots)
-            .with_no_client_auth();
+        let builder = rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()?;
+        let mut config = verify(builder)?.with_no_client_auth();
         // WebSocket upgrades are HTTP/1.1.
         config.alpn_protocols = vec![b"http/1.1".to_vec()];
         Ok(Self {
@@ -294,10 +309,11 @@ impl Jitter {
     }
 }
 
-/// Why [`run`] stopped. `Display` is the sentence the user reads.
+/// Why [`run`] stopped. `Display` is the sentence the user reads. The binary exits 2 for the first
+/// two (fix it and run again) and 3 for [`RunError::Terminal`] (a person has to act).
 #[derive(Debug, Error)]
 pub enum RunError {
-    /// The home holds no record, or only a pending one.
+    /// The home holds no enrolment, or only a pending one.
     #[error("this machine is not enrolled; run `abc worker enrol <url>` first")]
     NotEnrolled,
     /// The home is busy, insecure, damaged or unreadable.
@@ -306,18 +322,6 @@ pub enum RunError {
     /// The server said this worker must stop.
     #[error(transparent)]
     Terminal(#[from] Terminal),
-}
-
-impl RunError {
-    /// 2 for configuration (fix it and run again), 3 when the server said stop: a person has to
-    /// act, so a service manager should stop restarting it (`RestartPreventExitStatus=3`).
-    #[must_use]
-    pub const fn exit_code(&self) -> u8 {
-        match self {
-            Self::NotEnrolled | Self::Home(_) => 2,
-            Self::Terminal(_) => 3,
-        }
-    }
 }
 
 #[cfg(test)]
@@ -345,21 +349,6 @@ mod tests {
     }
 
     #[test]
-    fn exit_codes_say_who_has_to_act() {
-        assert_eq!(RunError::NotEnrolled.exit_code(), 2, "configuration");
-        assert_eq!(
-            RunError::Home(HomeError::NoHomeDir).exit_code(),
-            2,
-            "configuration"
-        );
-        assert_eq!(
-            RunError::Terminal(Terminal::Revoked).exit_code(),
-            3,
-            "a person"
-        );
-    }
-
-    #[test]
     fn jitter_is_seeded_and_in_range() {
         let draws = |seed| {
             let jitter = Jitter::from_seed(seed);
@@ -376,8 +365,8 @@ mod tests {
     }
 
     #[test]
-    fn the_public_trust_builds() {
-        let trust = Trust::public().unwrap();
+    fn the_platform_trust_builds() {
+        let trust = Trust::platform().unwrap();
         assert_eq!(
             trust.config().alpn_protocols,
             vec![b"http/1.1".to_vec()],
