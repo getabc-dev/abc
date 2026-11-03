@@ -31,9 +31,9 @@ use abc_core::policy::authorize;
 use abc_core::time::{Clock, Timestamp};
 use sqlx::{PgConnection, PgPool, Postgres, Transaction};
 
-use crate::entropy::ChaChaMint;
 use crate::error::{AuthError, ExecuteError, StoreError};
 use crate::{Caller, Inner, projection};
+use abc_platform::entropy::ChaChaMint;
 
 mod sealed {
     use std::future::Future;

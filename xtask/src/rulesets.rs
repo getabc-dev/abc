@@ -281,10 +281,13 @@ fn check_refs(text: &str, refs: Refs) -> anyhow::Result<()> {
     let (target, excluded, bypass, rules) = match refs {
         Refs::Branches => (
             "branch",
+            // GitHub matches a ruleset pattern one path segment per `*`; even `**` never crosses a
+            // `/`. The merge queue's branches are `gh-readonly-queue/main/pr-<n>-<sha>`, three
+            // segments, and agents' are `agent/<topic>`, two.
             serde_json::json!([
                 "~DEFAULT_BRANCH",
-                "refs/heads/agent/**",
-                "refs/heads/gh-readonly-queue/**"
+                "refs/heads/agent/*",
+                "refs/heads/gh-readonly-queue/main/*"
             ]),
             serde_json::json!([admins, renovate]),
             serde_json::json!([{"type": "creation"}, {"type": "update"}, {"type": "deletion"}, {"type": "non_fast_forward"}]),
@@ -862,7 +865,7 @@ case \"$*\" in 'api repos/getabc-dev/abc/rulesets') echo '[]' ;; *) \
                 "must be active",
             ),
             (
-                branches.replace("\"refs/heads/agent/**\", ", ""),
+                branches.replace("\"refs/heads/agent/*\", ", ""),
                 "must cover every ref but",
             ),
             (
@@ -891,5 +894,45 @@ case \"$*\" in 'api repos/getabc-dev/abc/rulesets') echo '[]' ;; *) \
         assert!(refused(app, Refs::Tags).contains("only bypass must be"));
         assert!(refused("{".to_owned(), Refs::Tags).contains("not JSON"));
         check(&root).unwrap();
+    }
+
+    /// Whether GitHub's ruleset `pattern` matches `name`: one path segment per `*`, never across a
+    /// `/`, which is how the live rules treat `**` too.
+    fn github_matches(pattern: &str, name: &str) -> bool {
+        let pattern: Vec<&str> = pattern.split('/').collect();
+        let name: Vec<&str> = name.split('/').collect();
+        pattern.len() == name.len()
+            && pattern
+                .iter()
+                .zip(&name)
+                .all(|(want, have)| *want == "*" || want == have)
+    }
+
+    #[test]
+    fn the_branch_exclusions_free_the_merge_queue_and_agents_and_nothing_else() {
+        let ruleset: serde_json::Value =
+            serde_json::from_str(include_str!("../../.github/rulesets/branches.json")).unwrap();
+        let excluded: Vec<String> = ruleset["conditions"]["ref_name"]["exclude"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|pattern| pattern.as_str().unwrap().to_owned())
+            .collect();
+        let free = |name: &str| excluded.iter().any(|pattern| github_matches(pattern, name));
+        assert!(
+            free(
+                "refs/heads/gh-readonly-queue/main/pr-20-be44699ab1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6"
+            ),
+            "the merge queue's branches, which #20's queue run could not create"
+        );
+        assert!(free("refs/heads/agent/s0-worker"), "an agent's branch");
+        assert!(
+            !free("refs/heads/feature"),
+            "any other branch stays restricted"
+        );
+        assert!(
+            !free("refs/heads/agent/a/b"),
+            "agents' branches have one segment"
+        );
     }
 }

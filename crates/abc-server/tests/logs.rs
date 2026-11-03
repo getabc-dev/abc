@@ -54,7 +54,7 @@ mod tests {
         let pool = database.pool();
         let capture = Capture::default();
         let writer = capture.clone();
-        tracing::subscriber::set_global_default(abc_server::telemetry::subscriber(
+        tracing::subscriber::set_global_default(abc_platform::telemetry::subscriber(
             EnvFilter::new("trace"),
             move || writer.clone(),
         ))

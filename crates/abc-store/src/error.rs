@@ -55,7 +55,7 @@ pub enum StoreError {
     LogFull,
     /// No randomness could be drawn for ids and secrets.
     #[error(transparent)]
-    Entropy(#[from] crate::entropy::EntropyUnavailable),
+    Entropy(#[from] abc_platform::entropy::EntropyUnavailable),
 }
 
 impl From<sqlx::Error> for StoreError {

@@ -35,10 +35,9 @@ use sqlx::postgres::PgConnectOptions;
 use sqlx::{ConnectOptions as _, Connection as _, PgConnection, PgPool};
 use zeroize::Zeroizing;
 
-use crate::entropy::ChaChaMint;
 use crate::error::StoreError;
 use crate::{Caller, Database, DatabaseUrl, ExecuteError, Store, StoreOptions, projection};
-use crate::{Entropy, EntropyUnavailable};
+use abc_platform::entropy::{ChaChaMint, Entropy, EntropyUnavailable};
 
 /// Wraps a test's pool.
 #[must_use]

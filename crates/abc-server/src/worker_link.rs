@@ -42,7 +42,7 @@ use abc_core::id::SessionId;
 use abc_core::query::{WorkerIdentity, WorkerSelf};
 use abc_core::secret::Secret;
 use abc_protocol::api::ApiCode;
-use abc_protocol::link::{CloseCode, HANDSHAKE_TIMEOUT, IDLE_TIMEOUT, PING_INTERVAL};
+use abc_protocol::link::{CloseCode, HANDSHAKE_TIMEOUT, IDLE_TIMEOUT, MAX_MESSAGE, PING_INTERVAL};
 use abc_protocol::{
     Reject, RejectReason, SUPPORTED_VERSIONS, ServerMessage, Welcome, WorkerMessage, negotiate,
 };
@@ -147,9 +147,6 @@ pub(crate) async fn upgrade(
         .instrument(span)
     }))
 }
-
-/// The largest message or frame a worker may send.
-const MAX_MESSAGE: usize = 64 * 1024;
 
 /// What the worker sent while the server waited for its `Hello`.
 enum Incoming {

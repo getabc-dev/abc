@@ -13,6 +13,9 @@
 /Cargo.toml               @snehilvj
 /clippy.toml              @snehilvj
 /deny.toml                @snehilvj
+/fuzz/Cargo.lock          @snehilvj
+/fuzz/Cargo.toml          @snehilvj
+/fuzz/deny.toml           @snehilvj
 /rust-toolchain.toml      @snehilvj
 /rustfmt.toml             @snehilvj
 /xtask/                   @snehilvj

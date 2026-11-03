@@ -1,10 +1,11 @@
-//! Where the store's randomness comes from, without a panic in the path.
+//! Where abc's randomness comes from, on either side of the wire, without a panic in the path.
 //!
-//! Each request draws one 32-byte seed from an [`Entropy`] source, which can fail with a typed
-//! error, and seeds a `ChaCha20` generator ([`ChaChaMint`]) that mints that request's ids and
-//! secrets. `ChaCha20` seeded from the operating system is a cryptographically secure generator,
-//! so a token or setup code minted from it is as unpredictable as one read from the OS directly.
-//! Tests seed it from a fixed sequence instead, so every run mints the same values.
+//! A user of randomness draws one 32-byte seed from an [`Entropy`] source, which can fail with a
+//! typed error, and seeds a `ChaCha20` generator ([`ChaChaMint`]) with it: the store does so for
+//! each request, to mint that request's ids and secrets, and the worker once, to mint its key.
+//! `ChaCha20` seeded from the operating system is a cryptographically secure generator, so a
+//! token, setup code or worker key minted from it is as unpredictable as one read from the OS
+//! directly. Tests seed it from a fixed sequence instead, so every run mints the same values.
 
 use std::fmt;
 use std::sync::{Mutex, PoisonError};
@@ -16,7 +17,7 @@ use rand::{Rng as _, SeedableRng as _, TryRng as _};
 use thiserror::Error;
 use zeroize::Zeroizing;
 
-/// A source of seeds for the store's per-request generators.
+/// A source of seeds for [`ChaChaMint`]s.
 pub trait Entropy: Send + Sync + fmt::Debug {
     /// 32 fresh, unpredictable bytes.
     ///
@@ -32,8 +33,8 @@ pub trait Entropy: Send + Sync + fmt::Debug {
 pub struct EntropyUnavailable(#[source] pub rand::rngs::SysError);
 
 /// The operating system's generator.
-#[derive(Debug)]
-pub(crate) struct SystemEntropy;
+#[derive(Debug, Clone, Copy)]
+pub struct SystemEntropy;
 
 impl Entropy for SystemEntropy {
     fn seed(&self) -> Result<[u8; 32], EntropyUnavailable> {
@@ -45,12 +46,13 @@ impl Entropy for SystemEntropy {
     }
 }
 
-/// A `ChaCha20` generator that mints ids and secrets: one per request, seeded from [`Entropy`].
-pub(crate) struct ChaChaMint(Mutex<ChaCha20Rng>);
+/// A `ChaCha20` generator that mints ids and secrets, seeded from [`Entropy`].
+pub struct ChaChaMint(Mutex<ChaCha20Rng>);
 
 impl ChaChaMint {
     /// A generator seeded with `seed`.
-    pub(crate) fn from_seed(seed: [u8; 32]) -> Self {
+    #[must_use]
+    pub fn from_seed(seed: [u8; 32]) -> Self {
         Self(Mutex::new(ChaCha20Rng::from_seed(seed)))
     }
 
@@ -84,7 +86,7 @@ impl Mint for ChaChaMint {
 
 /// A `UUIDv7` whose time part is `now` (milliseconds since the Unix epoch) and whose remaining
 /// bits come from `random`.
-pub(crate) fn uuid_v7(now: Timestamp, random: &[u8; 10]) -> uuid::Uuid {
+fn uuid_v7(now: Timestamp, random: &[u8; 10]) -> uuid::Uuid {
     let millis = now.as_offset().unix_timestamp_nanos() / 1_000_000;
     uuid::Builder::from_unix_timestamp_millis(u64::try_from(millis).unwrap_or(0), random)
         .into_uuid()

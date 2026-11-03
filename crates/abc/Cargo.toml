@@ -1,6 +1,6 @@
 [package]
 name = "abc"
-description = "The abc binary: `abc server` and `abc server setup-code`."
+description = "The abc binary: `abc server`, `abc server setup-code`, `abc worker` and `abc worker enrol`."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -15,16 +15,28 @@ path = "src/main.rs"
 # No sqlx and no axum: the binary parses configuration and hands it over.
 [dependencies]
 abc-core = { path = "../abc-core" }
+abc-platform = { path = "../abc-platform" }
+abc-protocol = { path = "../abc-protocol" }
 abc-server = { path = "../abc-server" }
 abc-store = { path = "../abc-store" }
+abc-worker = { path = "../abc-worker" }
 clap = { workspace = true, features = ["env"] }
+semver.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
 abc-store = { path = "../abc-store", features = ["testing"] }
+http-body-util.workspace = true
+hyper = { workspace = true, features = ["client", "http1"] }
+hyper-util.workspace = true
+rustls.workspace = true
+rustls-platform-verifier.workspace = true
+serde_json.workspace = true
 sqlx.workspace = true
 tempfile.workspace = true
+tokio-rustls.workspace = true
 
 [lints]
 workspace = true

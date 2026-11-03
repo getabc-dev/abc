@@ -1,5 +1,6 @@
 //! The `abc` binary end to end: `abc server setup-code` against a real database, configuration
-//! errors and their exit codes, and `abc server` stopping cleanly on SIGTERM.
+//! errors and their exit codes, `abc server` and `abc worker` stopping cleanly on SIGTERM, and
+//! `abc worker enrol`'s refusals.
 
 #[cfg(test)]
 mod tests {
@@ -202,5 +203,184 @@ mod tests {
             "an unclaimed server says how to claim it: {}",
             output.1
         );
+    }
+
+    /// `abc worker` with `args`, a clean environment and the worker home `home`.
+    fn worker(args: &[&str], home: &std::path::Path) -> Command {
+        let mut command = abc(&["worker"], "");
+        command
+            .env_remove("ABC_DATABASE_URL")
+            .args(args)
+            .arg("--home")
+            .arg(home);
+        command
+    }
+
+    /// A private, empty worker home.
+    fn worker_home() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("worker");
+        (dir, home)
+    }
+
+    const TOKEN: &str = "abc_enr_0000000000000000000000000000000000000000000000000000";
+
+    #[test]
+    fn a_worker_that_is_not_enrolled_says_how_to_enrol() {
+        let (_dir, home) = worker_home();
+        let output = run(&mut worker(&[], &home));
+        assert_eq!(output.status.code(), Some(2), "configuration");
+        assert_eq!(
+            text(&output.stderr),
+            "abc: this machine is not enrolled; run `abc worker enrol <url>` first\n",
+            "the fix"
+        );
+        let (_other_dir, other) = worker_home();
+        let mut bad_filter = worker(&[], &other);
+        bad_filter.env("ABC_LOG", "[[[");
+        assert_eq!(
+            run(&mut bad_filter).status.code(),
+            Some(2),
+            "a bad log filter"
+        );
+    }
+
+    #[test]
+    fn enrolment_refuses_a_bad_url_or_token_without_echoing_it() {
+        let (_dir, home) = worker_home();
+        let plain = run(&mut worker(&["enrol", "http://abc.ts.net"], &home));
+        assert_eq!(plain.status.code(), Some(2), "not https");
+        assert!(
+            text(&plain.stderr).contains("it must start with https://"),
+            "{}",
+            text(&plain.stderr)
+        );
+        let mut env_token = worker(&["enrol", "https://abc.ts.net"], &home);
+        env_token.env("ABC_ENROLMENT_TOKEN", "abc_enr_hunter2");
+        let env_token = run(&mut env_token);
+        assert_eq!(env_token.status.code(), Some(2), "a malformed token");
+        assert!(
+            text(&env_token.stderr).contains("malformed enrolment token"),
+            "{}",
+            text(&env_token.stderr)
+        );
+        let mut from_stdin = worker(&["enrol", "https://abc.ts.net"], &home);
+        from_stdin
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = from_stdin.spawn().unwrap();
+        std::io::Write::write_all(&mut child.stdin.take().unwrap(), b"hunter2\n").unwrap();
+        let piped = child.wait_with_output().unwrap();
+        assert_eq!(piped.status.code(), Some(2), "a malformed token on stdin");
+        let mut hostname = worker(&["enrol", "https://abc.ts.net", "--hostname", " "], &home);
+        hostname.env("ABC_ENROLMENT_TOKEN", TOKEN);
+        let hostname = run(&mut hostname);
+        assert_eq!(hostname.status.code(), Some(2), "an empty hostname");
+        assert!(
+            text(&hostname.stderr).contains("pass --hostname"),
+            "{}",
+            text(&hostname.stderr)
+        );
+        for output in [&plain, &env_token, &piped, &hostname] {
+            assert!(!text(&output.stderr).contains("hunter2"), "never echoed");
+            assert!(!text(&output.stdout).contains("hunter2"), "never echoed");
+        }
+    }
+
+    #[test]
+    fn enrolment_saves_its_key_before_it_reaches_for_the_server() {
+        let (_dir, home) = worker_home();
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let url = format!("https://127.0.0.1:{port}");
+        let mut command = worker(&["enrol", &url], &home);
+        command.env("ABC_ENROLMENT_TOKEN", TOKEN);
+        let output = run(&mut command);
+        assert_eq!(output.status.code(), Some(1), "nothing answers there");
+        assert!(
+            text(&output.stderr)
+                .starts_with("abc: could not reach the server; run the same command again"),
+            "{}",
+            text(&output.stderr)
+        );
+        let record = home.join("worker.toml");
+        let mode = std::fs::metadata(&record).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "the key is saved, privately, for the retry");
+    }
+
+    #[tokio::test]
+    async fn the_worker_runs_until_sigterm_and_exits_cleanly() {
+        let (_dir, home) = worker_home();
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let record = home.join("worker.toml");
+        std::fs::write(
+            &record,
+            format!(
+                "format = 1\n\n[current.key]\nserver = \"https://127.0.0.1:{port}\"\ntoken = \"{}\"\nkey = \"abc_wk_{}\"\n\n[current.worker]\nworker = \"00000000-0000-0000-0000-000000000001\"\nworkspace = \"00000000-0000-0000-0000-000000000002\"\nname = \"mbp\"\n",
+                "0".repeat(64),
+                "0".repeat(52)
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&record, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let mut running = worker(&[], &home)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        // Nothing answers at the server's address, so the worker keeps backing off until told to
+        // stop. Its first log line says it started.
+        let stdout = running.stdout.take().unwrap();
+        let (lines, logged) = std::sync::mpsc::channel::<String>();
+        let reader = std::thread::spawn(move || {
+            for line in std::io::BufRead::lines(std::io::BufReader::new(stdout)) {
+                let Ok(line) = line else { break };
+                if lines.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+        let mut log = String::new();
+        while !log.contains("\"message\":\"starting\"") {
+            let line = logged
+                .recv_timeout(Duration::from_secs(30))
+                .expect("the worker logs that it started");
+            log.push_str(&line);
+            log.push('\n');
+        }
+        let busy = run(&mut worker(&[], &home));
+        assert_eq!(busy.status.code(), Some(2), "one worker per home");
+        assert!(
+            text(&busy.stderr).contains("another abc worker is already using"),
+            "{}",
+            text(&busy.stderr)
+        );
+        let killed = Command::new("kill")
+            .args(["-TERM", &running.id().to_string()])
+            .status()
+            .unwrap();
+        assert!(killed.success(), "SIGTERM was sent");
+        let output = tokio::task::spawn_blocking(move || running.wait_with_output().unwrap())
+            .await
+            .unwrap();
+        reader.join().unwrap();
+        log.extend(logged.try_iter().map(|line| line + "\n"));
+        assert!(
+            output.status.success(),
+            "a clean exit on SIGTERM: {}",
+            text(&output.stderr)
+        );
+        assert!(log.contains("\"message\":\"stopped\""), "{log}");
+        assert!(!log.contains(&"0".repeat(52)), "the key is never logged");
     }
 }

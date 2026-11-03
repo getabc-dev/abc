@@ -7,8 +7,10 @@
 //! It needs a real tailnet, so it is ignored unless asked for (`--run-ignored only`), and then
 //! fails unless these are set:
 //!
-//! * `ABC_TAILSCALE_AUTHKEY`: an auth key owned by a user (not tagged: tagged devices carry no
-//!   identity), reusable so both nodes can join, ideally ephemeral and approved in advance;
+//! * `ABC_TAILSCALE_AUTHKEY`: an ephemeral auth key owned by a user (not tagged: tagged devices
+//!   carry no identity), reusable so both nodes can join, approved in advance. It must be
+//!   ephemeral: a node a killed run leaves behind then disappears from the tailnet by itself, and
+//!   the test logs its nodes out on the way out;
 //! * `ABC_TAILSCALE_TAILNET`: the tailnet's DNS name, such as `tail1234.ts.net`, with `MagicDNS` and
 //!   HTTPS certificates enabled.
 //!
@@ -34,14 +36,16 @@ mod tests {
 
     use abc_core::credential::WorkerKey;
     use abc_core::secret::Secret;
+    use abc_protocol::url::PublicUrl;
     use abc_protocol::{Hello, ServerMessage, WorkerMessage};
-    use abc_server::{LinkTimings, PublicUrl};
+    use abc_server::LinkTimings;
     use abc_store::testing::Fixture;
     use futures::{SinkExt as _, StreamExt as _};
     use http_body_util::{BodyExt as _, Full};
     use hyper::body::Bytes;
     use hyper::{Request, StatusCode};
     use hyper_util::rt::TokioIo;
+    use rustls_platform_verifier::BuilderVerifierExt as _;
     use semver::Version;
     use serde_json::{Value, json};
     use sqlx::PgPool;
@@ -54,17 +58,36 @@ mod tests {
 
     use crate::common::{claim_body, config, enrol_body, socket_dir};
 
-    /// The Tailscale image, pinned by digest.
-    const IMAGE: &str = "tailscale/tailscale:v1.104.4@sha256:ed6480b33c6eb67c9cbd203ed42b9fb57e361986725b6856def71b7a3d9e276c";
+    /// The Tailscale image, pinned by digest in the one file the Tailscale workflow and both
+    /// Tailscale tests read.
+    const IMAGE: &str = include_str!("../../../.github/tailscale-image").trim_ascii();
 
-    /// Removes the test's containers however the test ends.
+    /// Logs the test's nodes out of the tailnet and removes their containers however the test
+    /// ends.
     struct Containers(Vec<String>);
 
     impl Drop for Containers {
         fn drop(&mut self) {
             for name in &self.0 {
+                let _logged_out = Command::new("docker")
+                    .args(["exec", name, "tailscale", "logout"])
+                    .output();
                 let _removed = Command::new("docker").args(["rm", "-f", name]).output();
             }
+        }
+    }
+
+    /// A node name no other run shares: the workflow run and attempt, or the time and process
+    /// when the test runs by hand, so a node left behind by a killed run never collides.
+    fn unique_node(prefix: &str) -> String {
+        if let Ok(run) = std::env::var("GITHUB_RUN_ID") {
+            let attempt = std::env::var("GITHUB_RUN_ATTEMPT").unwrap_or_else(|_| String::from("1"));
+            format!("{prefix}-{run}-{attempt}")
+        } else {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_nanos());
+            format!("{prefix}-{nanos:x}-{}", std::process::id())
         }
     }
 
@@ -108,14 +131,12 @@ mod tests {
                 break;
             }
         }
-        let roots = rustls::RootCertStore {
-            roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
-        };
         let provider = Arc::new(rustls::crypto::ring::default_provider());
         let tls = rustls::ClientConfig::builder_with_provider(provider)
             .with_safe_default_protocol_versions()
             .unwrap()
-            .with_root_certificates(roots)
+            .with_platform_verifier()
+            .unwrap()
             .with_no_client_auth();
         let name = rustls::pki_types::ServerName::try_from(host.to_owned()).unwrap();
         TlsConnector::from(Arc::new(tls))
@@ -292,7 +313,7 @@ mod tests {
         };
         let database = TestDatabase::migrated().await;
         let pool = database.pool();
-        let node = format!("abc-e2e-{}", std::process::id());
+        let node = unique_node("abc-e2e");
         let host = format!("{node}.{tailnet}");
         let sockets = socket_dir();
         std::fs::set_permissions(sockets.path(), std::fs::Permissions::from_mode(0o770)).unwrap();

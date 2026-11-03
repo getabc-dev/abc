@@ -23,7 +23,6 @@ mod live;
 mod ops;
 mod sessions;
 mod sidecar;
-pub mod telemetry;
 mod worker_link;
 
 use std::future::Future;
@@ -36,11 +35,11 @@ use abc_core::decision::Origin;
 use abc_core::event::SessionEndReason;
 use abc_core::query::{InstallationState, InstallationStatus, OpenSessions};
 use abc_core::secret::Secret;
+use abc_protocol::url::PublicUrl;
 use abc_store::{Caller, DatabaseUrl, Store, StoreOptions};
 use thiserror::Error;
 use tokio::sync::oneshot;
 
-pub use api::PublicUrl;
 pub use limits::Limits;
 pub use worker_link::LinkTimings;
 
@@ -239,15 +238,6 @@ pub enum ServeError {
         /// The path.
         path: PathBuf,
         /// What is wrong.
-        reason: &'static str,
-    },
-    /// `ABC_PUBLIC_URL` is not an https origin.
-    #[error(
-        "ABC_PUBLIC_URL must be the https URL Tailscale Serve answers on, such as \
-         https://abc.tail1234.ts.net ({reason})"
-    )]
-    PublicUrl {
-        /// What is wrong with it.
         reason: &'static str,
     },
     /// Binding or serving a listener failed.

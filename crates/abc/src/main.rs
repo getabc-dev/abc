@@ -1,19 +1,25 @@
 //! The abc binary. Thin: parse, set up logging, call the library, map errors to exit codes.
 //!
-//! Exit codes: 0 on success, 1 when running fails, 2 for a configuration error.
+//! Exit codes: 0 on success, 1 when running fails, 2 for a configuration error, and 3 when the
+//! server told a worker to stop (revoked, unknown key, superseded, no common protocol version):
+//! a person has to act, so a service manager should not restart it.
 
 use std::error::Error as StdError;
-use std::io::Write as _;
+use std::io::{BufRead as _, IsTerminal as _, Write as _};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
+use abc_core::credential::EnrolmentToken;
 use abc_core::secret::Secret;
-use abc_server::telemetry::chain;
-use abc_server::{Limits, LinkTimings, PublicUrl, ServerConfig};
+use abc_platform::telemetry::chain;
+use abc_protocol::url::PublicUrl;
+use abc_server::{Limits, LinkTimings, ServerConfig};
 use abc_store::{DatabaseUrl, ExecuteError, Store, StoreOptions};
+use abc_worker::{Env, IfEnrolled, WorkerHome};
 use clap::{Parser, Subcommand};
+use zeroize::Zeroizing;
 
 /// abc: a self-hosted software factory.
 #[derive(Debug, Parser)]
@@ -27,7 +33,48 @@ struct Cli {
 enum Command {
     /// Run the server (it migrates Postgres on start), or administer it from its host.
     Server(ServerCommand),
+    /// Run this machine's worker, or enrol it with a server first.
+    Worker(WorkerCommand),
 }
+
+#[derive(Debug, clap::Args)]
+struct WorkerCommand {
+    #[command(subcommand)]
+    action: Option<WorkerAction>,
+    /// The directory holding the worker's key [default: `ABC_WORKER_HOME`, else
+    /// `~/Library/Application Support/abc/worker` on macOS and `$XDG_CONFIG_HOME/abc/worker` or
+    /// `~/.config/abc/worker` on Linux].
+    #[arg(long, global = true)]
+    home: Option<PathBuf>,
+    /// Log filter, such as `info` or `abc_worker=debug`.
+    #[arg(long, env = "ABC_LOG")]
+    log: Option<String>,
+}
+
+#[derive(Debug, Subcommand)]
+enum WorkerAction {
+    /// Enrol this machine with a server, using a one-time token from the server's Machines
+    /// screen. The token is read from `ABC_ENROLMENT_TOKEN`, else from standard input; it is never
+    /// a command-line argument, where other users of this machine could read it and use it first.
+    /// Running the same command again is safe: the same token gets the same answer.
+    Enrol(EnrolArgs),
+}
+
+#[derive(Debug, clap::Args)]
+struct EnrolArgs {
+    /// The server's tailnet URL, such as `https://abc.tail1234.ts.net`.
+    url: String,
+    /// Enrol as a new worker even if this machine is already enrolled. The old worker stays on
+    /// the server, offline, until its owner revokes it.
+    #[arg(long)]
+    replace: bool,
+    /// The name this machine introduces itself with [default: its hostname].
+    #[arg(long)]
+    hostname: Option<String>,
+}
+
+/// The variable a token can be passed in.
+const ENROLMENT_TOKEN: &str = "ABC_ENROLMENT_TOKEN";
 
 #[derive(Debug, clap::Args)]
 struct ServerCommand {
@@ -98,6 +145,8 @@ enum Failure {
     Config(Box<dyn StdError>),
     /// Running failed.
     Run(Box<dyn StdError>),
+    /// The server told the worker to stop; a person has to act.
+    Stop(Box<dyn StdError>),
 }
 
 fn main() -> ExitCode {
@@ -109,10 +158,12 @@ fn main() -> ExitCode {
         Ok(runtime) => runtime,
         Err(error) => return report(&Failure::Run(Box::new(error))),
     };
-    let Command::Server(server) = cli.command;
-    let result = match server.action {
-        Some(ServerAction::SetupCode) => runtime.block_on(setup_code(&server.database)),
-        None => runtime.block_on(serve(server)),
+    let result = match cli.command {
+        Command::Server(server) => match server.action {
+            Some(ServerAction::SetupCode) => runtime.block_on(setup_code(&server.database)),
+            None => runtime.block_on(serve(server)),
+        },
+        Command::Worker(worker) => runtime.block_on(work(worker)),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -125,6 +176,7 @@ fn report(failure: &Failure) -> ExitCode {
     let (error, code) = match failure {
         Failure::Config(error) => (error, 2),
         Failure::Run(error) => (error, 1),
+        Failure::Stop(error) => (error, 3),
     };
     // Nothing more can be done if stderr is gone.
     let _unwritten = writeln!(std::io::stderr().lock(), "abc: {}", chain(error.as_ref()));
@@ -137,8 +189,16 @@ async fn serve(server: ServerCommand) -> Result<(), Failure> {
         .serve
         .public_url
         .ok_or_else(|| config("ABC_PUBLIC_URL is required to run the server".into()))?;
-    let public_url = PublicUrl::parse(&raw_url).map_err(|error| config(Box::new(error)))?;
-    abc_server::telemetry::init(server.serve.log.as_deref())
+    let public_url = PublicUrl::parse(&raw_url).map_err(|error| {
+        config(
+            format!(
+                "ABC_PUBLIC_URL must be the https URL Tailscale Serve answers on, such as \
+                 https://abc.tail1234.ts.net ({error})"
+            )
+            .into(),
+        )
+    })?;
+    abc_platform::telemetry::init(server.serve.log.as_deref())
         .map_err(|error| config(Box::new(error)))?;
     let settings = ServerConfig {
         database_url: database_url()?,
@@ -149,7 +209,7 @@ async fn serve(server: ServerCommand) -> Result<(), Failure> {
         link: LinkTimings::default(),
         limits: Limits::default(),
     };
-    abc_server::run(settings, shutdown_signal())
+    abc_server::run(settings, shutdown_signal()?)
         .await
         .map_err(|error| {
             tracing::error!(error = %chain(&error), "the server stopped");
@@ -193,21 +253,148 @@ async fn setup_code(database: &DatabaseArgs) -> Result<(), Failure> {
     .map_err(|error| run(Box::new(error)))
 }
 
-/// Resolves on SIGTERM or SIGINT.
-async fn shutdown_signal() {
-    use tokio::signal::unix::{SignalKind, signal};
-    match (
-        signal(SignalKind::terminate()),
-        signal(SignalKind::interrupt()),
-    ) {
-        (Ok(mut terminate), Ok(mut interrupt)) => {
-            tokio::select! {
-                _ = terminate.recv() => {}
-                _ = interrupt.recv() => {}
+/// `abc worker` and `abc worker enrol`.
+async fn work(worker: WorkerCommand) -> Result<(), Failure> {
+    let config = |error: Box<dyn StdError>| Failure::Config(error);
+    let home = match worker.home {
+        Some(dir) => WorkerHome::at(dir),
+        None => WorkerHome::discover(|name| std::env::var_os(name))
+            .map_err(|error| config(Box::new(error)))?,
+    };
+    let build = semver::Version::parse(env!("CARGO_PKG_VERSION"))
+        .map_err(|error| Failure::Run(Box::new(error)))?;
+    let env = Env::production(build).map_err(|error| Failure::Run(Box::new(error)))?;
+    match worker.action {
+        Some(WorkerAction::Enrol(args)) => enrol(&home, &env, args).await,
+        None => {
+            abc_platform::telemetry::init(worker.log.as_deref())
+                .map_err(|error| config(Box::new(error)))?;
+            abc_worker::run(&home, &env, shutdown_signal()?)
+                .await
+                .map_err(|error| worker_failure(&error))
+        }
+    }
+}
+
+/// How a stopped worker is reported, with the cause chain: a home to fix is configuration (2),
+/// and the server saying stop is for a person (3), so a service manager stops restarting it
+/// (`RestartPreventExitStatus=3`).
+fn worker_failure(error: &abc_worker::RunError) -> Failure {
+    let shown: Box<dyn StdError> = chain(error).into();
+    match error {
+        abc_worker::RunError::NotEnrolled | abc_worker::RunError::Home(_) => Failure::Config(shown),
+        abc_worker::RunError::Terminal(_) => Failure::Stop(shown),
+    }
+}
+
+/// Enrols this machine and says who it became. No logger is installed: the token must not reach
+/// a log, and the person running this reads plain sentences.
+async fn enrol(home: &WorkerHome, env: &Env, args: EnrolArgs) -> Result<(), Failure> {
+    let config = |error: Box<dyn StdError>| Failure::Config(error);
+    let server = PublicUrl::parse(&args.url).map_err(|error| {
+        config(format!("the URL must be the server's tailnet URL, such as https://abc.tail1234.ts.net ({error})").into())
+    })?;
+    let token = enrolment_token().map_err(config)?;
+    let machine =
+        abc_worker::machine(args.hostname.as_deref()).map_err(|error| config(Box::new(error)))?;
+    let if_enrolled = if args.replace {
+        IfEnrolled::Replace
+    } else {
+        IfEnrolled::Refuse
+    };
+    let enrolment = abc_worker::enrol(home, env, &server, token, machine, if_enrolled)
+        .await
+        .map_err(|error| {
+            let fix_the_command = matches!(
+                error,
+                abc_worker::EnrolError::AlreadyEnrolled(_)
+                    | abc_worker::EnrolError::Hostname
+                    | abc_worker::EnrolError::Home(_)
+            );
+            let shown: Box<dyn StdError> = chain(&error).into();
+            if fix_the_command {
+                Failure::Config(shown)
+            } else {
+                Failure::Run(shown)
             }
+        })?;
+    let enrolled = &enrolment.enrolled;
+    let opening = if enrolment.again {
+        "This machine was already enrolled with this token"
+    } else {
+        "Enrolled this machine"
+    };
+    writeln!(
+        std::io::stdout().lock(),
+        "{opening} as {} (worker {}) with {server}.\nStart the worker with: abc worker",
+        enrolled.name.as_str(),
+        enrolled.worker,
+    )
+    .map_err(|error| Failure::Run(Box::new(error)))
+}
+
+/// The enrolment token, from [`ENROLMENT_TOKEN`] or else one line of standard input.
+fn enrolment_token() -> Result<Secret<EnrolmentToken>, Box<dyn StdError>> {
+    let text = match std::env::var(ENROLMENT_TOKEN) {
+        Ok(text) => Zeroizing::new(text),
+        Err(_unset) => {
+            let stdin = std::io::stdin();
+            if stdin.is_terminal() {
+                write!(std::io::stderr().lock(), "Paste the enrolment token: ")?;
+            }
+            let mut line = Zeroizing::new(String::new());
+            stdin.lock().read_line(&mut line)?;
+            line
         }
-        (Err(error), _) | (_, Err(error)) => {
-            tracing::error!(error = %error, "cannot listen for shutdown signals; stopping");
+    };
+    EnrolmentToken::parse(text.trim()).map_err(|error| {
+        format!(
+            "{error}: pass the abc_enr_… token from the server's Machines screen in \
+             {ENROLMENT_TOKEN} or on standard input"
+        )
+        .into()
+    })
+}
+
+/// Listens for SIGTERM and SIGINT at once, and returns a future that resolves on either. Listening
+/// starts here, not on the future's first poll, so a signal that arrives while the process is
+/// still starting is a clean stop rather than the default action, which kills it.
+fn shutdown_signal() -> Result<impl Future<Output = ()>, Failure> {
+    use tokio::signal::unix::{SignalKind, signal};
+    let listen = |kind| signal(kind).map_err(|error| Failure::Run(Box::new(error)));
+    let mut terminate = listen(SignalKind::terminate())?;
+    let mut interrupt = listen(SignalKind::interrupt())?;
+    Ok(async move {
+        tokio::select! {
+            _ = terminate.recv() => {}
+            _ = interrupt.recv() => {}
         }
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use abc_worker::{HomeError, RunError, Terminal};
+
+    use super::{Failure, worker_failure};
+
+    #[test]
+    fn a_stopped_worker_exits_with_its_own_code() {
+        let code = |error: &RunError| match worker_failure(error) {
+            Failure::Config(_) => 2,
+            Failure::Run(_) => 1,
+            Failure::Stop(_) => 3,
+        };
+        assert_eq!(code(&RunError::NotEnrolled), 2, "configuration");
+        assert_eq!(
+            code(&RunError::Home(HomeError::NoHomeDir)),
+            2,
+            "configuration"
+        );
+        assert_eq!(
+            code(&RunError::Terminal(Terminal::Superseded)),
+            3,
+            "the server said stop"
+        );
     }
 }

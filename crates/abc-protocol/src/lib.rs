@@ -19,6 +19,7 @@
 pub mod api;
 pub mod enrol;
 pub mod link;
+pub mod url;
 
 use std::fmt;
 
@@ -602,6 +603,19 @@ mod tests {
         ]
     }
 
+    /// `text` with the byte at `at` (modulo its length) replaced by the ASCII `byte`, so the result
+    /// stays text: a message that is almost right.
+    fn corrupt(text: &str, at: usize, byte: u8) -> String {
+        let mut bytes = text.as_bytes().to_vec();
+        if let Some(slot) = at
+            .checked_rem(bytes.len())
+            .and_then(|slot| bytes.get_mut(slot))
+        {
+            *slot = byte & 0x7f;
+        }
+        String::from_utf8(bytes).unwrap_or_default()
+    }
+
     /// Proptest's defaults, with failing cases saved where this repository keeps them:
     /// `proptest-regressions/` beside the source file. Commit those files; proptest replays them
     /// before new cases.
@@ -627,6 +641,30 @@ mod tests {
         fn server_messages_survive_the_wire(message in server_message()) {
             let text = message.encode().unwrap();
             prop_assert_eq!(ServerMessage::decode(&text).unwrap(), message);
+        }
+
+        /// The fuzz target's property (`fuzz/fuzz_targets/decode.rs`), on every `check`: text
+        /// from a peer not yet trusted, whether arbitrary or a valid message with one byte
+        /// changed, decodes without panicking, and whatever decodes encodes and decodes back to
+        /// itself.
+        #[test]
+        fn untrusted_text_decodes_or_is_refused_never_half_read(
+            text in prop_oneof![
+                any::<String>(),
+                (worker_message(), any::<usize>(), any::<u8>()).prop_map(|(message, at, byte)| {
+                    corrupt(&message.encode().unwrap(), at, byte)
+                }),
+                (server_message(), any::<usize>(), any::<u8>()).prop_map(|(message, at, byte)| {
+                    corrupt(&message.encode().unwrap(), at, byte)
+                }),
+            ],
+        ) {
+            if let Ok(message) = WorkerMessage::decode(&text) {
+                prop_assert_eq!(WorkerMessage::decode(&message.encode().unwrap()).unwrap(), message);
+            }
+            if let Ok(message) = ServerMessage::decode(&text) {
+                prop_assert_eq!(ServerMessage::decode(&message.encode().unwrap()).unwrap(), message);
+            }
         }
 
         #[test]
