@@ -19,6 +19,7 @@
 pub mod api;
 pub mod enrol;
 pub mod link;
+pub mod url;
 
 use std::fmt;
 

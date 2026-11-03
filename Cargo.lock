@@ -7,6 +7,8 @@ name = "abc"
 version = "0.1.0"
 dependencies = [
  "abc-core",
+ "abc-platform",
+ "abc-protocol",
  "abc-server",
  "abc-store",
  "clap",
@@ -36,6 +38,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "abc-platform"
+version = "0.1.0"
+dependencies = [
+ "abc-core",
+ "rand 0.10.3",
+ "thiserror",
+ "time",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+ "zeroize",
+]
+
+[[package]]
 name = "abc-protocol"
 version = "0.1.0"
 dependencies = [
@@ -57,6 +73,7 @@ name = "abc-server"
 version = "0.1.0"
 dependencies = [
  "abc-core",
+ "abc-platform",
  "abc-protocol",
  "abc-store",
  "axum",
@@ -90,6 +107,7 @@ name = "abc-store"
 version = "0.1.0"
 dependencies = [
  "abc-core",
+ "abc-platform",
  "abc-store",
  "rand 0.10.3",
  "semver",

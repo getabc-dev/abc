@@ -11,6 +11,7 @@ publish.workspace = true
 # Deliberately no sqlx: abc-server can reach data only through abc_store::Store.
 [dependencies]
 abc-core = { path = "../abc-core" }
+abc-platform = { path = "../abc-platform" }
 abc-protocol = { path = "../abc-protocol" }
 abc-store = { path = "../abc-store" }
 axum.workspace = true
@@ -24,7 +25,6 @@ thiserror.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true
 tracing.workspace = true
-tracing-subscriber.workspace = true
 ts-rs.workspace = true
 uuid.workspace = true
 
@@ -42,6 +42,7 @@ tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 tokio-rustls.workspace = true
 tokio-tungstenite.workspace = true
+tracing-subscriber.workspace = true
 webpki-roots.workspace = true
 
 [lints]

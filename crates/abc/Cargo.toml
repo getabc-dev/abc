@@ -15,6 +15,8 @@ path = "src/main.rs"
 # No sqlx and no axum: the binary parses configuration and hands it over.
 [dependencies]
 abc-core = { path = "../abc-core" }
+abc-platform = { path = "../abc-platform" }
+abc-protocol = { path = "../abc-protocol" }
 abc-server = { path = "../abc-server" }
 abc-store = { path = "../abc-store" }
 clap = { workspace = true, features = ["env"] }

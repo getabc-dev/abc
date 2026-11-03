@@ -1,10 +1,10 @@
-//! Structured JSON logs (D12). One subscriber builder, used by the binary and by the tests, so the
-//! test that proves no secret is logged exercises the real configuration.
+//! Structured JSON logs (D12). One subscriber builder for `abc server`, `abc worker` and the tests,
+//! so the tests that prove no secret is logged exercise the real configuration.
 //!
 //! What is recorded: level, target, message, span fields (`request_id`, method, route, status,
-//! latency, login, worker, session). What is never recorded: headers, raw URIs, query strings,
-//! bodies, `Secret` values (their `Debug` is redacted anyway), or sqlx bind parameters (sqlx logs
-//! statement text only, and its level is capped at `warn` by default).
+//! latency, login, worker, session, server). What is never recorded: headers, raw URIs, query
+//! strings, bodies, `Secret` values (their `Debug` is redacted anyway), or sqlx bind parameters
+//! (sqlx logs statement text only, and its level is capped at `warn` by default).
 
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt::MakeWriter;
