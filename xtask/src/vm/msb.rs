@@ -125,14 +125,15 @@ impl Backend for Msb {
             .context("could not wait for the command in the VM")
     }
 
-    fn attach(&self, name: &str, command: &[OsString]) -> anyhow::Result<ExitStatus> {
-        self.command()
-            .args([
-                "exec".into(),
-                "--tty".into(),
-                name.into(),
-                OsString::from("--"),
-            ])
+    fn attach(&self, name: &str, command: &[OsString], tty: bool) -> anyhow::Result<ExitStatus> {
+        let mut exec = self.command();
+        exec.arg("exec");
+        if tty {
+            exec.arg("--tty");
+        }
+        // Inherited stdin, stdout and stderr pass straight through, as does the exit status.
+        exec.arg(name)
+            .arg("--")
             .args(command)
             .status()
             .with_context(|| format!("could not run {}", self.exe.display()))
@@ -317,7 +318,7 @@ mod tests {
         };
         assert!(format!("{:#}", missing.list().unwrap_err()).contains("could not run"));
         missing.exec("a", &[], b"").unwrap_err();
-        missing.attach("a", &[]).unwrap_err();
+        missing.attach("a", &[], false).unwrap_err();
         assert!(missing.load_image(&mut &b""[..], "t").is_err());
     }
 
@@ -370,13 +371,23 @@ mod tests {
             std::fs::read_to_string(dir.path().join("loaded")).unwrap(),
             "oci archive"
         );
-        let status = msb.attach("abc-w", &[OsString::from("claude")]).unwrap();
+        let status = msb
+            .attach("abc-w", &[OsString::from("claude")], true)
+            .unwrap();
         assert_eq!(status.code(), Some(7));
+        let headless = msb
+            .attach("abc-w", &[OsString::from("claude"), "-p".into()], false)
+            .unwrap();
+        assert_eq!(headless.code(), Some(7), "the exit status passes through");
         let log = log(dir.path());
         assert!(
             log.contains("load --quiet --tag abc-agent:latest\n"),
             "{log}"
         );
         assert!(log.contains("exec --tty abc-w -- claude\n"), "{log}");
+        assert!(
+            log.contains("exec abc-w -- claude -p\n"),
+            "no --tty without a terminal: {log}"
+        );
     }
 }
