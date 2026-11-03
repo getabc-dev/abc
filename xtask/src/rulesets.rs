@@ -433,13 +433,51 @@ fn run_gh(gh: &Path, root: &Path, args: &[&str]) -> anyhow::Result<String> {
         .output()
         .with_context(|| format!("could not run {}", gh.display()))?;
     if !output.status.success() {
-        bail!(
-            "gh {} failed: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let mut reason = stderr.trim().to_owned();
+        if let Some(explained) = github_error(&String::from_utf8_lossy(&output.stdout)) {
+            reason.push_str("; GitHub says: ");
+            reason.push_str(&explained);
+        }
+        bail!("gh {} failed: {reason}", args.join(" "));
     }
     String::from_utf8(output.stdout).context("gh printed text that is not UTF-8")
+}
+
+/// GitHub's own explanation of a failed API call, from the error body `gh api` prints on stdout:
+/// its `message`, then each entry of `errors`, which hold the actual reason behind a bare
+/// "Validation Failed". Entries are strings or objects with a `message` (else their `code`,
+/// `field` and `resource`). `None` when stdout holds no such body.
+fn github_error(stdout: &str) -> Option<String> {
+    let body: serde_json::Value = serde_json::from_str(stdout.trim()).ok()?;
+    let message = body.get("message").and_then(serde_json::Value::as_str);
+    let errors: Vec<String> = body
+        .get("errors")
+        .and_then(serde_json::Value::as_array)
+        .map(|errors| errors.iter().filter_map(error_entry).collect())
+        .unwrap_or_default();
+    match (message, errors.is_empty()) {
+        (None, true) => None,
+        (Some(message), true) => Some(message.to_owned()),
+        (None, false) => Some(errors.join("; ")),
+        (Some(message), false) => Some(format!("{message}: {}", errors.join("; "))),
+    }
+}
+
+/// One entry of a GitHub error body's `errors`, as text.
+fn error_entry(entry: &serde_json::Value) -> Option<String> {
+    if let Some(text) = entry.as_str() {
+        return Some(text.to_owned());
+    }
+    let field = |name: &str| entry.get(name).and_then(serde_json::Value::as_str);
+    if let Some(message) = field("message") {
+        return Some(message.to_owned());
+    }
+    let parts: Vec<String> = ["resource", "field", "code"]
+        .into_iter()
+        .filter_map(|name| field(name).map(|value| format!("{name} {value}")))
+        .collect();
+    (!parts.is_empty()).then(|| parts.join(", "))
 }
 
 #[cfg(test)]
@@ -449,7 +487,7 @@ mod tests {
 
     use super::{
         Action, BRANCHES, Existing, REPLACED, Refs, TAGS, apply, check, check_refs, check_text,
-        plan, repository, required_checks,
+        github_error, plan, repository, required_checks,
     };
     use crate::testing::{git, repository as new_repository};
 
@@ -745,6 +783,64 @@ mod tests {
         fs::write(&gh, "#!/bin/sh\necho denied >&2\nexit 1\n").unwrap();
         let error = apply(&repo, &gh, &mut Vec::new()).unwrap_err().to_string();
         assert!(error.contains("denied"), "gh's error is passed on: {error}");
+        // What `gh api` does when GitHub refuses a ruleset: the error body on stdout, a summary
+        // on stderr.
+        fs::write(
+            &gh,
+            "#!/bin/sh
+case \"$*\" in 'api repos/getabc-dev/abc/rulesets') echo '[]' ;; *) \
+             echo '{\"message\":\"Validation Failed\",\"errors\":[\"Actor Renovate integration \
+             must be part of the ruleset source or owner organization\"],\"status\":\"422\"}'; \
+             echo 'gh: Validation Failed (HTTP 422)' >&2; exit 1 ;; esac\n",
+        )
+        .unwrap();
+        let refused = apply(&repo, &gh, &mut Vec::new()).unwrap_err().to_string();
+        assert_eq!(
+            refused,
+            "gh api -X POST repos/getabc-dev/abc/rulesets --input .github/rulesets/main.json \
+             failed: gh: Validation Failed (HTTP 422); GitHub says: Validation Failed: Actor \
+             Renovate integration must be part of the ruleset source or owner organization",
+            "GitHub's reason, not only gh's summary"
+        );
+    }
+
+    #[test]
+    fn reads_githubs_error_bodies() {
+        assert_eq!(
+            github_error(r#"{"message":"Validation Failed","errors":["a","b"]}"#).as_deref(),
+            Some("Validation Failed: a; b"),
+            "the message, then every error"
+        );
+        assert_eq!(
+            github_error(
+                r#"{"message":"Validation Failed","errors":[{"message":"Name is taken"},{"resource":"Ruleset","field":"name","code":"invalid"},{"other":1}]}"#
+            )
+            .as_deref(),
+            Some("Validation Failed: Name is taken; resource Ruleset, field name, code invalid"),
+            "an object's message, else its resource, field and code; an entry with none is left out"
+        );
+        assert_eq!(
+            github_error(
+                r#"{"message":"Not Found","documentation_url":"https://docs.github.com"}"#
+            )
+            .as_deref(),
+            Some("Not Found"),
+            "a message alone"
+        );
+        assert_eq!(
+            github_error(r#"{"errors":["only errors"]}"#).as_deref(),
+            Some("only errors"),
+            "errors alone"
+        );
+        for silent in [
+            "",
+            "not json",
+            "[]",
+            r#"{"documentation_url":"x"}"#,
+            r#"{"errors":[]}"#,
+        ] {
+            assert_eq!(github_error(silent), None, "{silent:?} explains nothing");
+        }
     }
 
     #[test]
