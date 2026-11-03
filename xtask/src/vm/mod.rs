@@ -17,7 +17,7 @@ mod msb;
 mod session;
 
 use std::ffi::OsString;
-use std::io::{Read, Write};
+use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, ExitStatus, Output, Stdio};
 use std::time::Duration;
@@ -127,8 +127,9 @@ pub(crate) trait Backend {
     fn start(&self, spec: &Spec) -> anyhow::Result<()>;
     /// Runs `command` as root in VM `name` with `stdin`, capturing its output.
     fn exec(&self, name: &str, command: &[OsString], stdin: &[u8]) -> anyhow::Result<Output>;
-    /// Runs `command` as root in VM `name` on this terminal.
-    fn attach(&self, name: &str, command: &[OsString]) -> anyhow::Result<ExitStatus>;
+    /// Runs `command` as root in VM `name` with this process's stdin, stdout and stderr. With
+    /// `tty` the VM gives it a pseudo-terminal; without, the streams pass through as they are.
+    fn attach(&self, name: &str, command: &[OsString], tty: bool) -> anyhow::Result<ExitStatus>;
     /// Stops and deletes VM `name` with its logs; a VM that is gone is fine.
     fn remove(&self, name: &str) -> anyhow::Result<()>;
     fn remove_volumes(&self, names: &[String]) -> anyhow::Result<()>;
@@ -198,6 +199,9 @@ pub(crate) struct Host {
     pub(crate) patience: u32,
     /// Guest directories no mount may cover: [`RESERVED`].
     pub(crate) reserved: Vec<PathBuf>,
+    /// Whether stdin is a terminal: `shell` attaches a pseudo-terminal only then, so a headless
+    /// `claude -p` gets plain pipes and the command's exit status.
+    pub(crate) terminal: bool,
 }
 
 impl Host {
@@ -224,6 +228,7 @@ impl Host {
             builder: PathBuf::from(os.builder()),
             patience: 150,
             reserved: RESERVED.iter().map(PathBuf::from).collect(),
+            terminal: std::io::stdin().is_terminal(),
         })
     }
 }
@@ -301,7 +306,7 @@ pub(crate) fn run(
         }
         Action::Shell { worktree, command } => {
             let session = Session::open(&worktree, &host.repo, &host.state)?;
-            return shell(&session, backend, command);
+            return shell(&session, backend, command, host.terminal);
         }
         Action::Auth { worktree } => {
             let session = Session::open(&worktree, &host.repo, &host.state)?;
@@ -575,6 +580,7 @@ fn shell(
     session: &Session,
     backend: &dyn Backend,
     command: Vec<OsString>,
+    tty: bool,
 ) -> anyhow::Result<ExitCode> {
     let command = if command.is_empty() {
         vec![OsString::from("claude")]
@@ -583,7 +589,7 @@ fn shell(
     };
     let mut full = vec![OsString::from("agent-exec")];
     full.extend(command);
-    let status = backend.attach(&session.name, &full)?;
+    let status = backend.attach(&session.name, &full, tty)?;
     Ok(ExitCode::from(crate::tools::status_code(status)))
 }
 

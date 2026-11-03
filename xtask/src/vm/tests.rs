@@ -77,10 +77,11 @@ impl Backend for Fake {
         })
     }
 
-    fn attach(&self, name: &str, command: &[OsString]) -> anyhow::Result<ExitStatus> {
+    fn attach(&self, name: &str, command: &[OsString], tty: bool) -> anyhow::Result<ExitStatus> {
+        let tty = if tty { " --tty" } else { "" };
         self.calls
             .borrow_mut()
-            .push(format!("attach {name} {}", shown(command)));
+            .push(format!("attach{tty} {name} {}", shown(command)));
         Ok(ExitStatus::from_raw(5 << 8))
     }
 
@@ -203,6 +204,7 @@ fn world(token: &str) -> World {
         // Scratch worktrees live in the system's temporary directory, which the production policy
         // reserves on Linux; the policy itself is tested on its own.
         reserved: Vec::new(),
+        terminal: true,
     };
     let broker = fake_broker(&host.home);
     World {
@@ -485,7 +487,7 @@ fn starts_the_installed_broker_when_none_listens() {
 
 #[test]
 fn shells_auths_syncs_lists_and_stops() {
-    let world = world("t");
+    let mut world = world("t");
     let backend = subscribed();
     let worktree = world.worktree.clone();
     start_ok(&world, &backend);
@@ -504,6 +506,17 @@ fn shells_auths_syncs_lists_and_stops() {
         Action::Shell {
             worktree: worktree.clone(),
             command: vec!["bash".into(), "-l".into()],
+        },
+    )
+    .0
+    .unwrap();
+    world.host.terminal = false;
+    act(
+        &world,
+        &backend,
+        Action::Shell {
+            worktree: worktree.clone(),
+            command: vec!["claude".into(), "-p".into()],
         },
     )
     .0
@@ -533,12 +546,16 @@ fn shells_auths_syncs_lists_and_stops() {
     stop_session(&world, &backend, true);
     let calls = backend.calls.borrow();
     assert!(
-        calls.contains(&"attach abc-w agent-exec claude".to_owned()),
+        calls.contains(&"attach --tty abc-w agent-exec claude".to_owned()),
         "{calls:?}"
     );
     assert!(
-        calls.contains(&"attach abc-w agent-exec bash -l".to_owned()),
+        calls.contains(&"attach --tty abc-w agent-exec bash -l".to_owned()),
         "{calls:?}"
+    );
+    assert!(
+        calls.contains(&"attach abc-w agent-exec claude -p".to_owned()),
+        "no pseudo-terminal without a terminal: {calls:?}"
     );
     assert_eq!(
         calls.iter().filter(|call| *call == "remove abc-w").count(),
