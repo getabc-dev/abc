@@ -231,4 +231,75 @@ mod tests {
             "{log}"
         );
     }
+
+    #[test]
+    fn the_vm_guard_answers_when_the_workspace_does_not_build() {
+        // A project whose workspace cannot resolve, and a cargo that fails if anything runs it.
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(
+            project.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/broken\"]\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(project.path().join("crates/broken")).unwrap();
+        std::fs::write(
+            project.path().join("crates/broken/Cargo.toml"),
+            "[package]\nname = \"broken\"\n[dependencies]\nabc-server = { workspace = true, features = [\"nope\"] }\n",
+        )
+        .unwrap();
+        let bin = tempfile::tempdir().unwrap();
+        let script = |name: &str, body: String| {
+            let path = bin.path().join(name);
+            std::fs::write(&path, format!("#!/bin/sh\n{body}")).unwrap();
+            std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+                .unwrap();
+        };
+        script("cargo", "echo 'cargo ran' >&2\nexit 101\n".to_owned());
+        // The image's xtask: the real binary, past the billing check that needs a real VM.
+        script(
+            "abc-xtask",
+            format!(
+                "[ \"$1\" = vm ] && exit 0\nexec {} \"$@\"\n",
+                env!("CARGO_BIN_EXE_xtask")
+            ),
+        );
+        let hook = Path::new(env!("CARGO_MANIFEST_DIR")).join("hooks/pre-tool-use.sh");
+        let run = |command: &str| {
+            let input = format!(
+                r#"{{"cwd":"{}","tool_name":"Bash","tool_input":{{"command":"{command}"}}}}"#,
+                project.path().display()
+            );
+            let mut child = Command::new("sh")
+                .arg(&hook)
+                .env(
+                    "PATH",
+                    format!(
+                        "{}:{}",
+                        bin.path().display(),
+                        std::env::var("PATH").unwrap()
+                    ),
+                )
+                .env("ABC_VM", "1")
+                .env("CLAUDE_PROJECT_DIR", project.path())
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(input.as_bytes())
+                .unwrap();
+            let output = child.wait_with_output().unwrap();
+            (output.status.code(), stderr(&output))
+        };
+        let (code, said) = run("git push --force origin agent/x");
+        assert_eq!(code, Some(2), "the guard still blocks a force push: {said}");
+        assert!(!said.contains("cargo ran"), "nothing built: {said}");
+        let (allowed, also) = run("git status");
+        assert_eq!(allowed, Some(0), "and allows what is safe: {also}");
+        assert!(!also.contains("cargo ran"), "nothing built: {also}");
+    }
 }

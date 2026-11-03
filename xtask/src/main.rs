@@ -181,6 +181,11 @@ enum Task {
         /// The hook event.
         #[arg(value_enum)]
         event: hook::Event,
+        /// For `pre-tool-use`: judge the command by the guard's rules alone, without locating the
+        /// agent's checkout and handing over to its xtask. The agent VM runs its installed xtask
+        /// this way, so the guard never depends on a build of the checkout.
+        #[arg(long)]
+        standalone: bool,
     },
 }
 
@@ -347,12 +352,12 @@ fn run(
             Ok(ExitCode::SUCCESS)
         }
         Task::Tool { name, args } => tools::run(&tool(&name)?, root, &args),
-        Task::Hook { event } => {
+        Task::Hook { event, standalone } => {
             let mut input = String::new();
             io::stdin()
                 .read_to_string(&mut input)
                 .context("could not read the hook input from stdin")?;
-            let context = hook::Context::from_env(home.clone());
+            let context = hook::Context::from_env(home.clone(), standalone);
             Ok(ExitCode::from(hook::run(event, &input, &context, report)?))
         }
     }

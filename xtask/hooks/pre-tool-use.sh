@@ -2,9 +2,12 @@
 # Claude Code PreToolUse hook for Bash and Monitor. It runs `cargo xtask hook pre-tool-use`, which
 # blocks force pushes and git or gh commands it cannot read.
 #
-# xtask builds into target/hook, apart from target/, so the guard never waits on the build lock of
-# a cargo command the agent is running. .claude/settings.json gives this hook 300 seconds, enough to
-# build xtask there the first time. Claude Code cancels a hook at its timeout, and a timed-out
+# In an agent VM the guard is the image's installed xtask (`abc-xtask hook pre-tool-use
+# --standalone`, built from main), which never builds and so does not depend on the checkout's
+# workspace resolving (W19). Elsewhere xtask builds into target/hook, apart from target/, so the
+# guard never waits on the build lock of a cargo command the agent is running.
+# .claude/settings.json gives this hook 300 seconds, enough to build xtask there the first time.
+# Claude Code cancels a hook at its timeout, and a timed-out
 # PreToolUse hook does not block the tool call: the guard fails open only then, and GitHub's rules
 # still stand.
 #
@@ -21,7 +24,12 @@ input=$(cat)
 if [ "${ABC_VM:-}" = 1 ]; then
   abc-xtask vm billing || exit 2
 fi
-if cd "$CLAUDE_PROJECT_DIR" 2>/dev/null; then
+if [ "${ABC_VM:-}" = 1 ]; then
+  # The VM's installed xtask judges alone, so the guard never waits on a build and answers even
+  # when the checkout's workspace does not resolve.
+  printf '%s' "$input" | abc-xtask hook pre-tool-use --standalone
+  status=$?
+elif cd "$CLAUDE_PROJECT_DIR" 2>/dev/null; then
   printf '%s' "$input" | CARGO_TARGET_DIR="$CLAUDE_PROJECT_DIR/target/hook" cargo xtask hook pre-tool-use
   status=$?
 else

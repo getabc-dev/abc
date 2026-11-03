@@ -17,6 +17,10 @@
 //! The `PreToolUse` guard catches accidents; it is not the enforcement. GitHub rulesets on `main`
 //! (no force push, no deletion, required checks) and the abc-agent App's limited permissions are.
 //!
+//! The agent VM runs its installed xtask with `--standalone`, which judges by the guard's rules
+//! alone: nothing builds, so the guard answers even when the checkout's workspace does not resolve
+//! (W19).
+//!
 //! When the `PreToolUse` guard cannot run, it blocks commands that mention git or gh and lets the
 //! rest through, so a broken build never locks the agent out of the shell. When xtask cannot even
 //! start, `xtask/hooks/pre-tool-use.sh` applies the same rule.
@@ -72,11 +76,14 @@ pub(crate) struct Context {
     claude: PathBuf,
     /// Whether this hook runs inside the watchdog's own claude session, where it must do nothing.
     inside_watchdog: bool,
+    /// Whether the guard judges on its own rules, without locating a checkout.
+    standalone: bool,
 }
 
 impl Context {
-    pub(crate) fn from_env(own_root: PathBuf) -> Self {
+    pub(crate) fn from_env(own_root: PathBuf, standalone: bool) -> Self {
         Self {
+            standalone,
             own_root,
             project_dir: std::env::var_os("CLAUDE_PROJECT_DIR").map(PathBuf::from),
             delegated: std::env::var_os(DELEGATED).is_some(),
@@ -125,7 +132,11 @@ pub(crate) fn run(
     out: &mut impl Write,
 ) -> anyhow::Result<u8> {
     match event {
-        Event::PreToolUse => match act(event, input, context, out) {
+        Event::PreToolUse => match if context.standalone {
+            guard(input, out)
+        } else {
+            act(event, input, context, out)
+        } {
             Ok(code @ (0 | 2)) => Ok(code),
             Ok(code) => guard_unavailable(&format!("it exited {code}"), input, out),
             Err(error) => guard_unavailable(&format!("{error:#}"), input, out),
@@ -409,6 +420,7 @@ mod tests {
             cargo: PathBuf::from("cargo"),
             claude: PathBuf::from("claude"),
             inside_watchdog: false,
+            standalone: false,
         }
     }
 
@@ -684,6 +696,8 @@ mod tests {
             .args(args)
             .env("PATH", path)
             .env("CLAUDE_PROJECT_DIR", project)
+            // These tests run in an agent VM too, which sets this; the script's VM path has its own.
+            .env_remove("ABC_VM")
             .stdin(Stdio::piped())
             .stderr(Stdio::piped())
             .stdout(Stdio::null())
