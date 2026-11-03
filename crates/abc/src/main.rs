@@ -209,7 +209,7 @@ async fn serve(server: ServerCommand) -> Result<(), Failure> {
         link: LinkTimings::default(),
         limits: Limits::default(),
     };
-    abc_server::run(settings, shutdown_signal())
+    abc_server::run(settings, shutdown_signal()?)
         .await
         .map_err(|error| {
             tracing::error!(error = %chain(&error), "the server stopped");
@@ -269,7 +269,7 @@ async fn work(worker: WorkerCommand) -> Result<(), Failure> {
         None => {
             abc_platform::telemetry::init(worker.log.as_deref())
                 .map_err(|error| config(Box::new(error)))?;
-            abc_worker::run(&home, &env, shutdown_signal())
+            abc_worker::run(&home, &env, shutdown_signal()?)
                 .await
                 .map_err(|error| worker_failure(&error))
         }
@@ -355,23 +355,20 @@ fn enrolment_token() -> Result<Secret<EnrolmentToken>, Box<dyn StdError>> {
     })
 }
 
-/// Resolves on SIGTERM or SIGINT.
-async fn shutdown_signal() {
+/// Listens for SIGTERM and SIGINT at once, and returns a future that resolves on either. Listening
+/// starts here, not on the future's first poll, so a signal that arrives while the process is
+/// still starting is a clean stop rather than the default action, which kills it.
+fn shutdown_signal() -> Result<impl Future<Output = ()>, Failure> {
     use tokio::signal::unix::{SignalKind, signal};
-    match (
-        signal(SignalKind::terminate()),
-        signal(SignalKind::interrupt()),
-    ) {
-        (Ok(mut terminate), Ok(mut interrupt)) => {
-            tokio::select! {
-                _ = terminate.recv() => {}
-                _ = interrupt.recv() => {}
-            }
+    let listen = |kind| signal(kind).map_err(|error| Failure::Run(Box::new(error)));
+    let mut terminate = listen(SignalKind::terminate())?;
+    let mut interrupt = listen(SignalKind::interrupt())?;
+    Ok(async move {
+        tokio::select! {
+            _ = terminate.recv() => {}
+            _ = interrupt.recv() => {}
         }
-        (Err(error), _) | (_, Err(error)) => {
-            tracing::error!(error = %error, "cannot listen for shutdown signals; stopping");
-        }
-    }
+    })
 }
 
 #[cfg(test)]
