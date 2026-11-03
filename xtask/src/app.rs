@@ -47,16 +47,32 @@ fn default_repository() -> String {
 /// What a token is for, which decides the permissions it gets (I5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Scope {
-    /// git fetching and pushing, workflow files included.
+    /// git fetching and pushing, never workflow files: a change to one is the maintainer's to
+    /// push.
     Git,
     /// gh: pull requests and the branches behind them, and reading CI results.
     Gh,
 }
 
 impl Scope {
+    /// The scope's name in the token broker's protocol.
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Git => "git",
+            Self::Gh => "gh",
+        }
+    }
+
+    /// The scope named `name` in the token broker's protocol.
+    pub(crate) fn parse(name: &str) -> Option<Self> {
+        [Self::Git, Self::Gh]
+            .into_iter()
+            .find(|scope| scope.name() == name)
+    }
+
     fn permissions(self) -> serde_json::Value {
         match self {
-            Self::Git => serde_json::json!({"contents": "write", "workflows": "write"}),
+            Self::Git => serde_json::json!({"contents": "write"}),
             Self::Gh => serde_json::json!({
                 "contents": "write",
                 "pull_requests": "write",
@@ -250,16 +266,16 @@ pub(crate) fn credential(
     Ok(())
 }
 
-/// `cargo xtask gh`: runs `program` (gh) with `args` as `app`, with a token minted from `api` for
-/// this run and revoked when it ends.
+/// `cargo xtask gh`: runs `program` (gh) with `args` as the App, with a token from `mint` for this
+/// run, revoked at `api` when it ends.
 pub(crate) fn run_gh(
-    app: &App,
+    mint: impl FnOnce() -> anyhow::Result<String>,
     api: &str,
     program: &Path,
     args: &[OsString],
     out: &mut impl Write,
 ) -> anyhow::Result<ExitCode> {
-    let token = app.token(api, Scope::Gh)?;
+    let token = mint()?;
     let code = gh(program, args, &token);
     if let Err(error) = revoke(api, &token) {
         writeln!(
@@ -271,7 +287,7 @@ pub(crate) fn run_gh(
 }
 
 /// Revokes the installation `token` at `api`.
-fn revoke(api: &str, token: &str) -> anyhow::Result<()> {
+pub(crate) fn revoke(api: &str, token: &str) -> anyhow::Result<()> {
     ureq::delete(&format!("{api}/installation/token"))
         .header("Authorization", &format!("Bearer {token}"))
         .header("Accept", "application/vnd.github+json")
@@ -444,7 +460,7 @@ mod tests {
             body,
             serde_json::json!({
                 "repositories": ["abc"],
-                "permissions": {"contents": "write", "workflows": "write"}
+                "permissions": {"contents": "write"}
             }),
             "one repository, and only what git needs"
         );
@@ -522,9 +538,10 @@ mod tests {
             gh_permissions.get("workflows").is_none(),
             "gh does not edit workflows"
         );
-        assert!(
-            Scope::Git.permissions().get("pull_requests").is_none(),
-            "git does not touch pull requests"
+        assert_eq!(
+            Scope::Git.permissions(),
+            serde_json::json!({"contents": "write"}),
+            "git pushes contents alone: no pull requests, no workflow files"
         );
     }
 
@@ -539,7 +556,7 @@ mod tests {
         script(&fake, "[ \"$GH_TOKEN\" = ghs_test ] || exit 3\nexit 4\n");
         let mut out = Vec::new();
         let code = run_gh(
-            &App::load(dir.path()).unwrap(),
+            || App::load(dir.path()).unwrap().token(&url, Scope::Gh),
             &url,
             &fake,
             &["pr".into(), "list".into()],
@@ -572,7 +589,7 @@ mod tests {
         ]);
         let mut warned = Vec::new();
         run_gh(
-            &App::load(dir.path()).unwrap(),
+            || App::load(dir.path()).unwrap().token(&refusing, Scope::Gh),
             &refusing,
             &fake,
             &[],

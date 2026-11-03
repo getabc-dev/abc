@@ -8,7 +8,7 @@ use std::fs::{self, Permissions};
 use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
-use std::process::{Command, ExitCode, ExitStatus};
+use std::process::{Child, Command, ExitCode, ExitStatus};
 
 use anyhow::{Context, bail, ensure};
 use flate2::read::GzDecoder;
@@ -141,6 +141,11 @@ struct Asset {
     sha256: String,
     /// Lowercase hex sha256 of the installed executable, checked whenever xtask uses it.
     binary_sha256: String,
+    /// A shared library the executable loads from beside itself, as its path inside the archive;
+    /// it is installed next to the executable.
+    library: Option<String>,
+    /// Lowercase hex sha256 of that library, checked whenever xtask uses the tool.
+    library_sha256: Option<String>,
 }
 
 /// The validated tool list.
@@ -300,8 +305,49 @@ impl Tool {
                 self.binary.is_none() || !binary.is_empty(),
                 "{target}: binary must not be empty; omit it when the asset is the executable"
             );
+            self.validate_library(target, asset)?;
         }
         Ok(())
+    }
+
+    /// Checks the library of `asset`, the tool's asset for `target`, if it has one.
+    fn validate_library(&self, target: Target, asset: &Asset) -> anyhow::Result<()> {
+        match (self.library_member(asset), &asset.library_sha256) {
+            (None, None) => Ok(()),
+            (Some(library), Some(sha256)) => {
+                ensure!(
+                    self.binary.is_some(),
+                    "{target}: a library comes only from an archive, which needs `binary`"
+                );
+                ensure!(
+                    is_sha256_hex(sha256),
+                    "{target}: library-sha256 must be 64 lowercase hex digits"
+                );
+                let shown = library.display();
+                ensure!(
+                    !shown.to_string().contains(['{', '}']),
+                    "{target}: library {shown} has a placeholder other than {{version}} and \
+                     {{platform}}"
+                );
+                ensure!(
+                    library.file_name().is_some()
+                        && library
+                            .components()
+                            .all(|component| matches!(component, Component::Normal(_))),
+                    "{target}: library {shown:?} must be a relative path inside the archive"
+                );
+                Ok(())
+            }
+            _ => bail!("{target}: library and library-sha256 go together"),
+        }
+    }
+
+    /// The path inside the archive of the library of `asset`, if it has one.
+    fn library_member(&self, asset: &Asset) -> Option<PathBuf> {
+        asset
+            .library
+            .as_ref()
+            .map(|template| PathBuf::from(self.render(template, asset)))
     }
 
     fn source(&self) -> anyhow::Result<Source<'_>> {
@@ -373,6 +419,19 @@ impl Tool {
             .replace("{platform}", &asset.platform)
     }
 
+    /// The pinned library for `target`, where it is installed and its sha256, if the tool has one.
+    fn library(&self, root: &Path, target: Target) -> anyhow::Result<Option<(PathBuf, &str)>> {
+        let asset = self.asset(target)?;
+        Ok(self
+            .library_member(asset)
+            .zip(asset.library_sha256.as_deref())
+            .and_then(|(member, sha256)| {
+                let name = member.file_name()?.to_os_string();
+                let dir = self.executable(root).parent()?.to_path_buf();
+                Some((dir.join(name), sha256))
+            }))
+    }
+
     fn executable(&self, root: &Path) -> PathBuf {
         root.join(TOOLS_DIR)
             .join(&self.name)
@@ -404,6 +463,22 @@ impl Tool {
             "{} has sha256 {actual}, but its pin is {pinned}: run `cargo xtask setup`",
             executable.display()
         );
+        if let Source::Release { .. } = self.source()?
+            && let Some((library, library_pin)) = self.library(root, Target::host()?)?
+        {
+            let library_sha256 = file_sha256(&library).with_context(|| {
+                format!(
+                    "{} is not installed: run `cargo xtask setup`",
+                    library.display()
+                )
+            })?;
+            ensure!(
+                library_sha256 == library_pin,
+                "{} has sha256 {library_sha256}, but its pin is {library_pin}: run `cargo xtask \
+                 setup`",
+                library.display()
+            );
+        }
         Ok(executable)
     }
 
@@ -415,6 +490,19 @@ impl Tool {
         let sha256 = file_sha256(&executable)?;
         if self.executable_pin(root, target)?.as_deref() != Some(sha256.as_str()) {
             return Ok(Status::Modified { sha256 });
+        }
+        if let Source::Release { .. } = self.source()?
+            && let Some((library, library_pin)) = self.library(root, target)?
+        {
+            if !library.is_file() {
+                return Ok(Status::Missing);
+            }
+            let library_sha256 = file_sha256(&library)?;
+            if library_sha256 != library_pin {
+                return Ok(Status::LibraryModified {
+                    sha256: library_sha256,
+                });
+            }
         }
         let version_args = self
             .version_args
@@ -470,6 +558,10 @@ enum Status {
     Missing,
     /// Installed, but the executable is not the pinned one.
     Modified {
+        sha256: String,
+    },
+    /// Installed, but its library is not the pinned one.
+    LibraryModified {
         sha256: String,
     },
     /// Installed with the pinned sha256, but `--version` does not report the pinned version.
@@ -540,6 +632,14 @@ fn report(
                     tool.version,
                     tool.executable_pin(root, target)?
                         .unwrap_or_else(|| "missing".to_owned())
+                )?;
+            }
+            Status::LibraryModified { sha256 } => {
+                ready = false;
+                writeln!(
+                    out,
+                    "modified {} {}: the installed library has sha256 {sha256}, not its pin",
+                    tool.name, tool.version
                 )?;
             }
             Status::Drift { reported } => {
@@ -639,6 +739,16 @@ fn pin_text(
                 "binary-sha256",
                 &binary_sha256,
             )?;
+            if let Some(member) = tool.library_member(asset) {
+                let library_sha256 = sha256_hex(&extract(&archive, &member)?);
+                set_pin(
+                    &mut document,
+                    &tool.name,
+                    target,
+                    "library-sha256",
+                    &library_sha256,
+                )?;
+            }
         }
     }
     Ok(document.to_string())
@@ -754,6 +864,22 @@ pub(crate) fn status_code(status: ExitStatus) -> u8 {
         .unwrap_or(1)
 }
 
+/// Writes `input` to `child`'s piped stdin and closes it, saying whether the child took all of it.
+/// A child that exits without reading its input, such as a hook that only prints a note or a
+/// command that fails at once, closes the pipe first; its exit status then decides the outcome, so
+/// a broken pipe is not an error.
+pub(crate) fn feed(child: &mut Child, input: &mut dyn Read) -> std::io::Result<bool> {
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| std::io::Error::other("the child's input is not piped"))?;
+    match std::io::copy(input, &mut stdin) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
 fn download(url: &str) -> anyhow::Result<Vec<u8>> {
     let mut response = ureq::get(url)
         .call()
@@ -804,7 +930,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
 /// Verifies a downloaded release asset or `.crate` file and installs the tool's executable from
 /// it.
 fn install(root: &Path, tool: &Tool, target: Target, download: &[u8]) -> anyhow::Result<()> {
-    let binary = match tool.source()? {
+    let (binary, library) = match tool.source()? {
         Source::Release { .. } => verified_release(tool, target, download)?,
         Source::Crate { name, sha256 } => {
             let actual = sha256_hex(download);
@@ -814,14 +940,21 @@ fn install(root: &Path, tool: &Tool, target: Target, download: &[u8]) -> anyhow:
                  {actual}. If the version changed, run `cargo xtask pin`.",
                 tool.version
             );
-            build_crate(root, tool, name, download)?
+            (build_crate(root, tool, name, download)?, None)
         }
     };
-    place(root, tool, target, &binary)
+    place(root, tool, target, &binary, library.as_ref())
 }
 
-/// The executable in a verified release asset.
-fn verified_release(tool: &Tool, target: Target, archive: &[u8]) -> anyhow::Result<Vec<u8>> {
+/// A library to install beside an executable: its file name and contents.
+type Library = (OsString, Vec<u8>);
+
+/// The executable in a verified release asset, and its library if it has one.
+fn verified_release(
+    tool: &Tool,
+    target: Target,
+    archive: &[u8],
+) -> anyhow::Result<(Vec<u8>, Option<Library>)> {
     let asset = tool.asset(target)?;
     let actual = sha256_hex(archive);
     ensure!(
@@ -842,7 +975,23 @@ fn verified_release(tool: &Tool, target: Target, archive: &[u8]) -> anyhow::Resu
         tool.version,
         asset.binary_sha256
     );
-    Ok(binary)
+    let library = match (tool.library_member(asset), &asset.library_sha256) {
+        (Some(member), Some(pinned)) => {
+            let bytes = extract(archive, &member)?;
+            let sha256 = sha256_hex(&bytes);
+            ensure!(
+                &sha256 == pinned,
+                "sha256 mismatch for the {} {} library on {target}: {MANIFEST} pins {pinned}, the \
+                 archive holds {sha256}",
+                tool.name,
+                tool.version
+            );
+            let name = member.file_name().context("the library has no file name")?;
+            Some((name.to_os_string(), bytes))
+        }
+        _ => None,
+    };
+    Ok((binary, library))
 }
 
 /// Builds the executable of `tool` from the verified `.crate` file of crate `name`, with the
@@ -887,8 +1036,14 @@ fn build_crate(root: &Path, tool: &Tool, name: &str, archive: &[u8]) -> anyhow::
     Ok(binary)
 }
 
-/// Installs `binary` as the tool's executable and checks it.
-fn place(root: &Path, tool: &Tool, target: Target, binary: &[u8]) -> anyhow::Result<()> {
+/// Installs `binary` as the tool's executable, with `library` beside it, and checks them.
+fn place(
+    root: &Path,
+    tool: &Tool,
+    target: Target,
+    binary: &[u8],
+    library: Option<&Library>,
+) -> anyhow::Result<()> {
     let tool_dir = root.join(TOOLS_DIR).join(&tool.name);
     let staging = tool_dir.join(format!("{}.partial", tool.version));
     let destination = tool_dir.join(&tool.version);
@@ -900,6 +1055,10 @@ fn place(root: &Path, tool: &Tool, target: Target, binary: &[u8]) -> anyhow::Res
         .with_context(|| format!("could not write {}", executable.display()))?;
     fs::set_permissions(&executable, Permissions::from_mode(0o755))
         .with_context(|| format!("could not make {} executable", executable.display()))?;
+    if let Some((name, bytes)) = library {
+        let path = staging.join(name);
+        fs::write(&path, bytes).with_context(|| format!("could not write {}", path.display()))?;
+    }
     if let Source::Crate { .. } = tool.source()? {
         let mut record = executable.into_os_string();
         record.push(".sha256");
@@ -913,8 +1072,8 @@ fn place(root: &Path, tool: &Tool, target: Target, binary: &[u8]) -> anyhow::Res
     match tool.status(root, target)? {
         Status::Ready => Ok(()),
         Status::Missing => bail!("{} vanished after install", tool.name),
-        Status::Modified { sha256 } => bail!(
-            "{} changed while it was installed: its sha256 is now {sha256}",
+        Status::Modified { sha256 } | Status::LibraryModified { sha256 } => bail!(
+            "{} changed while it was installed: a sha256 is now {sha256}",
             tool.name
         ),
         Status::Drift { reported } => bail!(
@@ -1035,6 +1194,27 @@ mod tests {
         published_sha256, remove_other_versions, report, reports_version, set_pin, setup,
         sha256_hex,
     };
+
+    /// Input that cannot be read.
+    struct Unreadable;
+
+    impl std::io::Read for Unreadable {
+        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("the disk is gone"))
+        }
+    }
+
+    #[test]
+    fn feeding_reports_input_that_cannot_be_read() {
+        let mut child = std::process::Command::new("cat")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let error = super::feed(&mut child, &mut Unreadable).unwrap_err();
+        assert_eq!(error.to_string(), "the disk is gone");
+        assert!(child.wait().unwrap().success(), "its stdin was closed");
+    }
 
     const SHA_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const SHA_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
@@ -1348,6 +1528,141 @@ targets.aarch64-unknown-linux-gnu = {{ platform = "linux-arm64", sha256 = "{sha2
             fs::read(&executable).unwrap(),
             SCRIPT,
             "and replaced by the pinned build"
+        );
+    }
+
+    const LIBRARY: &[u8] = b"\x7fELF a library";
+
+    /// The tool list pinning `archive`, whose executable is `binary` and whose library is `lib`.
+    fn pinned_with_library(archive: &[u8], binary: &[u8], library: &[u8]) -> Manifest {
+        let text = manifest_text(&sha256_hex(archive), &sha256_hex(binary)).replace(
+            " }\n",
+            &format!(
+                ", library = \"fake-{{version}}/libfake.so\", library-sha256 = \"{}\" }}\n",
+                sha256_hex(library)
+            ),
+        );
+        Manifest::parse(&text).unwrap()
+    }
+
+    #[test]
+    fn installs_and_checks_a_library_beside_the_executable() {
+        let root = tempfile::tempdir().unwrap();
+        let archive = tarball(&[
+            ("fake-1.2.3/fake", SCRIPT, 0o755),
+            ("fake-1.2.3/libfake.so", LIBRARY, 0o644),
+        ]);
+        let manifest = pinned_with_library(&archive, SCRIPT, LIBRARY);
+        let tool = only_tool(&manifest);
+        install(root.path(), tool, Target::MacArm64, &archive).unwrap();
+        let library = root.path().join(".tools/fake/1.2.3/libfake.so");
+        assert_eq!(
+            fs::read(&library).unwrap(),
+            LIBRARY,
+            "beside the executable"
+        );
+        assert_eq!(
+            tool.status(root.path(), Target::MacArm64).unwrap(),
+            Status::Ready
+        );
+        tool.installed(root.path()).unwrap();
+
+        fs::write(&library, b"swapped").unwrap();
+        assert_eq!(
+            tool.status(root.path(), Target::MacArm64).unwrap(),
+            Status::LibraryModified {
+                sha256: sha256_hex(b"swapped")
+            }
+        );
+        let error = tool.installed(root.path()).unwrap_err().to_string();
+        assert!(error.contains("libfake.so has sha256"), "{error}");
+        let mut out = Vec::new();
+        let code = report(root.path(), &manifest, Target::MacArm64, &mut out).unwrap();
+        let printed = String::from_utf8(out).unwrap();
+        assert_eq!(code, ExitCode::FAILURE);
+        assert!(
+            printed.contains("the installed library has sha256"),
+            "{printed}"
+        );
+
+        fs::remove_file(&library).unwrap();
+        assert_eq!(
+            tool.status(root.path(), Target::MacArm64).unwrap(),
+            Status::Missing
+        );
+        let missing = tool.installed(root.path()).unwrap_err().to_string();
+        assert!(missing.contains("libfake.so is not installed"), "{missing}");
+        assert_eq!(
+            install_from(root.path(), &manifest, &archive),
+            1,
+            "setup reinstalls it"
+        );
+        assert_eq!(fs::read(&library).unwrap(), LIBRARY);
+    }
+
+    #[test]
+    fn refuses_an_archive_whose_library_is_not_the_pinned_one() {
+        let root = tempfile::tempdir().unwrap();
+        let archive = tarball(&[
+            ("fake-1.2.3/fake", SCRIPT, 0o755),
+            ("fake-1.2.3/libfake.so", b"other", 0o644),
+        ]);
+        let manifest = pinned_with_library(&archive, SCRIPT, LIBRARY);
+        let error = install(
+            root.path(),
+            only_tool(&manifest),
+            Target::MacArm64,
+            &archive,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("sha256 mismatch for the fake 1.2.3 library"),
+            "{error}"
+        );
+        assert!(
+            !root.path().join(".tools/fake/1.2.3").exists(),
+            "nothing installed"
+        );
+    }
+
+    #[test]
+    fn a_library_needs_its_pin_and_an_archive() {
+        let base = manifest_text(SHA_A, SHA_B);
+        let with = |extra: &str| base.replace(" }\n", &format!(", {extra} }}\n"));
+        for (extra, problem) in [
+            (
+                "library = \"lib.so\"",
+                "library and library-sha256 go together",
+            ),
+            (
+                &format!("library-sha256 = \"{SHA_A}\""),
+                "library and library-sha256 go together",
+            ),
+            (
+                "library = \"lib.so\", library-sha256 = \"XYZ\"",
+                "library-sha256 must be 64 lowercase hex digits",
+            ),
+            (
+                &format!("library = \"../lib.so\", library-sha256 = \"{SHA_A}\""),
+                "must be a relative path inside the archive",
+            ),
+            (
+                &format!("library = \"\", library-sha256 = \"{SHA_A}\""),
+                "must be a relative path inside the archive",
+            ),
+        ] {
+            let error = format!("{:#}", Manifest::parse(&with(extra)).unwrap_err());
+            assert!(error.contains(problem), "{extra}: {error}");
+        }
+        let no_archive = with(&format!(
+            "library = \"lib.so\", library-sha256 = \"{SHA_A}\""
+        ))
+        .replace("binary = \"fake-{version}/fake\"\n", "");
+        let error = format!("{:#}", Manifest::parse(&no_archive).unwrap_err());
+        assert!(
+            error.contains("a library comes only from an archive"),
+            "{error}"
         );
     }
 

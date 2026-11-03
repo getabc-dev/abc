@@ -14,6 +14,13 @@
 # fails inside xtask, and its tests run this script.
 
 input=$(cat)
+
+# In an agent VM, Claude Code may use only the subscription token: the VM's own xtask refuses API
+# keys, auth tokens, key helpers, custom endpoints and cloud providers before every tool call, and
+# exit 2 blocks the call with its reason.
+if [ "${ABC_VM:-}" = 1 ]; then
+  abc-xtask vm billing || exit 2
+fi
 if cd "$CLAUDE_PROJECT_DIR" 2>/dev/null; then
   printf '%s' "$input" | CARGO_TARGET_DIR="$CLAUDE_PROJECT_DIR/target/hook" cargo xtask hook pre-tool-use
   status=$?

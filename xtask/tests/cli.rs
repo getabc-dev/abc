@@ -17,6 +17,7 @@ mod tests {
             .env_remove("GITHUB_REPOSITORY")
             .env_remove("GITHUB_TOKEN")
             .env_remove("GITHUB_EVENT_PATH")
+            .env_remove("ABC_AGENT_BROKER")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -146,7 +147,7 @@ mod tests {
     }
 
     #[test]
-    fn the_credential_helper_needs_the_app() {
+    fn the_credential_helper_needs_the_broker() {
         let other_host = xtask(
             &["git-credential", "get"],
             "protocol=https\nhost=example.com\n\n",
@@ -159,8 +160,75 @@ mod tests {
             "protocol=https\nhost=github.com\n\n",
             &[],
         );
-        assert_eq!(github.status.code(), Some(1), "no App files, no token");
+        assert_eq!(github.status.code(), Some(1), "no broker, no token");
         assert!(github.stdout.is_empty(), "and nothing for git to use");
-        assert!(stderr(&github).contains("app.json"), "{}", stderr(&github));
+        assert!(
+            stderr(&github).contains("ABC_AGENT_BROKER is not set"),
+            "{}",
+            stderr(&github)
+        );
+    }
+
+    #[test]
+    fn the_broker_logs_from_its_threads_and_stops() {
+        // Outside any checkout, which it refuses to run from, with a test App and a short home.
+        let install = tempfile::Builder::new().tempdir_in("/tmp").unwrap();
+        let exe = install.path().join("xtask");
+        std::fs::copy(env!("CARGO_BIN_EXE_xtask"), &exe).unwrap();
+        let config = install.path().join("config");
+        let app = config.join("abc/agent-app");
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(
+            app.join("app.json"),
+            r#"{"client_id": "Iv23test", "installation_id": 42}"#,
+        )
+        .unwrap();
+        let key = app.join("private-key.pem");
+        std::fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/agent-app-test-key.pem"),
+            &key,
+        )
+        .unwrap();
+        std::fs::set_permissions(&key, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+            .unwrap();
+        let home = install.path().join("h");
+        let mut broker = Command::new(&exe)
+            .args(["broker", "--session", "abc-t"])
+            .env("HOME", &home)
+            .env("XDG_CONFIG_HOME", &config)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let dir = home.join(".config/abc/agent-broker");
+        while std::os::unix::net::UnixStream::connect(dir.join("abc-t.ctl")).is_err() {
+            assert!(
+                broker.try_wait().unwrap().is_none(),
+                "the broker exited early"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        // A refusal is logged from the thread that answered it.
+        let mut asker = std::os::unix::net::UnixStream::connect(dir.join("abc-t.sock")).unwrap();
+        asker.write_all(b"nope\n").unwrap();
+        let mut reply = String::new();
+        std::io::Read::read_to_string(&mut asker, &mut reply).unwrap();
+        assert!(reply.starts_with("error "), "{reply}");
+        let mut control = std::os::unix::net::UnixStream::connect(dir.join("abc-t.ctl")).unwrap();
+        control
+            .set_read_timeout(Some(std::time::Duration::from_secs(20)))
+            .unwrap();
+        control.write_all(b"stop\n").unwrap();
+        let mut stopped = String::new();
+        std::io::Read::read_to_string(&mut control, &mut stopped)
+            .expect("the broker stops, its log never blocked");
+        assert_eq!(stopped, "stopped revoked 0 of 0 tokens\n");
+        let output = broker.wait_with_output().unwrap();
+        assert!(output.status.success());
+        let log = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            log.contains("broker abc-t: refused a request: no scope is named \"nope\""),
+            "{log}"
+        );
     }
 }

@@ -1,0 +1,18 @@
+#!/bin/sh
+# Runs a command in the agent VM as the agent: uid 1000, no capabilities and no way to gain any
+# (no_new_privs; the image has no setuid programs). Sessions enter as root, so each goes through
+# this. It refuses unless Claude Code can use only the subscription token. Only a `claude` command
+# gets the token, from the root-only file `cargo xtask vm start` piped into the VM's memory, so
+# shells and other commands entered this way never see it. The commands Claude Code itself runs
+# inherit it: Claude Code strips it from them only under its bubblewrap isolation, which on Linux
+# leaves empty placeholder files (package.json, .npmrc, .env and more) in the worktree.
+set -eu
+abc-xtask vm billing
+cd "${ABC_WORKTREE:-/}"
+unset CLAUDE_CODE_OAUTH_TOKEN
+if [ "${1:-}" = claude ] && [ -r /run/abc/claude-token ]; then
+  CLAUDE_CODE_OAUTH_TOKEN=$(cat /run/abc/claude-token)
+  export CLAUDE_CODE_OAUTH_TOKEN
+fi
+exec setpriv --reuid agent --regid agent --init-groups --inh-caps=-all --bounding-set=-all \
+  --no-new-privs -- env HOME=/home/agent USER=agent LOGNAME=agent "$@"

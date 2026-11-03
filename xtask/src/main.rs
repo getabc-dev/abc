@@ -1,6 +1,7 @@
 //! Repository automation for abc, run as `cargo xtask <command>`.
 
 mod app;
+mod broker;
 mod check;
 mod coverage;
 mod git;
@@ -16,6 +17,7 @@ mod task;
 #[cfg(test)]
 mod testing;
 mod tools;
+mod vm;
 mod watchdog;
 
 use std::ffi::OsString;
@@ -39,7 +41,7 @@ struct Cli {
 }
 
 /// What `cargo xtask rulesets` does.
-#[derive(Debug, Subcommand)]
+#[derive(Clone, Copy, Debug, Subcommand)]
 enum RulesetAction {
     /// Check .github/rulesets/main.json against the CI workflows.
     Check,
@@ -109,11 +111,26 @@ enum Task {
         /// The operation git asks for: get, store or erase.
         operation: String,
     },
-    /// Run gh as the agent App, with a fresh installation token in `GH_TOKEN`.
+    /// Run gh as the agent App, with a fresh installation token from the broker in `GH_TOKEN`.
     Gh {
         /// Arguments passed to gh.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<OsString>,
+    },
+    /// Serve agent App tokens to one agent VM (D3): the one process that reads the App's key.
+    /// `cargo xtask vm start` starts it, one per session, from a build of main installed outside
+    /// any checkout: `cargo install --locked --git https://github.com/getabc-dev/abc --branch main
+    /// xtask --root ~/.local/share/abc/broker`. It refuses to run from inside a checkout, a guard
+    /// against mistakes, and listens on the session's sockets in `~/.config/abc/agent-broker/`.
+    Broker {
+        /// The session's name, such as abc-my-change.
+        #[arg(long)]
+        session: String,
+    },
+    /// Run agent sessions in microVMs, one per worktree (D37). Run it from the main clone.
+    Vm {
+        #[command(subcommand)]
+        action: vm::Action,
     },
     /// Have Gemini review the changes since the merge base against AGENTS.md (D8).
     Review {
@@ -176,7 +193,8 @@ fn main() -> ExitCode {
         Ok(invocation) => invocation,
         Err(error) => return report_error(&error),
     };
-    match run(cli.command, &invocation, &mut io::stderr().lock()) {
+    // Not a held lock: the broker's threads write to stderr too, and would wait on it forever.
+    match run(cli.command, &invocation, &mut io::stderr()) {
         Ok(code) => code,
         Err(error) => match writeln!(io::stderr().lock(), "error: {error:#}") {
             // With stderr gone there is nowhere left to report; the exit code still fails.
@@ -299,36 +317,19 @@ fn run(
             git_credential(&operation)?;
             Ok(ExitCode::SUCCESS)
         }
+        Task::Broker { session } => {
+            serve_tokens(&std::env::current_exe()?, &user_home(&env)?, &session)
+        }
+        Task::Vm { action } => run_vm(action, home, &env, report),
         Task::Gh { args } => app::run_gh(
-            &app::App::load(&app::config_dir()?)?,
+            || broker::token(app::Scope::Gh),
             app::GITHUB_API,
             Path::new("gh"),
             &args,
             report,
         ),
-        Task::Rulesets { action } => {
-            match action {
-                RulesetAction::Check => {
-                    rulesets::check(root)?;
-                    writeln!(report, "rulesets: {} matches CI", rulesets::RULESET)?;
-                }
-                RulesetAction::Apply => {
-                    rulesets::apply(root, Path::new("gh"), &mut io::stdout().lock())?;
-                }
-            }
-            Ok(ExitCode::SUCCESS)
-        }
-        Task::Work { action } => {
-            match action {
-                TaskAction::Set { text } => task::set(root, &text)?,
-                TaskAction::Show => match task::read(root)? {
-                    Some(text) => writeln!(io::stdout().lock(), "{text}")?,
-                    None => writeln!(report, "no task recorded")?,
-                },
-                TaskAction::Clear => task::clear(root)?,
-            }
-            Ok(ExitCode::SUCCESS)
-        }
+        Task::Rulesets { action } => run_rulesets(action, root, report),
+        Task::Work { action } => run_task(action, root, report),
         Task::Setup { tools: only } => {
             tools::setup(home, &only, &mut io::stdout().lock())?;
             Ok(ExitCode::SUCCESS)
@@ -390,6 +391,38 @@ fn integrity(
     integrity::run(root, base, pull_request.as_ref(), &event, report)
 }
 
+/// `cargo xtask rulesets`: checks the rulesets in `root` against CI, or applies them with the
+/// user's own gh.
+fn run_rulesets(
+    action: RulesetAction,
+    root: &Path,
+    report: &mut impl Write,
+) -> anyhow::Result<ExitCode> {
+    match action {
+        RulesetAction::Check => {
+            rulesets::check(root)?;
+            writeln!(report, "rulesets: {} matches CI", rulesets::RULESET)?;
+        }
+        RulesetAction::Apply => {
+            rulesets::apply(root, Path::new("gh"), &mut io::stdout().lock())?;
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `cargo xtask task`: records, prints or forgets the task in `root`.
+fn run_task(action: TaskAction, root: &Path, report: &mut impl Write) -> anyhow::Result<ExitCode> {
+    match action {
+        TaskAction::Set { text } => task::set(root, &text)?,
+        TaskAction::Show => match task::read(root)? {
+            Some(text) => writeln!(io::stdout().lock(), "{text}")?,
+            None => writeln!(report, "no task recorded")?,
+        },
+        TaskAction::Clear => task::clear(root)?,
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
 /// `cargo xtask git-credential`: answers git's request on stdin with an App token on stdout.
 fn git_credential(operation: &str) -> anyhow::Result<()> {
     let mut request = String::new();
@@ -397,8 +430,53 @@ fn git_credential(operation: &str) -> anyhow::Result<()> {
         .read_to_string(&mut request)
         .context("could not read git's credential request")?;
     app::credential(operation, &request, &mut io::stdout().lock(), || {
-        app::App::load(&app::config_dir()?)?.token(app::GITHUB_API, app::Scope::Git)
+        broker::token(app::Scope::Git)
     })
+}
+
+/// The user's home directory.
+fn user_home(env: &impl Fn(&str) -> Option<OsString>) -> anyhow::Result<PathBuf> {
+    env("HOME")
+        .filter(|home| !home.is_empty())
+        .map(PathBuf::from)
+        .context("HOME is not set")
+}
+
+/// `cargo xtask broker`, run from `exe`: serves session `session` tokens signed with the App's
+/// key on its sockets under `home`, refusing to run from a checkout, until it is stopped.
+fn serve_tokens(exe: &Path, home: &Path, session: &str) -> anyhow::Result<ExitCode> {
+    broker::refuse_checkout(exe)?;
+    broker::check_session(session)?;
+    let app = app::App::load(&app::config_dir()?)?;
+    broker::serve(
+        session,
+        &broker::sockets(home, session),
+        |scope| app.token(app::GITHUB_API, scope),
+        |token| app::revoke(app::GITHUB_API, token),
+        broker::MAX_PER_HOUR,
+        &mut io::stderr(),
+    )?;
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `cargo xtask vm`: the billing check inside a VM, or a session command on the host, from the
+/// main clone `repo`.
+fn run_vm(
+    action: vm::Action,
+    repo: &Path,
+    env: &impl Fn(&str) -> Option<OsString>,
+    report: &mut impl Write,
+) -> anyhow::Result<ExitCode> {
+    if matches!(action, vm::Action::Billing) {
+        vm::billing(env)?;
+        return Ok(ExitCode::SUCCESS);
+    }
+    vm::refuse_linked_worktree(repo)?;
+    let home = user_home(env)?;
+    let host = vm::Host::this(repo, &home, env)?;
+    vm::require_kvm(host.os, Path::new("/dev/kvm"))?;
+    let msb = vm::microsandbox(tools::pinned(repo, "msb")?, &home, env)?;
+    vm::run(action, &host, &msb, env, report)
 }
 
 /// The repository root: the workspace that contains xtask.
@@ -422,7 +500,8 @@ mod tests {
     use std::process::ExitCode;
 
     use super::{
-        Cli, Invocation, RulesetAction, Task, TaskAction, repo_root, run, usage_exit_code, verdict,
+        Cli, Invocation, RulesetAction, Task, TaskAction, repo_root, run, serve_tokens,
+        usage_exit_code, user_home, verdict,
     };
     use crate::testing::{git, repository_with_change, script};
 
@@ -464,6 +543,79 @@ mod tests {
             env,
         };
         run(task, &invocation, &mut Vec::new())
+    }
+
+    #[test]
+    fn vm_commands_run_from_the_main_clone_and_the_billing_check_in_the_vm() {
+        let temp = tempfile::tempdir().unwrap();
+        let main = crate::testing::repository(&temp.path().join("main"));
+        let linked = temp.path().join("linked");
+        git(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "--detach",
+                linked.to_str().unwrap(),
+            ],
+        );
+        let vm = |action| Task::Vm { action };
+        let key = |name: &str| (name == "ANTHROPIC_API_KEY").then(|| OsString::from("k"));
+        let billing = format!(
+            "{:#}",
+            dispatch(vm(crate::vm::Action::Billing), &linked, &linked, &key).unwrap_err()
+        );
+        assert!(
+            billing.contains("ANTHROPIC_API_KEY in the environment"),
+            "{billing}"
+        );
+        let clean = |_: &str| None;
+        assert_eq!(
+            dispatch(vm(crate::vm::Action::Billing), &linked, &linked, &clean).unwrap(),
+            ExitCode::SUCCESS,
+            "the billing check runs anywhere"
+        );
+        let linked_error = format!(
+            "{:#}",
+            dispatch(vm(crate::vm::Action::Ls), &linked, &linked, &clean).unwrap_err()
+        );
+        assert!(
+            linked_error.contains("run it from the main clone"),
+            "{linked_error}"
+        );
+        let no_home = format!(
+            "{:#}",
+            dispatch(vm(crate::vm::Action::Ls), &main, &main, &clean).unwrap_err()
+        );
+        assert_eq!(no_home, "HOME is not set");
+    }
+
+    #[test]
+    fn finds_the_users_home() {
+        let set = |name: &str| (name == "HOME").then(|| OsString::from("/home/m"));
+        assert_eq!(user_home(&set).unwrap(), Path::new("/home/m"));
+        let empty = |_: &str| Some(OsString::new());
+        assert_eq!(
+            format!("{:#}", user_home(&empty).unwrap_err()),
+            "HOME is not set"
+        );
+    }
+
+    #[test]
+    fn the_broker_refuses_a_build_in_a_checkout() {
+        let temp = tempfile::tempdir().unwrap();
+        let checkout = crate::testing::repository(&temp.path().join("abc"));
+        let error = format!(
+            "{:#}",
+            serve_tokens(&checkout.join("target/debug/xtask"), temp.path(), "abc-w").unwrap_err()
+        );
+        assert!(error.contains("installed outside any checkout"), "{error}");
+        let named = format!(
+            "{:#}",
+            serve_tokens(&temp.path().join("bin/xtask"), temp.path(), "../x").unwrap_err()
+        );
+        assert!(named.contains("is not a session's name"), "{named}");
     }
 
     #[test]

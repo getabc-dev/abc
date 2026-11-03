@@ -97,31 +97,79 @@ reasons, so the entries are needed with or without it.
 ## Claude Code
 
 If you work with Claude Code, the committed `.claude/settings.json` applies to your sessions. Read
-[CLAUDE.md](CLAUDE.md) for the details. Three parts affect contributors:
+[CLAUDE.md](CLAUDE.md) for the details. Two parts affect contributors:
 
-- **git credentials.** Its `env` block points git's credential helper for github.com at
-  `cargo xtask git-credential`, which mints tokens for the maintainers' agent App from
-  `~/.config/abc/agent-app/`. Without that key, git cannot push from your sessions. Override it
-  for yourself in `.claude/settings.local.json`, which takes precedence over the project file for
-  each variable it sets:
-
-  ```json
-  {
-    "env": {
-      "GIT_CONFIG_COUNT": "0"
-    }
-  }
-  ```
-
-  With `GIT_CONFIG_COUNT` at 0, git ignores the project's helper settings and uses your own. In a
-  worktree, Claude Code reads this file from the main checkout's root. The git guard still blocks
-  gh changes such as `gh pr create` in agent sessions, so open your PR from your own terminal.
 - **The watchdog.** When the agent stops, the Stop hook runs `cargo xtask check --changed` and then
   the watchdog, which runs your own `claude -p` with Haiku on the diff. It uses your Claude quota.
 - **Plugins.** The file enables the `pstack@cursor-plugins` and `egm@egm` plugins from GitHub
   marketplaces that are not pinned to a commit. Plugins can ship hooks and MCP servers that run as
   you. Review them before you trust the folder in Claude Code, as the maintainers do before
   adopting a pack (rule B1).
+
+## Agent sessions in microVMs (maintainers)
+
+The maintainers run every agent session in a microVM of its own, one per worktree (D37):
+`cargo xtask vm` starts [microsandbox](https://github.com/superradcompany/microsandbox), pinned in
+`xtask/tools.toml`. The VM sees only its worktree and a git repository holding only that branch;
+its network reaches only the hosts in `xtask/vm/egress-allow.txt`; git and `cargo xtask gh` act as
+the getabc-dev-agent App with tokens from a broker on the host, which alone reads the App's key;
+and Claude Code runs on your subscription only. [docs/threat-model.md](docs/threat-model.md) says
+what the VM keeps out and what it does not.
+
+It needs macOS on Apple silicon with Apple's [`container`](https://github.com/apple/container) to
+build the image (`brew install container`, then `container system start`), or Linux with KVM
+(`/dev/kvm` readable and writable) and Docker or Podman. Run every `cargo xtask vm` command from
+your main clone, never from a worktree an agent works in: they run on the host with your access.
+xtask refuses to run them from a linked worktree, which prevents the mistake but is no control.
+
+Once:
+
+```sh
+# The token broker, from main, outside any checkout (`vm start` starts one per session):
+cargo install --locked --git https://github.com/getabc-dev/abc --branch main xtask \
+  --root ~/.local/share/abc/broker
+# The App's files, readable by you alone: app.json ({"client_id": ..., "installation_id": ...})
+# and private-key.pem (mode 600), in ~/.config/abc/agent-app/.
+# Your Claude subscription token for the VMs:
+claude setup-token
+security add-generic-password -a "$USER" -s abc-vm-claude-code-oauth-token -w
+# On Linux: secret-tool store --label abc-vm service abc-vm-claude-code-oauth-token
+cargo xtask setup             # installs msb with the other tools
+cargo xtask vm image          # builds the agent image and loads it (about 20 minutes)
+```
+
+Paste the token at the prompt, never on the command line. Rebuild the image when
+`xtask/vm/`, `rust-toolchain.toml` or the pinned tools change.
+
+Per session:
+
+```sh
+git worktree add ../abc-my-change -b agent/my-change origin/main
+cargo xtask vm start ../abc-my-change    # starts the broker if needed; a few seconds
+cargo xtask vm shell ../abc-my-change    # Claude Code as the agent; add `bash` for a shell
+cargo xtask vm auth ../abc-my-change     # how Claude Code is signed in, without secrets
+cargo xtask vm sync ../abc-my-change     # move the worktree's branch to the VM's commits
+cargo xtask vm stop ../abc-my-change     # revokes its tokens; --purge also drops its volumes
+```
+
+`start` refuses unless `claude auth status` in the VM reports the subscription token
+(`authMethod` `oauth_token`). The launcher strips `ANTHROPIC_API_KEY` and every other API route
+from what it passes, and the VM refuses to start, or to run a session or a tool call, if one
+appears in its environment or in a Claude Code settings file. To rotate the token, replace the
+keychain item and restart the session; revoke old tokens in your claude.ai settings. A
+setup-token token lasts about a year. In the VM only Claude Code gets it, though the commands
+Claude Code runs inherit it; shells you open with `cargo xtask vm shell <worktree> bash` do not.
+
+Agents push only `agent/<topic>` branches, and never tags or workflow changes: GitHub's rulesets
+refuse the App the rest. Apply `.github/rulesets/` with `cargo xtask rulesets apply` (your own gh
+login) when they change.
+
+microsandbox writes the output of every command run in a VM, the Claude Code session included, to
+`exec.log` under `~/.local/share/abc/msb/<version>/sandboxes/<name>/logs/` while the VM exists;
+`stop` deletes the VM with its logs, so stop sessions you have finished. It is beta and breaks
+compatibility between releases: after a version bump in `xtask/tools.toml`, run
+`cargo xtask setup` and `cargo xtask vm image`, and `stop --purge` and `start` each session (they
+hold only caches); each version keeps its state apart, so delete the old version's directory.
 
 ## Open a pull request
 

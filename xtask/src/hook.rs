@@ -24,7 +24,7 @@
 use std::ffi::OsStr;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 
 use anyhow::{Context as _, bail, ensure};
 use serde::Deserialize;
@@ -323,30 +323,16 @@ fn delegate(cargo: &Path, root: &Path, event: Event, input: &str) -> anyhow::Res
         .stdin(Stdio::piped())
         .spawn()
         .with_context(|| format!("could not run cargo xtask in {}", root.display()))?;
-    feed(&mut child, input).context("could not pass the hook input on")?;
+    tools::feed(&mut child, &mut input.as_bytes()).context("could not pass the hook input on")?;
     let status = child
         .wait()
         .context("could not wait for the delegated hook")?;
     Ok(tools::status_code(status))
 }
 
-/// Writes `input` to `child`'s stdin and closes it. A child that exits without reading its input,
-/// such as a hook that only prints a note or a checkout whose xtask fails to build, closes the
-/// pipe first; its exit status then decides the outcome, so a broken pipe is not an error.
-fn feed(child: &mut Child, input: &str) -> std::io::Result<()> {
-    let Some(mut stdin) = child.stdin.take() else {
-        return Ok(());
-    };
-    match stdin.write_all(input.as_bytes()) {
-        Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
-        written => written,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::io::Write as _;
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
     use std::process::{Command, Stdio};
@@ -628,7 +614,8 @@ mod tests {
             .stdin(Stdio::piped())
             .spawn()
             .unwrap();
-        super::feed(&mut child, &input).unwrap();
+        let taken = crate::tools::feed(&mut child, &mut input.as_bytes()).unwrap();
+        assert!(!taken, "the child took none of it");
         assert_eq!(
             child.wait().unwrap().code(),
             Some(3),
@@ -658,7 +645,7 @@ mod tests {
             .stdout(Stdio::null())
             .spawn()
             .unwrap_or_else(|error| panic!("{shell} must be installed: {error}"));
-        super::feed(&mut child, input).unwrap();
+        crate::tools::feed(&mut child, &mut input.as_bytes()).unwrap();
         let output = child.wait_with_output().unwrap();
         (
             output.status.code(),
@@ -763,71 +750,6 @@ mod tests {
     }
 
     #[test]
-    fn only_the_agent_environment_asks_the_app_for_credentials() {
-        let temp = tempfile::tempdir().unwrap();
-        let repo = repository(&temp.path().join("repo"));
-        let home = temp.path().join("home");
-        fs::create_dir_all(&home).unwrap();
-        fs::write(
-            home.join(".gitconfig"),
-            "[credential]\n\thelper = \"!f() { echo username=user; echo password=user-secret; }; f\"\n",
-        )
-        .unwrap();
-        let settings: serde_json::Value = serde_json::from_str(
-            &fs::read_to_string(crate::repo_root().unwrap().join(".claude/settings.json")).unwrap(),
-        )
-        .unwrap();
-        let fill = |agent: bool| {
-            let mut command = Command::new("git");
-            command
-                .args(["credential", "fill"])
-                .current_dir(&repo)
-                .env("HOME", &home)
-                .env("GIT_CONFIG_NOSYSTEM", "1")
-                .env("GIT_TERMINAL_PROMPT", "0")
-                .env_remove("GIT_CONFIG_GLOBAL")
-                .env_remove("GIT_CONFIG_COUNT")
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped());
-            if agent {
-                for (name, value) in settings["env"].as_object().unwrap() {
-                    command.env(name, value.as_str().unwrap());
-                }
-                // The App's helper itself, which needs the App's files, stands in as a fake.
-                assert_eq!(
-                    settings["env"]["GIT_CONFIG_VALUE_1"], "!cargo xtask git-credential",
-                    "the real helper"
-                );
-                command.env(
-                    "GIT_CONFIG_VALUE_1",
-                    "!f() { echo username=x-access-token; echo password=app-token; }; f",
-                );
-            }
-            let mut child = command.spawn().unwrap();
-            child
-                .stdin
-                .take()
-                .unwrap()
-                .write_all(b"protocol=https\nhost=github.com\n\n")
-                .unwrap();
-            String::from_utf8(child.wait_with_output().unwrap().stdout).unwrap()
-        };
-        assert!(
-            fill(false).contains("password=user-secret"),
-            "the user's terminal keeps the user's credentials"
-        );
-        let agent = fill(true);
-        assert!(
-            agent.contains("password=app-token"),
-            "agents get the App's: {agent}"
-        );
-        assert!(
-            !agent.contains("user-secret"),
-            "and never the user's: {agent}"
-        );
-    }
-
-    #[test]
     fn settings_wire_the_hooks_to_xtask() {
         let settings: serde_json::Value = serde_json::from_str(
             &fs::read_to_string(crate::repo_root().unwrap().join(".claude/settings.json")).unwrap(),
@@ -851,40 +773,71 @@ mod tests {
             assert_eq!(stop["command"], stop_command, "{event} runs the check");
             assert_eq!(stop["timeout"], 900, "{event} is time-boxed");
         }
-        assert_eq!(
-            settings["permissions"]["deny"],
-            serde_json::json!([
-                "Bash(gh auth token)",
-                "Bash(gh auth token *)",
-                "Bash(gh auth status --show-token)",
-                "Bash(gh auth status --show-token *)",
-                "Bash(gh auth status * --show-token*)",
-                "Bash(gh auth status -t)",
-                "Bash(gh auth status -t *)",
-                "Bash(gh auth status * -t*)",
-                "Read(~/.config/gh/**)",
-                "Read(~/.config/abc/agent-app/**)",
-                "Bash(security find-generic-password *)",
-                "Bash(security find-internet-password *)"
-            ]),
-            "agents cannot read the user's GitHub credentials (D3)"
-        );
-        assert_eq!(
-            settings["env"],
-            serde_json::json!({
-                "GIT_CONFIG_COUNT": "2",
-                "GIT_CONFIG_KEY_0": "credential.https://github.com.helper",
-                "GIT_CONFIG_VALUE_0": "",
-                "GIT_CONFIG_KEY_1": "credential.https://github.com.helper",
-                "GIT_CONFIG_VALUE_1": "!cargo xtask git-credential"
-            }),
-            "agent sessions alone push as the App: the empty helper drops the user's (D3)"
+        assert!(
+            settings.get("env").is_none() && settings.get("permissions").is_none(),
+            "sessions run in agent VMs, which hold no credential but the broker's tokens (D37)"
         );
         assert_eq!(
             hooks["SubagentStop"][0]["matcher"],
             "^(?!(?:Explore|Plan|claude-code-guide|statusline-setup|web-fetch)$).+",
             "read-only and internal subagents are exempt"
         );
+    }
+
+    #[test]
+    fn in_an_agent_vm_the_hook_script_checks_the_billing_first() {
+        let temp = tempfile::tempdir().unwrap();
+        fake_cargo(temp.path(), 0);
+        let checked = temp.path().join("checked");
+        let script = crate::repo_root().unwrap().join(super::HOOK_SCRIPT);
+        let input = r#"{"tool_name":"Bash","tool_input":{"command":"ls"}}"#;
+        let run = |vm: bool| {
+            let path = format!(
+                "{}:{}",
+                temp.path().display(),
+                std::env::var("PATH").unwrap()
+            );
+            let mut command = Command::new("sh");
+            command
+                .arg(&script)
+                .env("PATH", path)
+                .env("CLAUDE_PROJECT_DIR", temp.path())
+                .stdin(Stdio::piped())
+                .stderr(Stdio::piped())
+                .stdout(Stdio::null());
+            if vm {
+                command.env("ABC_VM", "1");
+            } else {
+                command.env_remove("ABC_VM");
+            }
+            let mut child = command.spawn().unwrap();
+            crate::tools::feed(&mut child, &mut input.as_bytes()).unwrap();
+            let output = child.wait_with_output().unwrap();
+            (
+                output.status.code(),
+                String::from_utf8(output.stderr).unwrap(),
+            )
+        };
+        crate::testing::script(
+            &temp.path().join("abc-xtask"),
+            &format!(
+                "echo \"$*\" > {}\necho 'found: ANTHROPIC_API_KEY in the environment' >&2\nexit 1\n",
+                checked.display()
+            ),
+        );
+        let (code, stderr) = run(true);
+        assert_eq!(code, Some(2), "a finding blocks the tool call: {stderr}");
+        assert!(stderr.contains("ANTHROPIC_API_KEY"), "{stderr}");
+        assert_eq!(fs::read_to_string(&checked).unwrap(), "vm billing\n");
+        fs::remove_file(&checked).unwrap();
+        assert_eq!(
+            run(false).0,
+            Some(0),
+            "outside a VM there is nothing to check"
+        );
+        assert!(!checked.exists());
+        crate::testing::script(&temp.path().join("abc-xtask"), "exit 0\n");
+        assert_eq!(run(true).0, Some(0), "a clean VM goes on to the guard");
     }
 
     #[test]
