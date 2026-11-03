@@ -4,9 +4,10 @@
 //! operator) and runs the tests against every change. A mutant the tests do not catch means a
 //! behaviour no test pins down; the gate fails on any and lists them.
 
+use std::ffi::OsString;
 use std::fs;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, bail, ensure};
@@ -117,6 +118,19 @@ pub(crate) fn run(
     let diff_file = output.join("changes.diff");
     fs::write(&diff_file, &diff).context("could not write the diff for cargo-mutants")?;
     writeln!(out, "xtask: mutating the changed Rust code")?;
+    // cargo-mutants copies the tree, once per job, into the temporary directory and builds each
+    // copy there. That directory is small in an agent VM, where the build output has the room.
+    let scratch = scratch(root);
+    fs::create_dir_all(&scratch)
+        .with_context(|| format!("could not create {}", scratch.display()))?;
+    // The tests must not inherit that directory: inside the checkout it is inside its git
+    // repository and its Cargo workspace, and its paths can be too long for a Unix socket. Cargo's
+    // `[env]`, forced, gives every build and test cargo-mutants runs this process's own one back.
+    let test_env = output.join("test-env.toml");
+    fs::write(&test_env, test_env_config(&std::env::temp_dir())?)
+        .with_context(|| format!("could not write {}", test_env.display()))?;
+    let mut cargo_config = OsString::from("--cargo-arg=--config=");
+    cargo_config.push(&test_env);
     let status = Command::new(mutants)
         .arg("mutants")
         .arg("--in-diff")
@@ -130,6 +144,7 @@ pub(crate) fn run(
         ])
         // The tests run the pinned tools in .tools/, which .gitignore lists; copy them too.
         .args(["--gitignore", "false"])
+        .arg(&cargo_config)
         .arg("--timeout-multiplier")
         .arg(timeout_multiplier(options.jobs).to_string())
         .args(["--minimum-test-timeout", MINIMUM_TEST_TIMEOUT])
@@ -145,15 +160,45 @@ pub(crate) fn run(
         .arg(&output)
         .env("PATH", tools::path_with(nextest)?)
         .env("PROPTEST_RNG_SEED", PROPTEST_RNG_SEED)
+        .env("TMPDIR", &scratch)
         .current_dir(root)
         .status()
-        .context("could not run cargo-mutants")?;
-    let result = outcome(status.code())?;
+        .context("could not run cargo-mutants");
+    // Whatever cargo-mutants left behind goes, so repeated runs never fill the disk.
+    fs::remove_dir_all(&scratch)
+        .with_context(|| format!("could not remove {}", scratch.display()))?;
+    let result = outcome(status?.code())?;
     let missed = listed(&results.join("missed.txt"))?;
     let timed_out = listed(&results.join("timeout.txt"))?;
     let passed = missed.is_empty() && result != Outcome::Missed;
     write!(out, "{}", describe(passed, &missed, &timed_out))?;
     Ok(passed)
+}
+
+/// Cargo configuration that sets `TMPDIR` to `temp` for everything cargo runs, overriding the
+/// environment.
+fn test_env_config(temp: &Path) -> anyhow::Result<String> {
+    let temp = temp.to_str().with_context(|| {
+        format!(
+            "the temporary directory {} is not UTF-8, so Cargo's configuration cannot name it",
+            temp.display()
+        )
+    })?;
+    let mut tmpdir = toml_edit::InlineTable::new();
+    tmpdir.insert("value", temp.into());
+    tmpdir.insert("force", true.into());
+    let mut config = toml_edit::DocumentMut::new();
+    let mut env = toml_edit::Table::new();
+    env.insert("TMPDIR", toml_edit::value(tmpdir));
+    config.insert("env", toml_edit::Item::Table(env));
+    Ok(config.to_string())
+}
+
+/// Where cargo-mutants copies and builds the tree: under the checkout's build output.
+fn scratch(root: &Path) -> PathBuf {
+    std::env::var_os("CARGO_TARGET_DIR")
+        .map_or_else(|| root.join("target"), |target| root.join(target))
+        .join("mutants-tmp")
 }
 
 /// Whether the diff adds or changes lines in Rust files.
@@ -203,9 +248,11 @@ fn describe(passed: bool, missed: &[String], timed_out: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::path::Path;
 
     use super::{
-        Options, Outcome, Shard, changes_rust, describe, listed, outcome, run, timeout_multiplier,
+        Options, Outcome, Shard, changes_rust, describe, listed, outcome, run, test_env_config,
+        timeout_multiplier,
     };
     use crate::testing::{repository_with_change, script};
 
@@ -235,6 +282,28 @@ mod tests {
         jobs: 2,
         shard: None,
     };
+
+    #[test]
+    fn the_tests_get_the_callers_temporary_directory_back() {
+        let config: toml_edit::DocumentMut = test_env_config(Path::new("/tmp/a \"b\""))
+            .unwrap()
+            .parse()
+            .unwrap();
+        let tmpdir = &config["env"]["TMPDIR"];
+        assert_eq!(tmpdir["value"].as_str(), Some("/tmp/a \"b\""), "{config}");
+        assert_eq!(
+            tmpdir["force"].as_bool(),
+            Some(true),
+            "it overrides cargo-mutants' TMPDIR: {config}"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt as _;
+            let invalid = std::ffi::OsStr::from_bytes(b"/tmp/\xff");
+            let error = test_env_config(Path::new(invalid)).unwrap_err();
+            assert!(error.to_string().contains("not UTF-8"), "{error}");
+        }
+    }
 
     #[test]
     fn reads_shards() {
@@ -315,7 +384,11 @@ mod tests {
         let caught = temp.path().join("caught");
         script(
             &caught,
-            "while [ $# -gt 0 ]; do case \"$1\" in --shard) shard=$2 ;; esac; shift; done\n[ \"$shard\" = 1/4 ] || exit 9\n",
+            &format!(
+                "while [ $# -gt 0 ]; do case \"$1\" in --shard) shard=$2 ;; --cargo-arg=--config=*) config=${{1#--cargo-arg=--config=}} ;; esac; shift; done\n[ \"$shard\" = 1/4 ] || exit 9\nmkdir \"$TMPDIR/cargo-mutants-copy\"\necho \"$TMPDIR\" > {}\ncp \"$config\" {}\n",
+                temp.path().join("tmpdir").display(),
+                temp.path().join("config.toml").display()
+            ),
         );
         let sharded = Options {
             jobs: 2,
@@ -324,6 +397,25 @@ mod tests {
         assert!(
             run(&repo, "base", &sharded, &caught, &nextest, &mut Vec::new()).unwrap(),
             "all caught, in the shard asked for"
+        );
+        let tmpdir = fs::read_to_string(temp.path().join("tmpdir")).unwrap();
+        assert_eq!(
+            Path::new(tmpdir.trim()),
+            repo.join("target/mutants-tmp"),
+            "cargo-mutants copies the tree under the build output"
+        );
+        assert!(
+            !repo.join("target/mutants-tmp").exists(),
+            "and the copy is removed afterwards, with what it left in it"
+        );
+        let config: toml_edit::DocumentMut = fs::read_to_string(temp.path().join("config.toml"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(
+            config["env"]["TMPDIR"]["value"].as_str(),
+            std::env::temp_dir().to_str(),
+            "while the tests get this process's temporary directory: {config}"
         );
 
         let docs = repository_with_change(&temp.path().join("docs"), &[("README.md", "# x\n")]);

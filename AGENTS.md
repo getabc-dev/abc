@@ -8,7 +8,7 @@ trust it without reading the code. Other people will run abc and fund it through
 is built to production grade from the first commit.
 
 Product decisions and research live in the abc product brief (Claude Doc):
-https://claude.ai/artifact/1yeSnW2FFpd99v8ftvMisg
+https://claude.ai/artifact/JUbZzoDFMpqZnCSrn4i1Jh
 
 ## STRICT: this project is in development
 
@@ -108,13 +108,14 @@ watchdog compares the diff with that task and the rules above, and keeps it work
 | --- | --- |
 | `cargo xtask setup [TOOLS]` | Installs the tools pinned in `xtask/tools.toml` into `.tools/`, checking the sha256 of each archive or crate and of the executable. Run it in every new clone or worktree, and after the list changes. It never touches git config. |
 | `cargo xtask doctor [TOOLS]` | Fails unless every pinned tool, or each one named, is installed, matches its pinned sha256 and reports its pinned version. |
-| `cargo xtask check` | Format check, clippy (`--all-targets --locked -D warnings`), nextest, sqlx's query cache check, doctests and rustdoc with warnings denied, on the whole workspace. Property tests run with a fixed seed. Database tests use the warm Postgres 18 container (below). |
+| `cargo xtask check` | Format check, clippy (`--all-targets --locked -D warnings`), nextest, sqlx's query cache check, doctests and rustdoc with warnings denied, on the whole workspace. Property tests run with a fixed seed. Database tests use the warm Postgres 18 container (below). It first fails when the changes since the merge base with the default branch are larger than the Gemini review accepts (the diff `review` sends, without generated files), so an oversized change is split before CI; files not yet added to git are not counted. |
 | `cargo xtask check --changed` | The same, limited to the crates affected by changes since the merge base with the default branch (`upstream/HEAD`, else `origin/HEAD`). |
 | `cargo xtask integrity --base <rev> [--description <file>]` | Lists deleted test files and tests, newly skipped or `should_panic` tests, tests with fewer assertions, and changed gate files since the merge base. In CI it fails on any of them unless an approver listed in `.github/integrity-approvers` at the merge base labelled the PR `integrity-approved` after its last push and last description edit; a run for a description edit treats any earlier label as stale. Each flagged test change also needs a reason in the PR description, label or not (below). |
 | `cargo xtask coverage --base <rev>` | Runs the tests under cargo-llvm-cov and fails unless 90% of the changed, instrumented lines of shipped code are covered, listing the ones that are not. Test code (`#[cfg(test)]` items, test functions, test modules in their own files, `tests/`) does not count. |
 | `cargo xtask mutants --base <rev> [--jobs N] [--shard k/n]` | Runs cargo-mutants on the Rust lines changed since the merge base, or one shard of them, and fails on any missed mutant: a change to the code that no test notices. A mutant whose tests hang counts as caught. |
 | `cargo xtask review --base <rev>` | Gemini reviews the diff, the PR's title and description against this file as it stands at the merge base. Runs in CI; it blocks on a `block` verdict or any blocking finding, and fails closed on quota, size and missing-key errors. |
 | `cargo xtask task set "<text>"` / `show` / `clear` | Records, prints or forgets the current task in `.abc/task.md` (not committed), for the watchdog. |
+| `cargo xtask task blocked "<text>"` | Declares the task BLOCKED in `.abc/blocked.md`: what is missing and what was tried. The next Stop logs it in `.abc/blocked-log.md` and asks the watchdog whether the blocker is outside the agent's control; if so, or after 5 blocked stops in a row, the stop is allowed with this handoff, and otherwise it is sent back and counted (D39). |
 | `cargo xtask gh -- <args>` | Runs gh as the agent App with a token from the broker, revoked when gh exits. Agents create, merge and change things on GitHub only through this; the guard blocks plain `gh pr create`, `gh pr merge` and `gh api` writes. |
 | `cargo xtask git-credential <op>` | git's credential helper for github.com in agent VMs (`xtask/vm/gitconfig`): it answers with an agent App token from the broker. Never run it yourself. |
 | `cargo xtask broker --session <name>` | Started by `cargo xtask vm start`, one per session, from a build of main installed outside any checkout: serves that agent VM's App tokens, at most 120 an hour, and revokes them all when the session stops; the one process that reads the App's key. |

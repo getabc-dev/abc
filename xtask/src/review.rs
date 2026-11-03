@@ -18,15 +18,15 @@ use serde::Deserialize;
 
 use crate::git;
 
-/// The model, pinned: Gemini's newest stable Flash model with a free tier.
+/// The model, pinned: Gemini's newest stable Flash model, on the project's paid key.
 pub(crate) const MODEL: &str = "gemini-3.8-flash";
 
 /// Gemini's API.
 const ENDPOINT: &str = "https://generativelanguage.googleapis.com/v1beta/models";
 
-/// The largest diff sent for review, in bytes: about 100,000 tokens. With AGENTS.md and the reply
-/// it stays inside the free tier's per-minute token budget, and a larger change is more than one
-/// review can weigh carefully; split it instead.
+/// The largest diff sent for review, in bytes: about 100,000 tokens. A larger change is more than
+/// one review can weigh carefully, so it is split instead; `cargo xtask check` applies the same
+/// limit before a change reaches CI.
 pub(crate) const MAX_DIFF_BYTES: usize = 400_000;
 
 /// What the review is about.
@@ -150,7 +150,7 @@ fn generated(files: &[String]) -> String {
 }
 
 /// Fails when the diff is over [`MAX_DIFF_BYTES`].
-fn check_size(diff: &str) -> anyhow::Result<()> {
+pub(crate) fn check_size(diff: &str) -> anyhow::Result<()> {
     ensure!(
         diff.len() <= MAX_DIFF_BYTES,
         "the diff is {} bytes, too large for automated review (the limit is {MAX_DIFF_BYTES}); \
@@ -161,15 +161,37 @@ fn check_size(diff: &str) -> anyhow::Result<()> {
 }
 
 /// Asks Gemini to review `request`, sending the body through `post` (URL, JSON body, API key),
-/// which answers with the HTTP status and body.
+/// which answers with the HTTP status and body. Progress lines go to `progress` as it works, so a
+/// slow review shows where it is.
 pub(crate) fn review(
     request: &Request,
     key: &str,
     post: &mut impl FnMut(&str, &str, &str) -> anyhow::Result<(u16, String)>,
+    progress: &mut impl Write,
 ) -> anyhow::Result<Verdict> {
+    say(
+        progress,
+        &format!(
+            "review: the diff is {} bytes ({} generated files left out)",
+            request.diff.len(),
+            request.generated.len()
+        ),
+    );
     check_size(&request.diff)?;
     let url = format!("{ENDPOINT}/{MODEL}:generateContent");
-    let (status, answer) = post(&url, &body(request).to_string(), key)?;
+    let sent = body(request).to_string();
+    say(
+        progress,
+        &format!(
+            "review: sent to Gemini ({MODEL}, {} bytes); waiting for its verdict",
+            sent.len()
+        ),
+    );
+    let (status, answer) = post(&url, &sent, key)?;
+    say(
+        progress,
+        &format!("review: Gemini answered with HTTP {status}"),
+    );
     match status {
         200 => {}
         429 => bail!(
@@ -234,29 +256,61 @@ fn google_reason(answer: &str) -> String {
     }
 }
 
-/// Sends a request to Gemini, returning the status and body whatever the status.
+/// Writes one progress line. Progress is best effort: a closed stderr must not fail the review.
+fn say(progress: &mut impl Write, line: &str) {
+    if writeln!(progress, "{line}").is_err() {
+        // Nowhere to report progress; the review itself goes on.
+    }
+}
+
+/// How long one call to Gemini may take, from connecting to the last byte of its answer. A
+/// dropped connection then fails this attempt clearly instead of hanging until the CI job's
+/// limit: four attempts and the waits between them ([`RETRY_DELAYS`]) fit in the review job's 20
+/// minutes with room for checkout and build.
+pub(crate) const CALL_TIMEOUT: Duration = Duration::from_secs(180);
+
+/// Sends a request to Gemini, returning the status and body whatever the status, and failing
+/// after [`CALL_TIMEOUT`].
 pub(crate) fn post_gemini(url: &str, body: &str, key: &str) -> anyhow::Result<(u16, String)> {
+    post_within(url, body, key, CALL_TIMEOUT)
+}
+
+/// [`post_gemini`] with the call limited to `limit`.
+fn post_within(url: &str, body: &str, key: &str, limit: Duration) -> anyhow::Result<(u16, String)> {
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .http_status_as_error(false)
+        .timeout_global(Some(limit))
         .build()
         .into();
+    let timed_out = |error: &ureq::Error| matches!(error, ureq::Error::Timeout(_));
+    let explain = |error: ureq::Error, doing: &str| {
+        if timed_out(&error) {
+            anyhow::Error::new(error).context(format!(
+                "Gemini did not answer within {} s; the connection may have dropped",
+                limit.as_secs_f64()
+            ))
+        } else {
+            anyhow::Error::new(error).context(doing.to_owned())
+        }
+    };
     let mut response = agent
         .post(url)
         .header("x-goog-api-key", key)
         .header("Content-Type", "application/json")
         .send(body)
-        .context("could not reach Gemini")?;
+        .map_err(|error| explain(error, "could not reach Gemini"))?;
     let status = response.status().as_u16();
     let text = response
         .body_mut()
         .read_to_string()
-        .context("could not read Gemini's response")?;
+        .map_err(|error| explain(error, "could not read Gemini's response"))?;
     Ok((status, text))
 }
 
 /// How long to wait before each retry when Gemini is busy (HTTP 429 or 5xx) or unreachable: four
-/// attempts over about a minute and a half. Gemini's free tier often answers 503 for a moment;
-/// past the last attempt the review fails closed as before, with the last answer's reason.
+/// attempts over about a minute and a half. Gemini answers 503 for a moment when the model is in
+/// high demand; past the last attempt the review fails closed as before, with the last answer's
+/// reason.
 pub(crate) const RETRY_DELAYS: [Duration; 3] = [
     Duration::from_secs(10),
     Duration::from_secs(30),
@@ -271,20 +325,42 @@ fn transient(result: &anyhow::Result<(u16, String)>) -> bool {
     }
 }
 
+/// Why an attempt is being repeated, for the progress line.
+fn retry_reason(result: &anyhow::Result<(u16, String)>) -> String {
+    match result {
+        Ok((status, answer)) => {
+            format!("Gemini is busy (HTTP {status}: {})", google_reason(answer))
+        }
+        Err(error) => format!("{error:#}"),
+    }
+}
+
 /// `post`, retried after each of `delays` (waited out with `wait`) while the answer is
-/// [`transient`]. The last attempt's result is returned as it is, so a review that never got
-/// through still fails with that attempt's reason.
+/// [`transient`], saying on `progress` why and how long it waits before each retry. The last
+/// attempt's result is returned as it is, so a review that never got through still fails with
+/// that attempt's reason.
 pub(crate) fn retrying<'a>(
     mut post: impl FnMut(&str, &str, &str) -> anyhow::Result<(u16, String)> + 'a,
     mut wait: impl FnMut(Duration) + 'a,
     delays: &'a [Duration],
+    mut progress: impl Write + 'a,
 ) -> impl FnMut(&str, &str, &str) -> anyhow::Result<(u16, String)> + 'a {
     move |url, body, key| {
         let mut result = post(url, body, key);
-        for delay in delays {
+        let attempts = delays.len().saturating_add(1);
+        for (done, delay) in (1_usize..).zip(delays) {
             if !transient(&result) {
                 break;
             }
+            say(
+                &mut progress,
+                &format!(
+                    "review: {}; retrying in {} s (attempt {} of {attempts})",
+                    retry_reason(&result),
+                    delay.as_secs_f64(),
+                    done.saturating_add(1)
+                ),
+            );
             wait(*delay);
             result = post(url, body, key);
         }
@@ -401,8 +477,8 @@ fn plan(event: &Event, key: Option<&str>, local_title: &str) -> anyhow::Result<P
     })
 }
 
-/// Runs the review of the changes since the merge base with `base`, writing the result to
-/// `summary_path` (the job summary) when given and to `out`.
+/// Runs the review of the changes since the merge base with `base`, writing progress lines to
+/// `out` as it works, then the result to `summary_path` (the job summary) when given and to `out`.
 pub(crate) fn run(
     root: &Path,
     base: &str,
@@ -412,7 +488,7 @@ pub(crate) fn run(
     out: &mut impl Write,
     post: &mut impl FnMut(&str, &str, &str) -> anyhow::Result<(u16, String)>,
 ) -> anyhow::Result<bool> {
-    let result = review_changes(root, base, event, key, post);
+    let result = review_changes(root, base, event, key, post, out);
     let report = match &result {
         Ok((text, _)) => text.clone(),
         Err(error) => format!("## Gemini review: failed\n\n{error:#}\n"),
@@ -436,6 +512,7 @@ fn review_changes(
     event: &Event,
     key: Option<&str>,
     post: &mut impl FnMut(&str, &str, &str) -> anyhow::Result<(u16, String)>,
+    progress: &mut impl Write,
 ) -> anyhow::Result<(String, bool)> {
     let local_title = git::git(root, &["log", "-1", "--format=%s"])?;
     let (title, description) = match plan(event, key, local_title.trim())? {
@@ -455,7 +532,7 @@ fn review_changes(
         diff,
         generated,
     };
-    let verdict = review(&request, key.unwrap_or_default(), post)?;
+    let verdict = review(&request, key.unwrap_or_default(), post, progress)?;
     Ok((summary(&verdict), !verdict.blocks()))
 }
 
@@ -488,7 +565,7 @@ mod tests {
 
     use super::{
         Decision, Event, MAX_DIFF_BYTES, MODEL, Plan, Request, Verdict, body, plan, post_gemini,
-        retrying, review, run, run_from, summary,
+        post_within, retrying, review, run, run_from, summary,
     };
     use crate::testing::{git, repository, serve_once};
 
@@ -611,6 +688,7 @@ mod tests {
             &request("+x"),
             "test-key",
             &mut answering(200, recorded(PASS)),
+            &mut Vec::new(),
         )
         .unwrap();
         assert_eq!(verdict.verdict, Decision::Pass, "pass");
@@ -623,6 +701,7 @@ mod tests {
             &request("+x"),
             "test-key",
             &mut answering(200, recorded(BLOCK)),
+            &mut Vec::new(),
         )
         .unwrap();
         assert_eq!(verdict.verdict, Decision::Block, "block");
@@ -640,6 +719,7 @@ mod tests {
             &request("+x"),
             "test-key",
             &mut answering(200, recorded("Looks good to me!")),
+            &mut Vec::new(),
         )
         .unwrap_err();
         assert!(
@@ -653,6 +733,7 @@ mod tests {
                 200,
                 r#"{"candidates": [{"finishReason": "SAFETY"}]}"#.to_owned(),
             ),
+            &mut Vec::new(),
         )
         .unwrap_err();
         assert!(format!("{refused:#}").contains("no answer"), "{refused:#}");
@@ -660,6 +741,7 @@ mod tests {
             &request("+x"),
             "test-key",
             &mut answering(200, "<html>".to_owned()),
+            &mut Vec::new(),
         )
         .unwrap_err();
         assert!(format!("{garbage:#}").contains("not JSON"), "{garbage:#}");
@@ -674,6 +756,7 @@ mod tests {
                 429,
                 r#"{"error": {"code": 429, "status": "RESOURCE_EXHAUSTED"}}"#.to_owned(),
             ),
+            &mut Vec::new(),
         )
         .unwrap_err();
         assert_eq!(
@@ -685,6 +768,7 @@ mod tests {
             &request("+x"),
             "test-key",
             &mut answering(503, String::new()),
+            &mut Vec::new(),
         )
         .unwrap_err();
         assert!(
@@ -695,6 +779,7 @@ mod tests {
             &request("+x"),
             "test-key",
             &mut answering(400, "bad key".to_owned()),
+            &mut Vec::new(),
         )
         .unwrap_err();
         assert!(
@@ -724,7 +809,9 @@ mod tests {
                 },
                 |delay| waits.push(delay),
                 delays,
+                std::io::sink(),
             ),
+            &mut Vec::new(),
         );
         (outcome, calls.get(), waits)
     }
@@ -736,6 +823,7 @@ mod tests {
             &request("+x"),
             "test-key",
             &mut answering(503, overloaded.to_owned()),
+            &mut Vec::new(),
         )
         .unwrap_err();
         assert_eq!(
@@ -749,6 +837,7 @@ mod tests {
             &request("+x"),
             "test-key",
             &mut answering(429, limited.to_owned()),
+            &mut Vec::new(),
         )
         .unwrap_err();
         assert!(
@@ -761,6 +850,7 @@ mod tests {
             &request("+x"),
             "test-key",
             &mut answering(502, "<html>Bad Gateway</html>".to_owned()),
+            &mut Vec::new(),
         )
         .unwrap_err();
         assert_eq!(
@@ -772,6 +862,7 @@ mod tests {
             &request("+x"),
             "test-key",
             &mut answering(500, String::new()),
+            &mut Vec::new(),
         )
         .unwrap_err();
         assert!(
@@ -858,6 +949,7 @@ mod tests {
             &request(&diff),
             "test-key",
             &mut |_: &str, _: &str, _: &str| panic!("an oversized diff is never sent"),
+            &mut Vec::new(),
         )
         .unwrap_err();
         assert!(
@@ -1081,6 +1173,15 @@ mod tests {
         )
         .unwrap();
         assert!(!passed, "a block fails the check");
+        let printed = String::from_utf8(out).unwrap();
+        assert!(
+            printed.starts_with("review: the diff is "),
+            "progress comes before the verdict: {printed}"
+        );
+        assert!(
+            printed.contains("## Gemini review: block"),
+            "then the verdict: {printed}"
+        );
         assert!(
             fs::read_to_string(&summary_path)
                 .unwrap()
@@ -1103,6 +1204,142 @@ mod tests {
                 .unwrap()
                 .contains("## Gemini review: failed\n\nGemini quota exhausted"),
             "and the summary says why"
+        );
+    }
+    #[test]
+    fn reports_its_progress_as_it_works() {
+        let mut with_generated = request("+fn a() {}");
+        with_generated.generated = vec!["Cargo.lock".to_owned()];
+        let mut progress = Vec::new();
+        review(
+            &with_generated,
+            "test-key",
+            &mut answering(200, recorded(PASS)),
+            &mut progress,
+        )
+        .unwrap();
+        let lines = String::from_utf8(progress).unwrap();
+        let lines: Vec<&str> = lines.lines().collect();
+        assert_eq!(lines.len(), 3, "three steps: {lines:?}");
+        assert_eq!(
+            lines.first().copied(),
+            Some("review: the diff is 10 bytes (1 generated files left out)"),
+            "the diff's size first"
+        );
+        assert!(
+            lines.get(1).is_some_and(|line| line
+                .starts_with(&format!("review: sent to Gemini ({MODEL}, "))
+                && line.ends_with(" bytes); waiting for its verdict")),
+            "then that it was sent: {lines:?}"
+        );
+        assert_eq!(
+            lines.get(2).copied(),
+            Some("review: Gemini answered with HTTP 200"),
+            "then the answer's status"
+        );
+
+        let mut refused = Vec::new();
+        let oversized = "+".repeat(MAX_DIFF_BYTES + 1);
+        assert!(
+            review(
+                &request(&oversized),
+                "test-key",
+                &mut |_: &str, _: &str, _: &str| panic!("an oversized diff is never sent"),
+                &mut refused,
+            )
+            .is_err(),
+            "an oversized diff fails"
+        );
+        assert_eq!(
+            String::from_utf8(refused).unwrap(),
+            format!(
+                "review: the diff is {} bytes (0 generated files left out)\n",
+                MAX_DIFF_BYTES + 1
+            ),
+            "after saying how large it is, and without claiming to send it"
+        );
+    }
+
+    #[test]
+    fn says_why_and_how_long_it_waits_before_each_retry() {
+        let delays = [Duration::from_secs(10), Duration::from_millis(1500)];
+        let mut answers = vec![
+            Ok((
+                503,
+                r#"{"error": {"message": "overloaded", "status": "UNAVAILABLE"}}"#.to_owned(),
+            )),
+            Err(anyhow::anyhow!("timed out").context("Gemini did not answer within 180 s")),
+            Ok((200, recorded(PASS))),
+        ]
+        .into_iter();
+        let mut progress = Vec::new();
+        let verdict = review(
+            &request("+x"),
+            "test-key",
+            &mut retrying(
+                |_: &str, _: &str, _: &str| answers.next().expect("one answer per attempt"),
+                |_| {},
+                &delays,
+                &mut progress,
+            ),
+            &mut std::io::sink(),
+        )
+        .unwrap();
+        assert_eq!(
+            verdict.verdict,
+            Decision::Pass,
+            "the third attempt's verdict"
+        );
+        assert_eq!(
+            String::from_utf8(progress).unwrap(),
+            "review: Gemini is busy (HTTP 503: UNAVAILABLE: overloaded); retrying in 10 s \
+             (attempt 2 of 3)\nreview: Gemini did not answer within 180 s: timed out; retrying \
+             in 1.5 s (attempt 3 of 3)\n",
+            "each retry with its reason and its wait"
+        );
+    }
+
+    #[test]
+    fn a_call_that_gets_no_answer_fails_within_its_limit() {
+        // Accepts the connection and reads the request, then never answers.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let (done, finished) = std::sync::mpsc::channel::<()>();
+        let silent = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            // Holds the connection open until the test is done, ten seconds at most.
+            let _done = finished.recv_timeout(Duration::from_secs(10));
+            drop(stream);
+        });
+        let started = std::time::Instant::now();
+        let error = post_within(&url, "{}", "test-key", Duration::from_millis(200)).unwrap_err();
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "it gives up at its limit, not when the peer does: {:?}",
+            started.elapsed()
+        );
+        assert!(
+            format!("{error:#}")
+                .starts_with("Gemini did not answer within 0.2 s; the connection may have dropped"),
+            "and says so: {error:#}"
+        );
+        done.send(()).unwrap();
+        silent.join().unwrap();
+    }
+
+    #[test]
+    fn a_whole_call_has_a_limit() {
+        assert_eq!(
+            super::CALL_TIMEOUT,
+            Duration::from_secs(180),
+            "three minutes a call"
+        );
+        let attempts = u32::try_from(super::RETRY_DELAYS.len() + 1).unwrap();
+        let worst = super::CALL_TIMEOUT * attempts + super::RETRY_DELAYS.iter().sum::<Duration>();
+        assert!(
+            worst < Duration::from_mins(15),
+            "every attempt and wait fits in the review job's 20 minutes, with time to build: \
+             {worst:?}"
         );
     }
 }

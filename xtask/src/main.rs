@@ -61,6 +61,12 @@ enum TaskAction {
     Show,
     /// Forget the recorded task.
     Clear,
+    /// Declare the task BLOCKED when what stops it is outside your control. The main agent's next
+    /// stop asks the watchdog once whether it is, then lets the stop through with this handoff.
+    Blocked {
+        /// What is missing and what was tried.
+        text: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -175,6 +181,12 @@ enum Task {
         /// The hook event.
         #[arg(value_enum)]
         event: hook::Event,
+        /// Act without locating the agent's checkout and handing over to its xtask: `pre-tool-use`
+        /// judges the command by the guard's rules alone, and `stop` runs on the session's project
+        /// directory (`CLAUDE_PROJECT_DIR`) with its pinned tools. The agent VM runs its installed
+        /// xtask this way, so neither hook depends on a build of the checkout.
+        #[arg(long)]
+        standalone: bool,
     },
 }
 
@@ -311,6 +323,7 @@ fn run(
                 review::post_gemini,
                 std::thread::sleep,
                 &review::RETRY_DELAYS,
+                io::stderr(),
             ),
         )?)),
         Task::GitCredential { operation } => {
@@ -340,13 +353,19 @@ fn run(
             Ok(ExitCode::SUCCESS)
         }
         Task::Tool { name, args } => tools::run(&tool(&name)?, root, &args),
-        Task::Hook { event } => {
+        Task::Hook { event, standalone } => {
             let mut input = String::new();
             io::stdin()
                 .read_to_string(&mut input)
                 .context("could not read the hook input from stdin")?;
-            let context = hook::Context::from_env(home.clone());
-            Ok(ExitCode::from(hook::run(event, &input, &context, report)?))
+            let context = hook::Context::from_env(home.clone(), standalone);
+            Ok(ExitCode::from(hook::run(
+                event,
+                &input,
+                &context,
+                report,
+                &mut io::stdout().lock(),
+            )?))
         }
     }
 }
@@ -419,6 +438,7 @@ fn run_task(action: TaskAction, root: &Path, report: &mut impl Write) -> anyhow:
             None => writeln!(report, "no task recorded")?,
         },
         TaskAction::Clear => task::clear(root)?,
+        TaskAction::Blocked { text } => task::block(root, &text)?,
     }
     Ok(ExitCode::SUCCESS)
 }
