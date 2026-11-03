@@ -55,8 +55,9 @@ mod tests {
 
     use crate::common::{claim_body, config, enrol_body, socket_dir};
 
-    /// The Tailscale image, pinned by digest.
-    const IMAGE: &str = "tailscale/tailscale:v1.104.4@sha256:ed6480b33c6eb67c9cbd203ed42b9fb57e361986725b6856def71b7a3d9e276c";
+    /// The Tailscale image, pinned by digest in the one file the Tailscale workflow and both
+    /// Tailscale tests read.
+    const IMAGE: &str = include_str!("../../../.github/tailscale-image").trim_ascii();
 
     /// Removes the test's containers however the test ends.
     struct Containers(Vec<String>);

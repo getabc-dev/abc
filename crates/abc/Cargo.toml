@@ -28,8 +28,15 @@ zeroize.workspace = true
 
 [dev-dependencies]
 abc-store = { path = "../abc-store", features = ["testing"] }
+http-body-util.workspace = true
+hyper = { workspace = true, features = ["client", "http1"] }
+hyper-util.workspace = true
+rustls.workspace = true
+rustls-platform-verifier.workspace = true
+serde_json.workspace = true
 sqlx.workspace = true
 tempfile.workspace = true
+tokio-rustls.workspace = true
 
 [lints]
 workspace = true
