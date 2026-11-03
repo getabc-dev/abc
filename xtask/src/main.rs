@@ -4,6 +4,7 @@ mod app;
 mod broker;
 mod check;
 mod coverage;
+mod fuzz;
 mod git;
 mod guard;
 mod hook;
@@ -91,6 +92,13 @@ enum Task {
         /// run into shards this way.
         #[arg(long, value_parser = mutants::Shard::parse)]
         shard: Option<mutants::Shard>,
+    },
+    /// Fuzz protocol message decoding for a while with the pinned cargo-fuzz; fails when the
+    /// fuzzer finds an input that breaks it.
+    Fuzz {
+        /// How long to fuzz, in seconds.
+        #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u64).range(1..))]
+        seconds: u64,
     },
     /// Report deleted, skipped or weakened tests and changed gate files since the merge base.
     Integrity {
@@ -288,6 +296,12 @@ fn run(
             &mutants::Options { jobs, shard },
             &tool("cargo-mutants")?,
             &tool("cargo-nextest")?,
+            report,
+        )?)),
+        Task::Fuzz { seconds } => Ok(verdict(fuzz::run(
+            root,
+            &tool("cargo-fuzz")?,
+            seconds,
             report,
         )?)),
         Task::Integrity {
@@ -523,6 +537,7 @@ mod tests {
             "while [ $# -gt 0 ]; do [ \"$1\" = --output ] && out=$2; shift; done\nmkdir -p \"$out/mutants.out\"\necho 'src/a.rs:1:1: replace a with ()' > \"$out/mutants.out/missed.txt\"\nexit 2\n",
         );
         script(&dir.join("cargo-nextest"), "exit 0\n");
+        script(&dir.join("cargo-fuzz"), "exit 77\n");
     }
 
     fn dispatch(
@@ -641,6 +656,7 @@ mod tests {
                 },
             ),
             ("coverage", Task::Coverage { base: base() }),
+            ("fuzz", Task::Fuzz { seconds: 1 }),
             (
                 "mutants",
                 Task::Mutants {
