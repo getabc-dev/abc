@@ -8,7 +8,7 @@ trust it without reading the code. Other people will run abc and fund it through
 is built to production grade from the first commit.
 
 Product decisions and research live in the abc product brief (Claude Doc):
-https://claude.ai/artifact/1yeSnW2FFpd99v8ftvMisg
+https://claude.ai/artifact/JUbZzoDFMpqZnCSrn4i1Jh
 
 ## STRICT: this project is in development
 
