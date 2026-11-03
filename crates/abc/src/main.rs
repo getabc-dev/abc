@@ -10,8 +10,9 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use abc_core::secret::Secret;
-use abc_server::telemetry::chain;
-use abc_server::{Limits, LinkTimings, PublicUrl, ServerConfig};
+use abc_platform::telemetry::chain;
+use abc_protocol::url::PublicUrl;
+use abc_server::{Limits, LinkTimings, ServerConfig};
 use abc_store::{DatabaseUrl, ExecuteError, Store, StoreOptions};
 use clap::{Parser, Subcommand};
 
@@ -137,8 +138,16 @@ async fn serve(server: ServerCommand) -> Result<(), Failure> {
         .serve
         .public_url
         .ok_or_else(|| config("ABC_PUBLIC_URL is required to run the server".into()))?;
-    let public_url = PublicUrl::parse(&raw_url).map_err(|error| config(Box::new(error)))?;
-    abc_server::telemetry::init(server.serve.log.as_deref())
+    let public_url = PublicUrl::parse(&raw_url).map_err(|error| {
+        config(
+            format!(
+                "ABC_PUBLIC_URL must be the https URL Tailscale Serve answers on, such as \
+                 https://abc.tail1234.ts.net ({error})"
+            )
+            .into(),
+        )
+    })?;
+    abc_platform::telemetry::init(server.serve.log.as_deref())
         .map_err(|error| config(Box::new(error)))?;
     let settings = ServerConfig {
         database_url: database_url()?,

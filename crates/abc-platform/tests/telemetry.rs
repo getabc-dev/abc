@@ -2,7 +2,7 @@
 
 #[cfg(test)]
 mod tests {
-    use abc_server::telemetry::{TelemetryError, init};
+    use abc_platform::telemetry::{TelemetryError, init};
 
     #[test]
     fn init_installs_the_logger_once_and_refuses_a_bad_filter() {

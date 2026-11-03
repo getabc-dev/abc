@@ -16,7 +16,7 @@ use abc_core::policy::{DenialReason, Denied};
 use abc_protocol::api::{ApiCode, ApiErrorBody, ApiErrorDetail};
 use abc_store::{AuthError, ExecuteError, QueryError, StoreError};
 
-use crate::telemetry::chain;
+use abc_platform::telemetry::chain;
 
 /// An error response: `{"error":{"code":…,"message":…}}`, with the request id in `x-request-id`.
 #[derive(Debug)]

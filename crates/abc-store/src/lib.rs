@@ -14,7 +14,6 @@
 //! let mut feed = store.feed(); // wakes when the log head advances
 //! ```
 
-mod entropy;
 mod error;
 mod execute;
 mod facts;
@@ -37,11 +36,11 @@ use abc_core::id::{FromUuid, WorkerId, WorkspaceId};
 use abc_core::identity::TailnetLogin;
 use abc_core::secret::Secret;
 use abc_core::time::Clock;
+use abc_platform::entropy::{ChaChaMint, Entropy, SystemEntropy};
 use sqlx::PgPool;
 use sqlx::migrate::Migrator;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 
-pub use entropy::{Entropy, EntropyUnavailable};
 pub use error::{AuthError, ExecuteError, NotReady, OpenError, QueryError, StoreError};
 pub use execute::Executable;
 pub use feed::LogFeed;
@@ -190,7 +189,7 @@ impl StoreOptions {
     pub fn production() -> Self {
         Self {
             clock: Arc::new(execute::SystemClock),
-            entropy: Arc::new(entropy::SystemEntropy),
+            entropy: Arc::new(SystemEntropy),
         }
     }
 }
@@ -328,7 +327,7 @@ impl Store {
     ///
     /// [`StoreError::Entropy`] when no seed can be drawn.
     pub fn fresh_id<T: FromUuid>(&self) -> Result<T, StoreError> {
-        let mint = entropy::ChaChaMint::from_seed(self.inner.entropy.seed()?);
+        let mint = ChaChaMint::from_seed(self.inner.entropy.seed()?);
         Ok(DecideCtx::new(self.inner.clock.now(), &mint).id())
     }
 

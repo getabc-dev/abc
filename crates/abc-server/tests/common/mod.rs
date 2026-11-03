@@ -9,8 +9,9 @@ use std::time::Duration;
 
 use abc_core::credential::WorkerKey;
 use abc_core::secret::Secret;
+use abc_protocol::url::PublicUrl;
 use abc_protocol::{Hello, ServerMessage, WorkerMessage};
-use abc_server::{Limits, LinkTimings, PublicUrl, ServeError, ServerConfig};
+use abc_server::{Limits, LinkTimings, ServeError, ServerConfig};
 use abc_store::testing::{Fixture, database};
 use abc_store::{Store, StoreOptions};
 use futures::{SinkExt as _, StreamExt as _};

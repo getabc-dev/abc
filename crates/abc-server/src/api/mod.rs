@@ -47,9 +47,9 @@ use abc_core::query::{ListEnrolmentTokens, SessionView, TokenSummary, WhoAmI};
 use abc_protocol::api::ApiCode;
 use abc_protocol::enrol::{ENROL_PATH, EnrolRequest, EnrolResponse};
 use abc_protocol::link::CONNECT_PATH;
+use abc_protocol::url::PublicUrl;
 use abc_store::{Caller, Store};
 
-use crate::ServeError;
 use crate::limits::{Limits, RateLimiter};
 use crate::listen::SidecarApp;
 use crate::sessions::Sessions;
@@ -100,68 +100,6 @@ impl Drain {
         let mut draining = self.0.subscribe();
         // The sender lives as long as `self`.
         let _started = draining.wait_for(|draining| *draining).await;
-    }
-}
-
-/// `https://<name>.<tailnet>.ts.net`, validated at start: https, a host, an optional port, and no
-/// path, query or credentials.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PublicUrl {
-    origin: String,
-    host: String,
-}
-
-impl PublicUrl {
-    /// Parses `ABC_PUBLIC_URL`.
-    ///
-    /// # Errors
-    ///
-    /// [`ServeError::PublicUrl`] naming what is wrong.
-    pub fn parse(raw: &str) -> Result<Self, ServeError> {
-        let refuse = |reason| ServeError::PublicUrl { reason };
-        let rest = raw
-            .strip_prefix("https://")
-            .ok_or_else(|| refuse("it must start with https://"))?;
-        let authority = rest.strip_suffix('/').unwrap_or(rest);
-        if authority.contains(['/', '?', '#']) {
-            return Err(refuse("it must not have a path, query or fragment"));
-        }
-        if authority.contains('@') {
-            return Err(refuse("it must not carry credentials"));
-        }
-        let authority = authority.to_ascii_lowercase();
-        let host = authority
-            .strip_suffix(":443")
-            .unwrap_or(&authority)
-            .to_owned();
-        let (name, port) = host
-            .rsplit_once(':')
-            .map_or((host.as_str(), None), |(name, port)| (name, Some(port)));
-        let valid_name = !name.is_empty()
-            && name
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'.' || byte == b'-');
-        if !valid_name {
-            return Err(refuse("it must name a host"));
-        }
-        if port.is_some_and(|port| port.parse::<u16>().is_err()) {
-            return Err(refuse("its port must be a number up to 65535"));
-        }
-        Ok(Self {
-            origin: format!("https://{host}"),
-            host,
-        })
-    }
-
-    /// The origin browsers send in `Origin`, such as `https://abc.tail1234.ts.net`.
-    pub(crate) fn origin(&self) -> &str {
-        &self.origin
-    }
-
-    /// The host clients send in `Host`, with the port when it is not 443; Serve forwards it in
-    /// `X-Forwarded-Host`.
-    pub(crate) fn host(&self) -> &str {
-        &self.host
     }
 }
 
@@ -482,52 +420,4 @@ async fn enrol(
         workspace: enrolled.workspace,
         name: enrolled.name,
     }))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_public_url_is_an_https_origin() {
-        let url = PublicUrl::parse("https://ABC.tail1234.ts.net/").unwrap();
-        assert_eq!(
-            url.origin(),
-            "https://abc.tail1234.ts.net",
-            "lower-cased, no slash"
-        );
-        assert_eq!(url.host(), "abc.tail1234.ts.net", "the Host clients send");
-        let default_port = PublicUrl::parse("https://abc.ts.net:443").unwrap();
-        assert_eq!(default_port.host(), "abc.ts.net", "443 is implied");
-        let port = PublicUrl::parse("https://abc.ts.net:8443").unwrap();
-        assert_eq!(port.host(), "abc.ts.net:8443", "another port is kept");
-        assert_eq!(
-            port.origin(),
-            "https://abc.ts.net:8443",
-            "in the origin too"
-        );
-        for (raw, reason) in [
-            ("http://abc.ts.net", "it must start with https://"),
-            (
-                "https://abc.ts.net/app",
-                "it must not have a path, query or fragment",
-            ),
-            (
-                "https://abc.ts.net?x",
-                "it must not have a path, query or fragment",
-            ),
-            ("https://me:pw@abc.ts.net", "it must not carry credentials"),
-            ("https://", "it must name a host"),
-            ("https://ab c.ts.net", "it must name a host"),
-            (
-                "https://abc.ts.net:99999",
-                "its port must be a number up to 65535",
-            ),
-        ] {
-            assert!(
-                matches!(PublicUrl::parse(raw), Err(ServeError::PublicUrl { reason: got }) if got == reason),
-                "{raw}: {reason}"
-            );
-        }
-    }
 }

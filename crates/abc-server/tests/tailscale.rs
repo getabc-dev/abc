@@ -34,8 +34,9 @@ mod tests {
 
     use abc_core::credential::WorkerKey;
     use abc_core::secret::Secret;
+    use abc_protocol::url::PublicUrl;
     use abc_protocol::{Hello, ServerMessage, WorkerMessage};
-    use abc_server::{LinkTimings, PublicUrl};
+    use abc_server::LinkTimings;
     use abc_store::testing::Fixture;
     use futures::{SinkExt as _, StreamExt as _};
     use http_body_util::{BodyExt as _, Full};
