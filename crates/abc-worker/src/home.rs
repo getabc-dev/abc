@@ -6,7 +6,8 @@
 //!                            macOS: ~/Library/Application Support/abc/worker
 //!                            Linux: $XDG_CONFIG_HOME/abc/worker, else ~/.config/abc/worker
 //!   worker.lock       0600   locked by `Held` for the process's life; never renamed
-//!   worker.toml       0600   the record: server, token digest, key, enrolled?
+//!   worker.toml       0600   the record: the enrolment in use (server, token digest, key, who
+//!                            it is) and a pending key whose answer has not been seen
 //! ```
 //!
 //! A lost record loses the key for good: enrol again with a new token, and the owner revokes the
@@ -140,13 +141,10 @@ pub(crate) struct Held {
     dir: PathBuf,
 }
 
-/// `worker.toml`. The key is written here the moment it exists, before any request names it, so a
-/// crash at any point leaves either nothing or a key this machine can retry with.
+/// A key made for one enrolment token at one server.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct Record {
-    /// [`FORMAT`].
-    pub(crate) format: u32,
+pub(crate) struct Slot {
     /// The server the key was made for. Enrolment and every dial use this URL and no other.
     pub(crate) server: PublicUrl,
     /// The digest of the token the key was sent with. The same token again is a retry; another
@@ -155,25 +153,45 @@ pub(crate) struct Record {
     /// The worker's key. It leaves its `Secret` only here and in the `Authorization` header.
     #[serde(serialize_with = "serialize_exposed")]
     pub(crate) key: Secret<WorkerKey>,
-    /// Who the server says this machine is; `None` until its answer has been seen.
-    pub(crate) enrolled: Option<Enrolled>,
 }
 
-impl Record {
-    /// A record for a key just made, before the server has answered.
-    pub(crate) const fn pending(
-        server: PublicUrl,
-        token: EnrolmentTokenDigest,
-        key: Secret<WorkerKey>,
-    ) -> Self {
-        Self {
-            format: FORMAT,
-            server,
-            token,
-            key,
-            enrolled: None,
-        }
+impl Slot {
+    /// Whether this key was made for `token` at `server`: sending it again is a retry.
+    pub(crate) fn is_for(&self, server: &PublicUrl, token: &EnrolmentTokenDigest) -> bool {
+        self.server == *server && self.token == *token
     }
+}
+
+/// The enrolment in use: its key, and who the server said it is.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct Current {
+    /// The key the worker dials with.
+    pub(crate) key: Slot,
+    /// Who the server says this machine is.
+    pub(crate) worker: Enrolled,
+}
+
+/// `worker.toml`: the enrolment in use, and the one under way. A new key is written to `pending`
+/// the moment it exists, before any request names it, so a crash at any point leaves either
+/// nothing or a key this machine can retry with. It becomes `current` only once the server has
+/// answered, so a failed `--replace` leaves the enrolment in use working.
+#[derive(Debug, Default)]
+pub(crate) struct Record {
+    /// The enrolment the worker runs with.
+    pub(crate) current: Option<Current>,
+    /// A key sent, or about to be sent, whose answer has not been seen.
+    pub(crate) pending: Option<Slot>,
+}
+
+/// The record as stored: owned when loaded, borrowed when saved.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Stored<C, P> {
+    /// [`FORMAT`].
+    format: u32,
+    current: Option<C>,
+    pending: Option<P>,
 }
 
 impl Held {
@@ -195,22 +213,34 @@ impl Held {
             fs::read_to_string(&path).map_err(|source| HomeError::io(&path, source))?,
         );
         // The parser's message can quote the file, and the file holds the key: it is dropped.
-        let record: Record = toml_edit::de::from_str(&text)
+        let stored: Stored<Current, Slot> = toml_edit::de::from_str(&text)
             .ok()
             .ok_or_else(|| HomeError::Unreadable { path: path.clone() })?;
-        if record.format != FORMAT {
+        if stored.format != FORMAT {
             return Err(HomeError::Unreadable { path });
         }
-        Ok(Some(record))
+        Ok(Some(Record {
+            current: stored.current,
+            pending: stored.pending,
+        }))
     }
 
     /// Replaces the record, atomically and durably: the new text goes to a fresh 0600 file, which
     /// is synced, renamed over the record, and the directory synced. A crash leaves the old record
     /// or the new one, never part of either.
-    pub(crate) fn save(&self, record: &Record) -> Result<(), HomeError> {
+    pub(crate) fn save(
+        &self,
+        current: Option<&Current>,
+        pending: Option<&Slot>,
+    ) -> Result<(), HomeError> {
         let staged = self.dir.join(STAGED);
+        let stored = Stored {
+            format: FORMAT,
+            current,
+            pending,
+        };
         let text = zeroize::Zeroizing::new(
-            toml_edit::ser::to_string_pretty(record)
+            toml_edit::ser::to_string_pretty(&stored)
                 .ok()
                 .ok_or(HomeError::Encode)?,
         );
@@ -419,39 +449,75 @@ mod tests {
         );
     }
 
+    fn slot(seed: u8) -> Slot {
+        Slot {
+            server: url(),
+            token: token_digest(),
+            key: key(seed),
+        }
+    }
+
+    #[test]
+    fn a_slot_is_for_one_token_at_one_server() {
+        let slot = slot(1);
+        assert!(slot.is_for(&url(), &token_digest()), "its own");
+        let other = PublicUrl::parse("https://other.test.ts.net").unwrap();
+        assert!(!slot.is_for(&other, &token_digest()), "another server");
+        let token = EnrolmentToken::parse(&format!("abc_enr_{}", "2".repeat(52)))
+            .unwrap()
+            .expose_secret()
+            .digest();
+        assert!(!slot.is_for(&url(), &token), "another token");
+    }
+
     #[test]
     fn a_record_survives_a_save_and_a_load() {
         let (_temp, home) = home();
         let held = home.lock().unwrap();
         assert!(held.load().unwrap().is_none(), "no record yet");
-        let key = key(1);
-        let text = key.expose_secret().as_str().to_owned();
-        let mut record = Record::pending(url(), token_digest(), key);
-        held.save(&record).unwrap();
+        let text = key(1).expose_secret().as_str().to_owned();
+        held.save(None, Some(&slot(1))).unwrap();
         let path = home.dir().join(RECORD);
         assert_eq!(mode(&path), 0o600, "the record is private");
         assert!(!home.dir().join(STAGED).exists(), "nothing staged is left");
         let loaded = held.load().unwrap().unwrap();
-        assert_eq!(loaded.server, url(), "the server");
-        assert_eq!(loaded.token, token_digest(), "the token's digest");
-        assert_eq!(loaded.key.expose_secret().as_str(), text, "the key");
-        assert_eq!(loaded.enrolled, None, "pending");
+        assert!(loaded.current.is_none(), "nothing in use");
+        let pending = loaded.pending.unwrap();
+        assert_eq!(pending.server, url(), "the server");
+        assert_eq!(pending.token, token_digest(), "the token's digest");
+        assert_eq!(pending.key.expose_secret().as_str(), text, "the key");
         let enrolled = Enrolled {
             worker: abc_core::id::WorkerId::from_uuid(uuid::Uuid::from_u128(7)),
             workspace: abc_core::id::WorkspaceId::from_uuid(uuid::Uuid::from_u128(8)),
             name: DisplayName::parse("mbp").unwrap(),
         };
-        record.enrolled = Some(enrolled.clone());
+        let current = Current {
+            key: slot(1),
+            worker: enrolled.clone(),
+        };
         fs::write(home.dir().join(STAGED), "left by a crash").unwrap();
-        held.save(&record).unwrap();
+        held.save(Some(&current), Some(&slot(2))).unwrap();
+        let saved_both = held.load().unwrap().unwrap();
+        let loaded_current = saved_both.current.unwrap();
         assert_eq!(
-            held.load().unwrap().unwrap().enrolled,
-            Some(enrolled),
-            "an enrolled record; a stale staged file does not stop the save"
+            loaded_current.worker, enrolled,
+            "an enrolment in use; a stale staged file does not stop the save"
+        );
+        assert_eq!(
+            loaded_current.key.key.expose_secret().as_str(),
+            text,
+            "with its key"
+        );
+        assert_eq!(
+            saved_both.pending.unwrap().key.expose_secret().as_str(),
+            key(2).expose_secret().as_str(),
+            "beside a pending one"
         );
         let saved = fs::read_to_string(&path).unwrap();
         assert!(
-            saved.starts_with("format = 1\nserver = \"https://abc.test.ts.net\"\ntoken = \""),
+            saved.starts_with(
+                "format = 1\n\n[current.key]\nserver = \"https://abc.test.ts.net\"\ntoken = \""
+            ),
             "readable TOML: {saved}"
         );
     }
@@ -461,8 +527,7 @@ mod tests {
         let (_temp, home) = home();
         let held = home.lock().unwrap();
         let path = home.dir().join(RECORD);
-        held.save(&Record::pending(url(), token_digest(), key(2)))
-            .unwrap();
+        held.save(None, Some(&slot(2))).unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
         assert!(
             matches!(held.load(), Err(HomeError::Insecure { .. })),
@@ -472,17 +537,22 @@ mod tests {
         for damaged in [
             "not toml at all".to_owned(),
             format!(
-                "format = 2\nserver = \"https://abc.test.ts.net\"\ntoken = \"{}\"\nkey = \"{}\"\n",
+                "format = 2\n\n[pending]\nserver = \"https://abc.test.ts.net\"\ntoken = \"{}\"\nkey = \"{}\"\n",
                 "0".repeat(64),
                 secret.expose_secret().as_str()
             ),
             format!(
-                "format = 1\nserver = \"https://abc.test.ts.net\"\ntoken = \"{}\"\nkey = \"{}x\"\n",
+                "format = 1\n\n[pending]\nserver = \"https://abc.test.ts.net\"\ntoken = \"{}\"\nkey = \"{}x\"\n",
                 "0".repeat(64),
                 secret.expose_secret().as_str()
             ),
             format!(
-                "format = 1\nserver = \"http://abc\"\ntoken = \"{}\"\nkey = \"{}\"\n",
+                "format = 1\n\n[pending]\nserver = \"http://abc\"\ntoken = \"{}\"\nkey = \"{}\"\n",
+                "0".repeat(64),
+                secret.expose_secret().as_str()
+            ),
+            format!(
+                "format = 1\n\n[pending]\nserver = \"https://abc.test.ts.net\"\ntoken = \"{}\"\nkey = \"{}\"\nextra = 1\n",
                 "0".repeat(64),
                 secret.expose_secret().as_str()
             ),
@@ -521,9 +591,7 @@ mod tests {
         // A directory where the staged file goes cannot be removed; the save stops there.
         let staged = home.dir().join(STAGED);
         fs::create_dir(&staged).unwrap();
-        let blocked = held
-            .save(&Record::pending(url(), token_digest(), key(4)))
-            .unwrap_err();
+        let blocked = held.save(None, Some(&slot(4))).unwrap_err();
         assert!(
             matches!(&blocked, HomeError::Io { path, source }
                 if *path == staged && source.kind() != std::io::ErrorKind::AlreadyExists),

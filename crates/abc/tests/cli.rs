@@ -326,7 +326,7 @@ mod tests {
         std::fs::write(
             &record,
             format!(
-                "format = 1\nserver = \"https://127.0.0.1:{port}\"\ntoken = \"{}\"\nkey = \"abc_wk_{}\"\n\n[enrolled]\nworker = \"00000000-0000-0000-0000-000000000001\"\nworkspace = \"00000000-0000-0000-0000-000000000002\"\nname = \"mbp\"\n",
+                "format = 1\n\n[current.key]\nserver = \"https://127.0.0.1:{port}\"\ntoken = \"{}\"\nkey = \"abc_wk_{}\"\n\n[current.worker]\nworker = \"00000000-0000-0000-0000-000000000001\"\nworkspace = \"00000000-0000-0000-0000-000000000002\"\nname = \"mbp\"\n",
                 "0".repeat(64),
                 "0".repeat(52)
             ),

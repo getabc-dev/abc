@@ -14,8 +14,14 @@ use abc_protocol::enrol::{ENROL_PATH, EnrolRequest, EnrolResponse};
 use abc_protocol::link::{CONNECT_PATH, MAX_MESSAGE};
 use abc_protocol::url::PublicUrl;
 use bytes::Bytes;
-use http_body_util::{BodyExt as _, Full, Limited};
-use hyper::header::{AUTHORIZATION, CONTENT_TYPE, HOST, HeaderValue};
+use http_body_util::{BodyExt as _, Empty, Full, Limited};
+use hyper::StatusCode;
+use hyper::header::{
+    AUTHORIZATION, CONNECTION, CONTENT_TYPE, HOST, HeaderMap, HeaderValue, SEC_WEBSOCKET_ACCEPT,
+    SEC_WEBSOCKET_EXTENSIONS, SEC_WEBSOCKET_KEY, SEC_WEBSOCKET_PROTOCOL, SEC_WEBSOCKET_VERSION,
+    UPGRADE,
+};
+use hyper::upgrade::Upgraded;
 use hyper_util::rt::TokioIo;
 use rustls::pki_types::ServerName;
 use thiserror::Error;
@@ -23,14 +29,13 @@ use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 use tokio_rustls::client::TlsStream;
 use tokio_tungstenite::WebSocketStream;
-use tokio_tungstenite::tungstenite;
-use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
-use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
+use tokio_tungstenite::tungstenite::handshake;
+use tokio_tungstenite::tungstenite::protocol::{Role, WebSocketConfig};
 
 use crate::{EnrolError, Env};
 
 /// An upgraded link, its messages and frames capped at [`MAX_MESSAGE`].
-pub(crate) type Link = WebSocketStream<TlsStream<TcpStream>>;
+pub(crate) type Link = WebSocketStream<TokioIo<Upgraded>>;
 
 /// The largest error or enrolment body read from the server.
 const MAX_BODY: usize = 64 * 1024;
@@ -71,6 +76,9 @@ pub enum DialError {
     /// The HTTP exchange failed.
     #[error("the HTTP exchange with the server failed")]
     Http(#[source] Box<dyn std::error::Error + Send + Sync>),
+    /// The server answered 101 without completing the WebSocket handshake.
+    #[error("the server's upgrade is not a WebSocket handshake: {0}")]
+    Upgrade(&'static str),
     /// It did not complete in time.
     #[error("the server did not answer within {} s", .0.as_secs_f64())]
     Timeout(Duration),
@@ -280,7 +288,9 @@ pub(crate) enum Dialed {
 }
 
 /// `GET /api/worker/connect` with the key in `Authorization: Bearer` (marked sensitive), bounded
-/// by the connect timing. A refusal is an answer, not an error.
+/// by the connect timing. A refusal is an answer, not an error: its whole body is read, up to
+/// [`MAX_BODY`], however many reads it arrives in (behind Serve the head and the body come
+/// separately), so a revoked or unknown key is always recognised as one.
 pub(crate) async fn connect(
     env: &Env,
     server: &PublicUrl,
@@ -288,30 +298,95 @@ pub(crate) async fn connect(
 ) -> Result<Dialed, DialError> {
     within(env.timings.connect, async {
         let stream = tls(env, server).await?;
-        let mut request = format!("wss://{}{CONNECT_PATH}", server.host())
-            .into_client_request()
+        let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
+            .await
             .map_err(|error| DialError::Http(error.into()))?;
-        let mut bearer = HeaderValue::from_str(&format!("Bearer {}", key.expose_secret().as_str()))
+        // The connection hands its stream to the upgrade on a 101, and ends after a refusal.
+        drop(tokio::spawn(connection.with_upgrades()));
+        let nonce = handshake::client::generate_key();
+        let request = upgrade_request(server, key, &nonce)?;
+        let response = sender
+            .send_request(request)
+            .await
             .map_err(|error| DialError::Http(error.into()))?;
-        bearer.set_sensitive(true);
-        request.headers_mut().insert(AUTHORIZATION, bearer);
+        if response.status() != StatusCode::SWITCHING_PROTOCOLS {
+            let status = response.status().as_u16();
+            let body = Limited::new(response.into_body(), MAX_BODY)
+                .collect()
+                .await
+                .map_err(DialError::Http)?
+                .to_bytes();
+            let code = api_error(&body).map(|body| body.error.code);
+            return Ok(Dialed::Refused(refusal(status, code)));
+        }
+        accepted(response.headers(), &nonce).map_err(DialError::Upgrade)?;
+        let upgraded = hyper::upgrade::on(response)
+            .await
+            .map_err(|error| DialError::Http(error.into()))?;
         let config = WebSocketConfig::default()
             .max_message_size(Some(MAX_MESSAGE))
             .max_frame_size(Some(MAX_MESSAGE));
-        match tokio_tungstenite::client_async_with_config(request, stream, Some(config)).await {
-            Ok((link, _)) => Ok(Dialed::Upgraded(Box::new(link))),
-            Err(tungstenite::Error::Http(response)) => {
-                let code = response
-                    .body()
-                    .as_deref()
-                    .and_then(api_error)
-                    .map(|body| body.error.code);
-                Ok(Dialed::Refused(refusal(response.status().as_u16(), code)))
-            }
-            Err(error) => Err(DialError::Http(error.into())),
-        }
+        let link =
+            WebSocketStream::from_raw_socket(TokioIo::new(upgraded), Role::Client, Some(config))
+                .await;
+        Ok(Dialed::Upgraded(Box::new(link)))
     })
     .await
+}
+
+/// The upgrade request: the key as a sensitive bearer, and a WebSocket handshake offering no
+/// subprotocol and no extension.
+fn upgrade_request(
+    server: &PublicUrl,
+    key: &Secret<WorkerKey>,
+    nonce: &str,
+) -> Result<hyper::Request<Empty<Bytes>>, DialError> {
+    let host =
+        HeaderValue::from_str(server.host()).map_err(|error| DialError::Http(error.into()))?;
+    let mut bearer = HeaderValue::from_str(&format!("Bearer {}", key.expose_secret().as_str()))
+        .map_err(|error| DialError::Http(error.into()))?;
+    bearer.set_sensitive(true);
+    hyper::Request::get(CONNECT_PATH)
+        .header(HOST, host)
+        .header(CONNECTION, "Upgrade")
+        .header(UPGRADE, "websocket")
+        .header(SEC_WEBSOCKET_VERSION, "13")
+        .header(SEC_WEBSOCKET_KEY, nonce)
+        .header(AUTHORIZATION, bearer)
+        .body(Empty::new())
+        .map_err(|error| DialError::Http(error.into()))
+}
+
+/// Whether a 101's headers complete the WebSocket handshake for `nonce` (RFC 6455 section 4.1):
+/// `Upgrade: websocket`, a `Connection` naming `upgrade`, the accept key derived from the nonce,
+/// and no subprotocol or extension, since the worker offered none. `Err` says which is wrong.
+fn accepted(headers: &HeaderMap, nonce: &str) -> Result<(), &'static str> {
+    let text = |name| {
+        headers
+            .get(name)
+            .and_then(|value: &HeaderValue| value.to_str().ok())
+    };
+    if !text(UPGRADE).is_some_and(|value| value.eq_ignore_ascii_case("websocket")) {
+        return Err("no `Upgrade: websocket`");
+    }
+    let names_upgrade = |value: &str| {
+        value
+            .split(',')
+            .any(|token| token.trim().eq_ignore_ascii_case("upgrade"))
+    };
+    if !text(CONNECTION).is_some_and(names_upgrade) {
+        return Err("no `Connection: upgrade`");
+    }
+    if text(SEC_WEBSOCKET_ACCEPT) != Some(handshake::derive_accept_key(nonce.as_bytes()).as_str()) {
+        return Err("the accept key does not match the request's");
+    }
+    if headers.contains_key(SEC_WEBSOCKET_PROTOCOL) {
+        return Err("a subprotocol the worker did not offer");
+    }
+    if headers.contains_key(SEC_WEBSOCKET_EXTENSIONS) {
+        return Err("an extension the worker did not offer");
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -360,6 +435,102 @@ mod tests {
                 "a body that is not abc's: {status}"
             );
         }
+    }
+
+    #[test]
+    fn only_a_complete_websocket_handshake_is_accepted() {
+        // RFC 6455 section 1.3's example nonce and accept key.
+        let nonce = "dGhlIHNhbXBsZSBub25jZQ==";
+        let good = || {
+            let mut headers = HeaderMap::new();
+            headers.insert(UPGRADE, HeaderValue::from_static("WebSocket"));
+            headers.insert(CONNECTION, HeaderValue::from_static("keep-alive, Upgrade"));
+            headers.insert(
+                SEC_WEBSOCKET_ACCEPT,
+                HeaderValue::from_static("s3pPLMBiTxaQ9kYGzzhZRbK+xOo="),
+            );
+            headers
+        };
+        assert_eq!(accepted(&good(), nonce), Ok(()), "a complete handshake");
+        let changed = |change: &dyn Fn(&mut HeaderMap)| {
+            let mut headers = good();
+            change(&mut headers);
+            accepted(&headers, nonce)
+        };
+        assert_eq!(
+            changed(&|h| drop(h.remove(UPGRADE))),
+            Err("no `Upgrade: websocket`"),
+            "no upgrade"
+        );
+        assert_eq!(
+            changed(&|h| drop(h.insert(UPGRADE, HeaderValue::from_static("h2c")))),
+            Err("no `Upgrade: websocket`"),
+            "an upgrade to something else"
+        );
+        assert_eq!(
+            changed(&|h| drop(h.remove(CONNECTION))),
+            Err("no `Connection: upgrade`"),
+            "no connection header"
+        );
+        assert_eq!(
+            changed(&|h| drop(
+                h.insert(CONNECTION, HeaderValue::from_static("keep-alive, upgraded"))
+            )),
+            Err("no `Connection: upgrade`"),
+            "a connection header without the upgrade token"
+        );
+        assert_eq!(
+            changed(&|h| drop(h.remove(SEC_WEBSOCKET_ACCEPT))),
+            Err("the accept key does not match the request's"),
+            "no accept key"
+        );
+        assert_eq!(
+            accepted(&good(), "AQIDBAUGBwgJCgsMDQ4PEC=="),
+            Err("the accept key does not match the request's"),
+            "an accept key for another nonce"
+        );
+        assert_eq!(
+            changed(&|h| drop(h.insert(SEC_WEBSOCKET_PROTOCOL, HeaderValue::from_static("chat")))),
+            Err("a subprotocol the worker did not offer"),
+            "a subprotocol"
+        );
+        assert_eq!(
+            changed(&|h| {
+                drop(h.insert(
+                    SEC_WEBSOCKET_EXTENSIONS,
+                    HeaderValue::from_static("permessage-deflate"),
+                ));
+            }),
+            Err("an extension the worker did not offer"),
+            "an extension"
+        );
+    }
+
+    #[test]
+    fn the_upgrade_request_offers_a_plain_websocket_and_hides_the_key() {
+        let server = PublicUrl::parse("https://abc.tail1234.ts.net").unwrap();
+        let key = crate::testing::key(1);
+        let request = upgrade_request(&server, &key, "bm9uY2U=").unwrap();
+        assert_eq!(request.method(), hyper::Method::GET, "a GET");
+        assert_eq!(request.uri().path(), CONNECT_PATH, "to the link's path");
+        let header = |name| request.headers().get(name).unwrap().to_str().unwrap();
+        assert_eq!(header(HOST), "abc.tail1234.ts.net", "for the enrolled host");
+        assert_eq!(header(CONNECTION), "Upgrade", "asking for an upgrade");
+        assert_eq!(header(UPGRADE), "websocket", "to a WebSocket");
+        assert_eq!(header(SEC_WEBSOCKET_VERSION), "13", "of RFC 6455");
+        assert_eq!(header(SEC_WEBSOCKET_KEY), "bm9uY2U=", "with the nonce");
+        let bearer = request.headers().get(AUTHORIZATION).unwrap();
+        assert_eq!(
+            bearer.to_str().unwrap(),
+            format!("Bearer {}", key.expose_secret().as_str()),
+            "the key as a bearer"
+        );
+        assert!(bearer.is_sensitive(), "kept out of logs");
+        assert!(
+            !request.headers().contains_key(SEC_WEBSOCKET_PROTOCOL)
+                && !request.headers().contains_key(SEC_WEBSOCKET_EXTENSIONS),
+            "no subprotocol and no extension offered"
+        );
     }
 
     fn body(code: ApiCode) -> ApiErrorBody {

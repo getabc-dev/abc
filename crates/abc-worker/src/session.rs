@@ -215,7 +215,11 @@ async fn serve(
 
 /// Whether the wall clock ran ahead of the monotonic clock by more than `gap` between `before`
 /// and `after`: the machine slept in between.
-fn slept(before: (Instant, SystemTime), after: (Instant, SystemTime), gap: Duration) -> bool {
+pub(crate) fn slept(
+    before: (Instant, SystemTime),
+    after: (Instant, SystemTime),
+    gap: Duration,
+) -> bool {
     let monotonic = after.0.saturating_duration_since(before.0);
     // A wall clock that went backwards slept for no time.
     let wall = after.1.duration_since(before.1).unwrap_or_default();

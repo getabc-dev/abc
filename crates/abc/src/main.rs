@@ -276,13 +276,14 @@ async fn work(worker: WorkerCommand) -> Result<(), Failure> {
     }
 }
 
-/// How a stopped worker is reported: its own exit code, with the cause chain.
+/// How a stopped worker is reported, with the cause chain: a home to fix is configuration (2),
+/// and the server saying stop is for a person (3), so a service manager stops restarting it
+/// (`RestartPreventExitStatus=3`).
 fn worker_failure(error: &abc_worker::RunError) -> Failure {
     let shown: Box<dyn StdError> = chain(error).into();
-    match error.exit_code() {
-        3 => Failure::Stop(shown),
-        2 => Failure::Config(shown),
-        _ => Failure::Run(shown),
+    match error {
+        abc_worker::RunError::NotEnrolled | abc_worker::RunError::Home(_) => Failure::Config(shown),
+        abc_worker::RunError::Terminal(_) => Failure::Stop(shown),
     }
 }
 
