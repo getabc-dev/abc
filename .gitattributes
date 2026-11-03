@@ -5,3 +5,4 @@
 Cargo.lock linguist-generated
 **/.sqlx/** linguist-generated
 web/src/generated/** linguist-generated
+web/pnpm-lock.yaml linguist-generated
