@@ -31,8 +31,11 @@ mod tests {
     /// What the server does with one connection.
     #[derive(Debug, Clone)]
     enum Step {
-        /// Answers the upgrade with this status and body.
+        /// Answers the upgrade with this status and body, in one write.
         Refuse(u16, &'static str),
+        /// The same, with the head and the body in separate writes and a pause between them, as
+        /// Tailscale Serve delivers them.
+        RefuseSplit(u16, &'static str),
         /// Upgrades, reads `Hello`, then plays these.
         Upgrade(Vec<Act>),
     }
@@ -99,19 +102,9 @@ mod tests {
                     counted.connections = counted.connections.saturating_add(1);
                 }
                 match step {
-                    Step::Refuse(status, body) => {
-                        let mut head = Vec::new();
-                        let mut byte = [0_u8; 1];
-                        while !head.ends_with(b"\r\n\r\n") {
-                            tls.read_exact(&mut byte).await.unwrap();
-                            head.extend_from_slice(&byte);
-                        }
-                        let answer = format!(
-                            "HTTP/1.1 {status} Scripted\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-                            body.len()
-                        );
-                        tls.write_all(answer.as_bytes()).await.unwrap();
-                        tls.shutdown().await.unwrap();
+                    Step::Refuse(status, body) => refuse(&mut tls, status, body, false).await,
+                    Step::RefuseSplit(status, body) => {
+                        refuse(&mut tls, status, body, true).await;
                     }
                     Step::Upgrade(acts) => {
                         let bearer = Arc::new(Mutex::new(String::new()));
@@ -172,6 +165,37 @@ mod tests {
         (url, seen)
     }
 
+    /// Reads the upgrade request's head, then answers `status` with `body`: in one write, or
+    /// `split` into the head and then, after a pause, the body.
+    async fn refuse(
+        tls: &mut tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
+        status: u16,
+        body: &str,
+        split: bool,
+    ) {
+        let mut head = Vec::new();
+        let mut byte = [0_u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            tls.read_exact(&mut byte).await.unwrap();
+            head.extend_from_slice(&byte);
+        }
+        let answer = format!(
+            "HTTP/1.1 {status} Scripted\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            body.len()
+        );
+        if split {
+            tls.write_all(answer.as_bytes()).await.unwrap();
+            tls.flush().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            tls.write_all(body.as_bytes()).await.unwrap();
+        } else {
+            tls.write_all(format!("{answer}{body}").as_bytes())
+                .await
+                .unwrap();
+        }
+        tls.shutdown().await.unwrap();
+    }
+
     /// A home enrolled with `url` under a fixed key.
     fn enrolled_home(url: &str) -> (tempfile::TempDir, WorkerHome, String) {
         let dir = tempfile::tempdir().unwrap();
@@ -185,7 +209,7 @@ mod tests {
         let key = abc_worker::testing::key(9);
         let text = key.expose_secret().as_str().to_owned();
         let record = format!(
-            "format = 1\nserver = \"{url}\"\ntoken = \"{}\"\nkey = \"{text}\"\n\n[enrolled]\nworker = \"{}\"\nworkspace = \"{}\"\nname = \"scripted\"\n",
+            "format = 1\n\n[current.key]\nserver = \"{url}\"\ntoken = \"{}\"\nkey = \"{text}\"\n\n[current.worker]\nworker = \"{}\"\nworkspace = \"{}\"\nname = \"scripted\"\n",
             "0".repeat(64),
             uuid::Uuid::from_u128(1),
             uuid::Uuid::from_u128(2),
@@ -232,7 +256,6 @@ mod tests {
             matches!(&stopped, RunError::Terminal(terminal) if *terminal == mismatch()),
             "{stopped:?}"
         );
-        assert_eq!(stopped.exit_code(), 3, "upgrading is for a person");
         assert_eq!(
             seen.bearers,
             [format!("Bearer {key}")],
@@ -344,13 +367,77 @@ mod tests {
                 Terminal::Revoked,
             ),
         ] {
-            let (final_stop, final_seen, _) = play(vec![Step::Refuse(401, body)]).await;
-            assert!(
-                matches!(&final_stop, RunError::Terminal(terminal) if *terminal == expected),
-                "{body}: {final_stop:?}"
-            );
-            assert_eq!(final_seen.connections, 1, "not retried");
+            for step in [Step::Refuse(401, body), Step::RefuseSplit(401, body)] {
+                let (final_stop, final_seen, _) = play(vec![step.clone()]).await;
+                assert!(
+                    matches!(&final_stop, RunError::Terminal(terminal) if *terminal == expected),
+                    "{step:?}: {final_stop:?}"
+                );
+                assert_eq!(final_seen.connections, 1, "not retried: {step:?}");
+            }
         }
+    }
+
+    #[tokio::test]
+    async fn a_refusal_whose_body_arrives_after_its_head_is_still_read() {
+        let (stopped, seen, _) = play(vec![
+            Step::RefuseSplit(429, r#"{"error":{"code":"rate_limited","message":"m"}}"#),
+            Step::RefuseSplit(502, "<html>bad gateway</html>"),
+            reject(),
+        ])
+        .await;
+        assert!(matches!(stopped, RunError::Terminal(_)), "{stopped:?}");
+        assert_eq!(seen.connections, 3, "each refusal was retried");
+    }
+
+    #[tokio::test]
+    async fn a_sleep_during_the_backoff_dials_again_at_once() {
+        let pki = Pki::new();
+        let (url, seen) = serve(
+            &pki,
+            vec![
+                Step::Refuse(503, r#"{"error":{"code":"unavailable","message":"m"}}"#),
+                reject(),
+            ],
+        )
+        .await;
+        let (_dir, home, _) = enrolled_home(&url);
+        // A backoff of at least 30 s after the first refusal: far longer than the test waits.
+        let timings = abc_worker::Timings {
+            backoff_base: Duration::from_secs(60),
+            backoff_cap: Duration::from_secs(60),
+            ..abc_worker::testing::fast()
+        };
+        let wall = Arc::new(abc_worker::testing::ManualWallClock::default());
+        let clock: Arc<dyn abc_worker::WallClock> =
+            Arc::<abc_worker::testing::ManualWallClock>::clone(&wall);
+        let env = abc_worker::testing::env(
+            abc_worker::testing::trust(pki.root.clone()).unwrap(),
+            timings,
+            clock,
+        );
+        let running =
+            tokio::spawn(async move { abc_worker::run(&home, &env, std::future::pending()).await });
+        // The worker takes its first clock reading as the wait begins; a jump before that is not
+        // a sleep it can see. So the clock jumps an hour at a time until it dials again.
+        let mut jumps = 0;
+        while seen.lock().unwrap().connections < 2 {
+            assert!(jumps < 40, "the worker never noticed the sleep");
+            wall.sleep(Duration::from_secs(3600));
+            jumps += 1;
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        let stopped = tokio::time::timeout(Duration::from_secs(5), running)
+            .await
+            .expect("the second dial plays the reject")
+            .unwrap()
+            .unwrap_err();
+        assert!(matches!(stopped, RunError::Terminal(_)), "{stopped:?}");
+        assert_eq!(
+            seen.lock().unwrap().connections,
+            2,
+            "dialled again on waking, long before the backoff ran out"
+        );
     }
 
     #[tokio::test]

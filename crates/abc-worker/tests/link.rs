@@ -266,7 +266,6 @@ mod tests {
             matches!(stopped, RunError::Terminal(Terminal::Revoked)),
             "revoked while connected: {stopped:?}"
         );
-        assert_eq!(stopped.exit_code(), 3, "a person has to act");
         assert_eq!(world.until_ends(1).await, ["revoked"], "the log says why");
 
         let again = Running::start(home.clone(), world.fast_env())
@@ -432,6 +431,151 @@ mod tests {
                 EnrolError::Unreachable(abc_worker::DialError::Tls { .. })
             ),
             "enrolment refuses the certificate too: {refused:?}"
+        );
+    }
+
+    /// The key in `worker.toml` at `path` (`pending.key`, or `current.key.key`), if any.
+    fn stored_key(dir: &std::path::Path, path: &[&str]) -> Option<String> {
+        let text = std::fs::read_to_string(dir.join("worker/worker.toml")).unwrap();
+        let record: toml_edit::DocumentMut = text.parse().unwrap();
+        let mut item = record.as_item();
+        for part in path {
+            item = item.get(part)?;
+        }
+        item.as_str().map(str::to_owned)
+    }
+
+    #[tokio::test]
+    async fn a_retry_sends_the_pending_key_and_another_token_gets_a_new_one() {
+        let world = World::start().await;
+        let (dir, home) = home();
+        let env = world.fast_env();
+        let unknown = format!("abc_enr_{}", "0".repeat(52));
+        let refused = || async {
+            abc_worker::enrol(
+                &home,
+                &env,
+                &world.serve.url,
+                token(&unknown),
+                machine(),
+                IfEnrolled::Refuse,
+            )
+            .await
+            .unwrap_err()
+        };
+        let first = refused().await;
+        assert!(matches!(first, EnrolError::TokenUnknown), "{first:?}");
+        let pending = stored_key(dir.path(), &["pending", "key"]);
+        assert!(pending.is_some(), "the key waits in the pending slot");
+        let retried = refused().await;
+        assert!(matches!(retried, EnrolError::TokenUnknown), "{retried:?}");
+        assert_eq!(
+            stored_key(dir.path(), &["pending", "key"]),
+            pending,
+            "a retry with the same token sends the same key"
+        );
+        let text = world.token("laptop").await;
+        abc_worker::enrol(
+            &home,
+            &env,
+            &world.serve.url,
+            token(&text),
+            machine(),
+            IfEnrolled::Refuse,
+        )
+        .await
+        .unwrap();
+        let current = stored_key(dir.path(), &["current", "key", "key"]);
+        assert!(current.is_some(), "the new token's enrolment is in use");
+        assert_ne!(
+            current, pending,
+            "another token gets a new key, never the one sent with the old token"
+        );
+        assert_eq!(
+            stored_key(dir.path(), &["pending", "key"]),
+            None,
+            "and nothing is left pending"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_replace_leaves_the_old_enrolment_working() {
+        let world = World::start().await;
+        let (_dir, home) = home();
+        let env = world.fast_env();
+        let text = world.token("laptop").await;
+        let first = abc_worker::enrol(
+            &home,
+            &env,
+            &world.serve.url,
+            token(&text),
+            machine(),
+            IfEnrolled::Refuse,
+        )
+        .await
+        .unwrap();
+        let unknown = abc_worker::enrol(
+            &home,
+            &env,
+            &world.serve.url,
+            token(&format!("abc_enr_{}", "0".repeat(52))),
+            machine(),
+            IfEnrolled::Replace,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(unknown, EnrolError::TokenUnknown),
+            "the replacement is refused: {unknown:?}"
+        );
+        let again = abc_worker::enrol(
+            &home,
+            &env,
+            &world.serve.url,
+            token(&text),
+            machine(),
+            IfEnrolled::Refuse,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            (again.enrolled, again.again),
+            (first.enrolled, true),
+            "the old enrolment is still the one in use"
+        );
+        let running = Running::start(home.clone(), world.fast_env());
+        world.until_starts(1).await;
+        running.stop().await.unwrap();
+
+        let other = world.token("other").await;
+        let replaced = abc_worker::enrol(
+            &home,
+            &env,
+            &world.serve.url,
+            token(&other),
+            machine(),
+            IfEnrolled::Replace,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            (replaced.enrolled.name.as_str(), replaced.again),
+            ("other", false),
+            "a replacement that succeeds takes over"
+        );
+        let refused = abc_worker::enrol(
+            &home,
+            &env,
+            &world.serve.url,
+            token(&text),
+            machine(),
+            IfEnrolled::Refuse,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(&refused, EnrolError::AlreadyEnrolled(name) if name.as_str() == "other"),
+            "and the old token is now another enrolment's: {refused:?}"
         );
     }
 

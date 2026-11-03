@@ -8,7 +8,7 @@
 //! | refused `worker_revoked`; closed 4403                 | stop: [`Terminal::Revoked`]              |
 //! | closed 4409 (this process holds one link at a time)   | stop: [`Terminal::Superseded`]           |
 //! | `Reject`: no protocol version in common               | stop: [`Terminal::VersionMismatch`]      |
-//! | the machine slept                                     | dial again at once, backoff reset        |
+//! | the machine slept, on a link or waiting to dial again | dial again at once, backoff reset        |
 //! | refused `rate_limited`                                | dial again after the backoff, at least the rate-limit floor |
 //! | anything else: closed 4400, 4408, 4503 or another code; the link died, fell silent or timed out its handshake; the server broke the protocol; refused otherwise; the dial failed | dial again after the backoff |
 //! | the worker is stopping                                | done                                     |
@@ -38,6 +38,8 @@ pub(crate) enum Outcome<'a> {
     DialFailed,
     /// The link was up and ended.
     Ended(&'a SessionEnd),
+    /// The machine slept while the worker waited to dial again.
+    Slept,
 }
 
 /// What to do next.
@@ -129,6 +131,7 @@ impl Policy {
                 };
             }
             Outcome::DialFailed => return Verdict::RetryAfter(self.backoff(timings, draw)),
+            Outcome::Slept => return self.woke(),
             Outcome::Ended(end) => end,
         };
         if end.lived >= timings.stable_after {
@@ -143,10 +146,7 @@ impl Policy {
                 server: *supported,
                 worker: SUPPORTED_VERSIONS,
             }),
-            How::Dropped(DropCause::Woke) => {
-                self.exponent = 0;
-                Verdict::RetryAfter(Duration::ZERO)
-            }
+            How::Dropped(DropCause::Woke) => self.woke(),
             How::Closed(
                 ServerClose::Abc(
                     CloseCode::HandshakeTimeout
@@ -159,6 +159,13 @@ impl Policy {
             | How::Violation(_) => Verdict::RetryAfter(self.backoff(timings, draw)),
             How::Shutdown => Verdict::Done,
         }
+    }
+
+    /// After a sleep the network has likely changed and the server has long dropped the link:
+    /// dial at once, and start the backoff over.
+    fn woke(&mut self) -> Verdict {
+        self.exponent = 0;
+        Verdict::RetryAfter(Duration::ZERO)
     }
 
     /// The next delay, `c/2 + draw * c/2` with `c = min(cap, base * 2^n)`, and one more retry.
@@ -354,6 +361,19 @@ mod tests {
             policy.decide(Outcome::DialFailed, &timings(), ZERO),
             Verdict::RetryAfter(Duration::from_millis(250)),
             "and start the backoff over"
+        );
+        for _ in 0..5 {
+            policy.decide(Outcome::DialFailed, &timings(), ZERO);
+        }
+        assert_eq!(
+            policy.decide(Outcome::Slept, &timings(), HALF),
+            Verdict::RetryAfter(Duration::ZERO),
+            "a sleep while waiting to dial again: dial at once"
+        );
+        assert_eq!(
+            policy.decide(Outcome::DialFailed, &timings(), ZERO),
+            Verdict::RetryAfter(Duration::from_millis(250)),
+            "and start the backoff over too"
         );
     }
 

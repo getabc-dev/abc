@@ -1,7 +1,12 @@
 //! The worker's loop: dial, hold the link until it ends, ask [`crate::policy`] what next, wait,
-//! and dial again, until the server says stop or the worker is asked to.
+//! and dial again, until the server says stop or the worker is asked to. The wait watches the
+//! clocks as a session does: a machine that sleeps through a backoff dials at once on waking,
+//! because tokio's timers stop during a sleep and would otherwise run on for the rest of it.
 
 use std::pin::Pin;
+use std::time::Duration;
+
+use tokio::time::Instant;
 
 use abc_core::credential::WorkerKey;
 use abc_core::secret::Secret;
@@ -31,23 +36,68 @@ pub(crate) async fn supervise(
             Attempt::Ended(end) => Outcome::Ended(end),
             Attempt::Stopped => return Ok(()),
         };
-        let verdict = policy.decide(outcome, &env.timings, env.jitter.draw());
-        match verdict {
-            Verdict::RetryAfter(delay) => {
-                tracing::info!(
-                    retry_in_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
-                    "dialling the server again"
-                );
-                tokio::select! {
-                    () = tokio::time::sleep(delay) => {}
-                    () = shutdown.as_mut() => return Ok(()),
+        let mut verdict = policy.decide(outcome, &env.timings, env.jitter.draw());
+        loop {
+            match verdict {
+                Verdict::RetryAfter(delay) => {
+                    tracing::info!(
+                        retry_in_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
+                        "dialling the server again"
+                    );
+                    match wait(env, delay, &mut shutdown).await {
+                        Waited::Elapsed => break,
+                        Waited::Slept => {
+                            tracing::info!("the machine slept while waiting to dial again");
+                            verdict =
+                                policy.decide(Outcome::Slept, &env.timings, env.jitter.draw());
+                        }
+                        Waited::Stopped => return Ok(()),
+                    }
                 }
+                Verdict::Stop(terminal) => {
+                    tracing::error!(reason = %terminal, "stopping: the server said this worker must stop");
+                    return Err(terminal);
+                }
+                Verdict::Done => return Ok(()),
             }
-            Verdict::Stop(terminal) => {
-                tracing::error!(reason = %terminal, "stopping: the server said this worker must stop");
-                return Err(terminal);
+        }
+    }
+}
+
+/// How a wait before dialling again ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Waited {
+    /// It ran its course.
+    Elapsed,
+    /// The machine slept during it.
+    Slept,
+    /// The worker was asked to stop.
+    Stopped,
+}
+
+/// Waits `delay` of monotonic time, comparing the clocks every watchdog tick as a session does.
+async fn wait(
+    env: &Env,
+    delay: Duration,
+    shutdown: &mut Pin<&mut impl Future<Output = ()>>,
+) -> Waited {
+    let timings = env.timings;
+    let elapsed = tokio::time::sleep(delay);
+    let mut elapsed = std::pin::pin!(elapsed);
+    let mut tick = tokio::time::interval(timings.watchdog_tick);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut clocks = (Instant::now(), env.wall.now());
+    loop {
+        tokio::select! {
+            () = elapsed.as_mut() => return Waited::Elapsed,
+            _ = tick.tick() => {
+                let now = (Instant::now(), env.wall.now());
+                if session::slept(clocks, now, timings.wake_gap) {
+                    return Waited::Slept;
+                }
+                clocks = now;
             }
-            Verdict::Done => return Ok(()),
+            () = shutdown.as_mut() => return Waited::Stopped,
         }
     }
 }

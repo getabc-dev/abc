@@ -1,17 +1,19 @@
 //! Enrolment: make a key, save it, send its digest, record who the server says this machine is.
 //! Always the same two steps, "make sure the record holds a key for this token" and then "send",
 //! because the server's replay rule (the same token with the same key digest gets the same answer
-//! and records nothing, even after the token expired) makes every crash point converge:
+//! and records nothing, even after the token expired) makes every crash point converge. A new key
+//! waits in the record's pending slot and becomes the enrolment in use only once the server has
+//! answered, so a failed `--replace` leaves the old enrolment working.
 //!
-//! | Crash or loss                          | A re-run finds              | and does                         |
-//! | -------------------------------------- | --------------------------- | -------------------------------- |
-//! | before the pending record is saved     | nothing                     | starts clean                     |
-//! | after it is saved, before sending      | pending, same token         | sends the same key               |
-//! | the server enrolled, the answer is lost | pending, same token        | the same key: the same answer    |
-//! | after the answer, before the save      | pending, same token         | as above                         |
-//! | after the save                         | enrolled, same token        | as above, and says so            |
-//! | enrolled, another token or server      | enrolled, other digest      | refuses unless `--replace`       |
-//! | pending for another token or server    | pending, other digest       | a new key replaces the old one   |
+//! | Crash or loss                           | A re-run finds                | and does                       |
+//! | --------------------------------------- | ----------------------------- | ------------------------------ |
+//! | before the pending key is saved         | no key for this token         | makes one                      |
+//! | after it is saved, before sending       | pending, same token           | sends the same key             |
+//! | the server enrolled, the answer is lost | pending, same token           | the same key: the same answer  |
+//! | after the answer, before the save       | pending, same token           | as above                       |
+//! | after the save                          | in use, same token            | as above, and says so          |
+//! | in use, another token or server         | in use, other digest          | refuses unless `--replace`     |
+//! | pending for another token or server     | pending, other digest         | a new key replaces the pending |
 
 use abc_core::credential::{EnrolmentToken, WorkerKey};
 use abc_core::identity::{DisplayName, MachineInfo};
@@ -23,7 +25,7 @@ use abc_protocol::url::PublicUrl;
 use thiserror::Error;
 
 use crate::dial::{self, DialError};
-use crate::home::{HomeError, Record, WorkerHome};
+use crate::home::{Current, HomeError, Slot, WorkerHome};
 use crate::{Enrolled, Env, IfEnrolled};
 
 /// What an enrolment did.
@@ -54,37 +56,70 @@ pub async fn enrol(
 ) -> Result<Enrolment, EnrolError> {
     let held = home.lock()?;
     let digest = token.expose_secret().digest();
-    let mut record = match held.load()? {
-        Some(record) if record.server == *server && record.token == digest => record,
-        Some(Record {
-            enrolled: Some(enrolled),
-            ..
-        }) if if_enrolled == IfEnrolled::Refuse => {
-            return Err(EnrolError::AlreadyEnrolled(enrolled.name));
-        }
+    let mut record = held.load()?.unwrap_or_default();
+    if let Some(current) = record
+        .current
+        .as_mut()
+        .filter(|current| current.key.is_for(server, &digest))
+    {
+        current.worker = send(env, server, token, &current.key, machine).await?;
+        let enrolled = current.worker.clone();
+        held.save(record.current.as_ref(), record.pending.as_ref())?;
+        return Ok(Enrolment {
+            enrolled,
+            again: true,
+        });
+    }
+    if let Some(current) = &record.current
+        && if_enrolled == IfEnrolled::Refuse
+    {
+        return Err(EnrolError::AlreadyEnrolled(current.worker.name.clone()));
+    }
+    let pending = match record.pending {
+        Some(pending) if pending.is_for(server, &digest) => pending,
         Some(_) | None => {
             let mint = ChaChaMint::from_seed(SystemEntropy.seed()?);
-            let record = Record::pending(server.clone(), digest, WorkerKey::generate(&mint));
-            held.save(&record)?;
-            record
+            let pending = Slot {
+                server: server.clone(),
+                token: digest,
+                key: WorkerKey::generate(&mint),
+            };
+            held.save(record.current.as_ref(), Some(&pending))?;
+            pending
         }
     };
-    let again = record.enrolled.is_some();
+    let worker = send(env, server, token, &pending, machine).await?;
+    let current = Current {
+        key: pending,
+        worker,
+    };
+    held.save(Some(&current), None)?;
+    Ok(Enrolment {
+        enrolled: current.worker,
+        again: false,
+    })
+}
+
+/// Sends `key`'s digest with `token` and returns who the server says this machine is.
+async fn send(
+    env: &Env,
+    server: &PublicUrl,
+    token: Secret<EnrolmentToken>,
+    key: &Slot,
+    machine: MachineInfo,
+) -> Result<Enrolled, EnrolError> {
     let request = EnrolRequest {
         token,
-        key: record.key.expose_secret().digest(),
+        key: key.key.expose_secret().digest(),
         machine,
         build: env.build.clone(),
     };
     let response = dial::post_enrol(env, server, &request).await?;
-    let enrolled = Enrolled {
+    Ok(Enrolled {
         worker: response.worker,
         workspace: response.workspace,
         name: response.name,
-    };
-    record.enrolled = Some(enrolled.clone());
-    held.save(&record)?;
-    Ok(Enrolment { enrolled, again })
+    })
 }
 
 /// This machine as it introduces itself at enrolment: its hostname, or `hostname` when given, and
