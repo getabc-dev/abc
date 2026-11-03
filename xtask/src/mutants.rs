@@ -6,7 +6,7 @@
 
 use std::fs;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, bail, ensure};
@@ -117,6 +117,11 @@ pub(crate) fn run(
     let diff_file = output.join("changes.diff");
     fs::write(&diff_file, &diff).context("could not write the diff for cargo-mutants")?;
     writeln!(out, "xtask: mutating the changed Rust code")?;
+    // cargo-mutants copies the tree, once per job, into the temporary directory and builds each
+    // copy there. That directory is small in an agent VM, where the build output has the room.
+    let scratch = scratch(root);
+    fs::create_dir_all(&scratch)
+        .with_context(|| format!("could not create {}", scratch.display()))?;
     let status = Command::new(mutants)
         .arg("mutants")
         .arg("--in-diff")
@@ -145,15 +150,26 @@ pub(crate) fn run(
         .arg(&output)
         .env("PATH", tools::path_with(nextest)?)
         .env("PROPTEST_RNG_SEED", PROPTEST_RNG_SEED)
+        .env("TMPDIR", &scratch)
         .current_dir(root)
         .status()
-        .context("could not run cargo-mutants")?;
-    let result = outcome(status.code())?;
+        .context("could not run cargo-mutants");
+    // Whatever cargo-mutants left behind goes, so repeated runs never fill the disk.
+    fs::remove_dir_all(&scratch)
+        .with_context(|| format!("could not remove {}", scratch.display()))?;
+    let result = outcome(status?.code())?;
     let missed = listed(&results.join("missed.txt"))?;
     let timed_out = listed(&results.join("timeout.txt"))?;
     let passed = missed.is_empty() && result != Outcome::Missed;
     write!(out, "{}", describe(passed, &missed, &timed_out))?;
     Ok(passed)
+}
+
+/// Where cargo-mutants copies and builds the tree: under the checkout's build output.
+fn scratch(root: &Path) -> PathBuf {
+    std::env::var_os("CARGO_TARGET_DIR")
+        .map_or_else(|| root.join("target"), |target| root.join(target))
+        .join("mutants-tmp")
 }
 
 /// Whether the diff adds or changes lines in Rust files.
@@ -203,6 +219,7 @@ fn describe(passed: bool, missed: &[String], timed_out: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::path::Path;
 
     use super::{
         Options, Outcome, Shard, changes_rust, describe, listed, outcome, run, timeout_multiplier,
@@ -315,7 +332,10 @@ mod tests {
         let caught = temp.path().join("caught");
         script(
             &caught,
-            "while [ $# -gt 0 ]; do case \"$1\" in --shard) shard=$2 ;; esac; shift; done\n[ \"$shard\" = 1/4 ] || exit 9\n",
+            &format!(
+                "while [ $# -gt 0 ]; do case \"$1\" in --shard) shard=$2 ;; esac; shift; done\n[ \"$shard\" = 1/4 ] || exit 9\nmkdir \"$TMPDIR/cargo-mutants-copy\"\necho \"$TMPDIR\" > {}\n",
+                temp.path().join("tmpdir").display()
+            ),
         );
         let sharded = Options {
             jobs: 2,
@@ -324,6 +344,16 @@ mod tests {
         assert!(
             run(&repo, "base", &sharded, &caught, &nextest, &mut Vec::new()).unwrap(),
             "all caught, in the shard asked for"
+        );
+        let tmpdir = fs::read_to_string(temp.path().join("tmpdir")).unwrap();
+        assert_eq!(
+            Path::new(tmpdir.trim()),
+            repo.join("target/mutants-tmp"),
+            "cargo-mutants copies the tree under the build output"
+        );
+        assert!(
+            !repo.join("target/mutants-tmp").exists(),
+            "and the copy is removed afterwards, with what it left in it"
         );
 
         let docs = repository_with_change(&temp.path().join("docs"), &[("README.md", "# x\n")]);
