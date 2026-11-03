@@ -115,6 +115,16 @@ version-args = ["mutants", "--version"]
 sha256 = "07072e7bcdeb425d5e5fdbfd9f15a2c749e23cb2edf5ef40aee5876760ae1cf9"
 
 [[tool]]
+name = "cargo-fuzz"
+version = "0.13.2"
+# Ships no release builds, so it is built from crates.io with its lockfile. `cargo xtask fuzz` runs
+# the protocol's fuzz target with it on the pinned stable toolchain, without a sanitizer: abc
+# forbids unsafe code, and libFuzzer's coverage guidance needs none.
+crate = "cargo-fuzz"
+version-args = ["fuzz", "--version"]
+sha256 = "5acfd01930e49823e58c30dd8012d3338a620377d7c7d4cc140ca4b2169400e2"
+
+[[tool]]
 name = "cargo-sqlx"
 version = "0.9.0"
 # sqlx publishes no release builds, so it is built from crates.io with its lockfile: Postgres over

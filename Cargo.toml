@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/*", "xtask"]
+members = ["crates/*", "crates/abc-protocol/fuzz", "xtask"]
 # Crates that `cargo xtask setup` builds into .tools/ are never part of the workspace.
 exclude = [".tools"]
 
@@ -26,6 +26,7 @@ http-body-util = "0.1.5"
 hyper = "1.12.0"
 hyper-util = { version = "0.1.21", features = ["tokio"] }
 insta = "1.49.0"
+libfuzzer-sys = "0.4.13"
 proptest = { version = "1.12.0", default-features = false, features = ["std"] }
 rand = { version = "0.10.3", default-features = false, features = ["sys_rng", "std"] }
 # The worker test harness's TLS certificates, made at run time: a committed private key would be a

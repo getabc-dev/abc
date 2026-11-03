@@ -37,7 +37,8 @@
           { "context": "Coverage", "integration_id": 15368 },
           { "context": "Mutants", "integration_id": 15368 },
           { "context": "Integrity", "integration_id": 15368 },
-          { "context": "Gemini review", "integration_id": 15368 }
+          { "context": "Gemini review", "integration_id": 15368 },
+          { "context": "Fuzz protocol decoding", "integration_id": 15368 }
         ]
       }
     },
