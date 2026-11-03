@@ -2,7 +2,9 @@
 //! watchdog. Agents set it when they start a task (AGENTS.md says so).
 
 use std::fs;
+use std::io::Write as _;
 use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, ensure};
 
@@ -15,16 +17,56 @@ pub(crate) const BLOCKED: &str = ".abc/blocked.md";
 /// How many stops in a row the stop hook has blocked, as a number.
 const STOPS: &str = ".abc/stop-blocks";
 
-/// Where the stop hook records that its backstop let a stop through.
+/// Where the stop hook records, kept, each time its backstop let a stop through.
 pub(crate) const BACKSTOP: &str = ".abc/stop-backstop.md";
 
-/// Writes `text` to `.abc/<file>`, creating `.abc/`.
+/// The kept log of every BLOCKED declaration and what the stop hook did with it.
+pub(crate) const BLOCKED_LOG: &str = ".abc/blocked-log.md";
+
+/// Present once the watchdog has sent a BLOCKED declaration back, so the next one is not judged.
+const JUDGED: &str = ".abc/blocked-judged";
+
+/// Creates the directory `path` is in.
+fn create_parent(path: &Path) -> anyhow::Result<()> {
+    match path.parent() {
+        Some(dir) => {
+            fs::create_dir_all(dir).with_context(|| format!("could not create {}", dir.display()))
+        }
+        None => Ok(()),
+    }
+}
+
+/// Writes `text` to `file` atomically: a temporary file beside it, renamed over it, so a reader
+/// never sees half a file and two writers never mix theirs.
 fn write(root: &Path, file: &str, text: &str) -> anyhow::Result<()> {
     let path = root.join(file);
-    if let Some(dir) = path.parent() {
-        fs::create_dir_all(dir).with_context(|| format!("could not create {}", dir.display()))?;
-    }
-    fs::write(&path, text).with_context(|| format!("could not write {}", path.display()))
+    create_parent(&path)?;
+    let temporary = root.join(format!("{file}.{}.tmp", std::process::id()));
+    fs::write(&temporary, text)
+        .with_context(|| format!("could not write {}", temporary.display()))?;
+    fs::rename(&temporary, &path)
+        .with_context(|| format!("could not move {} into place", temporary.display()))
+}
+
+/// Appends `text` to `file`, creating it, as one write.
+fn append(root: &Path, file: &str, text: &str) -> anyhow::Result<()> {
+    let path = root.join(file);
+    create_parent(&path)?;
+    fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .and_then(|mut log| log.write_all(text.as_bytes()))
+        .with_context(|| format!("could not append to {}", path.display()))
+}
+
+/// A log entry's heading: the time in seconds since the Unix epoch and what happened.
+fn entry(what: &str) -> String {
+    let seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or_default();
+    format!("\n## Unix time {seconds}: {what}\n\n")
 }
 
 /// Reads `file`, or `None` when it does not exist.
@@ -92,18 +134,40 @@ pub(crate) fn count_blocked_stop(root: &Path) -> anyhow::Result<u32> {
     Ok(count)
 }
 
-/// Forgets the blocked stops: `check` passed, a new task began, or the backstop fired.
+/// Forgets the blocked stops and that a declaration was sent back: `check` passed, a declaration
+/// was accepted, a new task began, or the backstop fired.
 pub(crate) fn reset_blocked_stops(root: &Path) -> anyhow::Result<()> {
-    remove(root, STOPS)
+    remove(root, STOPS)?;
+    remove(root, JUDGED)
 }
 
-/// Records that the backstop let a stop through after `count` blocked ones.
+/// Whether the watchdog already sent a declaration back since the blocked stops were last reset.
+pub(crate) fn blocked_judged(root: &Path) -> bool {
+    root.join(JUDGED).exists()
+}
+
+/// Records that the watchdog sent a declaration back, so the next one is not judged.
+pub(crate) fn mark_blocked_judged(root: &Path) -> anyhow::Result<()> {
+    write(root, JUDGED, "")
+}
+
+/// Appends a BLOCKED declaration and what the stop hook did with it to the kept log.
+pub(crate) fn log_blocked(root: &Path, declaration: &str, outcome: &str) -> anyhow::Result<()> {
+    append(
+        root,
+        BLOCKED_LOG,
+        &format!("{}{declaration}\n", entry(outcome)),
+    )
+}
+
+/// Appends to the kept record that the backstop let a stop through after `count` blocked ones.
 pub(crate) fn record_backstop(root: &Path, count: u32) -> anyhow::Result<()> {
-    write(
+    append(
         root,
         BACKSTOP,
         &format!(
-            "The stop hook let a stop through after {count} blocked stops in a row, with no BLOCKED declaration.\n"
+            "{}The stop hook let a stop through after {count} blocked stops in a row, with no BLOCKED declaration.\n",
+            entry("backstop")
         ),
     )
 }
@@ -123,9 +187,59 @@ pub(crate) fn clear(root: &Path) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        BLOCKED, TASK, block, blocked_stops, clear, count_blocked_stop, read, record_backstop,
+        BLOCKED, BLOCKED_LOG, TASK, block, blocked_judged, blocked_stops, clear,
+        count_blocked_stop, log_blocked, mark_blocked_judged, read, record_backstop,
         reset_blocked_stops, set, take_blocked,
     };
+
+    #[test]
+    fn the_count_is_replaced_whole_and_leaves_no_temporary_file() {
+        let dir = tempfile::tempdir().unwrap();
+        for _ in 0..3 {
+            count_blocked_stop(dir.path()).unwrap();
+        }
+        let files: Vec<_> = std::fs::read_dir(dir.path().join(".abc"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        assert_eq!(files, ["stop-blocks"], "renamed into place");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(".abc/stop-blocks")).unwrap(),
+            "3\n"
+        );
+    }
+
+    #[test]
+    fn declarations_and_backstops_are_kept_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        log_blocked(dir.path(), "no network", "sent back: fix it").unwrap();
+        log_blocked(dir.path(), "still no network", "stop allowed").unwrap();
+        let log = std::fs::read_to_string(dir.path().join(BLOCKED_LOG)).unwrap();
+        let first = log.find(": sent back: fix it\n\nno network\n").unwrap();
+        let second = log.find(": stop allowed\n\nstill no network\n").unwrap();
+        assert!(first < second, "{log}");
+        assert!(log.starts_with("\n## Unix time "), "{log}");
+        record_backstop(dir.path(), 5).unwrap();
+        record_backstop(dir.path(), 6).unwrap();
+        let note = std::fs::read_to_string(dir.path().join(super::BACKSTOP)).unwrap();
+        assert!(
+            note.contains("after 5 blocked stops") && note.contains("after 6 blocked stops"),
+            "kept, not replaced: {note}"
+        );
+    }
+
+    #[test]
+    fn a_sent_back_declaration_is_remembered_until_the_count_resets() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!blocked_judged(dir.path()));
+        mark_blocked_judged(dir.path()).unwrap();
+        assert!(blocked_judged(dir.path()));
+        reset_blocked_stops(dir.path()).unwrap();
+        assert!(!blocked_judged(dir.path()), "a reset forgets it");
+        mark_blocked_judged(dir.path()).unwrap();
+        set(dir.path(), "next").unwrap();
+        assert!(!blocked_judged(dir.path()), "so does a new task");
+    }
 
     #[test]
     fn a_blocked_declaration_covers_one_stop_and_a_new_task_forgets_it() {
@@ -160,9 +274,6 @@ mod tests {
         std::fs::create_dir_all(dir.path().join(".abc")).unwrap();
         std::fs::write(dir.path().join(".abc/stop-blocks"), "many").unwrap();
         assert!(blocked_stops(dir.path()).is_err(), "a garbled count");
-        record_backstop(dir.path(), 5).unwrap();
-        let note = std::fs::read_to_string(dir.path().join(super::BACKSTOP)).unwrap();
-        assert!(note.contains("after 5 blocked stops"), "{note}");
     }
 
     #[test]

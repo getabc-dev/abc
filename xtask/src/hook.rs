@@ -17,13 +17,19 @@
 //! The `PreToolUse` guard catches accidents; it is not the enforcement. GitHub rulesets on `main`
 //! (no force push, no deletion, required checks) and the abc-agent App's limited permissions are.
 //!
-//! The agent VM runs its installed xtask with `--standalone`, which judges by the guard's rules
-//! alone: nothing builds, so the guard answers even when the checkout's workspace does not resolve
-//! (W19).
+//! The agent VM runs its installed xtask with `--standalone`: the guard judges by its rules alone
+//! and the stop hook checks the session's project directory, without locating a checkout or
+//! handing over to its xtask. Nothing of the checkout builds before either answers, so both work
+//! when the checkout's workspace does not resolve (W19).
 //!
 //! When the `PreToolUse` guard cannot run, it blocks commands that mention git or gh and lets the
 //! rest through, so a broken build never locks the agent out of the shell. When xtask cannot even
-//! start, `xtask/hooks/pre-tool-use.sh` applies the same rule.
+//! start, `xtask/hooks/pre-tool-use.sh` applies the same rule, and `xtask/hooks/stop.sh` honours
+//! the BLOCKED declaration and the backstop's count itself.
+//!
+//! Claude Code shows nothing of a `Stop` hook that exits 0, so a stop the hook lets through with a
+//! handoff prints `{"systemMessage": ...}` on stdout, which Claude Code shows the user; exit 2
+//! keeps the agent working and gives it stderr.
 
 use std::ffi::OsStr;
 use std::io::Write;
@@ -39,6 +45,11 @@ use crate::{check, guard, task, tools, watchdog};
 /// take a hook over.
 const HOOK_SCRIPT: &str = "xtask/hooks/pre-tool-use.sh";
 
+/// The `Stop` and `SubagentStop` hook script, which keeps the BLOCKED declaration and the
+/// backstop working when xtask cannot run.
+#[cfg(test)]
+const STOP_SCRIPT: &str = "xtask/hooks/stop.sh";
+
 /// Marks a hook handed over by another checkout, which must not be handed on again.
 const DELEGATED: &str = "XTASK_HOOK_DELEGATED";
 
@@ -48,7 +59,8 @@ pub(crate) enum Event {
     /// `PreToolUse` on Bash and Monitor: block force pushes and git or gh commands the guard
     /// cannot read.
     PreToolUse,
-    /// `Stop` and `SubagentStop`: run `cargo xtask check --changed`.
+    /// `Stop` and `SubagentStop`: run `cargo xtask check --changed`, honour a BLOCKED
+    /// declaration and, for the main agent, the watchdog.
     Stop,
 }
 
@@ -76,7 +88,8 @@ pub(crate) struct Context {
     claude: PathBuf,
     /// Whether this hook runs inside the watchdog's own claude session, where it must do nothing.
     inside_watchdog: bool,
-    /// Whether the guard judges on its own rules, without locating a checkout.
+    /// Whether the hook acts without locating a checkout: the guard on its rules alone, the stop
+    /// hook on the project directory.
     standalone: bool,
 }
 
@@ -106,10 +119,42 @@ struct HookInput {
 }
 
 impl HookInput {
-    /// Whether the watchdog judges this stop: the main agent's own, and not one a stop hook has
-    /// already sent back to work, so the watchdog can never keep an agent going forever.
+    /// Whether this is the main agent's stop. Only it takes a BLOCKED declaration and counts
+    /// blocked stops: a subagent's stop must not spend what the main agent declared.
+    fn main_agent(&self) -> bool {
+        self.hook_event_name.as_deref() == Some("Stop")
+    }
+
+    /// Whether the watchdog judges this stop's drift: the main agent's own, and not one a stop
+    /// hook has already sent back to work, so the watchdog can never keep an agent going forever.
     fn watched(&self) -> bool {
-        self.hook_event_name.as_deref() == Some("Stop") && !self.stop_hook_active
+        self.main_agent() && !self.stop_hook_active
+    }
+}
+
+/// What the stop hook decides.
+#[derive(Debug, PartialEq, Eq)]
+enum Verdict {
+    /// Let the agent stop.
+    Allow,
+    /// Let the agent stop, and show the user this handoff.
+    Handoff(String),
+    /// Keep the agent working; it reads why on stderr.
+    Block,
+}
+
+impl Verdict {
+    /// Prints the handoff for Claude Code and returns the hook's exit code.
+    fn emit(self, out: &mut impl Write, user: &mut impl Write) -> anyhow::Result<u8> {
+        match self {
+            Self::Allow => Ok(0),
+            Self::Handoff(message) => {
+                writeln!(out, "{message}")?;
+                writeln!(user, "{}", serde_json::json!({ "systemMessage": message }))?;
+                Ok(0)
+            }
+            Self::Block => Ok(2),
+        }
     }
 }
 
@@ -124,18 +169,19 @@ enum Location {
 }
 
 /// Runs the hook for `event` on the hook input JSON and returns the exit code for Claude Code.
-/// Messages for the agent go to `out`.
+/// Messages for the agent go to `out`; the JSON Claude Code reads from a stop hook goes to `user`.
 pub(crate) fn run(
     event: Event,
     input: &str,
     context: &Context,
     out: &mut impl Write,
+    user: &mut impl Write,
 ) -> anyhow::Result<u8> {
     match event {
         Event::PreToolUse => match if context.standalone {
             guard(input, out)
         } else {
-            act(event, input, context, out)
+            act(event, input, context, out, &mut std::io::sink())
         } {
             Ok(code @ (0 | 2)) => Ok(code),
             Ok(code) => guard_unavailable(&format!("it exited {code}"), input, out),
@@ -143,8 +189,23 @@ pub(crate) fn run(
         },
         // The watchdog's own session stops without a check, so it never starts another watchdog.
         Event::Stop if context.inside_watchdog => Ok(0),
-        Event::Stop => act(event, input, context, out),
+        Event::Stop if context.standalone => {
+            let fields = stop_input(input)?;
+            let Some(project_dir) = &context.project_dir else {
+                bail!("the stop hook runs standalone on CLAUDE_PROJECT_DIR, which is not set");
+            };
+            let root = project_dir
+                .canonicalize()
+                .with_context(|| format!("could not resolve {}", project_dir.display()))?;
+            stop_at(&root, &fields, context, out)?.emit(out, user)
+        }
+        Event::Stop => act(event, input, context, out, user),
     }
+}
+
+/// The stop hook's input.
+fn stop_input(input: &str) -> anyhow::Result<HookInput> {
+    serde_json::from_str(input).context("could not read the Stop hook input")
 }
 
 /// When the guard cannot run, blocks a command that mentions git or gh and lets any other through
@@ -175,14 +236,20 @@ fn guard_unavailable(reason: &str, input: &str, out: &mut impl Write) -> anyhow:
 }
 
 /// Finds where the agent works and runs the hook there.
-fn act(event: Event, input: &str, context: &Context, out: &mut impl Write) -> anyhow::Result<u8> {
-    let fields = match (event, serde_json::from_str::<HookInput>(input)) {
-        (_, Ok(fields)) => fields,
-        // The guard blocks input it cannot read and gives the parse error as the reason.
-        (Event::PreToolUse, Err(_)) => return guard(input, out),
-        (Event::Stop, Err(error)) => {
-            return Err(error).context("could not read the Stop hook input");
-        }
+fn act(
+    event: Event,
+    input: &str,
+    context: &Context,
+    out: &mut impl Write,
+    user: &mut impl Write,
+) -> anyhow::Result<u8> {
+    let fields = match event {
+        Event::Stop => stop_input(input)?,
+        Event::PreToolUse => match serde_json::from_str::<HookInput>(input) {
+            Ok(fields) => fields,
+            // The guard blocks input it cannot read and gives the parse error as the reason.
+            Err(_) => return guard(input, out),
+        },
     };
     let location = locate(
         fields.cwd.as_deref(),
@@ -192,25 +259,7 @@ fn act(event: Event, input: &str, context: &Context, out: &mut impl Write) -> an
     match location {
         Location::Here => match event {
             Event::PreToolUse => guard(input, out),
-            Event::Stop => stop(
-                &context.own_root,
-                fields.watched(),
-                out,
-                |out| {
-                    check::run(
-                        &context.own_root,
-                        true,
-                        &tools::pinned(&context.own_root, "cargo-nextest")?,
-                        &check::Postgres {
-                            warm: &crate::postgres::warm,
-                            sqlx: &|| tools::pinned(&context.own_root, "cargo-sqlx"),
-                        },
-                        None,
-                        out,
-                    )
-                },
-                |out| watchdog::check(&context.own_root, &context.claude, watchdog::TIMEOUT, out),
-            ),
+            Event::Stop => stop_at(&context.own_root, &fields, context, out)?.emit(out, user),
         },
         // GitHub is the gate, so a checkout that cannot take the hook is noted, never locked out.
         Location::Worktree(root) if !root.join(HOOK_SCRIPT).is_file() => {
@@ -239,51 +288,118 @@ fn act(event: Event, input: &str, context: &Context, out: &mut impl Write) -> an
     }
 }
 
+/// The stop hook in the checkout at `root`, with its pinned tools, the real check and the
+/// watchdog's claude.
+fn stop_at(
+    root: &Path,
+    fields: &HookInput,
+    context: &Context,
+    out: &mut impl Write,
+) -> anyhow::Result<Verdict> {
+    stop(
+        root,
+        fields,
+        out,
+        |out| {
+            check::run(
+                root,
+                true,
+                &tools::pinned(root, "cargo-nextest")?,
+                &check::Postgres {
+                    warm: &crate::postgres::warm,
+                    sqlx: &|| tools::pinned(root, "cargo-sqlx"),
+                },
+                None,
+                out,
+            )
+        },
+        |declaration, out| {
+            watchdog::blocker(root, &context.claude, watchdog::TIMEOUT, declaration, out)
+        },
+        |out| watchdog::check(root, &context.claude, watchdog::TIMEOUT, out),
+    )
+}
+
 /// How many stops in a row the stop hook blocks before it lets one through anyway.
 const MAX_BLOCKED_STOPS: u32 = 5;
 
 /// The stop hook: PASS, FAIL or BLOCKED (D39), so a run that can never go green still ends.
 ///
-/// - A BLOCKED declaration (`cargo xtask task blocked`) lets this stop through and prints the
-///   handoff; neither the check nor the watchdog overrides it.
-/// - Otherwise `check` decides. A pass resets the count of blocked stops and, when `watched`,
-///   hands over to the watchdog; a failure returns 1, which keeps the agent working.
-/// - After [`MAX_BLOCKED_STOPS`] blocked stops in a row the stop goes through anyway, says so on
-///   `out` and is recorded in `.abc/stop-backstop.md`.
+/// Only the main agent's stop takes a BLOCKED declaration or counts blocked stops; a subagent's
+/// stop is held to `check` alone and never spends what the main agent declared.
+///
+/// - A BLOCKED declaration (`cargo xtask task blocked`) is appended to `.abc/blocked-log.md` and
+///   taken, so it covers one stop. `blocker` asks the watchdog whether what blocks the agent is
+///   outside its control; when it is not, the stop is sent back once with the reason, and the
+///   next declaration is not judged. Otherwise the stop goes through with the handoff.
+/// - Otherwise `check` decides; a `check` that cannot run fails. A pass resets the count of
+///   blocked stops and, when the stop is watched, hands over to the drift watchdog; a failure
+///   keeps the agent working.
+/// - After [`MAX_BLOCKED_STOPS`] blocked stops in a row the stop goes through anyway, with a
+///   handoff that says so, recorded in `.abc/stop-backstop.md`.
 fn stop<W: Write>(
     root: &Path,
-    watched: bool,
+    fields: &HookInput,
     out: &mut W,
     check: impl FnOnce(&mut W) -> anyhow::Result<bool>,
+    blocker: impl FnOnce(&str, &mut W) -> anyhow::Result<Option<String>>,
     watchdog: impl FnOnce(&mut W) -> anyhow::Result<u8>,
-) -> anyhow::Result<u8> {
-    if let Some(declaration) = task::take_blocked(root)? {
+) -> anyhow::Result<Verdict> {
+    let main = fields.main_agent();
+    if main && let Some(declaration) = task::take_blocked(root)? {
+        if !task::blocked_judged(root)
+            && let Some(reason) = blocker(&declaration, out)?
+        {
+            task::log_blocked(root, &declaration, &format!("sent back: {reason}"))?;
+            task::mark_blocked_judged(root)?;
+            writeln!(
+                out,
+                "xtask stop hook: the BLOCKED declaration was sent back: {reason}\nKeep working. \
+                 If what stops you is truly outside your control, declare it again and say what \
+                 makes it so; a second declaration is not judged."
+            )?;
+            return Ok(Verdict::Block);
+        }
+        task::log_blocked(root, &declaration, "stop allowed")?;
         task::reset_blocked_stops(root)?;
-        writeln!(
-            out,
-            "xtask stop hook: BLOCKED, stop allowed. Handoff:\n{declaration}"
-        )?;
-        return Ok(0);
+        return Ok(Verdict::Handoff(format!(
+            "BLOCKED, stop allowed. Handoff: {declaration}"
+        )));
     }
-    if check(out)? {
-        task::reset_blocked_stops(root)?;
-        return if watched { watchdog(out) } else { Ok(0) };
+    let passed = match check(out) {
+        Ok(passed) => passed,
+        Err(error) => {
+            writeln!(out, "xtask stop hook: the check could not run: {error:#}")?;
+            false
+        }
+    };
+    if passed {
+        if main {
+            task::reset_blocked_stops(root)?;
+        }
+        let drifted = fields.watched() && watchdog(out)? != 0;
+        return Ok(if drifted {
+            Verdict::Block
+        } else {
+            Verdict::Allow
+        });
     }
-    let blocked = task::blocked_stops(root)?;
-    if blocked >= MAX_BLOCKED_STOPS {
+    if !main {
+        return Ok(Verdict::Block);
+    }
+    let count = task::blocked_stops(root)?;
+    if count >= MAX_BLOCKED_STOPS {
         task::reset_blocked_stops(root)?;
-        task::record_backstop(root, blocked)?;
-        writeln!(
-            out,
-            "xtask stop hook: the check failed and {blocked} stops in a row were blocked with no \
-             BLOCKED declaration, so this stop is allowed; recorded in {}. Next time declare it: \
-             cargo xtask task blocked \"<what is missing, what was tried>\"",
+        task::record_backstop(root, count)?;
+        return Ok(Verdict::Handoff(format!(
+            "The check failed and {count} stops in a row were blocked with no BLOCKED \
+             declaration, so this stop is allowed; recorded in {}. Next time declare it: cargo \
+             xtask task blocked \"<what is missing, what was tried>\"",
             task::BACKSTOP
-        )?;
-        return Ok(0);
+        )));
     }
     task::count_blocked_stop(root)?;
-    Ok(1)
+    Ok(Verdict::Block)
 }
 
 fn guard(input: &str, out: &mut impl Write) -> anyhow::Result<u8> {
@@ -394,7 +510,7 @@ mod tests {
 
     use tempfile::TempDir;
 
-    use super::{Context, Event, Location, git_in, guard_unavailable, locate, run};
+    use super::{Context, Event, Location, Verdict, git_in, guard_unavailable, locate, run};
     use crate::testing::{git, repository};
 
     /// A repository with a worktree nested inside it, where Claude Code puts its worktrees.
@@ -441,7 +557,14 @@ mod tests {
 
     fn run_pre_tool_use(context: &Context, cwd: Option<&Path>, command: &str) -> (u8, String) {
         let mut out = Vec::new();
-        let code = run(Event::PreToolUse, &input(cwd, command), context, &mut out).unwrap();
+        let code = run(
+            Event::PreToolUse,
+            &input(cwd, command),
+            context,
+            &mut out,
+            &mut std::io::sink(),
+        )
+        .unwrap();
         (code, String::from_utf8(out).unwrap())
     }
 
@@ -514,6 +637,7 @@ mod tests {
             &input(None, "git push --force"),
             &context(&main, Some(&main)),
             &mut out,
+            &mut std::io::sink(),
         )
         .unwrap();
         assert_eq!(code, 2, "a force push in the project directory is blocked");
@@ -533,6 +657,7 @@ mod tests {
             &input(Some(outside.path()), "git push --force"),
             &context(&main, Some(&main)),
             &mut out,
+            &mut std::io::sink(),
         )
         .unwrap();
         assert_eq!(code, 0, "nothing is checked outside the repository");
@@ -549,6 +674,7 @@ mod tests {
             &input(Some(outside.path()), ""),
             &context(&main, Some(&main)),
             &mut out,
+            &mut std::io::sink(),
         )
         .unwrap();
         let note = String::from_utf8(out).unwrap();
@@ -602,6 +728,7 @@ mod tests {
             &input(Some(&gone), ""),
             &context,
             &mut Vec::new(),
+            &mut std::io::sink(),
         )
         .unwrap_err();
         assert!(
@@ -625,6 +752,7 @@ mod tests {
             &input(Some(&worktree), ""),
             &context,
             &mut stop_out,
+            &mut std::io::sink(),
         )
         .unwrap();
         assert_eq!(stop, 0, "the agent may stop");
@@ -736,6 +864,208 @@ mod tests {
         results.into_iter().next().unwrap()
     }
 
+    /// What one run of the stop script did.
+    #[derive(Debug, PartialEq, Eq)]
+    struct ScriptRun {
+        code: Option<i32>,
+        stdout: String,
+        stderr: String,
+    }
+
+    /// Runs `xtask/hooks/stop.sh` under `shell` on `input`, in the project directory `project`,
+    /// with `bin` first on `PATH` and `ABC_VM` set when `vm`.
+    fn run_stop_script(
+        shell: &str,
+        project: &Path,
+        bin: &Path,
+        input: &str,
+        vm: bool,
+    ) -> ScriptRun {
+        let script = crate::repo_root().unwrap().join(super::STOP_SCRIPT);
+        let mut command = Command::new(shell);
+        command
+            .arg(&script)
+            .env(
+                "PATH",
+                format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+            )
+            .env("CLAUDE_PROJECT_DIR", project)
+            .env_remove("ABC_VM")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if vm {
+            command.env("ABC_VM", "1");
+        }
+        let mut child = command.spawn().unwrap();
+        crate::tools::feed(&mut child, &mut input.as_bytes()).unwrap();
+        let output = child.wait_with_output().unwrap();
+        ScriptRun {
+            code: output.status.code(),
+            stdout: String::from_utf8(output.stdout).unwrap(),
+            stderr: String::from_utf8(output.stderr).unwrap(),
+        }
+    }
+
+    /// Writes an executable script `bin/name` with `body`.
+    fn executable(bin: &Path, name: &str, body: &str) {
+        let path = bin.join(name);
+        fs::write(&path, format!("#!/bin/sh\n{body}")).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[test]
+    fn the_stop_script_passes_on_the_verdict_and_only_the_handoff_on_stdout() {
+        for shell in SHELLS {
+            let (project, bin) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+            for code in [0, 2] {
+                executable(
+                    bin.path(),
+                    "cargo",
+                    &format!(
+                        "cat >/dev/null\necho \"$*\"\necho 'from a test'\necho '{{\"systemMessage\":\"handed over\"}}'\nexit {code}\n"
+                    ),
+                );
+                let ran = run_stop_script(shell, project.path(), bin.path(), MAIN, false);
+                assert_eq!(ran.code, Some(code), "{shell}: {ran:?}");
+                assert_eq!(
+                    ran.stdout, "{\"systemMessage\":\"handed over\"}\n",
+                    "{shell}"
+                );
+                assert_eq!(ran.stderr, "xtask hook stop\nfrom a test\n", "{shell}");
+            }
+            executable(bin.path(), "cargo", "cat >/dev/null\nexit 2\n");
+            let quiet = run_stop_script(shell, project.path(), bin.path(), MAIN, false);
+            assert_eq!(
+                (quiet.code, quiet.stdout.as_str(), quiet.stderr.as_str()),
+                (Some(2), "", ""),
+                "{shell}"
+            );
+            assert!(
+                !project.path().join(".abc").exists(),
+                "xtask kept the files"
+            );
+        }
+    }
+
+    #[test]
+    fn in_an_agent_vm_the_stop_script_runs_the_images_xtask_standalone() {
+        let (project, bin) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        executable(
+            bin.path(),
+            "cargo",
+            "cat >/dev/null\necho cargo >&2\nexit 2\n",
+        );
+        executable(
+            bin.path(),
+            "abc-xtask",
+            "cat >/dev/null\necho \"abc-xtask $*\" >&2\nexit \"$(cat \"$(dirname \"$0\")/code\")\"\n",
+        );
+        for shell in SHELLS {
+            fs::write(bin.path().join("code"), "0").unwrap();
+            let ran = run_stop_script(shell, project.path(), bin.path(), MAIN, true);
+            assert_eq!(
+                (ran.code, ran.stderr.as_str()),
+                (Some(0), "abc-xtask hook stop --standalone\n"),
+                "{shell}: the checkout's xtask is not built"
+            );
+            fs::write(bin.path().join("code"), "1").unwrap();
+            let old_image = run_stop_script(shell, project.path(), bin.path(), MAIN, true);
+            assert_eq!(
+                (old_image.code, old_image.stderr.as_str()),
+                (Some(2), "abc-xtask hook stop --standalone\ncargo\n"),
+                "{shell}: an image whose xtask cannot run falls back to the checkout's"
+            );
+        }
+    }
+
+    #[test]
+    fn when_xtask_cannot_run_the_stop_script_honours_the_declaration() {
+        for shell in SHELLS {
+            let (project, bin) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+            fake_cargo(bin.path(), 101);
+            crate::task::count_blocked_stop(project.path()).unwrap();
+            crate::task::block(project.path(), "no \"network\" \\ here\n\ttried twice").unwrap();
+            let ran = run_stop_script(shell, project.path(), bin.path(), MAIN, false);
+            assert_eq!(ran.code, Some(0), "{shell}: {ran:?}");
+            let json: serde_json::Value = serde_json::from_str(&ran.stdout).unwrap();
+            assert_eq!(
+                json["systemMessage"],
+                "BLOCKED, stop allowed (the stop hook's xtask could not run (it exited 101)). \
+                 Handoff: no \"network\" \\ here\n tried twice",
+                "{shell}"
+            );
+            assert!(!project.path().join(crate::task::BLOCKED).exists(), "taken");
+            assert_eq!(
+                crate::task::blocked_stops(project.path()).unwrap(),
+                0,
+                "reset"
+            );
+            let log = fs::read_to_string(project.path().join(crate::task::BLOCKED_LOG)).unwrap();
+            assert!(
+                log.contains("stop allowed, not judged") && log.contains("tried twice"),
+                "{shell}: {log}"
+            );
+        }
+    }
+
+    #[test]
+    fn when_xtask_cannot_run_the_stop_script_counts_and_lets_the_sixth_through() {
+        for shell in SHELLS {
+            let (project, bin) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+            fake_cargo(bin.path(), 101);
+            fs::create_dir_all(project.path().join(".abc")).unwrap();
+            fs::write(project.path().join(".abc/stop-blocks"), "garbled\n").unwrap();
+            for count in 1..=5 {
+                let ran = run_stop_script(shell, project.path(), bin.path(), MAIN, false);
+                assert_eq!((ran.code, ran.stdout.as_str()), (Some(2), ""), "{shell}");
+                assert!(ran.stderr.contains(".abc/blocked.md"), "{shell}: {ran:?}");
+                assert_eq!(crate::task::blocked_stops(project.path()).unwrap(), count);
+            }
+            let sixth = run_stop_script(shell, project.path(), bin.path(), MAIN, false);
+            assert_eq!(sixth.code, Some(0), "{shell}: {sixth:?}");
+            let json: serde_json::Value = serde_json::from_str(&sixth.stdout).unwrap();
+            assert!(
+                json["systemMessage"]
+                    .as_str()
+                    .unwrap()
+                    .contains("5 stops in a row"),
+                "{shell}: {json}"
+            );
+            assert_eq!(crate::task::blocked_stops(project.path()).unwrap(), 0);
+            let note = fs::read_to_string(project.path().join(crate::task::BACKSTOP)).unwrap();
+            assert!(note.contains("after 5 blocked stops"), "{shell}: {note}");
+            let leftovers: Vec<_> = fs::read_dir(project.path().join(".abc"))
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .filter(|name| name.to_string_lossy().contains("stop-blocks."))
+                .collect();
+            assert!(leftovers.is_empty(), "{leftovers:?}");
+        }
+    }
+
+    #[test]
+    fn when_xtask_cannot_run_a_subagent_stops_without_taking_or_counting() {
+        for shell in SHELLS {
+            let (project, bin) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+            fake_cargo(bin.path(), 101);
+            crate::task::block(project.path(), "the main agent's").unwrap();
+            let input = r#"{"hook_event_name": "SubagentStop", "last_assistant_message": "\"hook_event_name\":\"Stop\""}"#;
+            let ran = run_stop_script(shell, project.path(), bin.path(), input, false);
+            assert_eq!(ran.code, Some(0), "{shell}: {ran:?}");
+            assert!(
+                ran.stdout.contains("A subagent stopped unchecked"),
+                "{shell}"
+            );
+            assert!(
+                project.path().join(crate::task::BLOCKED).is_file(),
+                "{shell}"
+            );
+            assert_eq!(crate::task::blocked_stops(project.path()).unwrap(), 0);
+            assert!(!project.path().join(crate::task::BLOCKED_LOG).exists());
+        }
+    }
+
     /// The command of each hook in `.claude/settings.json`, by event.
     fn hook_commands() -> Vec<(String, String)> {
         let settings: serde_json::Value = serde_json::from_str(
@@ -754,6 +1084,15 @@ mod tests {
                 })
             })
             .collect()
+    }
+
+    #[test]
+    fn a_handed_over_hook_names_its_event_as_the_command_line_does() {
+        use clap::ValueEnum as _;
+        for event in Event::value_variants() {
+            let name = event.to_possible_value().unwrap();
+            assert_eq!(event.name(), name.get_name(), "{event:?}");
+        }
     }
 
     #[test]
@@ -825,10 +1164,13 @@ mod tests {
             "the guard runs the hook script"
         );
         assert_eq!(guard["timeout"], 300, "the guard is time-boxed");
-        let stop_command = "if [ -f \"$CLAUDE_PROJECT_DIR/xtask/Cargo.toml\" ]; then cd \"$CLAUDE_PROJECT_DIR\" && cargo xtask hook stop 1>&2 || { echo 'xtask stop hook: keep working; see stderr'; exit 2; }; else echo \"xtask hook: $CLAUDE_PROJECT_DIR has no xtask; no checks run\" >&2; fi";
+        let stop_command = "if [ -f \"$CLAUDE_PROJECT_DIR/xtask/hooks/stop.sh\" ]; then sh \"$CLAUDE_PROJECT_DIR/xtask/hooks/stop.sh\"; else echo \"xtask hook: $CLAUDE_PROJECT_DIR has no xtask/hooks/stop.sh; no checks run\" >&2; fi";
         for event in ["Stop", "SubagentStop"] {
             let stop = &hooks[event][0]["hooks"][0];
-            assert_eq!(stop["command"], stop_command, "{event} runs the check");
+            assert_eq!(
+                stop["command"], stop_command,
+                "{event} runs the stop script"
+            );
             assert_eq!(stop["timeout"], 900, "{event} is time-boxed");
         }
         assert!(
@@ -968,68 +1310,205 @@ mod tests {
         assert!(!fields("{}").watched(), "an unnamed event is not watched");
     }
 
-    /// Runs the stop decision with a check that says `passes`, counting the watchdog's calls.
-    fn stop_with(root: &Path, passes: bool, watched: bool) -> (u8, String, bool) {
+    /// The hook input of the main agent's first stop.
+    const MAIN: &str = r#"{"hook_event_name": "Stop", "stop_hook_active": false}"#;
+    /// The hook input of the main agent's stop after a stop hook sent it back.
+    const MAIN_AGAIN: &str = r#"{"hook_event_name": "Stop", "stop_hook_active": true}"#;
+    /// The hook input of a subagent's stop.
+    const SUBAGENT: &str = r#"{"hook_event_name": "SubagentStop", "stop_hook_active": false}"#;
+
+    /// What one stop did: the verdict, what it said, and whether the blocker and drift watchdogs
+    /// ran.
+    #[derive(Debug)]
+    struct Stopped {
+        verdict: Verdict,
+        said: String,
+        judged: bool,
+        watched: bool,
+    }
+
+    /// Runs the stop decision for `input` with a check that answers `check`, a blocker judge that
+    /// answers `sent_back`, and a drift watchdog that answers `drift`.
+    fn stop_with(
+        root: &Path,
+        input: &str,
+        check: anyhow::Result<bool>,
+        sent_back: Option<&str>,
+        drift: u8,
+    ) -> Stopped {
+        let fields = serde_json::from_str::<super::HookInput>(input).unwrap();
         let mut out = Vec::new();
-        let mut watchdog_ran = false;
-        let code = super::stop(
+        let (mut judged, mut watched) = (false, false);
+        let verdict = super::stop(
             root,
-            watched,
+            &fields,
             &mut out,
-            |_| Ok(passes),
+            |_| check,
+            |declaration, _| {
+                assert_ne!(declaration, "");
+                judged = true;
+                Ok(sent_back.map(str::to_owned))
+            },
             |_| {
-                watchdog_ran = true;
-                Ok(0)
+                watched = true;
+                Ok(drift)
             },
         )
         .unwrap();
-        (code, String::from_utf8(out).unwrap(), watchdog_ran)
+        Stopped {
+            verdict,
+            said: String::from_utf8(out).unwrap(),
+            judged,
+            watched,
+        }
+    }
+
+    fn passes(root: &Path, input: &str) -> Stopped {
+        stop_with(root, input, Ok(true), None, 0)
+    }
+
+    fn fails(root: &Path, input: &str) -> Stopped {
+        stop_with(root, input, Ok(false), None, 0)
     }
 
     #[test]
     fn a_passing_stop_goes_to_the_watchdog_when_watched() {
         let dir = tempfile::tempdir().unwrap();
-        assert_eq!(stop_with(dir.path(), true, true), (0, String::new(), true));
-        assert_eq!(
-            stop_with(dir.path(), true, false),
-            (0, String::new(), false)
-        );
+        let first = passes(dir.path(), MAIN);
+        assert_eq!((first.verdict, first.watched), (Verdict::Allow, true));
+        let drifted = stop_with(dir.path(), MAIN, Ok(true), None, 2);
+        assert_eq!(drifted.verdict, Verdict::Block, "drift keeps it working");
+        for input in [MAIN_AGAIN, SUBAGENT] {
+            let unwatched = stop_with(dir.path(), input, Ok(true), None, 2);
+            assert_eq!(
+                (unwatched.verdict, unwatched.watched),
+                (Verdict::Allow, false),
+                "{input}"
+            );
+        }
     }
 
     #[test]
     fn a_failing_stop_is_blocked_until_the_check_passes() {
         let dir = tempfile::tempdir().unwrap();
-        assert_eq!(stop_with(dir.path(), false, true).0, 1, "fail");
+        assert_eq!(fails(dir.path(), MAIN).verdict, Verdict::Block, "fail");
         assert_eq!(crate::task::blocked_stops(dir.path()).unwrap(), 1);
-        assert_eq!(stop_with(dir.path(), false, true).0, 1, "fail again");
+        assert_eq!(fails(dir.path(), MAIN_AGAIN).verdict, Verdict::Block);
         assert_eq!(crate::task::blocked_stops(dir.path()).unwrap(), 2);
-        assert_eq!(stop_with(dir.path(), true, false).0, 0, "then pass");
+        assert_eq!(passes(dir.path(), MAIN_AGAIN).verdict, Verdict::Allow);
         assert_eq!(crate::task::blocked_stops(dir.path()).unwrap(), 0, "reset");
     }
 
     #[test]
-    fn a_blocked_declaration_ends_the_stop_without_check_or_watchdog() {
+    fn a_check_that_cannot_run_counts_as_a_blocked_stop() {
+        let dir = tempfile::tempdir().unwrap();
+        let stopped = stop_with(
+            dir.path(),
+            MAIN,
+            Err(anyhow::anyhow!("Postgres is down")),
+            None,
+            0,
+        );
+        assert_eq!(stopped.verdict, Verdict::Block);
+        assert!(
+            stopped
+                .said
+                .contains("the check could not run: Postgres is down"),
+            "{}",
+            stopped.said
+        );
+        assert_eq!(crate::task::blocked_stops(dir.path()).unwrap(), 1);
+    }
+
+    #[test]
+    fn a_subagent_stop_neither_takes_the_declaration_nor_counts() {
         let dir = tempfile::tempdir().unwrap();
         crate::task::block(dir.path(), "no network; tried twice").unwrap();
-        let mut out = Vec::new();
-        let code = super::stop(
-            dir.path(),
-            true,
-            &mut out,
-            |_| panic!("the check must not run"),
-            |_| panic!("the watchdog must not run"),
-        )
-        .unwrap();
-        let out = String::from_utf8(out).unwrap();
-        assert_eq!(code, 0);
+        crate::task::count_blocked_stop(dir.path()).unwrap();
+        let failed = fails(dir.path(), SUBAGENT);
+        assert_eq!((failed.verdict, failed.judged), (Verdict::Block, false));
+        let erred = stop_with(dir.path(), SUBAGENT, Err(anyhow::anyhow!("down")), None, 0);
+        assert_eq!(erred.verdict, Verdict::Block);
+        assert_eq!(passes(dir.path(), SUBAGENT).verdict, Verdict::Allow);
+        assert_eq!(
+            crate::task::blocked_stops(dir.path()).unwrap(),
+            1,
+            "neither counted nor reset"
+        );
         assert!(
-            out.contains("BLOCKED") && out.contains("no network; tried twice"),
-            "{out}"
+            dir.path().join(crate::task::BLOCKED).is_file(),
+            "the declaration is still the main agent's"
+        );
+        assert!(!dir.path().join(crate::task::BLOCKED_LOG).exists());
+        let main = fails(dir.path(), MAIN);
+        assert!(matches!(main.verdict, Verdict::Handoff(_)), "{main:?}");
+    }
+
+    #[test]
+    fn a_genuine_blocked_declaration_ends_the_stop_with_a_handoff_and_is_logged() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::task::count_blocked_stop(dir.path()).unwrap();
+        crate::task::block(dir.path(), "no network; tried twice").unwrap();
+        let stopped = stop_with(
+            dir.path(),
+            MAIN_AGAIN,
+            Err(anyhow::anyhow!("the check must not run")),
+            None,
+            2,
         );
         assert_eq!(
-            stop_with(dir.path(), false, true).0,
-            1,
+            stopped.verdict,
+            Verdict::Handoff("BLOCKED, stop allowed. Handoff: no network; tried twice".to_owned())
+        );
+        assert!(stopped.judged, "the watchdog was asked");
+        assert!(!stopped.watched, "the drift watchdog was not");
+        assert_eq!(crate::task::blocked_stops(dir.path()).unwrap(), 0, "reset");
+        let log = fs::read_to_string(dir.path().join(crate::task::BLOCKED_LOG)).unwrap();
+        assert!(
+            log.contains(": stop allowed\n\nno network; tried twice\n"),
+            "{log}"
+        );
+        assert_eq!(
+            fails(dir.path(), MAIN).verdict,
+            Verdict::Block,
             "it covered one stop"
+        );
+    }
+
+    #[test]
+    fn a_blocked_declaration_the_agent_can_remove_is_sent_back_once() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::task::block(dir.path(), "the check fails").unwrap();
+        let sent_back = stop_with(
+            dir.path(),
+            MAIN,
+            Ok(false),
+            Some("a failing check is the work"),
+            0,
+        );
+        assert_eq!(sent_back.verdict, Verdict::Block);
+        assert!(
+            sent_back
+                .said
+                .contains("sent back: a failing check is the work"),
+            "{}",
+            sent_back.said
+        );
+        assert!(!dir.path().join(crate::task::BLOCKED).exists(), "taken");
+        crate::task::block(dir.path(), "the check fails, and I mean it").unwrap();
+        let again = stop_with(dir.path(), MAIN_AGAIN, Ok(false), Some("still the work"), 0);
+        assert!(!again.judged, "the second declaration is not judged");
+        assert!(matches!(again.verdict, Verdict::Handoff(_)), "{again:?}");
+        let log = fs::read_to_string(dir.path().join(crate::task::BLOCKED_LOG)).unwrap();
+        assert!(
+            log.contains(": sent back: a failing check is the work\n\nthe check fails\n")
+                && log.contains(": stop allowed\n\nthe check fails, and I mean it\n"),
+            "{log}"
+        );
+        crate::task::block(dir.path(), "a third").unwrap();
+        assert!(
+            stop_with(dir.path(), MAIN, Ok(false), Some("no"), 0).judged,
+            "an accepted declaration starts the judging over"
         );
     }
 
@@ -1037,19 +1516,62 @@ mod tests {
     fn the_backstop_lets_the_sixth_blocked_stop_through_and_records_it() {
         let dir = tempfile::tempdir().unwrap();
         for _ in 0..5 {
-            assert_eq!(stop_with(dir.path(), false, true).0, 1);
+            assert_eq!(fails(dir.path(), MAIN).verdict, Verdict::Block);
         }
-        let (code, out, watchdog_ran) = stop_with(dir.path(), false, true);
-        assert_eq!(code, 0, "{out}");
-        assert!(!watchdog_ran);
-        assert!(out.contains("5 stops in a row"), "{out}");
+        let sixth = fails(dir.path(), MAIN);
+        let Verdict::Handoff(message) = sixth.verdict else {
+            panic!("{sixth:?}");
+        };
+        assert!(!sixth.watched);
+        assert!(message.contains("5 stops in a row"), "{message}");
         let note = fs::read_to_string(dir.path().join(crate::task::BACKSTOP)).unwrap();
         assert!(note.contains("after 5 blocked stops"), "{note}");
         assert_eq!(
-            stop_with(dir.path(), false, true).0,
-            1,
+            fails(dir.path(), MAIN).verdict,
+            Verdict::Block,
             "the count starts over"
         );
+    }
+
+    #[test]
+    fn a_handoff_reaches_the_user_as_a_system_message() {
+        let (mut out, mut user) = (Vec::new(), Vec::new());
+        let code = Verdict::Handoff("BLOCKED: \"no\" network".to_owned())
+            .emit(&mut out, &mut user)
+            .unwrap();
+        assert_eq!(code, 0);
+        let json: serde_json::Value = serde_json::from_slice(&user).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({"systemMessage": "BLOCKED: \"no\" network"})
+        );
+        assert_eq!(String::from_utf8(out).unwrap(), "BLOCKED: \"no\" network\n");
+        let (mut said, mut shown) = (Vec::new(), Vec::new());
+        assert_eq!(Verdict::Allow.emit(&mut said, &mut shown).unwrap(), 0);
+        assert_eq!(Verdict::Block.emit(&mut said, &mut shown).unwrap(), 2);
+        assert!(said.is_empty() && shown.is_empty(), "nothing to say");
+    }
+
+    #[test]
+    fn standalone_stop_runs_on_the_project_directory() {
+        let (_temp, main, worktree) = repository_with_nested_worktree();
+        let mut standalone = context(&main, Some(&worktree));
+        standalone.standalone = true;
+        crate::task::block(&worktree, "no network; tried twice").unwrap();
+        crate::task::mark_blocked_judged(&worktree).unwrap();
+        let (mut out, mut user) = (Vec::new(), Vec::new());
+        let code = run(Event::Stop, MAIN, &standalone, &mut out, &mut user).unwrap();
+        assert_eq!(code, 0, "{}", String::from_utf8_lossy(&out));
+        assert!(
+            String::from_utf8_lossy(&user).contains("no network; tried twice"),
+            "the worktree's declaration, though xtask's own root is the main checkout"
+        );
+        assert!(worktree.join(crate::task::BLOCKED_LOG).is_file());
+        standalone.project_dir = None;
+        let error = run(Event::Stop, MAIN, &standalone, &mut out, &mut user).unwrap_err();
+        assert!(error.to_string().contains("CLAUDE_PROJECT_DIR"), "{error}");
+        standalone.project_dir = Some(main.join("gone"));
+        run(Event::Stop, MAIN, &standalone, &mut out, &mut user).unwrap_err();
     }
 
     #[test]
@@ -1060,7 +1582,14 @@ mod tests {
         inside.cargo = fake_cargo(temp.path(), 101);
         let mut out = Vec::new();
         assert_eq!(
-            run(Event::Stop, "not json", &inside, &mut out).unwrap(),
+            run(
+                Event::Stop,
+                "not json",
+                &inside,
+                &mut out,
+                &mut std::io::sink()
+            )
+            .unwrap(),
             0,
             "no check, no watchdog, no recursion"
         );
@@ -1077,6 +1606,7 @@ mod tests {
             &input(Some(&worktree), ""),
             &handed_over,
             &mut Vec::new(),
+            &mut std::io::sink(),
         )
         .unwrap_err()
         .to_string();
@@ -1094,6 +1624,7 @@ mod tests {
             "not json",
             &context(&main, Some(&main)),
             &mut out,
+            &mut std::io::sink(),
         )
         .unwrap();
         assert_eq!(code, 2, "the guard blocks input it cannot read");
@@ -1102,6 +1633,7 @@ mod tests {
             "not json",
             &context(&main, Some(&main)),
             &mut Vec::new(),
+            &mut std::io::sink(),
         )
         .unwrap_err();
         assert!(
