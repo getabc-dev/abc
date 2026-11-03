@@ -28,7 +28,7 @@ jobs:
   passthrough:
     name: Tailscale passthrough
     if: contains(github.event.pull_request.labels.*.name, 'tailscale-check')
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
     environment: tailscale
     permissions:
@@ -67,7 +67,7 @@ jobs:
   real-app:
     name: Tailscale real app
     if: contains(github.event.pull_request.labels.*.name, 'tailscale-check')
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
     environment: tailscale
     permissions:

@@ -25,7 +25,7 @@ env:
 jobs:
   decode:
     name: Fuzz protocol decoding
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     # The nightly hour, plus building the target and cargo-fuzz.
     timeout-minutes: 90
     permissions:
