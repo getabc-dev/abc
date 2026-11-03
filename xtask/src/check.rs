@@ -414,12 +414,12 @@ impl<W: Write> Run<'_, W> {
             ));
         }
         // A workspace of binaries alone, such as xtask's, has no doctests to run.
-        let doc_tests = if packages.iter().any(|package| package.library) {
+        let doc_test_args = if packages.iter().any(|package| package.library) {
             scope.doc_test_args()
         } else {
             None
         };
-        if let Some(args) = doc_tests {
+        if let Some(args) = doc_test_args {
             let mut doc_tests = Command::new(cargo());
             doc_tests
                 .args(["test", "--doc"])
