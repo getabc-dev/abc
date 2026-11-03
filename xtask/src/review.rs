@@ -150,7 +150,7 @@ fn generated(files: &[String]) -> String {
 }
 
 /// Fails when the diff is over [`MAX_DIFF_BYTES`].
-fn check_size(diff: &str) -> anyhow::Result<()> {
+pub(crate) fn check_size(diff: &str) -> anyhow::Result<()> {
     ensure!(
         diff.len() <= MAX_DIFF_BYTES,
         "the diff is {} bytes, too large for automated review (the limit is {MAX_DIFF_BYTES}); \

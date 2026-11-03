@@ -133,6 +133,9 @@ pub(crate) fn run(
     target_dir: Option<&Path>,
     out: &mut impl Write,
 ) -> anyhow::Result<bool> {
+    if !review_size(root, out)? {
+        return Ok(false);
+    }
     let (scope, packages) = if changed {
         let packages = workspace_packages(root)?;
         (affected(&packages, &changed_files(root)?), Some(packages))
@@ -140,6 +143,33 @@ pub(crate) fn run(
         (Scope::Workspace, None)
     };
     run_scope(root, &scope, nextest, packages, postgres, target_dir, out)
+}
+
+/// Whether the changes since the merge base with the default branch fit the Gemini review's
+/// limit, measured on the same diff the review sends, so an oversized change is split before it
+/// reaches CI rather than after. Where no default branch is known, as in a fresh clone or CI's
+/// checkout, it says so and passes: the review job enforces the limit there.
+fn review_size(root: &Path, out: &mut impl Write) -> anyhow::Result<bool> {
+    let branch = match default_branch(root) {
+        Ok(branch) => branch,
+        Err(error) => {
+            writeln!(out, "xtask: review size not measured: {error}")?;
+            return Ok(true);
+        }
+    };
+    let merge_base = crate::git::merge_base(root, &branch)?;
+    let (diff, _) = crate::git::reviewable_diff(root, &merge_base, 3)?;
+    if let Err(error) = crate::review::check_size(&diff) {
+        writeln!(out, "xtask: since {branch}, {error}")?;
+        return Ok(false);
+    }
+    writeln!(
+        out,
+        "xtask: review size {} of {} bytes",
+        diff.len(),
+        crate::review::MAX_DIFF_BYTES
+    )?;
+    Ok(true)
 }
 
 /// What the crates of `scope` among `packages` need from Postgres.
@@ -492,7 +522,9 @@ mod tests {
 
     use std::collections::BTreeSet;
 
-    use super::{PROPTEST_RNG_SEED, Package, Scope, affected, changed_since, run, test_command};
+    use super::{
+        PROPTEST_RNG_SEED, Package, Scope, affected, changed_since, review_size, run, test_command,
+    };
     use crate::git::default_branch;
     use crate::testing::{git, repository};
     use crate::tools::Manifest;
@@ -704,6 +736,68 @@ mod tests {
                 "a fork's upstream wins over origin"
             );
         }
+    }
+
+    /// A clone whose origin's default branch is `main`, at the clone's first commit.
+    fn clone_with_origin(temp: &Path) -> PathBuf {
+        let work = repository(&temp.join("work"));
+        let bare = temp.join("origin.git");
+        git(temp, &["init", "--quiet", "--bare", bare.to_str().unwrap()]);
+        git(&work, &["remote", "add", "origin", bare.to_str().unwrap()]);
+        git(&work, &["push", "--quiet", "origin", "HEAD:main"]);
+        git(&work, &["fetch", "--quiet", "origin"]);
+        git(&work, &["remote", "set-head", "origin", "main"]);
+        work
+    }
+
+    #[test]
+    fn a_change_within_the_review_limit_passes_and_reports_its_size() {
+        let temp = tempfile::tempdir().unwrap();
+        let work = clone_with_origin(temp.path());
+        fs::write(work.join("small.txt"), "one line\n").unwrap();
+        git(&work, &["add", "small.txt"]);
+        git(&work, &["commit", "--quiet", "-m", "small"]);
+        let mut out = Vec::new();
+        assert!(review_size(&work, &mut out).unwrap());
+        let said = String::from_utf8(out).unwrap();
+        assert!(said.starts_with("xtask: review size "), "{said}");
+        assert!(said.contains(" of 400000 bytes"), "{said}");
+    }
+
+    #[test]
+    fn a_change_over_the_review_limit_fails_and_says_to_split_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let work = clone_with_origin(temp.path());
+        let line = "x".repeat(99);
+        let big = format!("{line}\n").repeat(4_100);
+        fs::write(work.join("big.txt"), big).unwrap();
+        git(&work, &["add", "big.txt"]);
+        git(&work, &["commit", "--quiet", "-m", "big"]);
+        let mut out = Vec::new();
+        assert!(!review_size(&work, &mut out).unwrap());
+        let said = String::from_utf8(out).unwrap();
+        assert!(
+            said.contains("too large for automated review (the limit is 400000)"),
+            "{said}"
+        );
+        assert!(said.trim_end().ends_with("split the PR"), "{said}");
+        assert!(
+            said.contains("refs/remotes/origin/main"),
+            "names the base: {said}"
+        );
+    }
+
+    #[test]
+    fn without_a_default_branch_the_review_size_is_not_measured() {
+        let temp = tempfile::tempdir().unwrap();
+        let work = repository(&temp.path().join("work"));
+        let mut out = Vec::new();
+        assert!(review_size(&work, &mut out).unwrap());
+        let said = String::from_utf8(out).unwrap();
+        assert!(
+            said.starts_with("xtask: review size not measured: "),
+            "{said}"
+        );
     }
 
     #[test]
