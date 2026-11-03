@@ -73,8 +73,9 @@ The Integrity check compares your PR with its merge base and flags:
 - tests newly marked `#[ignore]` or `#[should_panic]`;
 - tests with fewer assertions than before;
 - changes to gate files: CI and rulesets (`.github/`), cargo, lint, toolchain and tool
-  configuration, `Cargo.toml` and `Cargo.lock`, the agent settings, `AGENTS.md`, `CLAUDE.md` and
-  `xtask/`. AGENTS.md has the full list. Gate files also need a code owner's review.
+  configuration, `Cargo.toml` and `Cargo.lock` (the fuzz workspace's too, with its `deny.toml`),
+  the agent settings, `AGENTS.md`, `CLAUDE.md` and `xtask/`. AGENTS.md has the full list. Gate
+  files also need a code owner's review.
 
 Each flagged test needs an entry in the `## Test changes` section of your PR description, in the
 form `` `path::test`: reason ``. Name the test as the check reports it (`<file>::<test>`, or the
