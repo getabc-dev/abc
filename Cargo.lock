@@ -93,6 +93,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "rustls",
+ "rustls-platform-verifier",
  "schemars",
  "semver",
  "serde",
@@ -109,7 +110,6 @@ dependencies = [
  "tracing-subscriber",
  "ts-rs",
  "uuid",
- "webpki-roots",
 ]
 
 [[package]]
