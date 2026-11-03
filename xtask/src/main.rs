@@ -99,8 +99,8 @@ enum Task {
         #[arg(long, value_parser = mutants::Shard::parse)]
         shard: Option<mutants::Shard>,
     },
-    /// Fuzz protocol message decoding for a while with the pinned cargo-fuzz; fails when the
-    /// fuzzer finds an input that breaks it.
+    /// Lint the fuzz workspace (`fuzz/`), then fuzz protocol message decoding for a while with
+    /// the pinned cargo-fuzz; fails when a lint fails or the fuzzer finds an input that breaks it.
     Fuzz {
         /// How long to fuzz, in seconds.
         #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u64).range(1..))]
@@ -312,6 +312,7 @@ fn run(
         )?)),
         Task::Fuzz { seconds } => Ok(verdict(fuzz::run(
             root,
+            &check::cargo(),
             &tool("cargo-fuzz")?,
             seconds,
             report,
