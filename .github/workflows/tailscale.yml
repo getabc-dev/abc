@@ -106,11 +106,17 @@ jobs:
             --cap-add NET_ADMIN --cap-add NET_RAW --device /dev/net/tun \
             --env TS_AUTHKEY --env TS_HOSTNAME="abc-runner-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
             --env TS_USERSPACE=false --env TS_ACCEPT_DNS=false "$image"
+          # Only the state is read, never printed: `tailscale status` lists the tailnet's peers
+          # in a public log.
+          running() {
+            docker exec abc-runner-node tailscale status --json 2>/dev/null |
+              jq -e '.BackendState == "Running"' >/dev/null
+          }
           for _ in $(seq 60); do
-            if docker exec abc-runner-node tailscale status >/dev/null 2>&1; then break; fi
+            if running; then break; fi
             sleep 2
           done
-          docker exec abc-runner-node tailscale status
+          running || { echo "the runner did not join the tailnet" >&2; exit 1; }
           sudo resolvectl dns tailscale0 100.100.100.100
           sudo resolvectl domain tailscale0 "~${ABC_TAILSCALE_TAILNET}"
         env:

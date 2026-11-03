@@ -9,8 +9,10 @@
 //! It needs a real tailnet, so it is ignored unless asked for (`--run-ignored only`), and then
 //! fails unless these are set:
 //!
-//! * `ABC_TAILSCALE_AUTHKEY`: an auth key owned by a user (not tagged: tagged devices carry no
-//!   identity), reusable, ideally ephemeral and approved in advance;
+//! * `ABC_TAILSCALE_AUTHKEY`: an ephemeral auth key owned by a user (not tagged: tagged devices
+//!   carry no identity), approved in advance. It must be ephemeral: a node a killed run leaves
+//!   behind then disappears from the tailnet by itself, and the test logs its node out on the way
+//!   out;
 //! * `ABC_TAILSCALE_TAILNET`: the tailnet's DNS name, such as `tail1234.ts.net`, with `MagicDNS` and
 //!   HTTPS certificates enabled.
 //!
@@ -21,9 +23,10 @@
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write as _;
     use std::os::unix::fs::PermissionsExt as _;
     use std::path::Path;
-    use std::process::{Child, Command, ExitStatus, Output, Stdio};
+    use std::process::{Child, Command, ExitStatus, Output};
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -42,17 +45,59 @@ mod tests {
     /// Tailscale tests read.
     const IMAGE: &str = include_str!("../../../.github/tailscale-image").trim_ascii();
 
-    /// Removes the Serve container however the test ends.
+    /// Logs the Serve node out of the tailnet and removes its container however the test ends.
     struct Container(String);
 
     impl Drop for Container {
         fn drop(&mut self) {
+            let _logged_out = Command::new("docker")
+                .args(["exec", &self.0, "tailscale", "logout"])
+                .output();
             let _removed = Command::new("docker").args(["rm", "-f", &self.0]).output();
         }
     }
 
-    /// Kills a process the test started if the test ends before stopping it.
-    struct Running(Option<Child>);
+    /// A node name no other run shares: the workflow run and attempt, or the time and process
+    /// when the test runs by hand, so a node left behind by a killed run never collides.
+    fn unique_node(prefix: &str) -> String {
+        if let Ok(run) = std::env::var("GITHUB_RUN_ID") {
+            let attempt = std::env::var("GITHUB_RUN_ATTEMPT").unwrap_or_else(|_| String::from("1"));
+            format!("{prefix}-{run}-{attempt}")
+        } else {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_nanos());
+            format!("{prefix}-{nanos:x}-{}", std::process::id())
+        }
+    }
+
+    /// The text a process wrote to the file `log`, its last 8000 bytes at most.
+    fn tail(log: &Path) -> String {
+        let bytes = std::fs::read(log).unwrap_or_default();
+        bytes.rchunks(8000).next().map(text).unwrap_or_default()
+    }
+
+    /// Prints the tails of the processes' logs when the test fails, since their output goes to
+    /// files that are removed with the test's directory.
+    struct Logs(Vec<(&'static str, std::path::PathBuf)>);
+
+    impl Drop for Logs {
+        fn drop(&mut self) {
+            if std::thread::panicking() {
+                for (name, log) in &self.0 {
+                    let _shown = writeln!(
+                        std::io::stderr(),
+                        "--- the end of the {name}'s output ---\n{}",
+                        tail(log)
+                    );
+                }
+            }
+        }
+    }
+    /// Kills a process the test started if the test ends before stopping it. Its output goes to a
+    /// file, so a process nobody reads from never blocks on a full pipe, and the test can show
+    /// the end of it.
+    struct Running(Option<Child>, std::path::PathBuf);
 
     impl Drop for Running {
         fn drop(&mut self) {
@@ -64,11 +109,13 @@ mod tests {
     }
 
     impl Running {
-        fn new(command: &mut Command) -> Self {
-            Self(Some(command.spawn().unwrap()))
+        fn new(command: &mut Command, log: &Path) -> Self {
+            let file = std::fs::File::create(log).unwrap();
+            command.stdout(file.try_clone().unwrap()).stderr(file);
+            Self(Some(command.spawn().unwrap()), log.to_owned())
         }
 
-        /// Sends SIGTERM and waits for the exit, with what the process wrote on stderr.
+        /// Sends SIGTERM and waits for the exit, with the end of what the process wrote.
         async fn terminate(mut self) -> (ExitStatus, String) {
             let mut child = self.0.take().unwrap();
             let killed = Command::new("kill")
@@ -76,13 +123,10 @@ mod tests {
                 .status()
                 .unwrap();
             assert!(killed.success(), "SIGTERM was sent");
+            let log = self.1.clone();
             tokio::task::spawn_blocking(move || {
                 let status = child.wait().unwrap();
-                let mut stderr = String::new();
-                if let Some(mut pipe) = child.stderr.take() {
-                    std::io::Read::read_to_string(&mut pipe, &mut stderr).unwrap();
-                }
-                (status, stderr)
+                (status, tail(&log))
             })
             .await
             .unwrap()
@@ -285,7 +329,7 @@ mod tests {
 
     /// Starts `abc server` on the database at `database` behind `host`, and waits until it
     /// reports ready.
-    async fn start_server(database: &str, host: &str, socket: &Path) -> Running {
+    async fn start_server(database: &str, host: &str, socket: &Path, log: &Path) -> Running {
         let ops = std::net::TcpListener::bind("127.0.0.1:0")
             .unwrap()
             .local_addr()
@@ -295,9 +339,8 @@ mod tests {
                 .env("ABC_DATABASE_URL", database)
                 .env("ABC_PUBLIC_URL", format!("https://{host}"))
                 .env("ABC_SIDECAR_SOCKET", socket)
-                .env("ABC_OPS_ADDR", ops.to_string())
-                .stdout(Stdio::null())
-                .stderr(Stdio::piped()),
+                .env("ABC_OPS_ADDR", ops.to_string()),
+            log,
         );
         for _ in 0..1200 {
             if socket.exists() {
@@ -326,9 +369,18 @@ mod tests {
         };
         let database = TestDatabase::migrated().await;
         let url = abc_store::testing::database_url_text(&database.pool(), None);
-        let node = format!("abc-app-{}", std::process::id());
+        let node = unique_node("abc-app");
         let host = format!("{node}.{tailnet}");
 
+        let logs = tempfile::tempdir().unwrap();
+        let (server_log, worker_log) = (
+            logs.path().join("server.log"),
+            logs.path().join("worker.log"),
+        );
+        let _tails = Logs(vec![
+            ("server", server_log.clone()),
+            ("worker", worker_log.clone()),
+        ]);
         let sockets = tempfile::tempdir().unwrap();
         // The Serve container's root reaches the socket through the group bits.
         std::fs::set_permissions(sockets.path(), std::fs::Permissions::from_mode(0o770)).unwrap();
@@ -342,7 +394,7 @@ mod tests {
         });
         std::fs::write(serve_config.path().join("serve.json"), serve.to_string()).unwrap();
 
-        let server = start_server(&url, &host, &socket).await;
+        let server = start_server(&url, &host, &socket, &server_log).await;
         let container = start_serve(&key, &node, sockets.path(), serve_config.path());
         let session = first_session(&host).await.unwrap();
         assert_eq!(session.1["state"], "unclaimed", "{}", session.1);
@@ -382,26 +434,21 @@ mod tests {
             text(&enrolled.stderr)
         );
 
-        let running = Running::new(
-            worker(&[], &home)
-                .env("ABC_LOG", "info")
-                .stdout(Stdio::null())
-                .stderr(Stdio::piped()),
-        );
+        let running = Running::new(worker(&[], &home).env("ABC_LOG", "info"), &worker_log);
         let online = until_online(&host, &workspace, true).await;
         assert_eq!(online[0]["hostname"], "ci-runner", "{online:?}");
 
-        let (worker_exit, worker_log) = running.terminate().await;
+        let (worker_exit, worker_output) = running.terminate().await;
         assert!(
             worker_exit.success(),
-            "the worker exits cleanly on SIGTERM: {worker_log}"
+            "the worker exits cleanly on SIGTERM: {worker_output}"
         );
         until_online(&host, &workspace, false).await;
 
-        let (server_exit, server_log) = server.terminate().await;
+        let (server_exit, server_output) = server.terminate().await;
         assert!(
             server_exit.success(),
-            "the server exits cleanly on SIGTERM: {server_log}"
+            "the server exits cleanly on SIGTERM: {server_output}"
         );
         drop(container);
     }
