@@ -519,8 +519,8 @@ mod tests {
             ),
             package("abc", "crates/abc", false, &["crates/abc-worker"]),
             package(
-                "abc-fuzz",
-                "crates/abc-protocol/fuzz",
+                "abc-protocol-bench",
+                "crates/abc-protocol/bench",
                 false,
                 &["crates/abc-protocol"],
             ),
@@ -615,7 +615,7 @@ mod tests {
     fn a_change_affects_its_crate_and_every_dependent() {
         assert_eq!(
             scope_for(&["crates/abc-protocol/src/lib.rs"]),
-            packages(&["abc", "abc-fuzz", "abc-protocol", "abc-worker"]),
+            packages(&["abc", "abc-protocol", "abc-protocol-bench", "abc-worker"]),
             "dependents are found transitively"
         );
     }
@@ -632,13 +632,18 @@ mod tests {
             packages(&["xtask"]),
             "any file in a crate counts"
         );
+        assert_eq!(
+            scope_for(&["fuzz/fuzz_targets/decode.rs"]),
+            packages(&[]),
+            "the fuzz workspace is not a member; `cargo xtask fuzz` lints it"
+        );
     }
 
     #[test]
     fn the_innermost_crate_owns_a_file() {
         assert_eq!(
-            scope_for(&["crates/abc-protocol/fuzz/src/main.rs"]),
-            packages(&["abc-fuzz"]),
+            scope_for(&["crates/abc-protocol/bench/src/main.rs"]),
+            packages(&["abc-protocol-bench"]),
             "a crate nested in another owns its files"
         );
     }
@@ -715,6 +720,41 @@ mod tests {
             error.contains("git remote set-head origin --auto"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn changed_files_are_those_since_the_merge_base_with_the_default_branch() {
+        let temp = tempfile::tempdir().unwrap();
+        let work = repository(&temp.path().join("work"));
+        let bare = temp.path().join("origin.git");
+        git(
+            temp.path(),
+            &["init", "--quiet", "--bare", bare.to_str().unwrap()],
+        );
+        git(&work, &["remote", "add", "origin", bare.to_str().unwrap()]);
+        git(&work, &["push", "--quiet", "origin", "HEAD:main"]);
+        git(&work, &["fetch", "--quiet", "origin"]);
+        git(&work, &["remote", "set-head", "origin", "main"]);
+        assert_eq!(
+            super::changed_files(&work).unwrap(),
+            Vec::<PathBuf>::new(),
+            "nothing yet"
+        );
+        fs::write(work.join("new"), "x\n").unwrap();
+        git(&work, &["add", "new"]);
+        git(&work, &["commit", "--quiet", "-m", "change"]);
+        assert_eq!(
+            super::changed_files(&work).unwrap(),
+            [PathBuf::from("new")],
+            "the branch's own commit"
+        );
+    }
+
+    #[test]
+    fn a_scope_is_empty_only_when_it_names_no_crate() {
+        assert!(packages(&[]).is_empty());
+        assert!(!packages(&["abc"]).is_empty());
+        assert!(!Scope::Workspace.is_empty());
     }
 
     #[test]

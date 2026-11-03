@@ -643,9 +643,10 @@ mod tests {
             prop_assert_eq!(ServerMessage::decode(&text).unwrap(), message);
         }
 
-        /// The fuzz target's property (`crates/abc-protocol/fuzz`), on every `check`: text from a
-        /// peer not yet trusted, whether arbitrary or a valid message with one byte changed,
-        /// decodes without panicking, and whatever decodes encodes and decodes back to itself.
+        /// The fuzz target's property (`fuzz/fuzz_targets/decode.rs`), on every `check`: text
+        /// from a peer not yet trusted, whether arbitrary or a valid message with one byte
+        /// changed, decodes without panicking, and whatever decodes encodes and decodes back to
+        /// itself.
         #[test]
         fn untrusted_text_decodes_or_is_refused_never_half_read(
             text in prop_oneof![

@@ -1,9 +1,10 @@
 name: Fuzz
 
-# Fuzzes protocol message decoding (`cargo xtask fuzz`, target `decode` in crates/abc-protocol/fuzz):
-# for a minute on every pull request and in the merge queue, where it is a required check, and for
-# an hour every night on main. A failure prints the failing input in the job log (libFuzzer's
-# `Base64:` line); add it to crates/abc-protocol/fuzz/seeds/decode once fixed, so every run replays it.
+# Lints the fuzz workspace (fuzz/, its own Cargo workspace) and fuzzes protocol message decoding
+# with it (`cargo xtask fuzz`, target `decode`): for a minute on every pull request and in the merge
+# queue, where it is a required check, and for an hour every night on main. A failure prints the
+# failing input in the job log (libFuzzer's `Base64:` line); add it to fuzz/seeds/decode once fixed,
+# so every run replays it.
 
 on:
   pull_request:
@@ -36,11 +37,16 @@ jobs:
       - name: Install the pinned Rust toolchain
         run: rustup toolchain install --no-self-update
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          # xtask builds in the main workspace's target/, the fuzz target in the fuzz workspace's.
+          workspaces: |
+            . -> target
+            fuzz -> target
       - name: Install the pinned tools
         run: cargo xtask setup cargo-fuzz
       - name: Check the installed tools against their pins
         run: cargo xtask doctor cargo-fuzz
-      - name: Fuzz decoding
+      - name: Lint the fuzz workspace and fuzz decoding
         run: cargo xtask fuzz --seconds "$SECONDS_TO_FUZZ"
         env:
           SECONDS_TO_FUZZ: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '3600' || '60' }}

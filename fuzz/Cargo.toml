@@ -1,0 +1,90 @@
+# The fuzz targets for abc's wire formats, run with `cargo xtask fuzz`. A workspace of its own, laid
+# out as `cargo fuzz init --fuzzing-workspace true` makes it, so that libFuzzer, which only fuzzing
+# needs, is never built by the main workspace, and its dependencies are locked in fuzz/Cargo.lock.
+[package]
+name = "abc-fuzz"
+description = "Fuzz targets for abc's wire formats, run with `cargo xtask fuzz`."
+version = "0.1.0"
+edition = "2024"
+# Equal to the main workspace's; an xtask test keeps them in step.
+rust-version = "1.99.1"
+license = "MIT"
+repository = "https://github.com/getabc-dev/abc"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+abc-protocol = { path = "../crates/abc-protocol" }
+libfuzzer-sys = "0.4.13"
+
+[workspace]
+members = ["."]
+
+# Decodes untrusted bytes as every message either side reads, and checks that anything accepted
+# survives an encode and a decode unchanged.
+[[bin]]
+name = "decode"
+path = "fuzz_targets/decode.rs"
+test = false
+doc = false
+bench = false
+
+# A copy of the main workspace's `[workspace.lints]`, which another workspace cannot inherit; an
+# xtask test keeps the two equal. `cargo xtask fuzz` runs clippy with them before fuzzing.
+[lints.rust]
+unsafe_code = "forbid"
+unreachable_pub = "deny"
+unused_qualifications = "deny"
+elided_lifetimes_in_paths = "deny"
+let_underscore_drop = "deny"
+missing_debug_implementations = "deny"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+# Selected nursery lints.
+use_self = "deny"
+redundant_clone = "deny"
+significant_drop_in_scrutinee = "deny"
+needless_collect = "deny"
+or_fun_call = "deny"
+# Restriction lints: no panics, unchecked arithmetic, lossy casts, silent errors or catch-all matches.
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+unreachable = "deny"
+dbg_macro = "deny"
+print_stdout = "deny"
+print_stderr = "deny"
+indexing_slicing = "deny"
+string_slice = "deny"
+get_unwrap = "deny"
+arithmetic_side_effects = "deny"
+as_conversions = "deny"
+allow_attributes = "deny"
+allow_attributes_without_reason = "deny"
+unwrap_in_result = "deny"
+panic_in_result_fn = "deny"
+missing_assert_message = "deny"
+exit = "deny"
+mem_forget = "deny"
+wildcard_enum_match_arm = "deny"
+let_underscore_must_use = "deny"
+let_underscore_untyped = "deny"
+clone_on_ref_ptr = "deny"
+error_impl_error = "deny"
+map_err_ignore = "deny"
+unused_result_ok = "deny"
+assertions_on_result_states = "deny"
+tests_outside_test_module = "deny"
+cfg_not_test = "deny"
+iter_over_hash_type = "deny"
+shadow_unrelated = "deny"
+try_err = "deny"
+float_cmp_const = "deny"
+lossy_float_literal = "deny"
+self_named_module_files = "deny"

@@ -69,10 +69,14 @@ jobs:
         run: cargo xtask doctor cargo-deny cargo-shear osv-scanner
       - name: Advisories, licences, bans and sources
         run: cargo xtask tool cargo-deny check
+      - name: Advisories, licences, bans and sources of the fuzz workspace
+        run: cargo xtask tool cargo-deny --manifest-path fuzz/Cargo.toml --config fuzz/deny.toml --locked check
       - name: Unused dependencies
         run: cargo xtask tool cargo-shear --deny-warnings --locked
+      - name: Unused dependencies of the fuzz workspace
+        run: cargo xtask tool cargo-shear --deny-warnings --locked fuzz
       - name: Known vulnerabilities (OSV)
-        run: cargo xtask tool osv-scanner scan source --lockfile Cargo.lock
+        run: cargo xtask tool osv-scanner scan source --lockfile Cargo.lock --lockfile fuzz/Cargo.lock
 
   scans:
     name: Secrets and workflows
