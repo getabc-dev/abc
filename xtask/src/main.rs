@@ -311,6 +311,7 @@ fn run(
                 review::post_gemini,
                 std::thread::sleep,
                 &review::RETRY_DELAYS,
+                io::stderr(),
             ),
         )?)),
         Task::GitCredential { operation } => {
