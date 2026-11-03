@@ -229,8 +229,6 @@ impl Run<'_> {
                 "--colors",
                 "never",
             ])
-            // The tests run the pinned tools in .tools/, which .gitignore lists; copy them too.
-            .args(["--gitignore", "false"])
             .arg(&cargo_config)
             .arg("--timeout-multiplier")
             .arg(timeout_multiplier(self.options.jobs).to_string())
@@ -238,7 +236,11 @@ impl Run<'_> {
         if in_place {
             command.args(["--dir", self.workspace.dir(), "--in-place"]);
         } else {
-            command.arg("--jobs").arg(self.options.jobs.to_string());
+            command
+                .arg("--jobs")
+                .arg(self.options.jobs.to_string())
+                // The tests run the pinned tools in .tools/, which .gitignore lists; copy them too.
+                .args(["--gitignore", "false"]);
         }
         let status = command
             .args(
@@ -578,6 +580,10 @@ mod tests {
         assert!(
             !called.contains("--jobs"),
             "one at a time in place: {called}"
+        );
+        assert!(
+            !called.contains("--gitignore"),
+            "nothing is copied in place, and cargo-mutants refuses the option there: {called}"
         );
         assert!(
             called.contains(&format!(
