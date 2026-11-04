@@ -62,12 +62,16 @@ pub(crate) struct Test {
     pub(crate) assertions: usize,
 }
 
-/// The tests in a file, for the languages the check reads; `None` for any other file.
-fn inventory(path: &str, source: &str) -> Option<anyhow::Result<Vec<Test>>> {
+/// Whether the file at `path` is in a language the check reads tests in.
+fn has_tests(path: &str) -> bool {
     Path::new(path)
         .extension()
         .is_some_and(|extension| extension == "rs")
-        .then(|| rust::tests(source))
+}
+
+/// The tests in a file, for the languages the check reads; `None` for any other file.
+fn inventory(path: &str, source: &str) -> Option<anyhow::Result<Vec<Test>>> {
+    has_tests(path).then(|| rust::tests(source))
 }
 
 /// The test-only code in a file, for the languages the check reads; `None` for any other file.
@@ -227,20 +231,21 @@ fn findings(root: &Path, commit: &str) -> anyhow::Result<Vec<Finding>> {
                 break;
             }
         }
+        // Only files with tests are read: any other may be binary, or a link to a directory.
         let before = match &change.old {
-            Some(path) => match git::show(root, commit, path)? {
+            Some(path) if has_tests(path) => match git::show(root, commit, path)? {
                 Some(source) => tests_in(path, &source)?,
                 None => None,
             },
-            None => None,
+            Some(_) | None => None,
         };
         let after = match &change.new {
-            Some(path) => {
+            Some(path) if has_tests(path) => {
                 let source = fs::read_to_string(root.join(path))
                     .with_context(|| format!("could not read {path}"))?;
                 tests_in(path, &source)?
             }
-            None => None,
+            Some(_) | None => None,
         };
         let file = change
             .new
@@ -481,10 +486,13 @@ mod tests {
         )
         .unwrap();
         fs::write(repo.join("deny.toml"), "[bans]\n").unwrap();
+        // A binary file at the base is not read for tests when it goes away.
+        fs::write(repo.join("old.bin"), [0xff_u8, 0xfe, 0x00]).unwrap();
         git(&repo, &["add", "--all"]);
         git(&repo, &["commit", "--quiet", "-m", "base"]);
         let base = git(&repo, &["rev-parse", "HEAD"]).trim().to_owned();
 
+        fs::remove_file(repo.join("old.bin")).unwrap();
         fs::write(
             repo.join("src/lib.rs"),
             "#[cfg(test)]\nmod tests {\n    #[test]\n    #[ignore]\n    fn kept() { assert!(true); }\n}\n",
@@ -502,6 +510,10 @@ mod tests {
             "[bans]\nmultiple-versions = \"allow\"\n",
         )
         .unwrap();
+        // Files with no tests to read: a link to a directory and a binary file.
+        std::os::unix::fs::symlink("src", repo.join("linked")).unwrap();
+        fs::write(repo.join("logo.bin"), [0xff_u8, 0xfe, 0x00]).unwrap();
+        git(&repo, &["add", "linked", "logo.bin"]);
 
         let found = findings(&repo, &base).unwrap();
         for expected in [
