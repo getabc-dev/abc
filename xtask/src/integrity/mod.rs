@@ -486,10 +486,13 @@ mod tests {
         )
         .unwrap();
         fs::write(repo.join("deny.toml"), "[bans]\n").unwrap();
+        // A binary file at the base is not read for tests when it goes away.
+        fs::write(repo.join("old.bin"), [0xff_u8, 0xfe, 0x00]).unwrap();
         git(&repo, &["add", "--all"]);
         git(&repo, &["commit", "--quiet", "-m", "base"]);
         let base = git(&repo, &["rev-parse", "HEAD"]).trim().to_owned();
 
+        fs::remove_file(repo.join("old.bin")).unwrap();
         fs::write(
             repo.join("src/lib.rs"),
             "#[cfg(test)]\nmod tests {\n    #[test]\n    #[ignore]\n    fn kept() { assert!(true); }\n}\n",
