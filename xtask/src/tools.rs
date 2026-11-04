@@ -1380,6 +1380,31 @@ targets.aarch64-unknown-linux-gnu = {{ platform = "linux-arm64", sha256 = "{sha2
     }
 
     #[test]
+    fn no_checked_in_pin_is_all_zeros() {
+        let manifest = Manifest::load(&crate::repo_root().unwrap()).unwrap();
+        let zeros = "0".repeat(64);
+        for tool in &manifest.tools {
+            let mut pins: Vec<(String, &str)> = Vec::new();
+            if let Some(sha256) = &tool.sha256 {
+                pins.push((format!("{} crate", tool.name), sha256));
+            }
+            for (target, asset) in &tool.targets {
+                pins.push((format!("{} {target} archive", tool.name), &asset.sha256));
+                pins.push((
+                    format!("{} {target} executable", tool.name),
+                    &asset.binary_sha256,
+                ));
+                if let Some(library) = &asset.library_sha256 {
+                    pins.push((format!("{} {target} library", tool.name), library));
+                }
+            }
+            for (what, pin) in pins {
+                assert_ne!(pin, zeros, "{what} is unpinned: run `cargo xtask pin`");
+            }
+        }
+    }
+
+    #[test]
     fn checked_in_tool_list_is_valid() {
         let root = crate::repo_root().unwrap();
         let manifest = Manifest::load(&root).unwrap();
