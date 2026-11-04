@@ -756,6 +756,12 @@ mod tests {
     }
 
     #[test]
+    fn a_workspace_is_labelled_by_its_directory_except_the_main_one() {
+        assert_eq!(MAIN.label(), "");
+        assert_eq!(XTASK.label(), " (xtask/)");
+    }
+
+    #[test]
     fn crates_in_scope_decide_what_postgres_is_needed_for() {
         let mut store = package("store", "crates/store", true, &[]);
         store.database = true;
