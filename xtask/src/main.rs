@@ -396,10 +396,15 @@ fn check(
         warm: &postgres::warm,
         sqlx: &|| tool("cargo-sqlx"),
     };
+    let tools = check::Tools {
+        nextest: tool("cargo-nextest")?,
+        shellcheck: tool("shellcheck")?,
+    };
     check::run(
         root,
+        check::REPOSITORY,
         changed,
-        &tool("cargo-nextest")?,
+        &tools,
         &postgres,
         None,
         report,
