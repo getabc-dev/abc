@@ -1065,6 +1065,10 @@ mod tests {
             "{only_stale}"
         );
         assert!(!only_stale.contains("::error"), "{only_stale}");
+        assert!(
+            !only_stale.contains("finding(s)"),
+            "no count of findings when there are none: {only_stale}"
+        );
         let mut unexplained = Vec::new();
         assert!(
             !run_with(

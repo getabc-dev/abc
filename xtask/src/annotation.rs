@@ -235,10 +235,8 @@ mod tests {
         );
         assert_eq!(lines[10], "::warning title=w::w");
         let exactly: Vec<Annotation> = many.into_iter().take(PER_LEVEL).collect();
-        assert_eq!(
-            commands(Mode::Actions, &exactly).lines().count(),
-            PER_LEVEL,
-            "ten fit without a summary"
-        );
+        let ten = commands(Mode::Actions, &exactly);
+        assert_eq!(ten.lines().count(), PER_LEVEL, "ten fit: {ten}");
+        assert!(!ten.contains("more"), "and need no summary: {ten}");
     }
 }

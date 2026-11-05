@@ -187,6 +187,8 @@ mod tests {
             "https://gitlab.com/o/r.git",
             "https://github.com/o",
             "https://github.com/o/r/x",
+            "https://github.com//r.git",
+            "https://github.com/o/.git",
         ] {
             assert!(Repo::parse(url).is_err(), "{url}");
         }

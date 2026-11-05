@@ -395,6 +395,53 @@ mod tests {
     }
 
     #[test]
+    fn a_failing_merge_queue_run_fails_a_clean_head() {
+        let mut answers = vec![queue_runs(), {
+            let mut clean = recorded(true);
+            let runs = clean
+                .pointer_mut(
+                    "/data/repository/pullRequest/commits/nodes/0/commit/checkSuites/nodes/0/checkRuns/nodes",
+                )
+                .unwrap();
+            *runs = json!([check_run("Check", "COMPLETED", Some("SUCCESS"), &json!([]))]);
+            clean
+        }]
+        .into_iter();
+        let mut send = |_: &Request| Ok(answers.next().unwrap());
+        let mut out = String::new();
+        assert!(!run(&repo(), 25, &mut send, &mut out).unwrap(), "{out}");
+        assert!(out.contains("0 failing, 0 cancelled, 0 running"), "{out}");
+    }
+
+    #[test]
+    fn only_finished_passing_checks_pass() {
+        let commit = |run: Value| -> super::Commit {
+            serde_json::from_value(json!({
+                "oid": "3333333333333333333333333333333333333333",
+                "checkSuites": {"nodes": [{"workflowRun": null, "checkRuns": {"nodes": [run]}}]}
+            }))
+            .unwrap()
+        };
+        for (status, conclusion, passes) in [
+            ("COMPLETED", Some("SUCCESS"), true),
+            ("COMPLETED", Some("CANCELLED"), false),
+            ("IN_PROGRESS", None, false),
+            ("COMPLETED", Some("FAILURE"), false),
+        ] {
+            let mut out = String::new();
+            assert_eq!(
+                super::describe(
+                    "x",
+                    &commit(check_run("C", status, conclusion, &json!([]))),
+                    &mut out
+                ),
+                passes,
+                "{status} {conclusion:?}: {out}"
+            );
+        }
+    }
+
+    #[test]
     fn a_clean_head_without_a_merge_queue_run_passes() {
         let mut answers = vec![json!({"workflow_runs": []}), {
             let mut clean = recorded(false);
