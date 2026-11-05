@@ -14,6 +14,13 @@ crates.io
 index.crates.io
 static.crates.io
 static.rust-lang.org
+# The web app (S0 PR 5): the pinned node, packages from npm's registry (metadata and tarballs both
+# come from registry.npmjs.org), and Playwright's browsers, from its CDN and its documented fallback
+# (playwright-core's download list).
+nodejs.org
+registry.npmjs.org
+cdn.playwright.dev
+playwright.download.prss.microsoft.com
 # osv-scanner's vulnerability database.
 api.osv.dev
 # Claude Code, on the subscription token: the API alone.
