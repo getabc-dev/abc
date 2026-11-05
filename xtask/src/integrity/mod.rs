@@ -1,7 +1,8 @@
 //! `cargo xtask integrity`: changes that weaken the gates, which a person must approve.
 //!
 //! Comparing each changed file with its version at the merge base, it reports deleted tests and
-//! test files, newly added `#[ignore]` and `#[should_panic]`, tests that lost assertions, and
+//! test files, newly added `#[ignore]` and `#[should_panic]`, tests that lost assertions, tests
+//! that a commit of the pull request added and a later one deleted, and
 //! changes to gate files: CI, lint, dependency and toolchain settings, hook settings, and the
 //! xtask code that runs the gates. In CI a finding fails the check unless a listed approver has
 //! labelled the pull request `integrity-approved` after its latest push.
@@ -92,6 +93,12 @@ enum Finding {
         file: String,
         tests: usize,
     },
+    /// A test that a commit since the merge base added and a later one deleted, which comparing
+    /// the merge base with the tree cannot see.
+    AddedThenDeleted {
+        file: String,
+        test: String,
+    },
     NewlyIgnored {
         file: String,
         test: String,
@@ -118,6 +125,9 @@ impl fmt::Display for Finding {
             Self::DeletedTestFile { file, tests } => {
                 write!(f, "deleted test file  {file} ({tests} tests)")
             }
+            Self::AddedThenDeleted { file, test } => {
+                write!(f, "added then deleted {file}: {test}")
+            }
             Self::NewlyIgnored { file, test } => write!(f, "newly #[ignore]    {file}: {test}"),
             Self::NewlyShouldPanic { file, test } => {
                 write!(f, "newly #[should_panic] {file}: {test}")
@@ -142,6 +152,7 @@ impl Finding {
     fn test(&self) -> Option<String> {
         match self {
             Self::DeletedTest { file, test }
+            | Self::AddedThenDeleted { file, test }
             | Self::NewlyIgnored { file, test }
             | Self::NewlyShouldPanic { file, test }
             | Self::FewerAssertions { file, test, .. } => Some(format!("{file}::{test}")),
@@ -253,6 +264,48 @@ fn findings(root: &Path, commit: &str) -> anyhow::Result<Vec<Finding>> {
             .or_else(|| change.old.clone())
             .unwrap_or_default();
         found.extend(compare(&file, before.as_deref(), after.as_deref()));
+    }
+    found.extend(added_then_deleted(root, commit)?);
+    Ok(found)
+}
+
+/// Tests that exist in a file at some commit between `commit` and HEAD but neither at `commit`
+/// nor in the working tree: added, then deleted, within the pull request. Only the files with
+/// tests that those commits touched are read, once per version.
+fn added_then_deleted(root: &Path, commit: &str) -> anyhow::Result<Vec<Finding>> {
+    let range = format!("{commit}..HEAD");
+    let touched = git::git(
+        root,
+        &["log", "--format=", "--name-only", "--no-renames", &range],
+    )?;
+    let names = |path: &str, source: Option<String>| -> anyhow::Result<BTreeSet<String>> {
+        Ok(match source {
+            Some(source) => tests_in(path, &source)?
+                .unwrap_or_default()
+                .into_iter()
+                .map(|test| test.name)
+                .collect(),
+            None => BTreeSet::new(),
+        })
+    };
+    let mut found = Vec::new();
+    let paths: BTreeSet<&str> = touched.lines().filter(|path| has_tests(path)).collect();
+    for &path in &paths {
+        let now = fs::read_to_string(root.join(path)).ok();
+        let mut kept = names(path, git::show(root, commit, path)?)?;
+        kept.extend(names(path, now)?);
+        let mut gone = BTreeSet::new();
+        for version in git::git(root, &["rev-list", &range, "--", path])?.lines() {
+            gone.extend(
+                names(path, git::show(root, version, path)?)?
+                    .into_iter()
+                    .filter(|test| !kept.contains(test)),
+            );
+        }
+        found.extend(gone.into_iter().map(|test| Finding::AddedThenDeleted {
+            file: path.to_owned(),
+            test,
+        }));
     }
     Ok(found)
 }
@@ -843,6 +896,56 @@ mod tests {
     }
 
     #[test]
+    fn finds_a_test_added_then_deleted_within_the_pull_request() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = repository(&temp.path().join("repo"));
+        fs::create_dir_all(repo.join("src")).unwrap();
+        let tests = |names: &[&str]| -> String {
+            names
+                .iter()
+                .map(|name| format!("#[test]\nfn {name}() {{ assert!(true); }}\n"))
+                .collect::<Vec<_>>()
+                .concat()
+        };
+        let commit = |files: &[(&str, &str)]| {
+            for (path, text) in files {
+                fs::write(repo.join(path), text).unwrap();
+            }
+            git(&repo, &["add", "--all"]);
+            git(&repo, &["commit", "--quiet", "-m", "change"]);
+        };
+        commit(&[("src/a.rs", &tests(&["old", "gone"])), ("README.md", "x\n")]);
+        let base = git(&repo, &["rev-parse", "HEAD"]).trim().to_owned();
+        // A build agent once added a test, then deleted it in a later commit of the same pull
+        // request to fit the review's size limit; base and head alone never showed it.
+        commit(&[
+            ("src/a.rs", &tests(&["old", "gone", "added", "kept"])),
+            ("src/b.rs", &tests(&["brief"])),
+        ]);
+        commit(&[("src/a.rs", &tests(&["old", "kept"])), ("README.md", "y\n")]);
+        fs::remove_file(repo.join("src/b.rs")).unwrap();
+        let found = findings(&repo, &base).unwrap();
+        assert_eq!(
+            found,
+            [
+                Finding::DeletedTest {
+                    file: "src/a.rs".into(),
+                    test: "gone".into(),
+                },
+                Finding::AddedThenDeleted {
+                    file: "src/a.rs".into(),
+                    test: "added".into(),
+                },
+                Finding::AddedThenDeleted {
+                    file: "src/b.rs".into(),
+                    test: "brief".into(),
+                },
+            ],
+            "a test at the base is a deleted test, once; one kept to the end is no finding"
+        );
+    }
+
+    #[test]
     fn describes_every_finding() {
         let lines: Vec<String> = [
             Finding::DeletedTest {
@@ -852,6 +955,10 @@ mod tests {
             Finding::DeletedTestFile {
                 file: "a.rs".into(),
                 tests: 2,
+            },
+            Finding::AddedThenDeleted {
+                file: "a.rs".into(),
+                test: "t".into(),
             },
             Finding::NewlyIgnored {
                 file: "a.rs".into(),
@@ -879,6 +986,7 @@ mod tests {
             [
                 "deleted test       a.rs: t",
                 "deleted test file  a.rs (2 tests)",
+                "added then deleted a.rs: t",
                 "newly #[ignore]    a.rs: t",
                 "newly #[should_panic] a.rs: t",
                 "fewer assertions   a.rs: t (2 before, 1 now)",
