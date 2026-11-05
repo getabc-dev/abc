@@ -50,10 +50,12 @@ RUN arch="$(uname -m)-unknown-linux-gnu" \
 COPY --chown=agent:agent rust-toolchain.toml /opt/abc-src/rust-toolchain.toml
 RUN cd /opt/abc-src && rustup toolchain install
 
-# The repository's crates and pinned tools, so a session starts without downloading them, and
-# xtask itself, for the checks the VM runs before any checkout's code (`abc-xtask vm billing`).
-# `cargo xtask setup` checks every sha256 as on any machine; each session copies the tools into
-# its own volume at the worktree's .tools/ (entrypoint.sh).
+# The crates of both workspaces (the main one and xtask's own) and the pinned tools, so a session
+# starts without downloading them, and xtask itself for the one check the VM runs with code the
+# agent cannot change: `abc-xtask vm billing`, before the session and before every tool call. The
+# hooks build and run the checkout's own xtask, never this one. `cargo xtask setup` checks
+# every sha256 as on any machine; each session copies the tools into its own volume at the
+# worktree's .tools/ (entrypoint.sh).
 COPY --chown=agent:agent Cargo.toml Cargo.lock /opt/abc-src/
 COPY --chown=agent:agent .cargo /opt/abc-src/.cargo
 COPY --chown=agent:agent .config /opt/abc-src/.config
@@ -61,6 +63,7 @@ COPY --chown=agent:agent crates /opt/abc-src/crates
 COPY --chown=agent:agent xtask /opt/abc-src/xtask
 RUN cd /opt/abc-src \
  && cargo fetch --locked \
+ && cargo fetch --locked --manifest-path xtask/Cargo.toml \
  && CARGO_TARGET_DIR=/tmp/xtask-target cargo xtask setup \
  && CARGO_TARGET_DIR=/tmp/xtask-target cargo xtask doctor \
  && cp /tmp/xtask-target/debug/xtask /opt/abc-src/abc-xtask \

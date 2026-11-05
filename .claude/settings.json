@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "if [ -f \"$CLAUDE_PROJECT_DIR/xtask/hooks/pre-tool-use.sh\" ]; then sh \"$CLAUDE_PROJECT_DIR/xtask/hooks/pre-tool-use.sh\"; else echo \"xtask hook: $CLAUDE_PROJECT_DIR has no xtask/hooks/pre-tool-use.sh; the git guard is off\" >&2; fi",
+            "command": "if [ -f \"$CLAUDE_PROJECT_DIR/xtask/hooks/hook.sh\" ]; then sh \"$CLAUDE_PROJECT_DIR/xtask/hooks/hook.sh\" pre-tool-use; else echo \"xtask hook: $CLAUDE_PROJECT_DIR has no xtask/hooks/hook.sh; the git guard is off\" >&2; fi",
             "timeout": 300
           }
         ]
@@ -17,7 +17,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "if [ -f \"$CLAUDE_PROJECT_DIR/xtask/hooks/stop.sh\" ]; then sh \"$CLAUDE_PROJECT_DIR/xtask/hooks/stop.sh\"; else echo \"xtask hook: $CLAUDE_PROJECT_DIR has no xtask/hooks/stop.sh; no checks run\" >&2; fi",
+            "command": "if [ -f \"$CLAUDE_PROJECT_DIR/xtask/hooks/hook.sh\" ]; then sh \"$CLAUDE_PROJECT_DIR/xtask/hooks/hook.sh\" stop; else echo \"xtask hook: $CLAUDE_PROJECT_DIR has no xtask/hooks/hook.sh; no checks run\" >&2; fi",
             "timeout": 900,
             "statusMessage": "cargo xtask check --changed"
           }
@@ -30,7 +30,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "if [ -f \"$CLAUDE_PROJECT_DIR/xtask/hooks/stop.sh\" ]; then sh \"$CLAUDE_PROJECT_DIR/xtask/hooks/stop.sh\"; else echo \"xtask hook: $CLAUDE_PROJECT_DIR has no xtask/hooks/stop.sh; no checks run\" >&2; fi",
+            "command": "if [ -f \"$CLAUDE_PROJECT_DIR/xtask/hooks/hook.sh\" ]; then sh \"$CLAUDE_PROJECT_DIR/xtask/hooks/hook.sh\" stop; else echo \"xtask hook: $CLAUDE_PROJECT_DIR has no xtask/hooks/hook.sh; no checks run\" >&2; fi",
             "timeout": 900,
             "statusMessage": "cargo xtask check --changed"
           }

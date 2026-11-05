@@ -95,54 +95,52 @@ pub(crate) fn blocker(
     }
 }
 
-/// Runs the watchdog for the worktree at `root` with the `claude` executable, and returns the
-/// hook's exit code: 2 to keep the agent working, 0 to let it stop.
+/// Runs the watchdog for the worktree at `root` with the `claude` executable, and returns why the
+/// changes drifted from the task, to keep the agent working, or `None` to let it stop.
 pub(crate) fn check(
     root: &Path,
     claude: &Path,
     timeout: Duration,
     out: &mut impl Write,
-) -> anyhow::Result<u8> {
+) -> anyhow::Result<Option<String>> {
     let Some(task) = task::read(root)? else {
         writeln!(
             out,
             "xtask watchdog: no task recorded (cargo xtask task set \"...\"); skipped"
         )?;
-        return Ok(0);
+        return Ok(None);
     };
     let prompt = prompt(root, &task)?;
     let answer = match ask(claude, root, &prompt, timeout) {
         Ok(answer) => answer,
         Err(error) => {
             writeln!(out, "xtask watchdog: {error:#}; skipped")?;
-            return Ok(0);
+            return Ok(None);
         }
     };
     match parse::<Assessment>(&answer) {
         Some(Assessment { on_track: true, .. }) => {
             writeln!(out, "xtask watchdog: on track")?;
-            Ok(0)
+            Ok(None)
         }
         Some(Assessment { reasons, .. }) => {
-            writeln!(
-                out,
-                "xtask watchdog: the changes have drifted from the task:"
-            )?;
-            for reason in reasons {
-                writeln!(out, "  - {reason}")?;
-            }
-            writeln!(
-                out,
-                "Get back to the task, or record the new one with `cargo xtask task set`."
-            )?;
-            Ok(2)
+            let listed = reasons.iter().fold(String::new(), |mut listed, reason| {
+                listed.push_str("  - ");
+                listed.push_str(reason);
+                listed.push('\n');
+                listed
+            });
+            Ok(Some(format!(
+                "xtask watchdog: the changes have drifted from the task:\n{listed}Get back to the \
+                 task, or record the new one with `cargo xtask task set`."
+            )))
         }
         None => {
             writeln!(
                 out,
                 "xtask watchdog: could not read claude's answer; skipped"
             )?;
-            Ok(0)
+            Ok(None)
         }
     }
 }
@@ -285,7 +283,7 @@ mod tests {
         (temp, repo)
     }
 
-    fn run(repo: &Path, claude: &Path, timeout: Duration) -> (u8, String) {
+    fn run(repo: &Path, claude: &Path, timeout: Duration) -> (Option<String>, String) {
         let mut out = Vec::new();
         let code = check(repo, claude, timeout, &mut out).unwrap();
         (code, String::from_utf8(out).unwrap())
@@ -296,7 +294,7 @@ mod tests {
         let (temp, repo) = worktree();
         let claude = fake_claude(temp.path(), &envelope("unused"));
         let (code, out) = run(&repo, &claude, Duration::from_secs(30));
-        assert_eq!(code, 0, "{out}");
+        assert_eq!(code, None, "{out}");
         assert_eq!(out.lines().count(), 1, "one line: {out}");
         assert!(out.contains("no task recorded"), "{out}");
     }
@@ -304,13 +302,13 @@ mod tests {
     #[test]
     fn lets_an_agent_on_track_stop() {
         let (temp, repo) = worktree();
-        task::set(&repo, "Add the coverage gate").unwrap();
+        task::set(&repo, "Add the coverage gate", &mut std::io::sink()).unwrap();
         let claude = fake_claude(
             temp.path(),
             &envelope(r#"{"on_track": true, "reasons": []}"#),
         );
         let (code, out) = run(&repo, &claude, Duration::from_secs(30));
-        assert_eq!(code, 0, "{out}");
+        assert_eq!(code, None, "{out}");
         let prompt = fs::read_to_string(temp.path().join("prompt.txt")).unwrap();
         assert!(
             prompt.contains("# Task\n\nAdd the coverage gate"),
@@ -354,22 +352,26 @@ mod tests {
     #[test]
     fn keeps_a_drifting_agent_working() {
         let (temp, repo) = worktree();
-        task::set(&repo, "Add the coverage gate").unwrap();
+        task::set(&repo, "Add the coverage gate", &mut std::io::sink()).unwrap();
         let claude = fake_claude(
             temp.path(),
             &envelope(
                 "```json\n{\"on_track\": false, \"reasons\": [\"Rewrote the README instead (S1)\"]}\n```",
             ),
         );
-        let (code, out) = run(&repo, &claude, Duration::from_secs(30));
-        assert_eq!(code, 2, "exit 2 keeps the agent working: {out}");
-        assert!(out.contains("  - Rewrote the README instead (S1)"), "{out}");
+        let (code, _) = run(&repo, &claude, Duration::from_secs(30));
+        let drift = code.expect("a drift keeps the agent working");
+        assert!(
+            drift.contains("  - Rewrote the README instead (S1)\n"),
+            "{drift}"
+        );
+        assert!(drift.ends_with("`cargo xtask task set`."), "{drift}");
     }
 
     #[test]
     fn steps_aside_when_claude_fails() {
         let (temp, repo) = worktree();
-        task::set(&repo, "Add the coverage gate").unwrap();
+        task::set(&repo, "Add the coverage gate", &mut std::io::sink()).unwrap();
         let cases: [(PathBuf, &str); 3] = [
             (temp.path().join("absent"), "could not run"),
             (
@@ -383,7 +385,7 @@ mod tests {
         ];
         for (claude, expected) in cases {
             let (code, out) = run(&repo, &claude, Duration::from_secs(30));
-            assert_eq!(code, 0, "{expected}: {out}");
+            assert_eq!(code, None, "{expected}: {out}");
             assert!(out.contains(expected), "{expected}: {out}");
         }
         let failing = temp.path().join("failing");
@@ -392,7 +394,7 @@ mod tests {
         let failed = run(&repo, &failing, Duration::from_secs(30));
         assert_eq!(
             (failed.0, failed.1.contains("claude failed")),
-            (0, true),
+            (None, true),
             "{}",
             failed.1
         );
@@ -402,7 +404,7 @@ mod tests {
         let timed_out = run(&repo, &slow, Duration::from_millis(300));
         assert_eq!(
             (timed_out.0, timed_out.1.contains("took longer than")),
-            (0, true),
+            (None, true),
             "{}",
             timed_out.1
         );
@@ -424,7 +426,7 @@ mod tests {
     #[test]
     fn a_blocker_outside_the_agents_control_stands() {
         let (temp, repo) = worktree();
-        task::set(&repo, "Add the coverage gate").unwrap();
+        task::set(&repo, "Add the coverage gate", &mut std::io::sink()).unwrap();
         let claude = fake_claude(
             temp.path(),
             &envelope(r#"{"outside_control": true, "reason": "an outage"}"#),
