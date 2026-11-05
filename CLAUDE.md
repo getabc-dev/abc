@@ -6,29 +6,32 @@ Claude included.
 ## Claude Code notes
 
 - **Hooks** live in `.claude/settings.json` and act in the checkout you are working in, worktrees
-  included. Stop and SubagentStop run `xtask/hooks/stop.sh`, and through it `cargo xtask hook
-  stop`: `cargo xtask check --changed`, then, for the main agent's first Stop, the watchdog. While
-  either fails you keep working, but a stop can end honestly (D39): PASS, FAIL or BLOCKED. If the
-  task cannot be finished, run `cargo xtask task blocked "<what is missing, what was tried>"`. Your
-  next Stop logs the declaration in `.abc/blocked-log.md` and asks the watchdog one question: is
-  the blocker outside your control? A failing check or flaky tests never is. If it says no, the
-  stop is sent back with its reason, and every declaration is judged the same way; otherwise the
-  stop is allowed and the handoff is shown to the user. A `check` that cannot run counts as a
-  failed one, a refused declaration counts as a blocked stop, and after 5 blocked stops in a row
-  the hook lets the next stop through (a declaration with its handoff, unjudged; otherwise noted in
-  `.abc/stop-backstop.md`). The count lives in `.abc/` and resets when `check` passes, a
-  declaration is accepted or a new task is set. Only the main agent's Stop takes the declaration
-  and uses the main count; each subagent's blocked stops are counted apart, by its `agent_id`, and
-  its stop is let through after 5 as well. When xtask cannot run, `stop.sh` holds and counts the
-  stop itself and never honours a declaration unjudged. Read-only subagents
-  (Explore, Plan and the like) and Claude Code's internal agents are exempt. A PreToolUse hook on
-  Bash and Monitor runs `xtask/hooks/pre-tool-use.sh`, and through it `cargo xtask hook
-  pre-tool-use`, which catches accidental force pushes, git or gh commands it cannot read, and gh
-  changes made as the user; GitHub's ruleset and the agent App's permissions are the enforcement.
-  If the guard itself cannot run, git and gh commands are blocked and everything else still runs.
-  In an agent VM both hooks run the image's installed `abc-xtask` with `--standalone`, so a
-  checkout whose workspace does not build cannot block the guard or trap a stop. Outside this
-  repository, or in a checkout without these hooks, the hooks check nothing.
+  included. Every hook runs `xtask/hooks/hook.sh`, which builds this checkout's own xtask into
+  `target/hook` and runs `cargo xtask hook <event>`. xtask is a Cargo workspace of its own, so a
+  crate of the main workspace that does not build cannot block the guard or trap a stop. It
+  answers in Claude Code's hook JSON and exits 0, so no exit code, usage error or crash can read
+  as a decision. Stop and SubagentStop run `cargo xtask check --changed`, then, for the main
+  agent's first Stop since one was let through, the watchdog. While either fails you keep working,
+  but a stop can end honestly (D39): PASS, FAIL or BLOCKED. If the task cannot be finished, run
+  `cargo xtask task blocked "<what is missing, what was tried>"`. Your next Stop logs the
+  declaration in `.abc/blocked-log.md` and asks the watchdog one question: is the blocker outside
+  your control? A failing check or flaky tests never is. If it says no, the stop is sent back with
+  its reason, and every declaration is judged the same way; otherwise the stop is allowed and the
+  handoff is shown to the user. A `check` that cannot run counts as a failed one, a refused
+  declaration counts as a blocked stop, and after 5 blocked stops in a row the hook lets the next
+  stop through (a declaration with its handoff, unjudged; otherwise noted in
+  `.abc/stop-backstop.md`). One pure state machine decides every stop (`xtask/src/stop.rs`), on one
+  record per agent in `.abc/stop-state.json`: the main agent's count and declaration, and each
+  subagent's count by its `agent_id`, which no subagent's stop can reach past. The main count
+  resets when `check` passes, a declaration is accepted or a new task is set. When xtask cannot
+  start, the launcher answers itself: it holds a stop at most 5 times in a row
+  (`.abc/hook-holds`), never honouring a declaration, and denies git and gh commands while letting
+  everything else run. Read-only subagents (Explore, Plan and the like) and Claude Code's internal
+  agents are exempt. The PreToolUse hook on Bash and Monitor is the git guard: it catches
+  accidental force pushes, git or gh commands it cannot read, and gh changes made as the user;
+  GitHub's ruleset and the agent App's permissions are the enforcement. In an agent VM it first
+  runs the image's `abc-xtask vm billing`, the one check made with code the agent cannot change.
+  Outside this repository, or in a checkout without these hooks, the hooks check nothing.
 - **Watchdog.** Run `cargo xtask task set "<the task>"` when you start a task. When you stop, the
   watchdog runs your own `claude -p` with Haiku, no tools, hooks off and `ABC_WATCHDOG=1` so it
   cannot recurse, on the task, the rule IDs and the diff. Off track, it keeps you working with its

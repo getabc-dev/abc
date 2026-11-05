@@ -128,7 +128,7 @@ watchdog compares the diff with that task and the rules above, and keeps it work
 | `cargo xtask rulesets apply` | For the maintainer only, with their own gh login: puts `.github/rulesets/` on GitHub (`main`, the `agent/*` branch limit and the tag rule), replacing the rulesets they supersede. Agents never run it. |
 | `cargo xtask tool <name> [args]` | Runs a pinned tool from `.tools/`, such as `cargo xtask tool cargo-deny check`. Never run these tools from `PATH`. |
 | `cargo xtask pin` | After a version changes in `xtask/tools.toml`, records each target's archive sha256 and its executable's, or a crate's sha256 from the crates.io index. To add a tool, write zeros and run it. |
-| `cargo fmt --all` | Fixes formatting. |
+| `cargo fmt --all && cargo fmt --all --manifest-path xtask/Cargo.toml` | Fixes formatting in both workspaces; `cargo fmt --all` alone formats only the main one. |
 
 The gates take `--root <path>` to check another tree with the pinned tools of the checkout xtask
 was built from.

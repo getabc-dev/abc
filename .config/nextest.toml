@@ -11,3 +11,8 @@ slow-timeout = { period = "30s", terminate-after = 4 }
 [[profile.default.overrides]]
 filter = "test(serve_passes_identity_websockets_and_unbuffered_sse_to_the_unix_socket)"
 slow-timeout = { period = "60s", terminate-after = 10 }
+
+# Builds xtask from a copy of the repository, from scratch the first time.
+[[profile.default.overrides]]
+filter = "test(the_hooks_answer_when_the_main_workspace_does_not_resolve)"
+slow-timeout = { period = "60s", terminate-after = 10 }

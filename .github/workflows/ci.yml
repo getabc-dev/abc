@@ -171,8 +171,8 @@ jobs:
           workspaces: |
             . -> target
             xtask -> ../target
-      - name: Install the pinned cargo-nextest the pull request's tests use
-        run: cargo xtask setup cargo-nextest
+      - name: Install the pinned cargo-nextest and shellcheck the pull request's tests use
+        run: cargo xtask setup cargo-nextest shellcheck
       - name: 90% of changed lines covered
         working-directory: ${{ runner.temp }}/base
         run: cargo xtask coverage --root "$GITHUB_WORKSPACE" --base "$BASE"
@@ -223,8 +223,8 @@ jobs:
           workspaces: |
             . -> target
             xtask -> ../target
-      - name: Install the pinned cargo-nextest the pull request's tests use
-        run: cargo xtask setup cargo-nextest
+      - name: Install the pinned cargo-nextest and shellcheck the pull request's tests use
+        run: cargo xtask setup cargo-nextest shellcheck
       - name: No missed mutants in this shard of the changed code
         working-directory: ${{ runner.temp }}/base
         run: cargo xtask mutants --root "$GITHUB_WORKSPACE" --base "$BASE" --jobs 2 --shard "$SHARD/8"

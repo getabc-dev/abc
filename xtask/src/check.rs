@@ -28,24 +28,28 @@ pub(crate) struct Workspace {
     dir: &'static str,
     /// Files outside its crates, beside [`SHARED_FILES`], whose change can affect all of them.
     files: &'static [&'static str],
+    /// Directories outside its crates, beside [`SHARED_DIRS`], whose change can affect all of them.
+    dirs: &'static [&'static str],
 }
 
 /// The main workspace: the crates abc ships.
 pub(crate) const MAIN: Workspace = Workspace {
     dir: "",
     files: &["Cargo.toml", "Cargo.lock"],
+    dirs: &[],
 };
 
-/// xtask's own workspace. Its tests compare its lints with the main workspace's manifest.
+/// xtask's own workspace. Its tests compare its lints with the main workspace's manifest, read the
+/// agent settings and the fuzz workspace's manifest, and check the CI workflows and rulesets.
 pub(crate) const XTASK: Workspace = Workspace {
     dir: "xtask",
-    files: &["Cargo.toml"],
+    files: &["Cargo.toml", ".claude/settings.json", "fuzz/Cargo.toml"],
+    dirs: &[".github"],
 };
 
 /// The shell scripts of the repository, which shellcheck lints.
-pub(crate) const SCRIPTS: [&str; 4] = [
-    "xtask/hooks/pre-tool-use.sh",
-    "xtask/hooks/stop.sh",
+pub(crate) const SCRIPTS: [&str; 3] = [
+    "xtask/hooks/hook.sh",
     "xtask/vm/entrypoint.sh",
     "xtask/vm/agent-exec",
 ];
@@ -98,7 +102,10 @@ impl Workspace {
             .iter()
             .chain(self.files)
             .any(|file| path == Path::new(file))
-            || SHARED_DIRS.iter().any(|dir| path.starts_with(dir))
+            || SHARED_DIRS
+                .iter()
+                .chain(self.dirs)
+                .any(|dir| path.starts_with(dir))
     }
 }
 
@@ -185,16 +192,6 @@ impl Failure {
 pub(crate) struct Tools {
     pub(crate) nextest: PathBuf,
     pub(crate) shellcheck: PathBuf,
-}
-
-impl Tools {
-    /// The tools pinned in the checkout at `home`.
-    pub(crate) fn pinned(home: &Path) -> anyhow::Result<Self> {
-        Ok(Self {
-            nextest: crate::tools::pinned(home, "cargo-nextest")?,
-            shellcheck: crate::tools::pinned(home, "shellcheck")?,
-        })
-    }
 }
 
 /// How the check reaches Postgres.
@@ -869,6 +866,22 @@ mod tests {
             xtask_scope_for(&["xtask/Cargo.lock"]),
             xtask,
             "its own lockfile is in it"
+        );
+        for file in [
+            ".claude/settings.json",
+            "fuzz/Cargo.toml",
+            ".github/workflows/ci.yml",
+            ".github/rulesets/main.json",
+        ] {
+            assert_eq!(
+                xtask_scope_for(&[file]),
+                Scope::Workspace,
+                "{file}: a test of xtask reads it"
+            );
+        }
+        assert!(
+            xtask_scope_for(&["fuzz/seeds/decode/a", ".claude/other.json"]).is_empty(),
+            "only the files its tests read"
         );
         for file in ["Cargo.toml", "rust-toolchain.toml", ".cargo/config.toml"] {
             assert_eq!(

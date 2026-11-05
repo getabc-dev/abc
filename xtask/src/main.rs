@@ -14,6 +14,7 @@ mod postgres;
 mod review;
 mod rulesets;
 mod shell;
+mod stop;
 mod task;
 #[cfg(test)]
 mod testing;
@@ -183,18 +184,12 @@ enum Task {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<OsString>,
     },
-    /// Run a Claude Code hook on the hook input from stdin, in the checkout the agent is in.
-    /// Exit code 2 blocks the tool call or keeps the agent working.
+    /// Run a Claude Code hook on the hook input from stdin, in the checkout the agent is in. It
+    /// answers in Claude Code's hook JSON on stdout and exits 0; xtask/hooks/hook.sh runs it.
     Hook {
         /// The hook event.
         #[arg(value_enum)]
         event: hook::Event,
-        /// Act without locating the agent's checkout and handing over to its xtask: `pre-tool-use`
-        /// judges the command by the guard's rules alone, and `stop` runs on the session's project
-        /// directory (`CLAUDE_PROJECT_DIR`) with its pinned tools. The agent VM runs its installed
-        /// xtask this way, so neither hook depends on a build of the checkout.
-        #[arg(long)]
-        standalone: bool,
     },
 }
 
@@ -202,7 +197,7 @@ fn main() -> ExitCode {
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
         Err(error) => {
-            let code = usage_exit_code(&error);
+            let code = u8::try_from(error.exit_code()).unwrap_or(1);
             return match error.print() {
                 // With the terminal gone there is nowhere left to report; the code still tells.
                 Ok(()) | Err(_) => ExitCode::from(code),
@@ -266,13 +261,6 @@ fn pinned_tool(name: &str) -> anyhow::Result<PathBuf> {
 
 fn env_var(name: &str) -> Option<OsString> {
     std::env::var_os(name)
-}
-
-/// The exit code for clap's help, version and usage errors. Clap exits 2 on usage errors, but 2
-/// is how a Claude Code hook blocks an action, so a hook command xtask does not understand exits 1
-/// and reports a hook error instead of posing as a decision.
-fn usage_exit_code(error: &clap::Error) -> u8 {
-    u8::from(error.use_stderr())
 }
 
 /// Success when a gate passed, failure otherwise.
@@ -368,21 +356,36 @@ fn run(
             Ok(ExitCode::SUCCESS)
         }
         Task::Tool { name, args } => tools::run(&tool(&name)?, root, &args),
-        Task::Hook { event, standalone } => {
-            let mut input = String::new();
-            io::stdin()
-                .read_to_string(&mut input)
-                .context("could not read the hook input from stdin")?;
-            let context = hook::Context::from_env(home.clone(), standalone);
-            Ok(ExitCode::from(hook::run(
-                event,
-                &input,
-                &context,
-                report,
-                &mut io::stdout().lock(),
-            )?))
-        }
+        Task::Hook { event } => run_hook(event, home, report),
     }
+}
+
+/// `cargo xtask hook EVENT`: reads the hook input on stdin and prints the answer, in JSON, on
+/// stdout. A stop whose check failed with no state to count it in prints its reason and exits
+/// [`hook::UNKEPT_STATUS`], for the launcher to count.
+fn run_hook(event: hook::Event, home: &Path, report: &mut impl Write) -> anyhow::Result<ExitCode> {
+    let mut input = String::new();
+    let mut log = Vec::new();
+    if let Err(error) = io::stdin().read_to_string(&mut input) {
+        // Input that cannot be read is answered as unreadable input.
+        writeln!(log, "xtask hook: could not read the hook input: {error}")?;
+        input.clear();
+    }
+    let answer = hook::run(
+        event,
+        &input,
+        &hook::Context::from_env(home.to_path_buf()),
+        &mut log,
+    );
+    report.write_all(&log)?;
+    if let hook::Answer::Held(reason) = &answer {
+        writeln!(io::stdout().lock(), "{reason}")?;
+        return Ok(ExitCode::from(hook::UNKEPT_STATUS));
+    }
+    if let Some(json) = answer.json(event) {
+        writeln!(io::stdout().lock(), "{json}")?;
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 /// `cargo xtask check` on `root`, with the pinned tools `tool` finds and the warm Postgres.
@@ -452,13 +455,13 @@ fn run_rulesets(
 /// `cargo xtask task`: records, prints or forgets the task in `root`.
 fn run_task(action: TaskAction, root: &Path, report: &mut impl Write) -> anyhow::Result<ExitCode> {
     match action {
-        TaskAction::Set { text } => task::set(root, &text)?,
+        TaskAction::Set { text } => task::set(root, &text, report)?,
         TaskAction::Show => match task::read(root)? {
             Some(text) => writeln!(io::stdout().lock(), "{text}")?,
             None => writeln!(report, "no task recorded")?,
         },
         TaskAction::Clear => task::clear(root)?,
-        TaskAction::Blocked { text } => task::block(root, &text)?,
+        TaskAction::Blocked { text } => task::block(root, &text, report)?,
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -540,8 +543,8 @@ mod tests {
     use std::process::ExitCode;
 
     use super::{
-        Cli, Invocation, RulesetAction, Task, TaskAction, repo_root, run, serve_tokens,
-        usage_exit_code, user_home, verdict,
+        Cli, Invocation, RulesetAction, Task, TaskAction, repo_root, run, serve_tokens, user_home,
+        verdict,
     };
     use crate::testing::{git, repository_with_change, script};
 
@@ -957,39 +960,12 @@ mod tests {
     }
 
     #[test]
-    fn usage_errors_never_exit_2() {
-        let unknown = Cli::try_parse_from(["xtask", "guard"]).unwrap_err();
-        assert_eq!(
-            usage_exit_code(&unknown),
-            1,
-            "an unknown command must not read as a hook's block"
-        );
-        let bad_event = Cli::try_parse_from(["xtask", "hook", "post-tool-use"]).unwrap_err();
-        assert_eq!(
-            usage_exit_code(&bad_event),
-            1,
-            "an unknown hook event fails with 1"
-        );
-        let help = Cli::try_parse_from(["xtask", "--help"]).unwrap_err();
-        assert_eq!(usage_exit_code(&help), 0, "help is not an error");
-    }
-
-    #[test]
-    fn workspace_rust_version_is_the_pinned_toolchain() {
-        let root = repo_root().unwrap();
-        let toolchain: toml_edit::DocumentMut =
-            fs::read_to_string(root.join("rust-toolchain.toml"))
-                .unwrap()
-                .parse()
-                .unwrap();
-        let manifest: toml_edit::DocumentMut = fs::read_to_string(root.join("Cargo.toml"))
-            .unwrap()
-            .parse()
-            .unwrap();
-        assert_eq!(
-            manifest["workspace"]["package"]["rust-version"].as_str(),
-            toolchain["toolchain"]["channel"].as_str(),
-            "Cargo.toml's rust-version must equal the channel in rust-toolchain.toml"
+    fn a_hook_takes_only_its_event() {
+        let args = ["xtask", "hook", "post-tool-use", "x"];
+        let error = Cli::try_parse_from(args).unwrap_err();
+        assert!(
+            error.use_stderr(),
+            "{args:?} is a usage error, reported on stderr and never as an answer"
         );
     }
 
@@ -1040,6 +1016,25 @@ mod tests {
                     .as_str()
                     .is_some_and(|member| member.starts_with("xtask"))),
             "and not a member of the main one"
+        );
+    }
+
+    #[test]
+    fn workspace_rust_version_is_the_pinned_toolchain() {
+        let root = repo_root().unwrap();
+        let toolchain: toml_edit::DocumentMut =
+            fs::read_to_string(root.join("rust-toolchain.toml"))
+                .unwrap()
+                .parse()
+                .unwrap();
+        let manifest: toml_edit::DocumentMut = fs::read_to_string(root.join("Cargo.toml"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(
+            manifest["workspace"]["package"]["rust-version"].as_str(),
+            toolchain["toolchain"]["channel"].as_str(),
+            "Cargo.toml's rust-version must equal the channel in rust-toolchain.toml"
         );
     }
 }

@@ -12,10 +12,16 @@
   },
   "packageRules": [
     {
-      "description": "Bump the toolchain and both workspaces' rust-version together; xtask tests require them equal.",
+      "description": "Bump the toolchain and every workspace's rust-version together; xtask tests require them equal.",
       "matchDatasources": ["rust-version"],
       "matchDepNames": ["rust"],
       "groupName": "Rust toolchain"
+    },
+    {
+      "description": "axum and tokio-tungstenite move together. axum's ws feature depends on one tokio-tungstenite version and cargo-deny refuses two versions of a crate in the lockfile, so the worker's tokio-tungstenite can move only when axum's does: #18 (tokio-tungstenite 0.30) was closed because axum 0.8.9 still needs 0.29.",
+      "matchDatasources": ["crate"],
+      "matchPackageNames": ["axum", "tokio-tungstenite"],
+      "groupName": "axum and tokio-tungstenite"
     },
     {
       "description": "Pinned tools need new checksums with every version.",
@@ -28,8 +34,8 @@
   "customManagers": [
     {
       "customType": "regex",
-      "description": "The rust-version in Cargo.toml and in the fuzz workspace's fuzz/Cargo.toml.",
-      "managerFilePatterns": ["/^(fuzz/)?Cargo\\.toml$/"],
+      "description": "The rust-version in Cargo.toml and in the fuzz and xtask workspaces' manifests.",
+      "managerFilePatterns": ["/^(fuzz/|xtask/)?Cargo\\.toml$/"],
       "matchStrings": ["\\nrust-version = \"(?<currentValue>[^\"]+)\""],
       "depNameTemplate": "rust",
       "datasourceTemplate": "rust-version",
