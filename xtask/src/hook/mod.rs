@@ -9,6 +9,10 @@
 //! decision, so a usage error, a panic or a build failure can never read as one: the launcher
 //! answers for an xtask that cannot start.
 //!
+//! The answer's shape, the hook inputs this reads (`cwd`, `agent_id`, `stop_hook_active`) and the
+//! rule that a timed-out hook's output is discarded are Claude Code's, as its hooks reference
+//! specifies them: <https://code.claude.com/docs/en/hooks>. Check a change here against it.
+//!
 //! Claude Code starts every hook from the directory the session began in, but the agent may have
 //! moved since, for example into a worktree. The hook input's `cwd` says where it is now; without
 //! one, the session's project directory stands in. The hook resolves that directory's repository
