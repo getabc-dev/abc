@@ -52,8 +52,51 @@ jobs:
         run: cargo xtask setup --for-tests cargo-sqlx
       - name: Check the installed tools against their pins
         run: cargo xtask doctor --for-tests cargo-sqlx
-      - name: Format, clippy, tests, query caches, doctests, docs and shell scripts, in both workspaces
+      - name: Format, clippy, tests, query caches, doctests, docs and shell scripts, in both workspaces, and the web app's gates
         run: cargo xtask check
+
+  e2e:
+    name: End-to-end
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    # Database tests run against Postgres 18 on the port .cargo/config.toml's ABC_TEST_DATABASE_URL names,
+    # the same image as each machine's warm container (xtask/src/postgres.rs).
+    services:
+      postgres:
+        image: postgres:18.6@sha256:3a4264520e121176619f54ff867d12774bc81e95e7b84db58d63bccdb6144b81
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 127.0.0.1:55432:5432
+        options: >-
+          --health-cmd "pg_isready --host 127.0.0.1"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the pinned Rust toolchain
+        run: rustup toolchain install --no-self-update
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          # xtask is a workspace of its own, built into the root's target/ (.cargo/config.toml).
+          workspaces: |
+            . -> target
+            xtask -> ../target
+      - name: Install the pinned tools the tests run, and cargo-sqlx
+        run: cargo xtask setup --for-tests cargo-sqlx
+      - name: Check the installed tools against their pins
+        run: cargo xtask doctor --for-tests cargo-sqlx
+      - name: Install the web app's dependencies, and Chromium with the system libraries it needs
+        run: |
+          cargo xtask pnpm install --frozen-lockfile
+          cargo xtask pnpm exec playwright install --with-deps chromium
+      - name: The web app in Chromium, served by the release binary over Postgres and a sidecar stand-in
+        run: cargo xtask e2e
 
   dependencies:
     name: Dependencies
@@ -90,7 +133,7 @@ jobs:
       - name: Unused dependencies of the xtask workspace
         run: cargo xtask tool cargo-shear --deny-warnings --locked xtask
       - name: Known vulnerabilities (OSV)
-        run: cargo xtask tool osv-scanner scan source --lockfile Cargo.lock --lockfile fuzz/Cargo.lock --lockfile xtask/Cargo.lock
+        run: cargo xtask tool osv-scanner scan source --lockfile Cargo.lock --lockfile fuzz/Cargo.lock --lockfile xtask/Cargo.lock --lockfile web/pnpm-lock.yaml
 
   scans:
     name: Secrets and workflows
@@ -162,7 +205,7 @@ jobs:
         with:
           base: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
           gate: coverage
-          tools: cargo-nextest cargo-llvm-cov
+          tools: cargo-nextest cargo-llvm-cov node pnpm
       - name: Install the pull request's Rust toolchain
         run: rustup toolchain install --no-self-update
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
@@ -214,7 +257,7 @@ jobs:
         with:
           base: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
           gate: mutants
-          tools: cargo-nextest cargo-mutants
+          tools: cargo-nextest cargo-mutants node pnpm
       - name: Install the pull request's Rust toolchain
         run: rustup toolchain install --no-self-update
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3

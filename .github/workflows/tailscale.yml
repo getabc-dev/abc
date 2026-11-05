@@ -102,9 +102,14 @@ jobs:
             . -> target
             xtask -> ../target
       - name: Install the pinned tools
-        run: cargo xtask setup cargo-nextest
+        run: cargo xtask setup cargo-nextest node pnpm
       - name: Check the installed tools against their pins
-        run: cargo xtask doctor cargo-nextest
+        run: cargo xtask doctor cargo-nextest node pnpm
+      # The abc binary embeds the built web app (crates/abc/build.rs).
+      - name: Build the web app the binary embeds
+        run: |
+          cargo xtask pnpm install --frozen-lockfile
+          cargo xtask pnpm run build
       - name: Build the test first, so the node is not left waiting
         run: cargo xtask tool cargo-nextest nextest list --locked -p abc --run-ignored only
       # The runner joins as a node in kernel mode, as a worker's machine does: tailscale0 in the
