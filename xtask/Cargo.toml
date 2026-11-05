@@ -27,14 +27,11 @@ serde_json = "1.0.154"
 sha2 = "0.11.1"
 syn = { version = "3.0.9", features = ["full", "visit"] }
 tar = "0.4.46"
-# The review prompt states the date (UTC).
-time = "0.3.55"
 toml_edit = { version = "0.25.17", features = ["serde"] }
 ureq = "3.5.0"
 yaml-rust2 = "0.13.0"
 
 [dev-dependencies]
-proptest = { version = "1.12.0", default-features = false, features = ["std"] }
 tempfile = "3.27.0"
 
 # xtask hashes every pinned tool before running it; optimise sha2 so debug builds hash quickly.
