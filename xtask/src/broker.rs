@@ -118,18 +118,41 @@ pub(crate) fn request(socket: &Path, scope: Scope) -> anyhow::Result<String> {
     stream
         .set_read_timeout(Some(PATIENCE))
         .context("could not set a timeout on the broker's socket")?;
-    exchange(stream, scope)
+    exchange(stream, scope, std::thread::sleep)
 }
 
-/// Asks the broker on `stream` for a token for `scope`.
-fn exchange(mut stream: impl Read + Write, scope: Scope) -> anyhow::Result<String> {
+/// How long a client waits before reading the broker's answer again when the socket says it would
+/// block (`EAGAIN`), once per delay. A push once failed on one such read, and its retry worked.
+const READ_RETRY_DELAYS: [Duration; 3] = [
+    Duration::from_millis(50),
+    Duration::from_millis(200),
+    Duration::from_millis(500),
+];
+
+/// Asks the broker on `stream` for a token for `scope`, reading its answer again after `wait`ing
+/// whenever a read would block.
+fn exchange(
+    mut stream: impl Read + Write,
+    scope: Scope,
+    mut wait: impl FnMut(Duration),
+) -> anyhow::Result<String> {
     stream
         .write_all(format!("{}\n", scope.name()).as_bytes())
         .context("could not send the broker a request")?;
-    let mut answer = String::new();
-    BufReader::new(stream)
-        .read_line(&mut answer)
-        .context("could not read the broker's answer")?;
+    let mut reader = BufReader::new(stream);
+    let mut answer = Vec::new();
+    let mut delays = READ_RETRY_DELAYS.iter();
+    loop {
+        match reader.read_until(b'\n', &mut answer) {
+            Ok(_) => break,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => match delays.next() {
+                Some(&delay) => wait(delay),
+                None => return Err(error).context("could not read the broker's answer"),
+            },
+            Err(error) => return Err(error).context("could not read the broker's answer"),
+        }
+    }
+    let answer = String::from_utf8_lossy(&answer);
     let answer = answer.trim_end_matches('\n');
     match answer.split_once(' ') {
         Some(("token", token)) if !token.is_empty() => Ok(token.to_owned()),
@@ -621,7 +644,8 @@ mod tests {
                 (&server).write_all(answer.as_bytes()).unwrap();
                 request
             });
-            let token = exchange(client, scope).map_err(|error| format!("{error:#}"));
+            let token = exchange(client, scope, |_| panic!("no read would block"))
+                .map_err(|error| format!("{error:#}"));
             (broker.join().unwrap(), token)
         };
         assert_eq!(
@@ -642,6 +666,76 @@ mod tests {
                 "{nothing:?}"
             );
         }
+    }
+
+    /// A broker's end whose first `blocked` reads fail with `error`, then answers `answer`.
+    struct Hesitant {
+        blocked: usize,
+        error: std::io::ErrorKind,
+        answer: std::io::Cursor<&'static [u8]>,
+    }
+
+    impl std::io::Read for Hesitant {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.blocked > 0 {
+                self.blocked = self.blocked.saturating_sub(1);
+                return Err(self.error.into());
+            }
+            self.answer.read(buf)
+        }
+    }
+
+    impl std::io::Write for Hesitant {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_client_reads_again_when_the_socket_would_block() {
+        let ask_with = |blocked: usize, kind| {
+            let stream = Hesitant {
+                blocked,
+                error: kind,
+                answer: std::io::Cursor::new(b"token ghs_x\n"),
+            };
+            let mut waits = Vec::new();
+            let token = exchange(stream, Scope::Git, |delay| waits.push(delay))
+                .map_err(|error| format!("{error:#}"));
+            (token, waits)
+        };
+        let ask = |blocked| ask_with(blocked, std::io::ErrorKind::WouldBlock);
+        // `could not read the broker's answer: Resource temporarily unavailable (os error 11)`
+        // failed a push once; the retry by hand worked.
+        assert_eq!(
+            ask(2),
+            (
+                Ok("ghs_x".to_owned()),
+                super::READ_RETRY_DELAYS[..2].to_vec()
+            ),
+            "two reads would block, then the answer comes, after a short wait each time"
+        );
+        assert_eq!(ask(0), (Ok("ghs_x".to_owned()), Vec::new()), "no wait");
+        let (token, waits) = ask(4);
+        assert_eq!(
+            waits,
+            super::READ_RETRY_DELAYS.to_vec(),
+            "it waits a few times"
+        );
+        let error = token.unwrap_err();
+        assert!(
+            error.starts_with("could not read the broker's answer"),
+            "then gives up: {error}"
+        );
+        let (reset, reset_waits) = ask_with(1, std::io::ErrorKind::ConnectionReset);
+        assert!(
+            reset_waits.is_empty() && reset.is_err(),
+            "any other error fails at once"
+        );
     }
 
     #[test]
