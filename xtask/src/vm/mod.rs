@@ -25,7 +25,7 @@ use std::time::Duration;
 use anyhow::{Context as _, bail, ensure};
 use clap::Subcommand;
 
-use session::Session;
+use session::{Push, Session};
 
 /// What `cargo xtask vm` does.
 #[derive(Debug, Subcommand)]
@@ -43,6 +43,9 @@ pub(crate) enum Action {
     Auth { worktree: PathBuf },
     /// Move the worktree's branch to the commits made in the session.
     Sync { worktree: PathBuf },
+    /// Bring the worktree branch's commits made on the host into the running session's
+    /// repository, fast-forward only; refuses when the session's branch has diverged.
+    Push { worktree: PathBuf },
     /// Stop the session's VM and delete it with its logs; --purge also deletes its volumes and
     /// git repository.
     Stop {
@@ -315,6 +318,10 @@ pub(crate) fn run(
         Action::Sync { worktree } => {
             let session = Session::open(&worktree, &host.repo, &host.state)?;
             writeln!(out, "vm: {}", session.sync()?)?;
+        }
+        Action::Push { worktree } => {
+            let session = Session::open(&worktree, &host.repo, &host.state)?;
+            writeln!(out, "vm: {}", push(&session, backend)?)?;
         }
         Action::Stop { worktree, purge } => {
             stop(
@@ -591,6 +598,39 @@ fn shell(
     full.extend(command);
     let status = backend.attach(&session.name, &full, tty)?;
     Ok(ExitCode::from(crate::tools::status_code(status)))
+}
+
+/// Brings the worktree branch's new commits into the running VM of `session`: the VM's own git
+/// fetches them from a bundle piped in, so the host never runs git in the repository the VM is
+/// writing. Returns what changed, for the user.
+fn push(session: &Session, backend: &dyn Backend) -> anyhow::Result<String> {
+    ensure!(
+        backend.is_running(&session.name)?,
+        "{} is not running; `cargo xtask vm start` brings the worktree's commits in as it starts",
+        session.name
+    );
+    let (branch, from, to, bundle) = match session.push()? {
+        Push::Current(note) => return Ok(note),
+        Push::Bundle {
+            branch,
+            from,
+            to,
+            bundle,
+        } => (branch, from, to, bundle),
+    };
+    let mut command = words(&["agent-exec", "sh", "-c", session::APPLY_PUSH, "sh"]);
+    command.push(OsString::from(&branch));
+    let output = backend.exec(&session.name, &command, &bundle)?;
+    ensure!(
+        output.status.success(),
+        "the VM did not take the commits: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    Ok(format!(
+        "the VM's {branch}: {} -> {}; its index now matches the new commit",
+        session::short(&from),
+        session::short(&to)
+    ))
 }
 
 fn stop(session: &Session, host: &Host, backend: &dyn Backend, purge: bool) -> anyhow::Result<()> {

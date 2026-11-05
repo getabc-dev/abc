@@ -152,6 +152,7 @@ cargo xtask vm start ../abc-my-change    # starts the broker if needed; a few se
 cargo xtask vm shell ../abc-my-change    # Claude Code as the agent; add `bash` for a shell
 cargo xtask vm auth ../abc-my-change     # how Claude Code is signed in, without secrets
 cargo xtask vm sync ../abc-my-change     # move the worktree's branch to the VM's commits
+cargo xtask vm push ../abc-my-change     # bring commits made on the host into the running VM
 cargo xtask vm stop ../abc-my-change     # revokes its tokens; --purge also drops its volumes
 ```
 
