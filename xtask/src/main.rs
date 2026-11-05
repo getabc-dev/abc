@@ -992,4 +992,54 @@ mod tests {
             "Cargo.toml's rust-version must equal the channel in rust-toolchain.toml"
         );
     }
+
+    #[test]
+    fn the_xtask_workspace_shares_the_nextest_configuration() {
+        let root = repo_root().unwrap();
+        assert_eq!(
+            fs::read_link(root.join("xtask/.config")).unwrap(),
+            Path::new("../.config"),
+            "nextest reads .config/ from the workspace root; xtask's is the repository's"
+        );
+    }
+
+    #[test]
+    fn the_xtask_workspace_keeps_the_main_workspace_lints_and_rust_version() {
+        let root = repo_root().unwrap();
+        let read = |path: &str| -> serde_json::Value {
+            toml_edit::de::from_str(&fs::read_to_string(root.join(path)).unwrap()).unwrap()
+        };
+        let main = read("Cargo.toml");
+        let xtask = read("xtask/Cargo.toml");
+        assert!(
+            main["workspace"]["lints"].is_object(),
+            "the main workspace sets lints"
+        );
+        assert_eq!(
+            xtask["lints"], main["workspace"]["lints"],
+            "xtask/Cargo.toml's [lints] must equal Cargo.toml's [workspace.lints]"
+        );
+        assert!(
+            main["workspace"]["package"]["rust-version"].is_string(),
+            "the main workspace sets rust-version"
+        );
+        assert_eq!(
+            xtask["package"]["rust-version"], main["workspace"]["package"]["rust-version"],
+            "xtask/Cargo.toml's rust-version must equal the main workspace's"
+        );
+        assert!(
+            xtask["workspace"].is_object(),
+            "xtask is a workspace of its own"
+        );
+        assert!(
+            !main["workspace"]["members"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|member| member
+                    .as_str()
+                    .is_some_and(|member| member.starts_with("xtask"))),
+            "and not a member of the main one"
+        );
+    }
 }
