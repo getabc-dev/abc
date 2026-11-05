@@ -81,8 +81,13 @@ brief.
 
 - **Server and worker:** Rust in one Cargo workspace, shipped as one signed binary
   (`abc server`, `abc worker`).
-- **Web app and phone:** React, strict TypeScript, Vite, TanStack Router and Query; an installable
-  PWA.
+- **Web app and phone:** React with strict TypeScript 7 (the native compiler), Vite, TanStack
+  Router and Query, Tailwind CSS v4 with its tokens as CSS variables in `@theme`, and React Aria
+  Components; pnpm, and an installable PWA. It lives in `web/`; each screen follows the Elm
+  architecture: a discriminated-union message type, a pure `update(model, message)` and effects at
+  the edge. The `abc` binary embeds the built app (`web/dist`) and serves it beside the API.
+  Biome, Oxlint with type-aware rules, `tsc`, knip and Vitest gate it, and Playwright runs it in
+  Chromium end to end.
 - **Types:** Rust is the source of truth. TypeScript types and JSON Schema are generated from it,
   never written by hand.
 - **Data:** Postgres on the server and a SQLite outbox on each worker, both through sqlx with
@@ -111,11 +116,14 @@ watchdog compares the diff with that task and the rules above, and keeps it work
 | --- | --- |
 | `cargo xtask setup [--for-tests] [TOOLS]` | Installs the tools pinned in `xtask/tools.toml` into `.tools/`, checking the sha256 of each archive or crate and of the executable. Run it in every new clone or worktree, and after the list changes. It never touches git config. `--for-tests` installs the tools marked `for-tests`, those the tests run, with any named; every CI job that runs tests uses it, and `rulesets check` fails one that does not. |
 | `cargo xtask doctor [--for-tests] [TOOLS]` | Fails unless every pinned tool, or each one named or marked `for-tests`, is installed, matches its pinned sha256 and reports its pinned version. |
-| `cargo xtask check` | Format check, clippy (`--all-targets --locked -D warnings`), nextest, sqlx's query cache check, doctests and rustdoc with warnings denied, on both workspaces, the main one and xtask's, and the pinned shellcheck on the shell scripts. Property tests run with a fixed seed. Database tests use the warm Postgres 18 container (below). It first fails when the changes since the merge base with the default branch are larger than the Gemini review accepts (the diff `review` sends, without generated files), so an oversized change is split before CI; files not yet added to git are not counted. |
-| `cargo xtask check --changed` | The same, limited to the crates affected by changes since the merge base with the default branch (`upstream/HEAD`, else `origin/HEAD`). |
+| `cargo xtask check` | Format check, clippy (`--all-targets --locked -D warnings`), nextest, sqlx's query cache check, doctests and rustdoc with warnings denied, on both workspaces, the main one and xtask's, and the pinned shellcheck on the shell scripts. Then the web app's gates (`web/package.json`'s scripts): it installs `web/node_modules` with the pinned pnpm (`--frozen-lockfile`), builds `web/dist`, and runs Biome (format and lint), Oxlint with type-aware rules, `tsc` (TypeScript 7), knip (unused files, exports and dependencies) and Vitest; each failure names its fix. Property tests and Vitest's shuffled order run with a fixed seed. Database tests use the warm Postgres 18 container (below). It first fails when the changes since the merge base with the default branch are larger than the Gemini review accepts (the diff `review` sends, without generated files), so an oversized change is split before CI; files not yet added to git are not counted. |
+| `cargo xtask check --changed` | The same, limited to the crates affected by changes since the merge base with the default branch (`upstream/HEAD`, else `origin/HEAD`), and to the web gates when `web/` or `xtask/tools.toml` changed. The `abc` crate embeds `web/dist`, so a change to the main workspace builds the web app first when no build is there. |
+| `cargo xtask build` | Builds the web app with the pinned pnpm, then the `abc` binary with it embedded (`cargo build --release -p abc`), into `target/release/abc`. A plain `cargo build` of `abc` without a web build fails and names this command. |
+| `cargo xtask pnpm [args]` | Runs the pinned pnpm in `web/` with the pinned node first on `PATH`: `install` after `web/package.json` changes, `run dev` for Vite's dev server, `exec biome check --write` to format. pnpm refuses packages published less than 3 days ago (`web/pnpm-workspace.yaml`). |
+| `cargo xtask e2e` | Builds abc as `build` does, starts `abc server` on a fresh database on the test Postgres server behind `web/e2e/sidecar.ts`, a stand-in for the Tailscale sidecar that answers over HTTPS on the server's public origin, as Serve does, and runs Playwright's tests (`web/e2e/`) in Chromium, which it installs first; on Linux, `cargo xtask pnpm exec playwright install --with-deps chromium` installs its system libraries, and agent VMs have Chromium in their image. |
 | `cargo xtask fuzz [--seconds N]` | Fuzzes protocol message decoding (target `decode` in `fuzz/`, a Cargo workspace of its own so normal builds never compile libFuzzer) with the pinned cargo-fuzz for N seconds (default 60), starting from the committed seeds in `fuzz/seeds/decode/`. It first runs rustfmt and clippy (`--locked`, warnings denied) on `fuzz/`, which `check` does not cover; `fuzz/Cargo.toml` copies the root's lints, and an xtask test keeps them equal. A failing input is saved under `fuzz/artifacts/decode/`; once fixed, add it to the seeds. |
-| `cargo xtask integrity --base <rev> [--description <file>]` | Lists deleted test files and tests, tests a commit of the branch added and a later one deleted, newly skipped or `should_panic` tests, tests with fewer assertions, and changed gate files since the merge base. In CI it fails on any of them unless an approver listed in `.github/integrity-approvers` at the merge base labelled the PR `integrity-approved` after its last push and last description edit; a run for a description edit treats any earlier label as stale. Each flagged test change also needs a reason in the PR description, label or not, and the description names no test it does not flag (below). |
-| `cargo xtask coverage --base <rev>` | Runs the tests of both workspaces under cargo-llvm-cov and fails unless 90% of the changed, instrumented lines of shipped code are covered, listing the ones that are not. Test code (`#[cfg(test)]` items, test functions, test modules in their own files, `tests/`) does not count. |
+| `cargo xtask integrity --base <rev> [--description <file>]` | Reads Rust tests and the web app's (`*.test.ts`, `*.test.tsx`, where `.skip`, `.todo`, `.fixme` and `x`-prefixed calls count as skipped and `.fails` as `should_panic`). Lists deleted test files and tests, tests a commit of the branch added and a later one deleted, newly skipped or `should_panic` tests, tests with fewer assertions, and changed gate files since the merge base. In CI it fails on any of them unless an approver listed in `.github/integrity-approvers` at the merge base labelled the PR `integrity-approved` after its last push and last description edit; a run for a description edit treats any earlier label as stale. Each flagged test change also needs a reason in the PR description, label or not, and the description names no test it does not flag (below). |
+| `cargo xtask coverage --base <rev>` | Runs the tests of both workspaces under cargo-llvm-cov and the web app's under Vitest's coverage-v8, and fails unless 90% of the changed, instrumented lines of shipped code, Rust and TypeScript together, are covered, listing the ones that are not. Test code (`#[cfg(test)]` items, test functions, test modules in their own files, `tests/`) does not count. |
 | `cargo xtask mutants --base <rev> [--jobs N] [--shard k/n]` | Runs cargo-mutants on the Rust lines changed since the merge base, or one shard of them, and fails on any missed mutant: a change to the code that no test notices. A mutant whose tests hang counts as caught. The main workspace's mutants build in copies of the tree; xtask's are tested in place, one at a time, because its tests read the repository around it. |
 | `cargo xtask review --base <rev>` | Gemini reviews the diff, the PR's title and description against this file as it stands at the merge base. Runs in CI; it blocks on a `block` verdict or any blocking finding, and fails closed on quota, size and missing-key errors. |
 | `cargo xtask task set "<text>"` / `show` / `clear` | Records, prints or forgets the current task in `.abc/task.md` (not committed), for the watchdog. |
@@ -147,15 +155,16 @@ of killed runs (`abc_test_*`, `abc_query_cache_*`) are swept after a day. sqlx's
 always read the committed `.sqlx/` cache (`SQLX_OFFLINE`), and `check` fails when a cache no
 longer matches its queries, saying how to regenerate it.
 
-CI runs `check`, `integrity`, `coverage`, `mutants` (in eight shards, reported as one `Mutants`
-check), `review` and `fuzz` (for a minute; for an hour nightly on `main`) on every pull request, and
+CI runs `check`, `e2e`, `integrity`, `coverage`, `mutants` (in eight shards, reported as one
+`Mutants` check), `review` and `fuzz` (for a minute; for an hour nightly on `main`) on every pull
+request, and
 `cargo xtask tool cargo-deny check`, `cargo xtask tool cargo-shear --deny-warnings --locked`, both
 again on the fuzz workspace (`cargo xtask tool cargo-deny --manifest-path fuzz/Cargo.toml --config
 fuzz/deny.toml --locked check`, `cargo xtask tool cargo-shear --deny-warnings --locked fuzz`) and
 on xtask's (`cargo xtask tool cargo-deny --manifest-path xtask/Cargo.toml --config xtask/deny.toml
 --locked check`, `cargo xtask tool cargo-shear --deny-warnings --locked xtask`), `cargo xtask tool
 osv-scanner scan source --lockfile Cargo.lock --lockfile fuzz/Cargo.lock --lockfile
-xtask/Cargo.lock`, `cargo
+xtask/Cargo.lock --lockfile web/pnpm-lock.yaml`, `cargo
 xtask tool zizmor --pedantic .github`, `cargo xtask tool pinact run --check --verify-comment` and
 `cargo xtask tool gitleaks git --redact --no-banner --verbose .`. Every job is a required check on
 `main`. Integrity, Coverage, Mutants and Gemini review run the base commit's xtask on the pull
@@ -182,7 +191,8 @@ changes no tests.
 
 The gate files are the files that decide what passes: CI and rulesets (`.github/`), cargo, lint,
 toolchain and tool configuration, `Cargo.toml` and `Cargo.lock` (the fuzz workspace's too, with
-`fuzz/deny.toml`), the agent settings, this file and `CLAUDE.md`, and all of `xtask/`, its
+`fuzz/deny.toml`), the web app's manifest, lockfile, pnpm, TypeScript, Vite, Biome, Oxlint, knip and
+Playwright configuration, the agent settings, this file and `CLAUDE.md`, and all of `xtask/`, its
 workspace's manifest, lockfile and `deny.toml` included. `GATES` in
 `xtask/src/integrity/mod.rs` lists them, and a test keeps `.github/CODEOWNERS` identical. A change
 to one needs the integrity approval and a code owner's review.

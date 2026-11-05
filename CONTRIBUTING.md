@@ -36,11 +36,43 @@ You need:
 ```sh
 git clone https://github.com/getabc-dev/abc.git
 cd abc
-cargo xtask setup    # install the pinned tools into .tools/, verifying each download
+cargo xtask setup    # install the pinned tools into .tools/, verifying each download,
+                     # node and pnpm for the web app among them
 cargo xtask doctor   # confirm every pinned tool is installed at its pinned version
 ```
 
-Run `cargo xtask setup` again in every new worktree, and whenever `xtask/tools.toml` changes.
+Run `cargo xtask setup` again in every new worktree, and whenever `xtask/tools.toml` changes. You
+never need a node or pnpm of your own: `cargo xtask pnpm` runs the pinned ones.
+
+## Build and run abc
+
+The `abc` binary embeds the web app (`web/`), so build it with xtask, which builds the web app
+first:
+
+```sh
+cargo xtask build    # web/dist with the pinned pnpm, then target/release/abc with it embedded
+```
+
+A plain `cargo build` of the `abc` crate without a web build fails and names `cargo xtask build`.
+`abc server` serves the app on its sidecar socket beside the API, behind the Tailscale sidecar.
+
+To work on the web app with Vite's dev server and its instant reloads:
+
+```sh
+cargo xtask pnpm install     # web/node_modules from web/pnpm-lock.yaml
+cargo xtask pnpm run dev     # http://localhost:5173
+cargo xtask pnpm add -E <package>@<version>   # add a dependency; commit web/pnpm-lock.yaml
+```
+
+pnpm refuses any package published less than 3 days ago, as Renovate waits 3 days to propose
+one. To see the app served by the real binary in Chromium, as CI does:
+
+```sh
+cargo xtask e2e      # build abc, serve it on a fresh database, run web/e2e/ with Playwright
+```
+
+On Linux, Chromium needs system libraries: `cargo xtask pnpm exec playwright install --with-deps
+chromium` installs them with sudo. In an agent VM, Chromium and its libraries come with the image.
 
 ## Work on a change
 
@@ -59,12 +91,15 @@ Before you open a PR, run the gate locally:
 cargo fmt --all              # fix formatting; the gate only checks it (and xtask's:
                              # cargo fmt --all --manifest-path xtask/Cargo.toml)
 cargo xtask check            # format, clippy, tests, doctests and rustdoc on both workspaces,
-                             # and shellcheck on the shell scripts
-cargo xtask check --changed  # the same, limited to the crates your change affects
+                             # shellcheck on the shell scripts, and the web app's Biome,
+                             # Oxlint, tsc, knip and Vitest
+cargo xtask check --changed  # the same, limited to the crates your change affects, and to the
+                             # web gates when web/ changed
+cargo xtask pnpm exec biome check --write   # format the web app and apply Biome's safe fixes
 ```
 
-CI runs more gates on every PR: Integrity, Coverage, Mutants, a Gemini review and the dependency,
-secret and workflow scans. The Commands section of [AGENTS.md](AGENTS.md#commands) lists them with
+CI runs more gates on every PR: End-to-end (`cargo xtask e2e`), Integrity, Coverage, Mutants, a
+Gemini review and the dependency, secret and workflow scans. The Commands section of [AGENTS.md](AGENTS.md#commands) lists them with
 the command behind each.
 
 ## Test changes
@@ -142,7 +177,8 @@ cargo xtask vm image          # builds the agent image and loads it (about 20 mi
 ```
 
 Paste the token at the prompt, never on the command line. Rebuild the image when
-`xtask/vm/`, `rust-toolchain.toml` or the pinned tools change.
+`xtask/vm/`, `rust-toolchain.toml`, the pinned tools or `@playwright/test` in `web/package.json`
+change: the image holds Playwright's Chromium, since VMs never download browsers.
 
 Per session:
 

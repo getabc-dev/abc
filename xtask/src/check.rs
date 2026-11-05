@@ -1,7 +1,14 @@
 //! `cargo xtask check`: the format, lint and test gate that agents' stop hooks and CI share.
 //!
-//! It covers the repository's two Cargo workspaces, the main one and xtask's own (`xtask/`), and
-//! lints its shell scripts with the pinned shellcheck. The fuzz workspace is `cargo xtask fuzz`'s.
+//! It covers the repository's two Cargo workspaces, the main one and xtask's own (`xtask/`), lints
+//! its shell scripts with the pinned shellcheck, and runs the web app's gates ([`crate::web`]):
+//! Biome, Oxlint, tsc, knip and Vitest, after installing and building it with the pinned pnpm.
+//! The fuzz workspace is `cargo xtask fuzz`'s.
+//!
+//! The main workspace's `abc` crate embeds the built web app (`web/dist`), so clippy and the tests
+//! of the main workspace need one. With `--changed`, the web gates run only when `web/` or the
+//! pinned node and pnpm changed, and the web app is built for the main workspace only when no
+//! build is there yet, so a change elsewhere does not wait for pnpm.
 
 use std::collections::BTreeSet;
 use std::ffi::OsString;
@@ -60,12 +67,15 @@ pub(crate) struct Tree<'a> {
     pub(crate) workspaces: &'a [Workspace],
     /// Shell scripts, relative to the root.
     pub(crate) scripts: &'a [&'a str],
+    /// Whether the tree holds the web app (`web/`), which [`MAIN`]'s crates embed.
+    pub(crate) web: bool,
 }
 
-/// This repository: both workspaces and every script.
+/// This repository: both workspaces, every script and the web app.
 pub(crate) const REPOSITORY: Tree<'static> = Tree {
     workspaces: &[MAIN, XTASK],
     scripts: &SCRIPTS,
+    web: true,
 };
 
 impl Workspace {
@@ -192,6 +202,8 @@ impl Failure {
 pub(crate) struct Tools {
     pub(crate) nextest: PathBuf,
     pub(crate) shellcheck: PathBuf,
+    /// node and pnpm, for a tree with the web app.
+    pub(crate) web: Option<crate::web::Toolchain>,
 }
 
 /// How the check reaches Postgres.
@@ -233,6 +245,8 @@ struct Run<'a, W> {
     target_dir: Option<&'a Path>,
     out: &'a mut W,
     failures: Vec<Failure>,
+    /// node and pnpm, when the tree holds the web app.
+    web: Option<&'a crate::web::Toolchain>,
 }
 
 /// Runs the check of `tree` from `root` and reports whether it passed. With `changed`, clippy and
@@ -256,6 +270,13 @@ pub(crate) fn run(
     } else {
         None
     };
+    let web = if tree.web {
+        Some(tools.web.as_ref().context(
+            "the tree holds the web app, but node and pnpm were not given; run `cargo xtask setup`",
+        )?)
+    } else {
+        None
+    };
     let mut run = Run {
         root,
         tools,
@@ -263,8 +284,22 @@ pub(crate) fn run(
         target_dir,
         out,
         failures: Vec::new(),
+        web,
     };
     run.shellcheck(tree.scripts)?;
+    if let Some(toolchain) = web {
+        match &changed_files {
+            _ if !crate::web::present(root) => writeln!(
+                run.out,
+                "xtask: the tree holds no web app (web/package.json); skipping the web gates"
+            )?,
+            Some(files) if !files.iter().any(|path| crate::web::affected_by(path)) => writeln!(
+                run.out,
+                "xtask: nothing under web/ changed; skipping the web gates"
+            )?,
+            Some(_) | None => run.web_gates(toolchain)?,
+        }
+    }
     for &workspace in tree.workspaces {
         let (scope, packages) = match &changed_files {
             Some(files) => {
@@ -352,6 +387,55 @@ impl<W: Write> Run<'_, W> {
         Ok(())
     }
 
+    /// Installs and builds the web app, then runs its gates.
+    fn web_gates(&mut self, toolchain: &crate::web::Toolchain) -> anyhow::Result<()> {
+        if !self.web_build(toolchain)? {
+            return Ok(());
+        }
+        for gate in crate::web::GATES {
+            if !self.step(&mut toolchain.step(self.root, &gate)?)? {
+                self.failures.push(Failure {
+                    step: gate.name.to_owned(),
+                    fix: gate.fix.to_owned(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Installs and builds the web app, and reports whether both passed.
+    fn web_build(&mut self, toolchain: &crate::web::Toolchain) -> anyhow::Result<bool> {
+        let root = self.root;
+        let failed = crate::web::build(root, toolchain, &mut |command| self.step(command))?;
+        Ok(match failed {
+            Some(step) => {
+                self.failures.push(Failure {
+                    step: step.name.to_owned(),
+                    fix: step.fix.to_owned(),
+                });
+                false
+            }
+            None => true,
+        })
+    }
+
+    /// Whether the web app the main workspace's `abc` crate embeds is built, building it when the
+    /// tree holds it and no build is there yet. A tree without the web app, such as a test's
+    /// fixture, needs none.
+    fn web_built(&mut self) -> anyhow::Result<bool> {
+        let Some(toolchain) = self.web else {
+            return Ok(true);
+        };
+        if crate::web::built(self.root) || !crate::web::present(self.root) {
+            return Ok(true);
+        }
+        writeln!(
+            self.out,
+            "xtask: the abc crate embeds web/dist, which is not built yet; building it"
+        )?;
+        self.web_build(toolchain)
+    }
+
     /// Runs each step on `scope` of `workspace`. `packages` are the workspace's, when already
     /// read.
     fn workspace(
@@ -378,6 +462,9 @@ impl<W: Write> Run<'_, W> {
                  tests and docs",
                 workspace.label()
             )?;
+            return Ok(());
+        }
+        if workspace == MAIN && !self.web_built()? {
             return Ok(());
         }
         let mut clippy = Command::new(cargo());
@@ -1187,10 +1274,12 @@ mod tests {
         let tools = Tools {
             nextest,
             shellcheck: crate::testing::pinned_for_tests("shellcheck"),
+            web: None,
         };
         let tree = Tree {
             workspaces: &[MAIN],
             scripts: &[],
+            web: false,
         };
         let passed = run(
             fixture.path(),
@@ -1263,6 +1352,7 @@ mod tests {
         let tools = Tools {
             nextest: PathBuf::from("unused"),
             shellcheck: crate::testing::pinned_for_tests("shellcheck"),
+            web: None,
         };
         let unused = |_: &mut dyn std::io::Write| anyhow::bail!("no database");
         let no_sqlx = || anyhow::bail!("no query cache");
@@ -1273,10 +1363,177 @@ mod tests {
         let tree = Tree {
             workspaces: &[],
             scripts,
+            web: false,
         };
         let mut out = Vec::new();
         let passed = run(dir, tree, false, &tools, &postgres, None, &mut out).unwrap();
         (passed, String::from_utf8(out).unwrap())
+    }
+
+    /// Runs only the web gates on the tree at `dir`, with node and pnpm from `web`.
+    fn web_gates_in(
+        dir: &Path,
+        web: Option<crate::web::Toolchain>,
+    ) -> anyhow::Result<(bool, String)> {
+        let tools = Tools {
+            nextest: PathBuf::from("unused"),
+            shellcheck: PathBuf::from("unused"),
+            web,
+        };
+        let unused = |_: &mut dyn std::io::Write| anyhow::bail!("no database");
+        let no_sqlx = || anyhow::bail!("no query cache");
+        let postgres = super::Postgres {
+            warm: &unused,
+            sqlx: &no_sqlx,
+        };
+        let tree = Tree {
+            workspaces: &[],
+            scripts: &[],
+            web: true,
+        };
+        let mut out = Vec::new();
+        let passed = run(dir, tree, false, &tools, &postgres, None, &mut out)?;
+        Ok((passed, String::from_utf8(out)?))
+    }
+
+    #[test]
+    fn the_web_gates_run_in_order_and_each_failure_names_its_fix() {
+        let temp = tempfile::tempdir().unwrap();
+        let tree = temp.path().join("tree");
+        crate::testing::abc_tree(&tree);
+        let tools = temp.path().join("tools");
+        let (passed, out) =
+            web_gates_in(&tree, Some(crate::testing::fake_web(&tools, ""))).unwrap();
+        assert!(passed, "{out}");
+        assert_eq!(
+            crate::testing::pnpm_calls(&tools),
+            "install --frozen-lockfile\nrun --silent build\nrun --silent biome\n\
+             run --silent oxlint\nrun --silent typecheck\nrun --silent knip\n\
+             run --silent test\n"
+        );
+
+        let failing = temp.path().join("failing");
+        let (knip_passed, knip_out) =
+            web_gates_in(&tree, Some(crate::testing::fake_web(&failing, "knip"))).unwrap();
+        assert!(!knip_passed, "{knip_out}");
+        assert!(
+            knip_out.contains("  web unused code (knip): delete each unused file"),
+            "{knip_out}"
+        );
+        assert!(
+            crate::testing::pnpm_calls(&failing).ends_with("run --silent test\n"),
+            "the other gates still run"
+        );
+
+        let broken = temp.path().join("broken");
+        let (install_passed, install_out) =
+            web_gates_in(&tree, Some(crate::testing::fake_web(&broken, "install"))).unwrap();
+        assert!(!install_passed, "{install_out}");
+        assert!(
+            install_out.contains("  web install: web/pnpm-lock.yaml must match"),
+            "{install_out}"
+        );
+        assert_eq!(
+            crate::testing::pnpm_calls(&broken),
+            "install --frozen-lockfile\n",
+            "no gate runs on a failed install"
+        );
+    }
+
+    #[test]
+    fn with_changed_the_web_gates_follow_web_changes_and_the_build_is_made_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let work = clone_with_origin(temp.path());
+        crate::testing::abc_tree(&work);
+        fs::write(work.join(".gitignore"), "/web/dist/\n").unwrap();
+        git(&work, &["add", "--all"]);
+        git(&work, &["commit", "--quiet", "-m", "the app"]);
+        git(&work, &["push", "--quiet", "origin", "HEAD:main"]);
+        git(&work, &["fetch", "--quiet", "origin"]);
+        let tools_dir = temp.path().join("tools");
+        let tools = Tools {
+            nextest: crate::testing::pinned_for_tests("cargo-nextest"),
+            shellcheck: PathBuf::from("unused"),
+            web: Some(crate::testing::fake_web(&tools_dir, "")),
+        };
+        let unused = |_: &mut dyn std::io::Write| anyhow::bail!("no database");
+        let no_sqlx = || anyhow::bail!("no query cache");
+        let postgres = super::Postgres {
+            warm: &unused,
+            sqlx: &no_sqlx,
+        };
+        let tree = Tree {
+            workspaces: &[MAIN],
+            scripts: &[],
+            web: true,
+        };
+        let target = temp.path().join("target");
+        let check = || {
+            let mut out = Vec::new();
+            let passed = run(
+                &work,
+                tree,
+                true,
+                &tools,
+                &postgres,
+                Some(&target),
+                &mut out,
+            )
+            .unwrap();
+            (passed, String::from_utf8(out).unwrap())
+        };
+
+        fs::write(work.join("src/notes.rs"), "//! Notes.\n").unwrap();
+        let (passed, out) = check();
+        assert!(passed, "{out}");
+        assert!(
+            out.contains("nothing under web/ changed; skipping the web gates"),
+            "{out}"
+        );
+        assert!(
+            out.contains("embeds web/dist, which is not built yet"),
+            "{out}"
+        );
+        assert_eq!(
+            crate::testing::pnpm_calls(&tools_dir),
+            "install --frozen-lockfile\nrun --silent build\n",
+            "built for the abc crate, with no gate run"
+        );
+        let (again, said) = check();
+        assert!(again, "{said}");
+        assert_eq!(
+            crate::testing::pnpm_calls(&tools_dir),
+            "install --frozen-lockfile\nrun --silent build\n",
+            "a build that is there is used as it is"
+        );
+
+        fs::write(work.join("web/package.json"), "{\"private\": true}\n").unwrap();
+        let (gated, gates_out) = check();
+        assert!(gated, "{gates_out}");
+        assert!(
+            crate::testing::pnpm_calls(&tools_dir).ends_with("run --silent test\n"),
+            "a web change runs the gates"
+        );
+    }
+
+    #[test]
+    fn a_tree_without_the_web_app_skips_its_gates_and_one_with_it_needs_node_and_pnpm() {
+        let empty = tempfile::tempdir().unwrap();
+        let tools = tempfile::tempdir().unwrap();
+        let (passed, out) = web_gates_in(
+            empty.path(),
+            Some(crate::testing::fake_web(tools.path(), "")),
+        )
+        .unwrap();
+        assert!(passed, "{out}");
+        assert!(out.contains("skipping the web gates"), "{out}");
+        assert_eq!(
+            crate::testing::pnpm_calls(tools.path()),
+            "",
+            "pnpm never ran"
+        );
+        let error = web_gates_in(empty.path(), None).unwrap_err().to_string();
+        assert!(error.contains("run `cargo xtask setup`"), "{error}");
     }
 
     #[test]

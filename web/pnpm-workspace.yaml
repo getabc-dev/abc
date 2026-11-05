@@ -1,0 +1,19 @@
+# pnpm's settings for the web app. web/ is one package, not a workspace of several.
+
+# Refuse any version published less than 3 days (4320 minutes) ago, as Renovate waits 3 days
+# before proposing one (renovate.json).
+minimumReleaseAge: 4320
+# Exact versions only, in package.json and in what `pnpm add` writes.
+savePrefix: ""
+# Fail on a dependency that wants to run an install script nobody allowed.
+strictDepBuilds: true
+# What dependencies may do beyond being installed. Agent skills they ship would reach the agents
+# that build abc, so each package that offers some is denied by name.
+permissions:
+  "@tanstack/react-router":
+    skills: false
+  "@tanstack/router-plugin":
+    skills: false
+# The package store, inside the repository's build output so it shares the checkout's file system
+# (pnpm links from it) and `cargo clean` clears it.
+storeDir: ../target/pnpm-store

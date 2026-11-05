@@ -4,6 +4,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fmt;
+use std::fmt::Write as _;
 use std::fs::{self, Permissions};
 use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
@@ -112,6 +113,11 @@ pub(crate) struct Tool {
     /// `cargo xtask setup --for-tests`.
     #[serde(rename = "for-tests", default)]
     pub(crate) for_tests: bool,
+    /// Whether the whole archive is installed as the tool's directory, for a tool that needs the
+    /// files beside its executable at run time, such as pnpm's `dist/`. `binary` is then the
+    /// executable's path in that directory, and each target's `tree-sha256` pins the directory.
+    #[serde(default)]
+    tree: bool,
 }
 
 /// Where a tool comes from.
@@ -155,6 +161,10 @@ struct Asset {
     library: Option<String>,
     /// Lowercase hex sha256 of that library, checked whenever xtask uses the tool.
     library_sha256: Option<String>,
+    /// For a tool installed as a directory: lowercase hex sha256 of the directory's manifest
+    /// ([`Tree::manifest`]), every file with its sha256 and whether it is executable, checked
+    /// whenever xtask uses the tool.
+    tree_sha256: Option<String>,
 }
 
 /// The validated tool list.
@@ -304,8 +314,34 @@ impl Tool {
                 "{target}: binary must not be empty; omit it when the asset is the executable"
             );
             self.validate_library(target, asset)?;
+            self.validate_tree(target, asset)?;
         }
         Ok(())
+    }
+
+    /// Checks that a tool installed as a directory pins each target's tree, and that only such a
+    /// tool does.
+    fn validate_tree(&self, target: Target, asset: &Asset) -> anyhow::Result<()> {
+        match (self.tree, &asset.tree_sha256) {
+            (false, None) => Ok(()),
+            (true, Some(sha256)) => {
+                ensure!(
+                    self.binary.is_some(),
+                    "{target}: a tree comes only from an archive, which needs `binary`"
+                );
+                ensure!(
+                    asset.library.is_none(),
+                    "{target}: a tree holds its libraries itself; drop `library`"
+                );
+                ensure!(
+                    is_sha256_hex(sha256),
+                    "{target}: tree-sha256 must be 64 lowercase hex digits"
+                );
+                Ok(())
+            }
+            (true, None) => bail!("{target}: `tree = true` needs a tree-sha256"),
+            (false, Some(_)) => bail!("{target}: tree-sha256 needs `tree = true`"),
+        }
     }
 
     /// Checks what vouches for a release tool's downloads: at least one source, each well formed.
@@ -425,7 +461,7 @@ impl Tool {
     }
 
     fn recorded_sha256(&self, root: &Path) -> PathBuf {
-        let mut record = self.executable(root).into_os_string();
+        let mut record = self.version_dir(root).join(&self.name).into_os_string();
         record.push(".sha256");
         PathBuf::from(record)
     }
@@ -458,36 +494,61 @@ impl Tool {
             .zip(asset.library_sha256.as_deref())
             .and_then(|(member, sha256)| {
                 let name = member.file_name()?.to_os_string();
-                let dir = self.executable(root).parent()?.to_path_buf();
-                Some((dir.join(name), sha256))
+                Some((self.version_dir(root).join(name), sha256))
             }))
     }
 
-    fn executable(&self, root: &Path) -> PathBuf {
-        root.join(TOOLS_DIR)
-            .join(&self.name)
-            .join(&self.version)
-            .join(&self.name)
+    /// The directory the tool's version is installed in.
+    fn version_dir(&self, root: &Path) -> PathBuf {
+        root.join(TOOLS_DIR).join(&self.name).join(&self.version)
+    }
+
+    /// The installed executable for `target`: named after the tool, or at its path in the
+    /// installed directory of a tool installed as one.
+    fn executable(&self, root: &Path, target: Target) -> anyhow::Result<PathBuf> {
+        let dir = self.version_dir(root);
+        match (&self.binary, self.tree) {
+            (Some(member), true) => Ok(dir.join(self.render(member, self.asset(target)?))),
+            _ => Ok(dir.join(&self.name)),
+        }
+    }
+
+    /// The pinned sha256 of the tool's directory for `target`, if it is installed as one.
+    fn tree_pin(&self, target: Target) -> anyhow::Result<Option<&str>> {
+        if !self.tree {
+            return Ok(None);
+        }
+        Ok(self.asset(target)?.tree_sha256.as_deref())
     }
 
     /// The installed executable, once its sha256 matches the pin; otherwise an error saying how
     /// to install it.
     pub(crate) fn installed(&self, root: &Path) -> anyhow::Result<PathBuf> {
-        let executable = self.executable(root);
+        let target = Target::host()?;
+        let executable = self.executable(root, target)?;
         ensure!(
             executable.is_file(),
             "{} {} is not installed: run `cargo xtask setup`",
             self.name,
             self.version
         );
-        let pinned = self
-            .executable_pin(root, Target::host()?)?
-            .with_context(|| {
-                format!(
-                    "{} has no recorded sha256: run `cargo xtask setup`",
-                    self.name
-                )
-            })?;
+        if let Some(pinned) = self.tree_pin(target)? {
+            let dir = self.version_dir(root);
+            let actual = Tree::of_dir(&dir)?.sha256();
+            ensure!(
+                actual == pinned,
+                "{} holds files with sha256 {actual}, but its pin is {pinned}: run `cargo xtask \
+                 setup`",
+                dir.display()
+            );
+            return Ok(executable);
+        }
+        let pinned = self.executable_pin(root, target)?.with_context(|| {
+            format!(
+                "{} has no recorded sha256: run `cargo xtask setup`",
+                self.name
+            )
+        })?;
         let actual = file_sha256(&executable)?;
         ensure!(
             actual == pinned,
@@ -495,7 +556,7 @@ impl Tool {
             executable.display()
         );
         if let Source::Release { .. } = self.source()?
-            && let Some((library, library_pin)) = self.library(root, Target::host()?)?
+            && let Some((library, library_pin)) = self.library(root, target)?
         {
             let library_sha256 = file_sha256(&library).with_context(|| {
                 format!(
@@ -514,13 +575,20 @@ impl Tool {
     }
 
     fn status(&self, root: &Path, target: Target) -> anyhow::Result<Status> {
-        let executable = self.executable(root);
+        let executable = self.executable(root, target)?;
         if !executable.is_file() {
             return Ok(Status::Missing);
         }
-        let sha256 = file_sha256(&executable)?;
-        if self.executable_pin(root, target)?.as_deref() != Some(sha256.as_str()) {
-            return Ok(Status::Modified { sha256 });
+        if let Some(pinned) = self.tree_pin(target)? {
+            let sha256 = Tree::of_dir(&self.version_dir(root))?.sha256();
+            if sha256 != pinned {
+                return Ok(Status::TreeModified { sha256 });
+            }
+        } else {
+            let sha256 = file_sha256(&executable)?;
+            if self.executable_pin(root, target)?.as_deref() != Some(sha256.as_str()) {
+                return Ok(Status::Modified { sha256 });
+            }
         }
         if let Source::Release { .. } = self.source()?
             && let Some((library, library_pin)) = self.library(root, target)?
@@ -593,6 +661,10 @@ enum Status {
     },
     /// Installed, but its library is not the pinned one.
     LibraryModified {
+        sha256: String,
+    },
+    /// Installed as a directory, but the directory's files are not the pinned ones.
+    TreeModified {
         sha256: String,
     },
     /// Installed with the pinned sha256, but `--version` does not report the pinned version.
@@ -680,6 +752,15 @@ fn report(
                     tool.name, tool.version
                 )?;
             }
+            Status::TreeModified { sha256 } => {
+                ready = false;
+                writeln!(
+                    out,
+                    "modified {} {}: the installed directory's files have sha256 {sha256}, not \
+                     its pin",
+                    tool.name, tool.version
+                )?;
+            }
             Status::Drift { reported } => {
                 ready = false;
                 writeln!(
@@ -763,11 +844,15 @@ fn pin_text(
                 sources.push("matches the digest GitHub recorded on upload".to_owned());
             }
             let binary_sha256 = sha256_hex(&tool.executable_in(&archive, asset)?);
-            let state = if sha256 == asset.sha256 && binary_sha256 == asset.binary_sha256 {
-                "same"
-            } else {
-                "changed"
-            };
+            let tree_same = !tool.tree
+                || asset.tree_sha256.as_deref()
+                    == Some(Tree::of_archive(&archive)?.sha256().as_str());
+            let state =
+                if sha256 == asset.sha256 && binary_sha256 == asset.binary_sha256 && tree_same {
+                    "same"
+                } else {
+                    "changed"
+                };
             writeln!(
                 out,
                 "{state:<8} {} {} {target}: {}",
@@ -783,6 +868,15 @@ fn pin_text(
                 "binary-sha256",
                 &binary_sha256,
             )?;
+            if tool.tree {
+                set_pin(
+                    &mut document,
+                    &tool.name,
+                    target,
+                    "tree-sha256",
+                    &Tree::of_archive(&archive)?.sha256(),
+                )?;
+            }
             if let Some(member) = tool.library_member(asset) {
                 let library_sha256 = sha256_hex(&extract(&archive, &member)?);
                 set_pin(
@@ -1039,7 +1133,16 @@ fn install(root: &Path, tool: &Tool, target: Target, download: &[u8]) -> anyhow:
             (build_crate(root, tool, name, download)?, None)
         }
     };
-    place(root, tool, target, &binary, library.as_ref())
+    if tool.tree {
+        return place(root, tool, target, |staging| {
+            tar::Archive::new(GzDecoder::new(download))
+                .unpack(staging)
+                .context("could not unpack the archive")
+        });
+    }
+    place(root, tool, target, |staging| {
+        place_files(tool, staging, &binary, library.as_ref())
+    })
 }
 
 /// A library to install beside an executable: its file name and contents.
@@ -1071,6 +1174,16 @@ fn verified_release(
         tool.version,
         asset.binary_sha256
     );
+    if let Some(pinned) = tool.tree_pin(target)? {
+        let sha256 = Tree::of_archive(archive)?.sha256();
+        ensure!(
+            sha256 == pinned,
+            "sha256 mismatch for the {} {} directory on {target}: {MANIFEST} pins {pinned}, the \
+             archive's files have {sha256}",
+            tool.name,
+            tool.version
+        );
+    }
     let library = match (tool.library_member(asset), &asset.library_sha256) {
         (Some(member), Some(pinned)) => {
             let bytes = extract(archive, &member)?;
@@ -1132,20 +1245,50 @@ fn build_crate(root: &Path, tool: &Tool, name: &str, archive: &[u8]) -> anyhow::
     Ok(binary)
 }
 
-/// Installs `binary` as the tool's executable, with `library` beside it, and checks them.
+/// Installs the tool's version from what `fill` writes into an empty staging directory, moved
+/// into place whole, and checks it.
 fn place(
     root: &Path,
     tool: &Tool,
     target: Target,
-    binary: &[u8],
-    library: Option<&Library>,
+    fill: impl FnOnce(&Path) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
     let tool_dir = root.join(TOOLS_DIR).join(&tool.name);
     let staging = tool_dir.join(format!("{}.partial", tool.version));
-    let destination = tool_dir.join(&tool.version);
+    let destination = tool.version_dir(root);
     remove_dir_if_present(&staging)?;
     fs::create_dir_all(&staging)
         .with_context(|| format!("could not create {}", staging.display()))?;
+    fill(&staging)?;
+    remove_dir_if_present(&destination)?;
+    fs::rename(&staging, &destination)
+        .with_context(|| format!("could not move {} into place", staging.display()))?;
+
+    match tool.status(root, target)? {
+        Status::Ready => Ok(()),
+        Status::Missing => bail!("{} vanished after install", tool.name),
+        Status::Modified { sha256 }
+        | Status::LibraryModified { sha256 }
+        | Status::TreeModified { sha256 } => bail!(
+            "{} changed while it was installed: a sha256 is now {sha256}",
+            tool.name
+        ),
+        Status::Drift { reported } => bail!(
+            "{} {} was installed, but `--version` reports {reported:?}",
+            tool.name,
+            tool.version
+        ),
+    }
+}
+
+/// Writes `binary` into `staging` as the tool's executable, with `library` beside it, and for a
+/// crate the executable's sha256.
+fn place_files(
+    tool: &Tool,
+    staging: &Path,
+    binary: &[u8],
+    library: Option<&Library>,
+) -> anyhow::Result<()> {
     let executable = staging.join(&tool.name);
     fs::write(&executable, binary)
         .with_context(|| format!("could not write {}", executable.display()))?;
@@ -1161,23 +1304,120 @@ fn place(
         fs::write(PathBuf::from(record), sha256_hex(binary))
             .context("could not record the executable's sha256")?;
     }
-    remove_dir_if_present(&destination)?;
-    fs::rename(&staging, &destination)
-        .with_context(|| format!("could not move {} into place", staging.display()))?;
+    Ok(())
+}
 
-    match tool.status(root, target)? {
-        Status::Ready => Ok(()),
-        Status::Missing => bail!("{} vanished after install", tool.name),
-        Status::Modified { sha256 } | Status::LibraryModified { sha256 } => bail!(
-            "{} changed while it was installed: a sha256 is now {sha256}",
-            tool.name
-        ),
-        Status::Drift { reported } => bail!(
-            "{} {} was installed, but `--version` reports {reported:?}",
-            tool.name,
-            tool.version
-        ),
+/// The files of a tool installed as a directory: each path relative to the directory, with its
+/// sha256 and whether it is executable. Directories are implied by the files in them; anything
+/// else, such as a symbolic link, is refused, so the manifest covers everything the tool can load.
+#[derive(Debug, PartialEq, Eq)]
+struct Tree(BTreeMap<String, (String, bool)>);
+
+impl Tree {
+    /// The files of a gzipped tarball as it unpacks: a hard link holds what its target holds.
+    fn of_archive(archive: &[u8]) -> anyhow::Result<Self> {
+        let mut files = BTreeMap::new();
+        let mut tarball = tar::Archive::new(GzDecoder::new(archive));
+        for entry in tarball
+            .entries()
+            .context("the archive is not a gzipped tarball")?
+        {
+            let mut entry = entry.context("the archive is corrupt")?;
+            let path = tree_path(&entry.path().context("the archive has an unreadable path")?)?;
+            let kind = entry.header().entry_type();
+            let mode = entry.header().mode().context("an entry has no mode")?;
+            if kind.is_file() {
+                let mut bytes = Vec::new();
+                entry
+                    .read_to_end(&mut bytes)
+                    .with_context(|| format!("could not read {path} from the archive"))?;
+                files.insert(path, (sha256_hex(&bytes), mode & 0o100 != 0));
+            } else if kind.is_hard_link() {
+                let target = entry
+                    .link_name()
+                    .context("a hard link has an unreadable target")?
+                    .with_context(|| format!("the hard link {path} has no target"))?;
+                let target = tree_path(&target)?;
+                let (sha256, _) = files
+                    .get(&target)
+                    .with_context(|| format!("{path} links to {target}, which comes after it"))?
+                    .clone();
+                files.insert(path, (sha256, mode & 0o100 != 0));
+            } else if !kind.is_dir() {
+                bail!("{path} in the archive is neither a file nor a directory");
+            }
+        }
+        Ok(Self(files))
     }
+
+    /// The files under `dir`, as installed.
+    fn of_dir(dir: &Path) -> anyhow::Result<Self> {
+        let mut files = BTreeMap::new();
+        let mut pending = vec![dir.to_path_buf()];
+        while let Some(current) = pending.pop() {
+            for entry in fs::read_dir(&current)
+                .with_context(|| format!("could not list {}", current.display()))?
+            {
+                let path = entry?.path();
+                let metadata = fs::symlink_metadata(&path)
+                    .with_context(|| format!("could not inspect {}", path.display()))?;
+                if metadata.is_dir() {
+                    pending.push(path);
+                } else if metadata.is_file() {
+                    let relative = path
+                        .strip_prefix(dir)
+                        .context("a listed file lies outside its directory")?;
+                    files.insert(
+                        tree_path(relative)?,
+                        (
+                            file_sha256(&path)?,
+                            metadata.permissions().mode() & 0o100 != 0,
+                        ),
+                    );
+                } else {
+                    bail!("{} is neither a file nor a directory", path.display());
+                }
+            }
+        }
+        Ok(Self(files))
+    }
+
+    /// The manifest: a line per file, `<sha256> <x or -> <path>`, in path order.
+    fn manifest(&self) -> String {
+        let mut manifest = String::new();
+        for (path, (sha256, executable)) in &self.0 {
+            let mode = if *executable { 'x' } else { '-' };
+            // Writing to a String cannot fail.
+            if writeln!(manifest, "{sha256} {mode} {path}").is_err() {
+                break;
+            }
+        }
+        manifest
+    }
+
+    /// The sha256 of the manifest, which `tree-sha256` pins.
+    fn sha256(&self) -> String {
+        sha256_hex(self.manifest().as_bytes())
+    }
+}
+
+/// `path` as the manifest names it: relative, `/`-separated, without `.` parts, and UTF-8.
+fn tree_path(path: &Path) -> anyhow::Result<String> {
+    let mut parts = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::Normal(part) => parts.push(
+                part.to_str()
+                    .with_context(|| format!("{} is not UTF-8", path.display()))?,
+            ),
+            Component::RootDir | Component::ParentDir | Component::Prefix(_) => {
+                bail!("{} leaves the tool's directory", path.display())
+            }
+        }
+    }
+    ensure!(!parts.is_empty(), "an archive entry has an empty path");
+    Ok(parts.join("/"))
 }
 
 /// Reads the regular file at `member` out of a gzipped tarball.
@@ -1286,7 +1526,7 @@ mod tests {
     use flate2::write::GzEncoder;
 
     use super::{
-        Manifest, Status, Target, Tool, doctor, extract, install, install_unready, pin_text,
+        Manifest, Status, Target, Tool, Tree, doctor, extract, install, install_unready, pin_text,
         published_sha256, remove_other_versions, report, reports_version, set_pin, setup,
         sha256_hex,
     };
@@ -2364,11 +2604,15 @@ targets.aarch64-unknown-linux-gnu = {{ platform = "linux-arm64", sha256 = "{sha2
                 .collect()
         };
         // #25's Coverage and Mutants jobs installed only cargo-nextest, and xtask's tests failed
-        // there for want of shellcheck.
-        assert_eq!(names(&[], true), ["cargo-nextest", "shellcheck"]);
+        // there for want of shellcheck. node and pnpm build the web app the abc binary embeds,
+        // and run its tests.
+        assert_eq!(
+            names(&[], true),
+            ["cargo-nextest", "shellcheck", "node", "pnpm"]
+        );
         assert_eq!(
             names(&["cargo-sqlx"], true),
-            ["cargo-nextest", "cargo-sqlx", "shellcheck"],
+            ["cargo-nextest", "cargo-sqlx", "shellcheck", "node", "pnpm"],
             "named tools join them"
         );
         assert!(names(&[], false).len() > 3, "all of them, with neither");
@@ -2420,5 +2664,279 @@ targets.aarch64-unknown-linux-gnu = {{ platform = "linux-arm64", sha256 = "{sha2
                 .is_err_and(|error| error.to_string().contains("no tool named other")),
             "an unknown tool is an error"
         );
+    }
+
+    const DIST: &[u8] = b"export const pnpm = true;\n";
+
+    /// The tool list pinning `archive` as a tool installed whole, whose executable is `binary`.
+    fn pinned_tree(archive: &[u8], binary: &[u8], tree_sha256: &str) -> Manifest {
+        let text = manifest_text(&sha256_hex(archive), &sha256_hex(binary))
+            .replace(
+                "binary = \"fake-{version}/fake\"\n",
+                "binary = \"fake-{version}/fake\"\ntree = true\n",
+            )
+            .replace(" }\n", &format!(", tree-sha256 = \"{tree_sha256}\" }}\n"));
+        Manifest::parse(&text).unwrap()
+    }
+
+    fn tree_archive() -> Vec<u8> {
+        tarball(&[
+            ("fake-1.2.3/fake", SCRIPT, 0o755),
+            ("fake-1.2.3/dist/pnpm.mjs", DIST, 0o644),
+        ])
+    }
+
+    #[test]
+    fn installs_a_whole_directory_and_checks_every_file() {
+        /// A change to the installed directory, and what it is.
+        type Change<'a> = (Box<dyn Fn() + 'a>, &'static str);
+        let root = tempfile::tempdir().unwrap();
+        let archive = tree_archive();
+        let tree = Tree::of_archive(&archive).unwrap();
+        assert_eq!(
+            tree.manifest(),
+            format!(
+                "{} - fake-1.2.3/dist/pnpm.mjs\n{} x fake-1.2.3/fake\n",
+                sha256_hex(DIST),
+                sha256_hex(SCRIPT)
+            ),
+            "each file with its sha256 and whether it is executable, in path order"
+        );
+        let manifest = pinned_tree(&archive, SCRIPT, &tree.sha256());
+        let tool = only_tool(&manifest);
+        install(root.path(), tool, Target::MacArm64, &archive).unwrap();
+        let dir = root.path().join(".tools/fake/1.2.3");
+        assert_eq!(Tree::of_dir(&dir).unwrap(), tree, "installed as it unpacks");
+        assert_eq!(
+            tool.status(root.path(), Target::MacArm64).unwrap(),
+            Status::Ready
+        );
+        assert_eq!(
+            tool.installed(root.path()).unwrap(),
+            dir.join("fake-1.2.3/fake"),
+            "the executable is at its path in the directory"
+        );
+
+        let dist = dir.join("fake-1.2.3/dist/pnpm.mjs");
+        let changes: [Change<'_>; 4] = [
+            (
+                Box::new(|| fs::write(&dist, b"swapped").unwrap()),
+                "a changed file",
+            ),
+            (
+                Box::new(|| fs::write(dir.join("fake-1.2.3/dist/extra.mjs"), b"more").unwrap()),
+                "an added file",
+            ),
+            (
+                Box::new(|| fs::remove_file(&dist).unwrap()),
+                "a removed file",
+            ),
+            (
+                Box::new(|| fs::set_permissions(&dist, fs::Permissions::from_mode(0o755)).unwrap()),
+                "a file made executable",
+            ),
+        ];
+        for (change, what) in changes {
+            change();
+            let sha256 = Tree::of_dir(&dir).unwrap().sha256();
+            assert_eq!(
+                tool.status(root.path(), Target::MacArm64).unwrap(),
+                Status::TreeModified { sha256 },
+                "{what}"
+            );
+            let error = tool.installed(root.path()).unwrap_err().to_string();
+            assert!(error.contains("run `cargo xtask setup`"), "{what}: {error}");
+            let mut out = Vec::new();
+            let code = report(root.path(), &manifest, Target::MacArm64, &mut out).unwrap();
+            let printed = String::from_utf8(out).unwrap();
+            assert_eq!(code, ExitCode::FAILURE, "{what}: {printed}");
+            assert!(
+                printed.contains("modified fake 1.2.3: the installed directory's files"),
+                "{what}: {printed}"
+            );
+            assert_eq!(
+                install_from(root.path(), &manifest, &archive),
+                1,
+                "{what}: setup reinstalls it"
+            );
+            assert_eq!(Tree::of_dir(&dir).unwrap(), tree, "{what}: restored");
+        }
+    }
+
+    #[test]
+    fn refuses_an_archive_whose_directory_is_not_the_pinned_one() {
+        let root = tempfile::tempdir().unwrap();
+        let archive = tree_archive();
+        let manifest = pinned_tree(&archive, SCRIPT, SHA_A);
+        let error = install(
+            root.path(),
+            only_tool(&manifest),
+            Target::MacArm64,
+            &archive,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("sha256 mismatch for the fake 1.2.3 directory"),
+            "{error}"
+        );
+        assert!(
+            !root.path().join(".tools/fake/1.2.3").exists(),
+            "nothing installed"
+        );
+    }
+
+    /// A gzipped tarball of `fake-1.2.3/fake`, then one more entry of `kind` at `path` that
+    /// points at `link`.
+    fn tarball_with_link(kind: tar::EntryType, path: &str, link: &str) -> Vec<u8> {
+        let mut builder = tar::Builder::new(GzEncoder::new(Vec::new(), Compression::fast()));
+        let mut header = tar::Header::new_gnu();
+        header.set_size(u64::try_from(SCRIPT.len()).unwrap());
+        header.set_mode(0o755);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "fake-1.2.3/fake", SCRIPT)
+            .unwrap();
+        let mut link_header = tar::Header::new_gnu();
+        link_header.set_entry_type(kind);
+        link_header.set_size(0);
+        link_header.set_mode(0o644);
+        builder.append_link(&mut link_header, path, link).unwrap();
+        builder.into_inner().unwrap().finish().unwrap()
+    }
+
+    #[test]
+    fn a_tree_holds_files_and_hard_links_only() {
+        let linked = Tree::of_archive(&tarball_with_link(
+            tar::EntryType::Link,
+            "fake-1.2.3/pnpm",
+            "fake-1.2.3/fake",
+        ))
+        .unwrap();
+        assert_eq!(
+            linked.manifest(),
+            format!(
+                "{0} x fake-1.2.3/fake\n{0} - fake-1.2.3/pnpm\n",
+                sha256_hex(SCRIPT)
+            ),
+            "a hard link holds what its target holds, with a mode of its own"
+        );
+        for (kind, path, link, problem) in [
+            (
+                tar::EntryType::Symlink,
+                "fake-1.2.3/pnpm",
+                "fake",
+                "fake-1.2.3/pnpm in the archive is neither a file nor a directory",
+            ),
+            (
+                tar::EntryType::Link,
+                "fake-1.2.3/pnpm",
+                "fake-1.2.3/later",
+                "fake-1.2.3/pnpm links to fake-1.2.3/later, which comes after it",
+            ),
+            (
+                tar::EntryType::Link,
+                "fake-1.2.3/pnpm",
+                "../outside",
+                "../outside leaves the tool's directory",
+            ),
+        ] {
+            let error = format!(
+                "{:#}",
+                Tree::of_archive(&tarball_with_link(kind, path, link)).unwrap_err()
+            );
+            assert!(error.contains(problem), "{problem}: {error}");
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("file"), b"x").unwrap();
+        std::os::unix::fs::symlink("file", dir.path().join("link")).unwrap();
+        let error = format!("{:#}", Tree::of_dir(dir.path()).unwrap_err());
+        assert!(
+            error.contains("link is neither a file nor a directory"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_tree_needs_its_pin_and_an_archive() {
+        let base = manifest_text(SHA_A, SHA_B);
+        let tree = |text: &str| {
+            text.replace(
+                "binary = \"fake-{version}/fake\"\n",
+                "binary = \"fake-{version}/fake\"\ntree = true\n",
+            )
+        };
+        let pin = |text: &str, extra: &str| text.replace(" }\n", &format!(", {extra} }}\n"));
+        for (text, problem) in [
+            (tree(&base), "`tree = true` needs a tree-sha256"),
+            (
+                pin(&base, &format!("tree-sha256 = \"{SHA_A}\"")),
+                "tree-sha256 needs `tree = true`",
+            ),
+            (
+                pin(&tree(&base), "tree-sha256 = \"XYZ\""),
+                "tree-sha256 must be 64 lowercase hex digits",
+            ),
+            (
+                pin(
+                    &tree(&base),
+                    &format!(
+                        "tree-sha256 = \"{SHA_A}\", library = \"lib.so\", library-sha256 = \
+                         \"{SHA_A}\""
+                    ),
+                ),
+                "a tree holds its libraries itself",
+            ),
+            (
+                pin(&tree(&base), &format!("tree-sha256 = \"{SHA_A}\""))
+                    .replace("binary = \"fake-{version}/fake\"\n", ""),
+                "a tree comes only from an archive",
+            ),
+        ] {
+            let error = format!("{:#}", Manifest::parse(&text).unwrap_err());
+            assert!(error.contains(problem), "{problem}: {error}");
+        }
+    }
+
+    #[test]
+    fn pin_records_a_tree_pin() {
+        let archive = tree_archive();
+        let text = manifest_text(SHA_A, SHA_B)
+            .replace(
+                "binary = \"fake-{version}/fake\"\n",
+                "binary = \"fake-{version}/fake\"\ntree = true\n",
+            )
+            .replace(" }\n", &format!(", tree-sha256 = \"{SHA_A}\" }}\n"));
+        let mut out = Vec::new();
+        let pinned = pin_text(&text, &mut out, &mut serving(&archive)).unwrap();
+        let tree = Tree::of_archive(&archive).unwrap().sha256();
+        let expected = text
+            .replace(
+                &format!("tree-sha256 = \"{SHA_A}\""),
+                &format!("tree-sha256 = \"{tree}\""),
+            )
+            .replace(SHA_A, &sha256_hex(&archive))
+            .replace(SHA_B, &sha256_hex(SCRIPT));
+        assert_eq!(pinned, expected, "the three pins change, nothing else does");
+        assert!(String::from_utf8(out).unwrap().contains("changed"));
+        let mut again = Vec::new();
+        pin_text(&pinned, &mut again, &mut serving(&archive)).unwrap();
+        let printed = String::from_utf8(again).unwrap();
+        assert!(
+            printed.lines().all(|line| line.starts_with("same")),
+            "{printed}"
+        );
+        let stale_tree = pinned.replace(&tree, SHA_B);
+        let stale_binary = pinned.replace(&sha256_hex(SCRIPT), SHA_A);
+        for (stale, what) in [(stale_tree, "the tree"), (stale_binary, "the executable")] {
+            let mut repinned = Vec::new();
+            pin_text(&stale, &mut repinned, &mut serving(&archive)).unwrap();
+            let states = String::from_utf8(repinned).unwrap();
+            assert!(
+                states.lines().all(|line| line.starts_with("changed")),
+                "a stale pin of {what} alone is a change: {states}"
+            );
+        }
     }
 }

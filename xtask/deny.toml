@@ -45,7 +45,10 @@ deny = [
 ]
 # Every skip names the crates holding the old version back:
 # { crate = "name@version", reason = "held back by ...; drop when ..." }
-skip = []
+skip = [
+    # Added 2026-11-06 with oxc_parser 0.157.0 (S0 PR 5a); review at each oxc bump.
+    { crate = "syn@2", reason = "held back by phf_macros 0.14, through phf in oxc_syntax and oxc_regular_expression; drop when phf_macros moves to syn 3" },
+]
 
 [sources]
 unknown-registry = "deny"

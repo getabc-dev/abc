@@ -11,7 +11,7 @@ use abc_core::credential::WorkerKey;
 use abc_core::secret::Secret;
 use abc_protocol::url::PublicUrl;
 use abc_protocol::{Hello, ServerMessage, WorkerMessage};
-use abc_server::{Limits, LinkTimings, ServeError, ServerConfig};
+use abc_server::{Limits, LinkTimings, ServeError, ServerConfig, WebApp};
 use abc_store::testing::{Fixture, database};
 use abc_store::{Store, StoreOptions};
 use futures::{SinkExt as _, StreamExt as _};
@@ -66,6 +66,18 @@ pub(crate) fn socket_dir() -> tempfile::TempDir {
 /// ignores it; it is there so the log test can look for it.
 pub(crate) const DATABASE_PASSWORD: &str = "db-pass-7f3e9a";
 
+/// The page of the test servers' web app.
+pub(crate) const INDEX: &[u8] =
+    b"<!doctype html><title>abc</title><script src=\"/assets/index-0123abcd.js\"></script>";
+
+/// The script of the test servers' web app.
+pub(crate) const SCRIPT: &[u8] = b"document.title = 'abc';";
+
+/// A web app as Vite builds one: the page and a hashed script.
+pub(crate) fn web_app() -> WebApp {
+    WebApp::new(&[("index.html", INDEX), ("assets/index-0123abcd.js", SCRIPT)]).unwrap()
+}
+
 /// The configuration a test server runs with.
 pub(crate) fn config(pool: &PgPool, socket: PathBuf, link: LinkTimings) -> ServerConfig {
     let url = abc_store::testing::database_url_text(pool, Some(DATABASE_PASSWORD));
@@ -77,6 +89,7 @@ pub(crate) fn config(pool: &PgPool, socket: PathBuf, link: LinkTimings) -> Serve
         public_url: PublicUrl::parse(&format!("https://{HOST}")).unwrap(),
         link,
         limits: Limits::default(),
+        web: web_app(),
     }
 }
 

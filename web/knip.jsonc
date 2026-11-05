@@ -1,0 +1,9 @@
+{
+  "$schema": "./node_modules/knip/schema-jsonc.json",
+  // Route files are entries: the router plugin imports them from src/routeTree.gen.ts, which
+  // is generated and not committed, so knip does not read it.
+  "entry": ["src/routes/**/*.tsx"],
+  "project": ["src/**/*.{ts,tsx,css}", "e2e/**/*.ts", "*.config.ts"],
+  // Written by ts-rs from Rust: every API type, used or not yet.
+  "ignore": ["src/generated/**"]
+}

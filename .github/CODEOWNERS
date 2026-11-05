@@ -18,4 +18,15 @@
 /fuzz/deny.toml           @snehilvj
 /rust-toolchain.toml      @snehilvj
 /rustfmt.toml             @snehilvj
+/web/.oxlintrc.json       @snehilvj
+/web/biome.json           @snehilvj
+/web/knip.jsonc           @snehilvj
+/web/package.json         @snehilvj
+/web/playwright.config.ts @snehilvj
+/web/pnpm-lock.yaml       @snehilvj
+/web/pnpm-workspace.yaml  @snehilvj
+/web/tsconfig.base.json   @snehilvj
+/web/tsconfig.json        @snehilvj
+/web/tsconfig.node.json   @snehilvj
+/web/vite.config.ts       @snehilvj
 /xtask/                   @snehilvj

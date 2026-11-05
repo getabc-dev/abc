@@ -3,3 +3,10 @@
 /.claude/worktrees/
 /.abc/
 *.pending-snap
+# The web app's dependencies, build, generated route tree and test output (web/).
+/web/node_modules/
+/web/dist/
+/web/src/routeTree.gen.ts
+/web/coverage/
+/web/test-results/
+/web/playwright-report/

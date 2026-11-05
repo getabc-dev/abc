@@ -216,6 +216,8 @@ impl Server {
             public_url: url.clone(),
             link,
             limits: Limits::default(),
+            // The worker's tests reach only the API.
+            web: abc_server::WebApp::new(&[("index.html", b"<!doctype html>")]).unwrap(),
         };
         let (stop, stopped) = oneshot::channel::<()>();
         let task = tokio::spawn(abc_server::run(config, async move {

@@ -1,6 +1,8 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
-  "extends": ["config:best-practices"],
+  "extends": [
+    "config:best-practices"
+  ],
   "minimumReleaseAge": "3 days",
   "minimumReleaseAgeBehaviour": "timestamp-required",
   "internalChecksFilter": "strict",
@@ -13,19 +15,93 @@
   "packageRules": [
     {
       "description": "Bump the toolchain and every workspace's rust-version together; xtask tests require them equal.",
-      "matchDatasources": ["rust-version"],
-      "matchDepNames": ["rust"],
+      "matchDatasources": [
+        "rust-version"
+      ],
+      "matchDepNames": [
+        "rust"
+      ],
       "groupName": "Rust toolchain"
     },
     {
       "description": "axum and tokio-tungstenite move together. axum's ws feature depends on one tokio-tungstenite version and cargo-deny refuses two versions of a crate in the lockfile, so the worker's tokio-tungstenite can move only when axum's does: #18 (tokio-tungstenite 0.30) was closed because axum 0.8.9 still needs 0.29.",
-      "matchDatasources": ["crate"],
-      "matchPackageNames": ["axum", "tokio-tungstenite"],
+      "matchDatasources": [
+        "crate"
+      ],
+      "matchPackageNames": [
+        "axum",
+        "tokio-tungstenite"
+      ],
       "groupName": "axum and tokio-tungstenite"
     },
     {
+      "description": "The web app's npm packages (web/package.json, locked in web/pnpm-lock.yaml): exact versions, which pnpm-workspace.yaml's savePrefix keeps, past the same 3-day minimum release age that pnpm's minimumReleaseAge enforces at install.",
+      "matchManagers": [
+        "npm"
+      ],
+      "rangeStrategy": "pin"
+    },
+    {
+      "description": "React and its type definitions move together: @types/react and @types/react-dom describe one React release.",
+      "matchManagers": [
+        "npm"
+      ],
+      "matchPackageNames": [
+        "react",
+        "react-dom",
+        "@types/react",
+        "@types/react-dom"
+      ],
+      "groupName": "React"
+    },
+    {
+      "description": "Tailwind CSS and its Vite plugin are released together and must match.",
+      "matchManagers": [
+        "npm"
+      ],
+      "matchPackageNames": [
+        "tailwindcss",
+        "@tailwindcss/vite"
+      ],
+      "groupName": "Tailwind CSS"
+    },
+    {
+      "description": "oxlint's type-aware rules run in oxlint-tsgolint, which each oxlint release names a version of.",
+      "matchManagers": [
+        "npm"
+      ],
+      "matchPackageNames": [
+        "oxlint",
+        "oxlint-tsgolint"
+      ],
+      "groupName": "oxlint"
+    },
+    {
+      "description": "Vitest and its coverage provider must be the same version.",
+      "matchManagers": [
+        "npm"
+      ],
+      "matchPackageNames": [
+        "vitest",
+        "@vitest/coverage-v8"
+      ],
+      "groupName": "Vitest"
+    },
+    {
+      "description": "node in xtask/tools.toml stays on an LTS line: Renovate proposes no odd-numbered, short-lived major.",
+      "matchFileNames": [
+        "xtask/tools.toml"
+      ],
+      "matchDepNames": [
+        "node"
+      ],
+      "allowedVersions": "/^\\d*[02468]\\./"
+    },
+    {
       "description": "Pinned tools need new checksums with every version.",
-      "matchFileNames": ["xtask/tools.toml"],
+      "matchFileNames": [
+        "xtask/tools.toml"
+      ],
       "prBodyNotes": [
         "Run `cargo xtask pin` on this branch and commit `xtask/tools.toml`: `cargo xtask setup` refuses archives whose sha256 is not pinned."
       ]
@@ -35,8 +111,12 @@
     {
       "customType": "regex",
       "description": "The rust-version in Cargo.toml and in the fuzz and xtask workspaces' manifests.",
-      "managerFilePatterns": ["/^(fuzz/|xtask/)?Cargo\\.toml$/"],
-      "matchStrings": ["\\nrust-version = \"(?<currentValue>[^\"]+)\""],
+      "managerFilePatterns": [
+        "/^(fuzz/|xtask/)?Cargo\\.toml$/"
+      ],
+      "matchStrings": [
+        "\\nrust-version = \"(?<currentValue>[^\"]+)\""
+      ],
       "depNameTemplate": "rust",
       "datasourceTemplate": "rust-version",
       "versioningTemplate": "rust-release-channel"
@@ -44,7 +124,9 @@
     {
       "customType": "regex",
       "description": "Pinned tools in xtask/tools.toml, released on GitHub.",
-      "managerFilePatterns": ["/^xtask/tools\\.toml$/"],
+      "managerFilePatterns": [
+        "/^xtask/tools\\.toml$/"
+      ],
       "matchStrings": [
         "version = \"(?<currentValue>[^\"]+)\"\\nurl = \"https://github\\.com/(?<depName>[^/\"]+/[^/\"]+)/releases/download/(?<tagPrefix>[^\"{/]*)\\{version\\}/"
       ],
@@ -54,8 +136,23 @@
     },
     {
       "customType": "regex",
+      "description": "node in xtask/tools.toml, released on nodejs.org.",
+      "managerFilePatterns": [
+        "/^xtask/tools\\.toml$/"
+      ],
+      "matchStrings": [
+        "version = \"(?<currentValue>[^\"]+)\"\\nurl = \"https://nodejs\\.org/dist/v\\{version\\}/"
+      ],
+      "depNameTemplate": "node",
+      "datasourceTemplate": "node-version",
+      "versioningTemplate": "node"
+    },
+    {
+      "customType": "regex",
       "description": "Pinned tools in xtask/tools.toml built from crates.io.",
-      "managerFilePatterns": ["/^xtask/tools\\.toml$/"],
+      "managerFilePatterns": [
+        "/^xtask/tools\\.toml$/"
+      ],
       "matchStrings": [
         "version = \"(?<currentValue>[^\"]+)\"\\n(?:#[^\\n]*\\n)*crate = \"(?<depName>[^\"]+)\""
       ],

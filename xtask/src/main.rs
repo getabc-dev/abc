@@ -5,6 +5,7 @@ mod app;
 mod broker;
 mod check;
 mod coverage;
+mod e2e;
 mod fuzz;
 mod git;
 mod github;
@@ -24,6 +25,7 @@ mod testing;
 mod tools;
 mod vm;
 mod watchdog;
+mod web;
 
 use std::ffi::OsString;
 use std::io::{self, Read, Write};
@@ -173,6 +175,19 @@ enum Task {
         #[command(subcommand)]
         action: RulesetAction,
     },
+    /// Build the abc binary with the web app embedded: web/ with the pinned pnpm, then
+    /// `cargo build --release -p abc`, into target/release/abc.
+    Build,
+    /// Run the pinned pnpm in web/, with the pinned node first on PATH, such as
+    /// `cargo xtask pnpm install` or `cargo xtask pnpm run dev`.
+    Pnpm {
+        /// Arguments passed to pnpm.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<OsString>,
+    },
+    /// Run the end-to-end tests: build abc, serve it on a fresh Postgres database behind a
+    /// stand-in for the Tailscale sidecar, and load the web app in Chromium with Playwright.
+    E2e,
     /// Install the tools pinned in xtask/tools.toml into .tools/, verifying each download.
     Setup {
         /// Install the tools the tests run (`for-tests` in xtask/tools.toml), with any named.
@@ -302,8 +317,11 @@ fn run(
         Task::Coverage { base } => Ok(verdict(coverage::run(
             root,
             &base,
-            &tool("cargo-llvm-cov")?,
-            &tool("cargo-nextest")?,
+            &coverage::Tools {
+                llvm_cov: tool("cargo-llvm-cov")?,
+                nextest: tool("cargo-nextest")?,
+                web: web::Toolchain::pinned(tool)?,
+            },
             mode,
             report,
         )?)),
@@ -313,6 +331,7 @@ fn run(
             &mutants::Options { jobs, shard, mode },
             &tool("cargo-mutants")?,
             &tool("cargo-nextest")?,
+            &web::Toolchain::pinned(tool)?,
             report,
         )?)),
         Task::Fuzz { seconds } => Ok(verdict(fuzz::run(
@@ -381,6 +400,9 @@ fn run(
             Ok(ExitCode::SUCCESS)
         }
         Task::Tool { name, args } => tools::run(&tool(&name)?, root, &args),
+        Task::Build => run_web(WebTask::Build, root, tool, report),
+        Task::Pnpm { args } => run_web(WebTask::Pnpm(args), root, tool, report),
+        Task::E2e => run_web(WebTask::E2e, root, tool, report),
         Task::Hook { event } => run_hook(event, home, report),
     }
 }
@@ -388,6 +410,40 @@ fn run(
 /// `cargo xtask hook EVENT`: reads the hook input on stdin and prints the answer, in JSON, on
 /// stdout. A stop whose check failed with no state to count it in prints its reason and exits
 /// [`hook::UNKEPT_STATUS`], for the launcher to count.
+/// The commands that run the web app's toolchain.
+enum WebTask {
+    Build,
+    Pnpm(Vec<OsString>),
+    E2e,
+}
+
+fn run_web(
+    task: WebTask,
+    root: &Path,
+    tool: &dyn Fn(&str) -> anyhow::Result<PathBuf>,
+    report: &mut impl Write,
+) -> anyhow::Result<ExitCode> {
+    let toolchain = web::Toolchain::pinned(tool)?;
+    match task {
+        WebTask::Build => Ok(verdict(web::build_binary(root, &toolchain, report)?)),
+        WebTask::Pnpm(args) => {
+            anyhow::ensure!(web::present(root), "{}", web::MISSING);
+            let status = toolchain
+                .pnpm(root)?
+                .args(&args)
+                .status()
+                .context("could not run pnpm")?;
+            Ok(ExitCode::from(tools::status_code(status)))
+        }
+        WebTask::E2e => Ok(verdict(e2e::run(
+            root,
+            &toolchain,
+            &tool("cargo-sqlx")?,
+            report,
+        )?)),
+    }
+}
+
 fn run_hook(event: hook::Event, home: &Path, report: &mut impl Write) -> anyhow::Result<ExitCode> {
     let mut input = String::new();
     let mut log = Vec::new();
@@ -427,6 +483,7 @@ fn check(
     let tools = check::Tools {
         nextest: tool("cargo-nextest")?,
         shellcheck: tool("shellcheck")?,
+        web: Some(web::Toolchain::pinned(tool)?),
     };
     check::run(
         root,
@@ -627,6 +684,9 @@ mod tests {
         script(&dir.join("cargo-nextest"), "exit 0\n");
         script(&dir.join("shellcheck"), "exit 0\n");
         script(&dir.join("cargo-fuzz"), "exit 77\n");
+        // The fixtures hold no web app, so node and pnpm are resolved but never run.
+        script(&dir.join("node"), "exit 9\n");
+        script(&dir.join("pnpm"), "exit 9\n");
     }
 
     fn dispatch(
@@ -648,6 +708,39 @@ mod tests {
             env,
         };
         run(task, &invocation, &mut Vec::new())
+    }
+
+    #[test]
+    fn the_web_commands_run_the_pinned_pnpm() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        fs::create_dir_all(home.join("tools")).unwrap();
+        fake_tools(&home.join("tools"));
+        let root = crate::testing::repository(&temp.path().join("root"));
+        let no_env = |_: &str| None;
+        let pnpm = || Task::Pnpm {
+            args: vec!["--version".into()],
+        };
+        let missing = dispatch(pnpm(), &home, &root, &no_env)
+            .unwrap_err()
+            .to_string();
+        assert!(missing.contains("no web/package.json"), "{missing}");
+        fs::create_dir(root.join("web")).unwrap();
+        fs::write(root.join("web/package.json"), "{}\n").unwrap();
+        assert_eq!(
+            dispatch(pnpm(), &home, &root, &no_env).unwrap(),
+            ExitCode::from(9),
+            "pnpm's exit code comes back"
+        );
+        assert_eq!(
+            dispatch(Task::Build, &home, &root, &no_env).unwrap(),
+            ExitCode::FAILURE,
+            "the fake pnpm fails the install, so no binary is built"
+        );
+        let error = dispatch(Task::E2e, &home, &root, &no_env)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("cargo-sqlx is not a fake tool"), "{error}");
     }
 
     #[test]
