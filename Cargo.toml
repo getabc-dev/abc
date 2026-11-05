@@ -47,7 +47,7 @@ time = { version = "0.3.55", features = ["serde", "formatting", "parsing"] }
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time"] }
 tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "tls12"] }
 tokio-stream = "0.1.19"
-tokio-tungstenite = "0.29.0"
+tokio-tungstenite = "0.30.0"
 toml_edit = { version = "0.25.17", features = ["serde"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["json", "env-filter", "fmt"] }
