@@ -12,9 +12,11 @@
 //! - `xtask/src/old.rs`: the old parser was removed with its tests.
 //! ```
 //!
-//! A test is named `<file>::<test>`, or by its file alone when the whole file was deleted. HTML
-//! comments, such as the hints in `.github/pull_request_template.md`, are not read, and "None" (the
-//! template's default) names no test, so it passes only when no test change was flagged. The
+//! A test is named `<file>::<test>`, or by its file alone when the whole file was deleted. An entry
+//! for a test the check does not flag fails too: a stale entry hides which changes need a reason
+//! (#25 carried three). HTML comments, such as the hints in `.github/pull_request_template.md`, are
+//! not read, and "None" (the template's default) names no test, so it passes only when no test
+//! change was flagged. The
 //! `integrity-approved` label approves a stated reason, so the reasons are required with or
 //! without it.
 
@@ -109,13 +111,14 @@ pub(super) struct Explained {
 }
 
 impl Explained {
+    /// Whether every flagged test has a reason and every entry names a flagged test.
     pub(super) const fn complete(&self) -> bool {
-        self.unexplained.is_empty()
+        self.unexplained.is_empty() && self.extra.is_empty()
     }
 
-    /// Tells the author what is missing, and notes entries for tests that were not flagged.
+    /// Tells the author what is missing, and which entries name tests that were not flagged.
     pub(super) fn report(&self, out: &mut impl Write) -> io::Result<()> {
-        if !self.complete() {
+        if !self.unexplained.is_empty() {
             let problem = if self.section {
                 format!("the \"## {HEADING}\" section gives no reason for")
             } else {
@@ -133,7 +136,8 @@ impl Explained {
         for test in &self.extra {
             writeln!(
                 out,
-                "integrity: note: \"## {HEADING}\" names `{test}`, which has no flagged change"
+                "integrity: failed; \"## {HEADING}\" names `{test}`, which has no flagged \
+                 change; remove the entry, or name the test as the findings above do"
             )?;
         }
         Ok(())
@@ -302,15 +306,24 @@ mod tests {
     }
 
     #[test]
-    fn extra_entries_are_noted_but_pass() {
+    fn an_entry_for_a_test_that_is_not_flagged_fails() {
         let description = "## Test changes\n- `src/a.rs::tests::one`: a\n- `src/a.rs::tests::two`: b\n- `src/gone.rs`: c\n- `src/b.rs::tests::three`: d\n";
         let result = explained(&flagged(), description);
-        assert!(result.complete(), "every flagged test is explained");
-        assert_eq!(result.extra, ["src/b.rs::tests::three"], "the extra entry");
         assert!(
-            report(&result).contains("names `src/b.rs::tests::three`, which has no flagged change"),
-            "noted"
+            result.unexplained.is_empty(),
+            "every flagged test is explained"
         );
+        assert_eq!(result.extra, ["src/b.rs::tests::three"], "the extra entry");
+        assert!(!result.complete(), "#25 carried three stale entries");
+        let text = report(&result);
+        assert!(
+            text.starts_with(
+                "integrity: failed; \"## Test changes\" names `src/b.rs::tests::three`, which has \
+                 no flagged change"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("gives no reason"), "{text}");
         assert!(
             explained(&[], "no section").complete(),
             "nothing flagged needs no section"

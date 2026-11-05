@@ -114,7 +114,7 @@ watchdog compares the diff with that task and the rules above, and keeps it work
 | `cargo xtask check` | Format check, clippy (`--all-targets --locked -D warnings`), nextest, sqlx's query cache check, doctests and rustdoc with warnings denied, on both workspaces, the main one and xtask's, and the pinned shellcheck on the shell scripts. Property tests run with a fixed seed. Database tests use the warm Postgres 18 container (below). It first fails when the changes since the merge base with the default branch are larger than the Gemini review accepts (the diff `review` sends, without generated files), so an oversized change is split before CI; files not yet added to git are not counted. |
 | `cargo xtask check --changed` | The same, limited to the crates affected by changes since the merge base with the default branch (`upstream/HEAD`, else `origin/HEAD`). |
 | `cargo xtask fuzz [--seconds N]` | Fuzzes protocol message decoding (target `decode` in `fuzz/`, a Cargo workspace of its own so normal builds never compile libFuzzer) with the pinned cargo-fuzz for N seconds (default 60), starting from the committed seeds in `fuzz/seeds/decode/`. It first runs rustfmt and clippy (`--locked`, warnings denied) on `fuzz/`, which `check` does not cover; `fuzz/Cargo.toml` copies the root's lints, and an xtask test keeps them equal. A failing input is saved under `fuzz/artifacts/decode/`; once fixed, add it to the seeds. |
-| `cargo xtask integrity --base <rev> [--description <file>]` | Lists deleted test files and tests, tests a commit of the branch added and a later one deleted, newly skipped or `should_panic` tests, tests with fewer assertions, and changed gate files since the merge base. In CI it fails on any of them unless an approver listed in `.github/integrity-approvers` at the merge base labelled the PR `integrity-approved` after its last push and last description edit; a run for a description edit treats any earlier label as stale. Each flagged test change also needs a reason in the PR description, label or not (below). |
+| `cargo xtask integrity --base <rev> [--description <file>]` | Lists deleted test files and tests, tests a commit of the branch added and a later one deleted, newly skipped or `should_panic` tests, tests with fewer assertions, and changed gate files since the merge base. In CI it fails on any of them unless an approver listed in `.github/integrity-approvers` at the merge base labelled the PR `integrity-approved` after its last push and last description edit; a run for a description edit treats any earlier label as stale. Each flagged test change also needs a reason in the PR description, label or not, and the description names no test it does not flag (below). |
 | `cargo xtask coverage --base <rev>` | Runs the tests of both workspaces under cargo-llvm-cov and fails unless 90% of the changed, instrumented lines of shipped code are covered, listing the ones that are not. Test code (`#[cfg(test)]` items, test functions, test modules in their own files, `tests/`) does not count. |
 | `cargo xtask mutants --base <rev> [--jobs N] [--shard k/n]` | Runs cargo-mutants on the Rust lines changed since the merge base, or one shard of them, and fails on any missed mutant: a change to the code that no test notices. A mutant whose tests hang counts as caught. The main workspace's mutants build in copies of the tree; xtask's are tested in place, one at a time, because its tests read the repository around it. |
 | `cargo xtask review --base <rev>` | Gemini reviews the diff, the PR's title and description against this file as it stands at the merge base. Runs in CI; it blocks on a `block` verdict or any blocking finding, and fails closed on quota, size and missing-key errors. |
@@ -158,13 +158,16 @@ xtask tool zizmor --pedantic .github`, `cargo xtask tool pinact run --check --ve
 `main`. Integrity, Coverage, Mutants and Gemini review run the base commit's xtask on the pull
 request's tree (`--root`), so a pull request cannot change the gates that judge it; a pull request
 that adds a gate fails that gate, which says it is bootstrapping. Only the review job has
-`GEMINI_API_KEY`, and it runs nothing from the pull request's tree.
+`GEMINI_API_KEY`, and it runs nothing from the pull request's tree. Inside GitHub Actions
+(`GITHUB_ACTIONS=true`), `review`, `mutants`, `coverage` and `integrity` also print their findings
+as annotations, at most ten of each level per step as GitHub keeps them; elsewhere their output is
+unchanged.
 
 A PR that deletes, skips or weakens a test explains each one in its description, in a
 `## Test changes` section: one entry per test, naming the test in backticks as the integrity check
 reports it (`<file>::<test>`, or the file for a deleted test file), then the requirement or
-behaviour that changed. A test change that only makes the code pass is not a reason; the Gemini
-review blocks it. `.github/pull_request_template.md` has the section, with "None" for a PR that
+behaviour that changed. An entry for a test the check does not flag fails it too. A test change
+that only makes the code pass is not a reason; the Gemini review blocks it. `.github/pull_request_template.md` has the section, with "None" for a PR that
 changes no tests.
 
 ```markdown

@@ -1,5 +1,6 @@
 //! Repository automation for abc, run as `cargo xtask <command>`.
 
+mod annotation;
 mod app;
 mod broker;
 mod check;
@@ -287,6 +288,7 @@ fn run(
         home, root, tool, ..
     } = invocation;
     let env = |name: &str| (invocation.env)(name);
+    let mode = annotation::Mode::from_env(&env);
     match task {
         Task::Check { changed } => Ok(verdict(check(root, changed, tool, report)?)),
         Task::Coverage { base } => Ok(verdict(coverage::run(
@@ -294,12 +296,13 @@ fn run(
             &base,
             &tool("cargo-llvm-cov")?,
             &tool("cargo-nextest")?,
+            mode,
             report,
         )?)),
         Task::Mutants { base, jobs, shard } => Ok(verdict(mutants::run(
             root,
             &base,
-            &mutants::Options { jobs, shard },
+            &mutants::Options { jobs, shard, mode },
             &tool("cargo-mutants")?,
             &tool("cargo-nextest")?,
             report,
@@ -321,6 +324,7 @@ fn run(
             pr,
             description.as_deref(),
             &env,
+            mode,
             report,
         )?)),
         Task::Review { base } => Ok(verdict(review::run_from(
@@ -434,6 +438,7 @@ fn integrity(
     pr: Option<u64>,
     description: Option<&Path>,
     env: &impl Fn(&str) -> Option<OsString>,
+    mode: annotation::Mode,
     report: &mut impl Write,
 ) -> anyhow::Result<bool> {
     let text = |name: &str| env(name).and_then(|value| value.into_string().ok());
@@ -442,7 +447,7 @@ fn integrity(
         .transpose()?;
     let payload = pr.and_then(|_| env("GITHUB_EVENT_PATH").map(PathBuf::from));
     let event = integrity::event(description, payload)?;
-    integrity::run(root, base, pull_request.as_ref(), &event, report)
+    integrity::run(root, base, pull_request.as_ref(), &event, mode, report)
 }
 
 /// `cargo xtask rulesets`: checks the rulesets in `root` against CI, or applies them with the

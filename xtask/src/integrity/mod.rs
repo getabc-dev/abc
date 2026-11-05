@@ -23,9 +23,11 @@ use std::path::Path;
 use anyhow::Context;
 
 pub(crate) use approval::PullRequest;
+use reasons::Explained;
 pub(crate) use reasons::{Event, event};
 pub(crate) use rust::TestCode;
 
+use crate::annotation::{self, Annotation, Mode};
 use crate::git;
 
 /// The gate files: whatever decides what passes. CODEOWNERS patterns, the single list both the
@@ -147,6 +149,19 @@ impl fmt::Display for Finding {
 }
 
 impl Finding {
+    /// The file the finding is about, and what kind of finding it is, as a short title.
+    fn place(&self) -> (&str, &'static str) {
+        match self {
+            Self::DeletedTest { file, .. } => (file, "Deleted test"),
+            Self::DeletedTestFile { file, .. } => (file, "Deleted test file"),
+            Self::AddedThenDeleted { file, .. } => (file, "Test added then deleted"),
+            Self::NewlyIgnored { file, .. } => (file, "Newly ignored test"),
+            Self::NewlyShouldPanic { file, .. } => (file, "Newly should_panic test"),
+            Self::FewerAssertions { file, .. } => (file, "Fewer assertions"),
+            Self::GateFile { file } => (file, "Gate file changed"),
+        }
+    }
+
     /// The test this finding changes, as the description's "## Test changes" section names it:
     /// `<file>::<test>`, or the file for a deleted test file. `None` for gate changes.
     fn test(&self) -> Option<String> {
@@ -164,17 +179,24 @@ impl Finding {
 
 /// Runs the check against the merge base with `base`. Each flagged test change needs a reason in
 /// the pull request's description; with a pull request, findings then pass when an approver
-/// listed at the merge base has approved them.
+/// listed at the merge base has approved them. In `mode` it annotates each finding for GitHub.
 pub(crate) fn run(
     root: &Path,
     base: &str,
     pull_request: Option<&PullRequest>,
     event: &Event,
+    mode: Mode,
     out: &mut impl Write,
 ) -> anyhow::Result<bool> {
-    run_with(root, base, pull_request, event, out, &mut |url, token| {
-        approval::github_get(url, token)
-    })
+    run_with(
+        root,
+        base,
+        pull_request,
+        event,
+        mode,
+        out,
+        &mut |url, token| approval::github_get(url, token),
+    )
 }
 
 /// [`run`], reading GitHub's API through `fetch` (URL and token).
@@ -183,30 +205,31 @@ fn run_with(
     base: &str,
     pull_request: Option<&PullRequest>,
     event: &Event,
+    mode: Mode,
     out: &mut impl Write,
     fetch: &mut impl FnMut(&str, &str) -> anyhow::Result<Vec<u8>>,
 ) -> anyhow::Result<bool> {
     let commit = git::merge_base(root, base)?;
-    let found = findings(root, &commit)?;
-    if found.is_empty() {
+    let review = Review::of(root, &commit, event.description.as_deref())?;
+    let Review { found, explained } = &review;
+    if found.is_empty() && explained.complete() {
         writeln!(
             out,
             "integrity: no deleted, skipped or weakened tests and no gate changes"
         )?;
         return Ok(true);
     }
-    writeln!(out, "integrity: {} finding(s)", found.len())?;
-    for finding in &found {
+    if !found.is_empty() {
+        writeln!(out, "integrity: {} finding(s)", found.len())?;
+    }
+    for finding in found {
         writeln!(out, "  {finding}")?;
     }
-    let flagged: Vec<String> = found
-        .iter()
-        .filter_map(Finding::test)
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect();
-    let explained = reasons::explained(&flagged, event.description.as_deref().unwrap_or_default());
     explained.report(out)?;
+    write!(out, "{}", annotation::commands(mode, &review.annotations()))?;
+    if found.is_empty() {
+        return Ok(false);
+    }
     let Some(pull_request) = pull_request else {
         writeln!(
             out,
@@ -230,6 +253,74 @@ fn run_with(
     })?;
     writeln!(out, "integrity: {}", verdict.reason)?;
     Ok(verdict.approved && explained.complete())
+}
+
+/// The findings since a merge base, and how a description explains them.
+#[derive(Debug)]
+struct Review {
+    found: Vec<Finding>,
+    explained: Explained,
+}
+
+impl Review {
+    /// The findings from `commit` to the working tree of `root`, against `description`.
+    fn of(root: &Path, commit: &str, description: Option<&str>) -> anyhow::Result<Self> {
+        let found = findings(root, commit)?;
+        let explained = reasons::explained(&flagged(&found), description.unwrap_or_default());
+        Ok(Self { found, explained })
+    }
+
+    /// An annotation for each finding, saying whether the description gives its reason, and
+    /// one for each entry that names a test no finding changes.
+    fn annotations(&self) -> Vec<Annotation> {
+        let mut annotations: Vec<Annotation> = self
+            .found
+            .iter()
+            .map(|finding| {
+                let (file, title) = finding.place();
+                let needs = match finding.test() {
+                    Some(test) if self.explained.unexplained.contains(&test) => format!(
+                        "No reason for `{test}` in the description's \"## {}\" section.",
+                        reasons::HEADING
+                    ),
+                    Some(test) => format!(
+                        "The description's \"## {}\" section gives a reason for `{test}`.",
+                        reasons::HEADING
+                    ),
+                    None => format!(
+                        "A gate file: it needs the {} label from an approver in {} and a code \
+                         owner's review.",
+                        approval::LABEL,
+                        approval::APPROVERS
+                    ),
+                };
+                Annotation::error(file, title, format!("{finding}. {needs}"))
+            })
+            .collect();
+        annotations.extend(self.explained.extra.iter().map(|test| Annotation {
+            file: None,
+            ..Annotation::error(
+                "",
+                "Stale test change",
+                format!(
+                    "The description's \"## {}\" section names `{test}`, which has no flagged \
+                     change.",
+                    reasons::HEADING
+                ),
+            )
+        }));
+        annotations
+    }
+}
+
+/// The tests `found` changes, each once, in order.
+fn flagged(found: &[Finding]) -> Vec<String> {
+    found
+        .iter()
+        .filter_map(Finding::test)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 
 /// Every finding in the changes from `commit` to the working tree.
@@ -390,6 +481,8 @@ mod tests {
     use std::collections::BTreeSet;
     use std::fs;
     use std::path::{Path, PathBuf};
+
+    use crate::annotation::Mode;
 
     use super::{
         Event, Finding, GATES, PullRequest, Test, compare, findings, is_gate_file, run, run_with,
@@ -669,7 +762,16 @@ mod tests {
         };
         let mut out = Vec::new();
         assert!(
-            run_with(&clean, "base", None, &Event::default(), &mut out, unused).unwrap(),
+            run_with(
+                &clean,
+                "base",
+                None,
+                &Event::default(),
+                Mode::Plain,
+                &mut out,
+                unused
+            )
+            .unwrap(),
             "no findings pass"
         );
         assert!(
@@ -687,6 +789,7 @@ mod tests {
                 "base",
                 None,
                 &Event::default(),
+                Mode::Plain,
                 &mut refused,
                 unused
             )
@@ -707,6 +810,7 @@ mod tests {
                 "base",
                 Some(&pull_request()),
                 &Event::default(),
+                Mode::Plain,
                 &mut accepted,
                 &mut labelled_by("snehilvj")
             )
@@ -730,6 +834,7 @@ mod tests {
                     description: None,
                     body_edited: true
                 },
+                Mode::Plain,
                 &mut edited,
                 &mut labelled_by("snehilvj")
             )
@@ -756,6 +861,7 @@ mod tests {
                 "base",
                 Some(&pull_request()),
                 &Event::default(),
+                Mode::Plain,
                 &mut out,
                 &mut labelled_by("agent")
             )
@@ -775,6 +881,7 @@ mod tests {
             "base",
             Some(&pull_request()),
             &Event::default(),
+            Mode::Plain,
             &mut Vec::new(),
             &mut labelled_by("snehilvj"),
         )
@@ -791,12 +898,28 @@ mod tests {
         let clean =
             repository_with_change(&temp.path().join("clean"), &[("src/a.rs", "fn a() {}\n")]);
         assert!(
-            run(&clean, "base", None, &Event::default(), &mut Vec::new()).unwrap(),
+            run(
+                &clean,
+                "base",
+                None,
+                &Event::default(),
+                Mode::Plain,
+                &mut Vec::new()
+            )
+            .unwrap(),
             "clean"
         );
         let gated = repository_with_change(&temp.path().join("gated"), &[("deny.toml", "\n")]);
         assert!(
-            !run(&gated, "base", None, &Event::default(), &mut Vec::new()).unwrap(),
+            !run(
+                &gated,
+                "base",
+                None,
+                &Event::default(),
+                Mode::Plain,
+                &mut Vec::new()
+            )
+            .unwrap(),
             "a gate change fails without asking GitHub"
         );
     }
@@ -815,6 +938,7 @@ mod tests {
                 "base",
                 Some(&pull_request()),
                 &described("Drops t."),
+                Mode::Plain,
                 &mut bare,
                 &mut labelled_by("snehilvj")
             )
@@ -841,6 +965,7 @@ mod tests {
                 "base",
                 Some(&pull_request()),
                 &reasoned,
+                Mode::Plain,
                 &mut Vec::new(),
                 &mut labelled_by("snehilvj")
             )
@@ -853,11 +978,99 @@ mod tests {
                 "base",
                 None,
                 &reasoned,
+                Mode::Plain,
                 &mut Vec::new(),
                 &mut labelled_by("snehilvj")
             )
             .unwrap(),
             "a reason without approval still fails"
+        );
+    }
+
+    #[test]
+    fn annotates_each_finding_and_fails_an_entry_for_a_test_not_flagged() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = approved_repository(&temp.path().join("repo"), &[("deny.toml", "\n")]);
+        fs::remove_file(repo.join("src/t.rs")).unwrap();
+        git(&repo, &["commit", "--quiet", "--all", "-m", "drop it"]);
+        let stale = described(
+            "## Test changes\n\n- `src/t.rs`: t covered the removed parser.\n- \
+             `src/u.rs::tests::gone`: an entry left from an earlier push.\n",
+        );
+        let mut out = Vec::new();
+        assert!(
+            !run_with(
+                &repo,
+                "base",
+                Some(&pull_request()),
+                &stale,
+                Mode::Actions,
+                &mut out,
+                &mut labelled_by("snehilvj")
+            )
+            .unwrap(),
+            "an entry for a test integrity does not flag fails, approved or not; #25 had three"
+        );
+        let text = String::from_utf8(out).unwrap();
+        for line in [
+            "::error file=deny.toml,title=Gate file changed::gate file changed  deny.toml. A gate \
+             file: it needs the integrity-approved label from an approver in \
+             .github/integrity-approvers and a code owner's review.",
+            "::error file=src/t.rs,title=Deleted test file::deleted test file  src/t.rs (1 tests). \
+             The description's \"## Test changes\" section gives a reason for `src/t.rs`.",
+            "::error title=Stale test change::The description's \"## Test changes\" section names \
+             `src/u.rs::tests::gone`, which has no flagged change.",
+        ] {
+            assert!(
+                text.lines().any(|printed| printed == line),
+                "{line}\n{text}"
+            );
+        }
+
+        let clean = approved_repository(&temp.path().join("clean"), &[("src/a.rs", "fn a() {}\n")]);
+        let mut only_stale = Vec::new();
+        assert!(
+            !run_with(
+                &clean,
+                "base",
+                None,
+                &stale,
+                Mode::Plain,
+                &mut only_stale,
+                &mut |_: &str, _: &str| -> anyhow::Result<Vec<u8>> {
+                    panic!("no findings, no API call")
+                }
+            )
+            .unwrap(),
+            "stale entries fail without any finding"
+        );
+        let only_stale = String::from_utf8(only_stale).unwrap();
+        assert!(
+            only_stale.contains("names `src/t.rs`, which has no flagged change"),
+            "{only_stale}"
+        );
+        assert!(!only_stale.contains("::error"), "{only_stale}");
+        let mut unexplained = Vec::new();
+        assert!(
+            !run_with(
+                &repo,
+                "base",
+                Some(&pull_request()),
+                &described("None"),
+                Mode::Actions,
+                &mut unexplained,
+                &mut labelled_by("snehilvj")
+            )
+            .unwrap()
+        );
+        let unexplained = String::from_utf8(unexplained).unwrap();
+        assert!(
+            unexplained.contains(
+                "::error file=src/t.rs,title=Deleted test file::deleted test file  src/t.rs (1 \
+                 tests). No reason for `src/t.rs` in the description's \"## Test changes\" \
+                 section."
+            ),
+            "{unexplained}"
         );
     }
 
