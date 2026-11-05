@@ -142,3 +142,15 @@ pub(crate) fn repository_with_change(path: &Path, files: &[(&str, &str)]) -> Pat
     git(&repo, &["commit", "--quiet", "-m", "change"]);
     repo
 }
+
+/// The pinned tool `name` of this repository, for a test that runs it. It must be marked
+/// `for-tests` in xtask/tools.toml, or CI's test jobs would not install it.
+pub(crate) fn pinned_for_tests(name: &str) -> PathBuf {
+    let repo = crate::repo_root().unwrap();
+    let manifest = crate::tools::Manifest::load(&repo).unwrap();
+    assert!(
+        manifest.tool(name).unwrap().for_tests,
+        "a test runs {name}: mark it `for-tests = true` in xtask/tools.toml"
+    );
+    crate::tools::pinned(&repo, name).unwrap()
+}

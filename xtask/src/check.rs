@@ -696,7 +696,6 @@ mod tests {
     };
     use crate::git::default_branch;
     use crate::testing::{git, repository};
-    use crate::tools::Manifest;
 
     fn package(name: &str, dir: &str, library: bool, path_dependencies: &[&str]) -> Package {
         Package {
@@ -1193,18 +1192,12 @@ mod tests {
 
     /// Runs the whole check on `fixture` with Postgres reached through `postgres`.
     fn check_in(fixture: &TempDir, postgres: &super::Postgres<'_>) -> (bool, String) {
-        let repo = crate::repo_root().unwrap();
-        let nextest = Manifest::load(&repo)
-            .unwrap()
-            .tool("cargo-nextest")
-            .unwrap()
-            .installed(&repo)
-            .unwrap();
+        let nextest = crate::testing::pinned_for_tests("cargo-nextest");
         let target_dir = fixture.path().join("target");
         let mut out = Vec::new();
         let tools = Tools {
             nextest,
-            shellcheck: crate::tools::pinned(&repo, "shellcheck").unwrap(),
+            shellcheck: crate::testing::pinned_for_tests("shellcheck"),
         };
         let tree = Tree {
             workspaces: &[MAIN],
@@ -1278,10 +1271,9 @@ mod tests {
 
     /// Runs only the shellcheck step on `scripts` of `dir`.
     fn shellcheck_in(dir: &Path, scripts: &[&str]) -> (bool, String) {
-        let repo = crate::repo_root().unwrap();
         let tools = Tools {
             nextest: PathBuf::from("unused"),
-            shellcheck: crate::tools::pinned(&repo, "shellcheck").unwrap(),
+            shellcheck: crate::testing::pinned_for_tests("shellcheck"),
         };
         let unused = |_: &mut dyn std::io::Write| anyhow::bail!("no database");
         let no_sqlx = || anyhow::bail!("no query cache");

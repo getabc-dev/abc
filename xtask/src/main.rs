@@ -166,12 +166,18 @@ enum Task {
     },
     /// Install the tools pinned in xtask/tools.toml into .tools/, verifying each download.
     Setup {
-        /// Install only these tools; all of them when none are named.
+        /// Install the tools the tests run (`for-tests` in xtask/tools.toml), with any named.
+        #[arg(long)]
+        for_tests: bool,
+        /// Install only these tools; all of them when none are named and not --for-tests.
         tools: Vec<String>,
     },
     /// Check that every pinned tool, or each one named, is installed at its pinned version.
     Doctor {
-        /// Check only these tools; all of them when none are named.
+        /// Check the tools the tests run (`for-tests` in xtask/tools.toml), with any named.
+        #[arg(long)]
+        for_tests: bool,
+        /// Check only these tools; all of them when none are named and not --for-tests.
         tools: Vec<String>,
     },
     /// Record the sha256 of every pinned tool's archive for every target in xtask/tools.toml.
@@ -346,11 +352,17 @@ fn run(
         ),
         Task::Rulesets { action } => run_rulesets(action, root, report),
         Task::Work { action } => run_task(action, root, report),
-        Task::Setup { tools: only } => {
-            tools::setup(home, &only, &mut io::stdout().lock())?;
+        Task::Setup {
+            for_tests,
+            tools: only,
+        } => {
+            tools::setup(home, &only, for_tests, &mut io::stdout().lock())?;
             Ok(ExitCode::SUCCESS)
         }
-        Task::Doctor { tools: only } => tools::doctor(home, &only, &mut io::stdout().lock()),
+        Task::Doctor {
+            for_tests,
+            tools: only,
+        } => tools::doctor(home, &only, for_tests, &mut io::stdout().lock()),
         Task::Pin => {
             tools::pin(home, &mut io::stdout().lock())?;
             Ok(ExitCode::SUCCESS)
@@ -904,7 +916,16 @@ mod tests {
         );
         let config = git(&home, &["config", "--local", "--list"]);
         assert_eq!(
-            dispatch(Task::Setup { tools: Vec::new() }, &home, &home, &|_| None).unwrap(),
+            dispatch(
+                Task::Setup {
+                    for_tests: false,
+                    tools: Vec::new()
+                },
+                &home,
+                &home,
+                &|_| None
+            )
+            .unwrap(),
             ExitCode::SUCCESS,
             "nothing to install"
         );
@@ -916,6 +937,7 @@ mod tests {
         assert!(
             dispatch(
                 Task::Doctor {
+                    for_tests: false,
                     tools: vec!["no-such-tool".to_owned()]
                 },
                 &home,
