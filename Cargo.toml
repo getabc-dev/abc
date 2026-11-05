@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/*", "xtask"]
+members = ["crates/*"]
 # Crates that `cargo xtask setup` builds into .tools/ are never part of the workspace.
 exclude = [".tools"]
 
@@ -14,13 +14,10 @@ repository = "https://github.com/getabc-dev/abc"
 publish = false
 
 [workspace.dependencies]
-anyhow = "1.0.104"
 axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "tokio", "ws", "matched-path", "tracing"] }
-base64 = "0.23.1"
 bytes = "1.12.1"
 clap = { version = "4.6.7", features = ["derive"] }
 data-encoding = "2.11.1"
-flate2 = "1.1.10"
 futures = "0.3.34"
 http-body-util = "0.1.5"
 hyper = "1.12.0"
@@ -36,8 +33,6 @@ semver = { version = "1.0.28", features = ["serde"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 serde_path_to_error = "0.1.20"
-proc-macro2 = { version = "1.0.107", features = ["span-locations"] }
-ring = "0.17.14"
 # getuid and uname for the worker, with no unsafe code of our own.
 rustix = "1.1.6"
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
@@ -46,8 +41,6 @@ rustls-platform-verifier = "0.7.1"
 sha2 = "0.11.1"
 sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "tls-rustls-ring-webpki", "postgres", "macros", "migrate", "uuid", "time", "json"] }
 subtle = "2.6.1"
-syn = { version = "3.0.9", features = ["full", "visit"] }
-tar = "0.4.46"
 tempfile = "3.27.0"
 thiserror = "2.0.21"
 time = { version = "0.3.55", features = ["serde", "formatting", "parsing"] }
@@ -55,18 +48,12 @@ tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "net", "s
 tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "tls12"] }
 tokio-stream = "0.1.19"
 tokio-tungstenite = "0.29.0"
-yaml-rust2 = "0.13.0"
 toml_edit = { version = "0.25.17", features = ["serde"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["json", "env-filter", "fmt"] }
 ts-rs = { version = "12.0.1", features = ["uuid-impl", "semver-impl", "serde-compat", "no-serde-warnings"] }
-ureq = "3.5.0"
 uuid = { version = "1.29.0", features = ["v7", "serde"] }
 zeroize = { version = "1.9.1", features = ["derive"] }
-
-# xtask hashes every pinned tool before running it; optimise sha2 so debug builds hash quickly.
-[profile.dev.package.sha2]
-opt-level = 3
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

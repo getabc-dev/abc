@@ -396,10 +396,15 @@ fn check(
         warm: &postgres::warm,
         sqlx: &|| tool("cargo-sqlx"),
     };
+    let tools = check::Tools {
+        nextest: tool("cargo-nextest")?,
+        shellcheck: tool("shellcheck")?,
+    };
     check::run(
         root,
+        check::REPOSITORY,
         changed,
-        &tool("cargo-nextest")?,
+        &tools,
         &postgres,
         None,
         report,
@@ -557,6 +562,7 @@ mod tests {
             "while [ $# -gt 0 ]; do [ \"$1\" = --output ] && out=$2; shift; done\nmkdir -p \"$out/mutants.out\"\necho 'src/a.rs:1:1: replace a with ()' > \"$out/mutants.out/missed.txt\"\nexit 2\n",
         );
         script(&dir.join("cargo-nextest"), "exit 0\n");
+        script(&dir.join("shellcheck"), "exit 0\n");
         script(&dir.join("cargo-fuzz"), "exit 77\n");
     }
 
@@ -802,25 +808,37 @@ mod tests {
         fs::create_dir_all(home.join("tools")).unwrap();
         fake_tools(&home.join("tools"));
         let root = temp.path().join("root");
-        fs::create_dir_all(root.join("src")).unwrap();
-        fs::write(
-            root.join("Cargo.toml"),
-            "[package]\nname = \"fixture-dispatch\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[workspace]\n",
-        )
-        .unwrap();
-        fs::write(
-            root.join("Cargo.lock"),
-            "version = 4\n\n[[package]]\nname = \"fixture-dispatch\"\nversion = \"0.1.0\"\n",
-        )
-        .unwrap();
+        // Both workspaces of a repository, each one crate, and its scripts.
+        for (dir, name) in [
+            ("", "fixture-dispatch"),
+            ("xtask", "fixture-dispatch-xtask"),
+        ] {
+            let crate_dir = root.join(dir);
+            fs::create_dir_all(crate_dir.join("src")).unwrap();
+            fs::write(
+                crate_dir.join("Cargo.toml"),
+                format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[workspace]\n"),
+            )
+            .unwrap();
+            fs::write(
+                crate_dir.join("Cargo.lock"),
+                format!("version = 4\n\n[[package]]\nname = \"{name}\"\nversion = \"0.1.0\"\n"),
+            )
+            .unwrap();
+            fs::write(
+                crate_dir.join("src/lib.rs"),
+                "//! A fixture crate.\n\n/// Adds one.\n#[must_use]\npub fn add_one(value: u32) -> u32 {\n    value.saturating_add(1)\n}\n",
+            )
+            .unwrap();
+        }
+        for script in crate::check::SCRIPTS {
+            let path = root.join(script);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, "#!/bin/sh\n").unwrap();
+        }
         fs::copy(
             repo_root().unwrap().join("rust-toolchain.toml"),
             root.join("rust-toolchain.toml"),
-        )
-        .unwrap();
-        fs::write(
-            root.join("src/lib.rs"),
-            "//! A fixture crate.\n\n/// Adds one.\n#[must_use]\npub fn add_one(value: u32) -> u32 {\n    value.saturating_add(1)\n}\n",
         )
         .unwrap();
         assert_eq!(
@@ -829,7 +847,7 @@ mod tests {
             })
             .unwrap(),
             ExitCode::SUCCESS,
-            "check passes a clean workspace with the pinned nextest it finds"
+            "check passes a clean tree with the pinned nextest and shellcheck it finds"
         );
     }
 
@@ -972,6 +990,56 @@ mod tests {
             manifest["workspace"]["package"]["rust-version"].as_str(),
             toolchain["toolchain"]["channel"].as_str(),
             "Cargo.toml's rust-version must equal the channel in rust-toolchain.toml"
+        );
+    }
+
+    #[test]
+    fn the_xtask_workspace_shares_the_nextest_configuration() {
+        let root = repo_root().unwrap();
+        assert_eq!(
+            fs::read_link(root.join("xtask/.config")).unwrap(),
+            Path::new("../.config"),
+            "nextest reads .config/ from the workspace root; xtask's is the repository's"
+        );
+    }
+
+    #[test]
+    fn the_xtask_workspace_keeps_the_main_workspace_lints_and_rust_version() {
+        let root = repo_root().unwrap();
+        let read = |path: &str| -> serde_json::Value {
+            toml_edit::de::from_str(&fs::read_to_string(root.join(path)).unwrap()).unwrap()
+        };
+        let main = read("Cargo.toml");
+        let xtask = read("xtask/Cargo.toml");
+        assert!(
+            main["workspace"]["lints"].is_object(),
+            "the main workspace sets lints"
+        );
+        assert_eq!(
+            xtask["lints"], main["workspace"]["lints"],
+            "xtask/Cargo.toml's [lints] must equal Cargo.toml's [workspace.lints]"
+        );
+        assert!(
+            main["workspace"]["package"]["rust-version"].is_string(),
+            "the main workspace sets rust-version"
+        );
+        assert_eq!(
+            xtask["package"]["rust-version"], main["workspace"]["package"]["rust-version"],
+            "xtask/Cargo.toml's rust-version must equal the main workspace's"
+        );
+        assert!(
+            xtask["workspace"].is_object(),
+            "xtask is a workspace of its own"
+        );
+        assert!(
+            !main["workspace"]["members"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|member| member
+                    .as_str()
+                    .is_some_and(|member| member.starts_with("xtask"))),
+            "and not a member of the main one"
         );
     }
 }

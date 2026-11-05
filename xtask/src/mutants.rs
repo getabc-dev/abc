@@ -12,7 +12,7 @@ use std::process::Command;
 
 use anyhow::{Context, bail, ensure};
 
-use crate::check::PROPTEST_RNG_SEED;
+use crate::check::{self, PROPTEST_RNG_SEED, Workspace};
 use crate::git;
 use crate::tools;
 
@@ -88,7 +88,12 @@ pub(crate) struct Options {
 }
 
 /// Runs cargo-mutants, with the cargo-mutants and cargo-nextest executables given, on the Rust
-/// lines changed since the merge base with `base`.
+/// lines changed since the merge base with `base`, in each workspace of the repository.
+///
+/// The main workspace's mutants are built in copies of the tree, as many at once as
+/// `options.jobs` says. xtask's are tested in place, one at a time: its tests read the repository
+/// around the workspace (the main manifest, the hook launcher, the CI workflows), which a copy of
+/// the workspace alone would not have. cargo-mutants puts each source file back after its mutants.
 pub(crate) fn run(
     root: &Path,
     base: &str,
@@ -98,81 +103,188 @@ pub(crate) fn run(
     out: &mut impl Write,
 ) -> anyhow::Result<bool> {
     let commit = git::merge_base(root, base)?;
-    let diff = git::diff(root, &commit, 3)?;
-    if !changes_rust(&diff) {
+    let mut passed = true;
+    let mut mutated = false;
+    for &workspace in check::REPOSITORY.workspaces {
+        let diff = workspace_diff(root, &commit, workspace)?;
+        if !changes_rust(&diff) {
+            continue;
+        }
+        mutated = true;
+        let run = Run {
+            root,
+            workspace,
+            options,
+            mutants,
+            nextest,
+        };
+        passed &= run.mutate(&diff, out)?;
+    }
+    if !mutated {
         writeln!(out, "mutants: no Rust lines changed; nothing to mutate")?;
-        return Ok(true);
     }
-    let output = root.join(OUTPUT);
-    fs::create_dir_all(&output)
-        .with_context(|| format!("could not create {}", output.display()))?;
-    let results = output.join("mutants.out");
-    // Results of an earlier run must not decide this one.
-    if results.exists() {
-        fs::remove_dir_all(&results)
-            .with_context(|| format!("could not remove {}", results.display()))?;
-    }
-    if crate::postgres::needed(root) {
-        crate::postgres::warm(out)?;
-    }
-    let diff_file = output.join("changes.diff");
-    fs::write(&diff_file, &diff).context("could not write the diff for cargo-mutants")?;
-    writeln!(out, "xtask: mutating the changed Rust code")?;
-    // cargo-mutants copies the tree, once per job, into the temporary directory and builds each
-    // copy there. That directory is small in an agent VM, where the build output has the room.
-    let scratch = scratch(root);
-    fs::create_dir_all(&scratch)
-        .with_context(|| format!("could not create {}", scratch.display()))?;
-    // The tests must not inherit that directory: inside the checkout it is inside its git
-    // repository and its Cargo workspace, and its paths can be too long for a Unix socket. Cargo's
-    // `[env]`, forced, gives every build and test cargo-mutants runs this process's own one back.
-    let test_env = output.join("test-env.toml");
-    fs::write(&test_env, test_env_config(&std::env::temp_dir())?)
-        .with_context(|| format!("could not write {}", test_env.display()))?;
-    let mut cargo_config = OsString::from("--cargo-arg=--config=");
-    cargo_config.push(&test_env);
-    let status = Command::new(mutants)
-        .arg("mutants")
-        .arg("--in-diff")
-        .arg(&diff_file)
-        .args([
-            "--test-tool",
-            "nextest",
-            "--no-shuffle",
-            "--colors",
-            "never",
-        ])
-        // The tests run the pinned tools in .tools/, which .gitignore lists; copy them too.
-        .args(["--gitignore", "false"])
-        .arg(&cargo_config)
-        .arg("--timeout-multiplier")
-        .arg(timeout_multiplier(options.jobs).to_string())
-        .args(["--minimum-test-timeout", MINIMUM_TEST_TIMEOUT])
-        .arg("--jobs")
-        .arg(options.jobs.to_string())
-        .args(
-            options
-                .shard
-                .map(|shard| vec!["--shard".to_owned(), format!("{}/{}", shard.index, shard.count)])
-                .unwrap_or_default(),
-        )
-        .arg("--output")
-        .arg(&output)
-        .env("PATH", tools::path_with(nextest)?)
-        .env("PROPTEST_RNG_SEED", PROPTEST_RNG_SEED)
-        .env("TMPDIR", &scratch)
-        .current_dir(root)
-        .status()
-        .context("could not run cargo-mutants");
-    // Whatever cargo-mutants left behind goes, so repeated runs never fill the disk.
-    fs::remove_dir_all(&scratch)
-        .with_context(|| format!("could not remove {}", scratch.display()))?;
-    let result = outcome(status?.code())?;
-    let missed = listed(&results.join("missed.txt"))?;
-    let timed_out = listed(&results.join("timeout.txt"))?;
-    let passed = missed.is_empty() && result != Outcome::Missed;
-    write!(out, "{}", describe(passed, &missed, &timed_out))?;
     Ok(passed)
+}
+
+/// The diff from `commit` of the files of `workspace`, with paths relative to its directory, as
+/// cargo-mutants reads them. The main workspace's leaves out the other workspaces.
+fn workspace_diff(root: &Path, commit: &str, workspace: Workspace) -> anyhow::Result<String> {
+    let mut args = vec![
+        "-c".to_owned(),
+        "core.quotePath=false".to_owned(),
+        "diff".to_owned(),
+        "--no-color".to_owned(),
+        "--no-ext-diff".to_owned(),
+        "-M".to_owned(),
+        "-U3".to_owned(),
+    ];
+    if workspace.dir().is_empty() {
+        args.extend([commit.to_owned(), "--".to_owned(), ".".to_owned()]);
+        args.extend(
+            check::REPOSITORY
+                .workspaces
+                .iter()
+                .filter(|other| !other.dir().is_empty())
+                .map(|other| format!(":(exclude){}", other.dir())),
+        );
+    } else {
+        args.extend([
+            format!("--relative={}", workspace.dir()),
+            commit.to_owned(),
+            "--".to_owned(),
+            workspace.dir().to_owned(),
+        ]);
+    }
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    git::git(root, &args)
+}
+
+/// One workspace's cargo-mutants run.
+struct Run<'a> {
+    root: &'a Path,
+    workspace: Workspace,
+    options: &'a Options,
+    mutants: &'a Path,
+    nextest: &'a Path,
+}
+
+impl Run<'_> {
+    /// Where the run's results go: `target/mutants`, and a directory in it for each workspace
+    /// but the main one.
+    fn output(&self) -> PathBuf {
+        self.root.join(OUTPUT).join(self.workspace.dir())
+    }
+
+    /// Mutates the lines `diff` changes and reports whether the tests caught every mutant.
+    fn mutate(&self, diff: &str, out: &mut impl Write) -> anyhow::Result<bool> {
+        let root = self.root;
+        let output = self.output();
+        fs::create_dir_all(&output)
+            .with_context(|| format!("could not create {}", output.display()))?;
+        let results = output.join("mutants.out");
+        // Results of an earlier run must not decide this one.
+        if results.exists() {
+            fs::remove_dir_all(&results)
+                .with_context(|| format!("could not remove {}", results.display()))?;
+        }
+        if crate::postgres::needed(root) {
+            crate::postgres::warm(out)?;
+        }
+        let diff_file = output.join("changes.diff");
+        fs::write(&diff_file, diff).context("could not write the diff for cargo-mutants")?;
+        let in_place = !self.workspace.dir().is_empty();
+        writeln!(
+            out,
+            "xtask: mutating the changed Rust code{}",
+            if in_place {
+                format!(" of {}/, in place", self.workspace.dir())
+            } else {
+                String::new()
+            }
+        )?;
+        // cargo-mutants copies the tree, once per job, into the temporary directory and builds
+        // each copy there. That directory is small in an agent VM, where the build output has the
+        // room.
+        let scratch = scratch(root);
+        fs::create_dir_all(&scratch)
+            .with_context(|| format!("could not create {}", scratch.display()))?;
+        // The tests must not inherit that directory: inside the checkout it is inside its git
+        // repository and its Cargo workspace, and its paths can be too long for a Unix socket.
+        // Cargo's `[env]`, forced, gives every build and test cargo-mutants runs this process's
+        // own one back.
+        let test_env = output.join("test-env.toml");
+        fs::write(&test_env, test_env_config(&std::env::temp_dir())?)
+            .with_context(|| format!("could not write {}", test_env.display()))?;
+        let mut cargo_config = OsString::from("--cargo-arg=--config=");
+        cargo_config.push(&test_env);
+        let mut command = Command::new(self.mutants);
+        command
+            .arg("mutants")
+            .arg("--in-diff")
+            .arg(&diff_file)
+            .args([
+                "--test-tool",
+                "nextest",
+                "--no-shuffle",
+                "--colors",
+                "never",
+            ])
+            .arg(&cargo_config)
+            .arg("--timeout-multiplier")
+            .arg(timeout_multiplier(self.options.jobs).to_string())
+            .args(["--minimum-test-timeout", MINIMUM_TEST_TIMEOUT]);
+        if in_place {
+            command.args(["--dir", self.workspace.dir(), "--in-place"]);
+        } else {
+            command
+                .arg("--jobs")
+                .arg(self.options.jobs.to_string())
+                // The tests run the pinned tools in .tools/, which .gitignore lists; copy them too.
+                .args(["--gitignore", "false"]);
+        }
+        let status = command
+            .args(
+                self.options
+                    .shard
+                    .map(|shard| {
+                        vec![
+                            "--shard".to_owned(),
+                            format!("{}/{}", shard.index, shard.count),
+                        ]
+                    })
+                    .unwrap_or_default(),
+            )
+            .arg("--output")
+            .arg(&output)
+            .env("PATH", tools::path_with(self.nextest)?)
+            .env("PROPTEST_RNG_SEED", PROPTEST_RNG_SEED)
+            .env("TMPDIR", &scratch)
+            .current_dir(root)
+            .status()
+            .context("could not run cargo-mutants");
+        // Whatever cargo-mutants left behind goes, so repeated runs never fill the disk.
+        fs::remove_dir_all(&scratch)
+            .with_context(|| format!("could not remove {}", scratch.display()))?;
+        let result = outcome(status?.code())?;
+        let named = |line: String| {
+            if in_place {
+                format!("{}/{line}", self.workspace.dir())
+            } else {
+                line
+            }
+        };
+        let missed: Vec<String> = listed(&results.join("missed.txt"))?
+            .into_iter()
+            .map(named)
+            .collect();
+        let timed_out: Vec<String> = listed(&results.join("timeout.txt"))?
+            .into_iter()
+            .map(named)
+            .collect();
+        let passed = missed.is_empty() && result != Outcome::Missed;
+        write!(out, "{}", describe(passed, &missed, &timed_out))?;
+        Ok(passed)
+    }
 }
 
 /// Cargo configuration that sets `TMPDIR` to `temp` for everything cargo runs, overriding the
@@ -431,6 +543,54 @@ mod tests {
                 .unwrap()
                 .contains("no Rust lines changed"),
             "said so"
+        );
+    }
+
+    #[test]
+    fn mutates_xtask_in_place_with_paths_relative_to_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = repository_with_change(
+            &temp.path().join("repo"),
+            &[
+                ("xtask/src/a.rs", "fn a() -> bool { true }\n"),
+                ("README.md", "# x\n"),
+            ],
+        );
+        let nextest = temp.path().join("cargo-nextest");
+        let mutants = temp.path().join("cargo-mutants");
+        let args = temp.path().join("args");
+        script(
+            &mutants,
+            &format!(
+                "echo \"$*\" > {}\nwhile [ $# -gt 0 ]; do case \"$1\" in --output) out=$2 ;; --in-diff) diff=$2 ;; esac; shift; done\ngrep -q '^+++ b/src/a.rs' \"$diff\" || exit 8\n! grep -q README \"$diff\" || exit 9\nmkdir -p \"$out/mutants.out\"\necho 'src/a.rs:1:18: replace a -> bool with false' > \"$out/mutants.out/missed.txt\"\nexit 2\n",
+                args.display()
+            ),
+        );
+        let mut out = Vec::new();
+        let passed = run(&repo, "base", &TWO, &mutants, &nextest, &mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(!passed, "{text}");
+        assert!(
+            text.contains("missed: xtask/src/a.rs:1:18: replace a -> bool with false"),
+            "named from the repository root: {text}"
+        );
+        assert!(text.contains("of xtask/, in place"), "{text}");
+        let called = fs::read_to_string(&args).unwrap();
+        assert!(called.contains("--dir xtask --in-place"), "{called}");
+        assert!(
+            !called.contains("--jobs"),
+            "one at a time in place: {called}"
+        );
+        assert!(
+            !called.contains("--gitignore"),
+            "nothing is copied in place, and cargo-mutants refuses the option there: {called}"
+        );
+        assert!(
+            called.contains(&format!(
+                "--output {}",
+                repo.join("target/mutants/xtask").display()
+            )),
+            "{called}"
         );
     }
 

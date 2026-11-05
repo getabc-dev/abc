@@ -1,6 +1,13 @@
+[build]
+# Every workspace builds here, xtask's and the fuzz workspace's too: one place for all build output,
+# which an agent VM keeps on its build volume. The hooks build xtask into target/hook instead.
+target-dir = "target"
+
 [alias]
-# --locked: never rewrite Cargo.lock as a side effect of running a check or a hook.
-xtask = "run --quiet --locked --package xtask --"
+# xtask is a workspace of its own (xtask/Cargo.toml), so a crate of the main workspace that does
+# not build never stops it. Run it from the repository root, where the manifest path resolves.
+# --locked: never rewrite a lockfile as a side effect of running a check or a hook.
+xtask = "run --quiet --locked --manifest-path xtask/Cargo.toml --"
 
 [env]
 # sqlx's query macros read the committed query cache (.sqlx/), never a live database, so every

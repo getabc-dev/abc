@@ -52,6 +52,11 @@ jobs:
       - name: Install the pinned Rust toolchain
         run: rustup toolchain install --no-self-update
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          # xtask is a workspace of its own, built into the root's target/ (.cargo/config.toml).
+          workspaces: |
+            . -> target
+            xtask -> ../target
       - name: Install the pinned tools
         run: cargo xtask setup cargo-nextest
       - name: Check the installed tools against their pins
@@ -91,6 +96,11 @@ jobs:
       - name: Install the pinned Rust toolchain
         run: rustup toolchain install --no-self-update
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          # xtask is a workspace of its own, built into the root's target/ (.cargo/config.toml).
+          workspaces: |
+            . -> target
+            xtask -> ../target
       - name: Install the pinned tools
         run: cargo xtask setup cargo-nextest
       - name: Check the installed tools against their pins

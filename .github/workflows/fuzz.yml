@@ -38,10 +38,11 @@ jobs:
         run: rustup toolchain install --no-self-update
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          # xtask builds in the main workspace's target/, the fuzz target in the fuzz workspace's.
+          # xtask and the fuzz target are workspaces of their own, both built into the root's target/
+          # (.cargo/config.toml).
           workspaces: |
-            . -> target
-            fuzz -> target
+            xtask -> ../target
+            fuzz -> ../target
       - name: Install the pinned tools
         run: cargo xtask setup cargo-fuzz
       - name: Check the installed tools against their pins

@@ -1,31 +1,97 @@
+# Repository automation, run as `cargo xtask`. A workspace of its own, as `fuzz/` is, so that no
+# crate of the main workspace can keep xtask from building: the hooks, the gates and the guard
+# build from here alone, with dependencies locked in xtask/Cargo.lock.
 [package]
 name = "xtask"
 description = "Repository automation for abc, run as `cargo xtask <command>`."
-version.workspace = true
-edition.workspace = true
-rust-version.workspace = true
-license.workspace = true
-repository.workspace = true
-publish.workspace = true
+version = "0.1.0"
+edition = "2024"
+# Equal to the main workspace's; an xtask test keeps them in step.
+rust-version = "1.99.1"
+license = "MIT"
+repository = "https://github.com/getabc-dev/abc"
+publish = false
+
+[workspace]
+members = ["."]
 
 [dependencies]
-anyhow.workspace = true
-base64.workspace = true
-clap.workspace = true
-flate2.workspace = true
-serde.workspace = true
-serde_json.workspace = true
-proc-macro2.workspace = true
-ring.workspace = true
-sha2.workspace = true
-syn.workspace = true
-tar.workspace = true
-toml_edit.workspace = true
-ureq.workspace = true
-yaml-rust2.workspace = true
+anyhow = "1.0.104"
+base64 = "0.23.1"
+clap = { version = "4.6.7", features = ["derive"] }
+flate2 = "1.1.10"
+proc-macro2 = { version = "1.0.107", features = ["span-locations"] }
+ring = "0.17.14"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+sha2 = "0.11.1"
+syn = { version = "3.0.9", features = ["full", "visit"] }
+tar = "0.4.46"
+toml_edit = { version = "0.25.17", features = ["serde"] }
+ureq = "3.5.0"
+yaml-rust2 = "0.13.0"
 
 [dev-dependencies]
-tempfile.workspace = true
+tempfile = "3.27.0"
 
-[lints]
-workspace = true
+# xtask hashes every pinned tool before running it; optimise sha2 so debug builds hash quickly.
+[profile.dev.package.sha2]
+opt-level = 3
+
+# A copy of the main workspace's `[workspace.lints]`, which another workspace cannot inherit; an
+# xtask test keeps the two equal.
+[lints.rust]
+unsafe_code = "forbid"
+unreachable_pub = "deny"
+unused_qualifications = "deny"
+elided_lifetimes_in_paths = "deny"
+let_underscore_drop = "deny"
+missing_debug_implementations = "deny"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+# Selected nursery lints.
+use_self = "deny"
+redundant_clone = "deny"
+significant_drop_in_scrutinee = "deny"
+needless_collect = "deny"
+or_fun_call = "deny"
+# Restriction lints: no panics, unchecked arithmetic, lossy casts, silent errors or catch-all matches.
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+unreachable = "deny"
+dbg_macro = "deny"
+print_stdout = "deny"
+print_stderr = "deny"
+indexing_slicing = "deny"
+string_slice = "deny"
+get_unwrap = "deny"
+arithmetic_side_effects = "deny"
+as_conversions = "deny"
+allow_attributes = "deny"
+allow_attributes_without_reason = "deny"
+unwrap_in_result = "deny"
+panic_in_result_fn = "deny"
+missing_assert_message = "deny"
+exit = "deny"
+mem_forget = "deny"
+wildcard_enum_match_arm = "deny"
+let_underscore_must_use = "deny"
+let_underscore_untyped = "deny"
+clone_on_ref_ptr = "deny"
+error_impl_error = "deny"
+map_err_ignore = "deny"
+unused_result_ok = "deny"
+assertions_on_result_states = "deny"
+tests_outside_test_module = "deny"
+cfg_not_test = "deny"
+iter_over_hash_type = "deny"
+shadow_unrelated = "deny"
+try_err = "deny"
+float_cmp_const = "deny"
+lossy_float_literal = "deny"
+self_named_module_files = "deny"

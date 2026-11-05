@@ -352,8 +352,9 @@ fn stop_at(
         |out| {
             check::run(
                 root,
+                check::REPOSITORY,
                 true,
-                &tools::pinned(root, "cargo-nextest")?,
+                &check::Tools::pinned(root)?,
                 &check::Postgres {
                     warm: &crate::postgres::warm,
                     sqlx: &|| tools::pinned(root, "cargo-sqlx"),

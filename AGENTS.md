@@ -98,8 +98,11 @@ brief.
 
 ## Commands
 
-Everything runs through `cargo xtask`, and agent hooks and CI call the same commands. The Rust
-toolchain is pinned in `rust-toolchain.toml`; rustup installs it on first use.
+Everything runs through `cargo xtask`, from the repository root, and agent hooks and CI call the
+same commands. xtask is a Cargo workspace of its own (`xtask/Cargo.toml`, locked in
+`xtask/Cargo.lock`, its lints a copy of the root's that an xtask test keeps equal), so no crate of
+the main workspace can keep it from building. The Rust toolchain is pinned in
+`rust-toolchain.toml`; rustup installs it on first use.
 
 Agents start every task with `cargo xtask task set "<the task>"`. When the agent stops, the
 watchdog compares the diff with that task and the rules above, and keeps it working if it drifted.
@@ -108,15 +111,15 @@ watchdog compares the diff with that task and the rules above, and keeps it work
 | --- | --- |
 | `cargo xtask setup [TOOLS]` | Installs the tools pinned in `xtask/tools.toml` into `.tools/`, checking the sha256 of each archive or crate and of the executable. Run it in every new clone or worktree, and after the list changes. It never touches git config. |
 | `cargo xtask doctor [TOOLS]` | Fails unless every pinned tool, or each one named, is installed, matches its pinned sha256 and reports its pinned version. |
-| `cargo xtask check` | Format check, clippy (`--all-targets --locked -D warnings`), nextest, sqlx's query cache check, doctests and rustdoc with warnings denied, on the whole workspace. Property tests run with a fixed seed. Database tests use the warm Postgres 18 container (below). It first fails when the changes since the merge base with the default branch are larger than the Gemini review accepts (the diff `review` sends, without generated files), so an oversized change is split before CI; files not yet added to git are not counted. |
+| `cargo xtask check` | Format check, clippy (`--all-targets --locked -D warnings`), nextest, sqlx's query cache check, doctests and rustdoc with warnings denied, on both workspaces, the main one and xtask's, and the pinned shellcheck on the shell scripts. Property tests run with a fixed seed. Database tests use the warm Postgres 18 container (below). It first fails when the changes since the merge base with the default branch are larger than the Gemini review accepts (the diff `review` sends, without generated files), so an oversized change is split before CI; files not yet added to git are not counted. |
 | `cargo xtask check --changed` | The same, limited to the crates affected by changes since the merge base with the default branch (`upstream/HEAD`, else `origin/HEAD`). |
 | `cargo xtask fuzz [--seconds N]` | Fuzzes protocol message decoding (target `decode` in `fuzz/`, a Cargo workspace of its own so normal builds never compile libFuzzer) with the pinned cargo-fuzz for N seconds (default 60), starting from the committed seeds in `fuzz/seeds/decode/`. It first runs rustfmt and clippy (`--locked`, warnings denied) on `fuzz/`, which `check` does not cover; `fuzz/Cargo.toml` copies the root's lints, and an xtask test keeps them equal. A failing input is saved under `fuzz/artifacts/decode/`; once fixed, add it to the seeds. |
 | `cargo xtask integrity --base <rev> [--description <file>]` | Lists deleted test files and tests, newly skipped or `should_panic` tests, tests with fewer assertions, and changed gate files since the merge base. In CI it fails on any of them unless an approver listed in `.github/integrity-approvers` at the merge base labelled the PR `integrity-approved` after its last push and last description edit; a run for a description edit treats any earlier label as stale. Each flagged test change also needs a reason in the PR description, label or not (below). |
-| `cargo xtask coverage --base <rev>` | Runs the tests under cargo-llvm-cov and fails unless 90% of the changed, instrumented lines of shipped code are covered, listing the ones that are not. Test code (`#[cfg(test)]` items, test functions, test modules in their own files, `tests/`) does not count. |
-| `cargo xtask mutants --base <rev> [--jobs N] [--shard k/n]` | Runs cargo-mutants on the Rust lines changed since the merge base, or one shard of them, and fails on any missed mutant: a change to the code that no test notices. A mutant whose tests hang counts as caught. |
+| `cargo xtask coverage --base <rev>` | Runs the tests of both workspaces under cargo-llvm-cov and fails unless 90% of the changed, instrumented lines of shipped code are covered, listing the ones that are not. Test code (`#[cfg(test)]` items, test functions, test modules in their own files, `tests/`) does not count. |
+| `cargo xtask mutants --base <rev> [--jobs N] [--shard k/n]` | Runs cargo-mutants on the Rust lines changed since the merge base, or one shard of them, and fails on any missed mutant: a change to the code that no test notices. A mutant whose tests hang counts as caught. The main workspace's mutants build in copies of the tree; xtask's are tested in place, one at a time, because its tests read the repository around it. |
 | `cargo xtask review --base <rev>` | Gemini reviews the diff, the PR's title and description against this file as it stands at the merge base. Runs in CI; it blocks on a `block` verdict or any blocking finding, and fails closed on quota, size and missing-key errors. |
 | `cargo xtask task set "<text>"` / `show` / `clear` | Records, prints or forgets the current task in `.abc/task.md` (not committed), for the watchdog. |
-| `cargo xtask task blocked "<text>"` | Declares the task BLOCKED in `.abc/blocked.md`: what is missing and what was tried. The next Stop logs it in `.abc/blocked-log.md` and asks the watchdog whether the blocker is outside the agent's control; if so, or after 5 blocked stops in a row, the stop is allowed with this handoff, and otherwise it is sent back and counted (D39). |
+| `cargo xtask task blocked "<text>"` | Declares the task BLOCKED, in the stop hook's state (`.abc/stop-state.json`): what is missing and what was tried. The next Stop logs it in `.abc/blocked-log.md` and asks the watchdog whether the blocker is outside the agent's control; if so, or after 5 blocked stops in a row, the stop is allowed with this handoff, and otherwise it is sent back and counted (D39). |
 | `cargo xtask gh -- <args>` | Runs gh as the agent App with a token from the broker, revoked when gh exits. Agents create, merge and change things on GitHub only through this; the guard blocks plain `gh pr create`, `gh pr merge` and `gh api` writes. |
 | `cargo xtask git-credential <op>` | git's credential helper for github.com in agent VMs (`xtask/vm/gitconfig`): it answers with an agent App token from the broker. Never run it yourself. |
 | `cargo xtask broker --session <name>` | Started by `cargo xtask vm start`, one per session, from a build of main installed outside any checkout: serves that agent VM's App tokens, at most 120 an hour, and revokes them all when the session stops; the one process that reads the App's key. |
@@ -145,8 +148,11 @@ CI runs `check`, `integrity`, `coverage`, `mutants` (in eight shards, reported a
 check), `review` and `fuzz` (for a minute; for an hour nightly on `main`) on every pull request, and
 `cargo xtask tool cargo-deny check`, `cargo xtask tool cargo-shear --deny-warnings --locked`, both
 again on the fuzz workspace (`cargo xtask tool cargo-deny --manifest-path fuzz/Cargo.toml --config
-fuzz/deny.toml --locked check`, `cargo xtask tool cargo-shear --deny-warnings --locked fuzz`),
-`cargo xtask tool osv-scanner scan source --lockfile Cargo.lock --lockfile fuzz/Cargo.lock`, `cargo
+fuzz/deny.toml --locked check`, `cargo xtask tool cargo-shear --deny-warnings --locked fuzz`) and
+on xtask's (`cargo xtask tool cargo-deny --manifest-path xtask/Cargo.toml --config xtask/deny.toml
+--locked check`, `cargo xtask tool cargo-shear --deny-warnings --locked xtask`), `cargo xtask tool
+osv-scanner scan source --lockfile Cargo.lock --lockfile fuzz/Cargo.lock --lockfile
+xtask/Cargo.lock`, `cargo
 xtask tool zizmor --pedantic .github`, `cargo xtask tool pinact run --check --verify-comment` and
 `cargo xtask tool gitleaks git --redact --no-banner --verbose .`. Every job is a required check on
 `main`. Integrity, Coverage, Mutants and Gemini review run the base commit's xtask on the pull
@@ -169,7 +175,8 @@ changes no tests.
 
 The gate files are the files that decide what passes: CI and rulesets (`.github/`), cargo, lint,
 toolchain and tool configuration, `Cargo.toml` and `Cargo.lock` (the fuzz workspace's too, with
-`fuzz/deny.toml`), the agent settings, this file and `CLAUDE.md`, and all of `xtask/`. `GATES` in
+`fuzz/deny.toml`), the agent settings, this file and `CLAUDE.md`, and all of `xtask/`, its
+workspace's manifest, lockfile and `deny.toml` included. `GATES` in
 `xtask/src/integrity/mod.rs` lists them, and a test keeps `.github/CODEOWNERS` identical. A change
 to one needs the integrity approval and a code owner's review.
 
