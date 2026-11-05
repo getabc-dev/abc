@@ -129,6 +129,19 @@ pub(crate) fn script(path: &Path, body: &str) {
     fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
 }
 
+/// A clone at `temp/work` of a bare `temp/origin.git`, whose one commit is `origin/main`, the
+/// default branch.
+pub(crate) fn clone_with_origin(temp: &Path) -> PathBuf {
+    let work = repository(&temp.join("work"));
+    let bare = temp.join("origin.git");
+    git(temp, &["init", "--quiet", "--bare", bare.to_str().unwrap()]);
+    git(&work, &["remote", "add", "origin", bare.to_str().unwrap()]);
+    git(&work, &["push", "--quiet", "origin", "HEAD:main"]);
+    git(&work, &["fetch", "--quiet", "origin"]);
+    git(&work, &["remote", "set-head", "origin", "main"]);
+    work
+}
+
 /// A repository with a `base` branch, then a commit that adds `files` (path and content).
 pub(crate) fn repository_with_change(path: &Path, files: &[(&str, &str)]) -> PathBuf {
     let repo = repository(path);

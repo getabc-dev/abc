@@ -120,7 +120,10 @@ watchdog compares the diff with that task and the rules above, and keeps it work
 | `cargo xtask review --base <rev>` | Gemini reviews the diff, the PR's title and description against this file as it stands at the merge base. Runs in CI; it blocks on a `block` verdict or any blocking finding, and fails closed on quota, size and missing-key errors. |
 | `cargo xtask task set "<text>"` / `show` / `clear` | Records, prints or forgets the current task in `.abc/task.md` (not committed), for the watchdog. |
 | `cargo xtask task blocked "<text>"` | Declares the task BLOCKED, in the stop hook's state (`.abc/stop-state.json`): what is missing and what was tried. The next Stop logs it in `.abc/blocked-log.md` and asks the watchdog whether the blocker is outside the agent's control; if so, or after 5 blocked stops in a row, the stop is allowed with this handoff, and otherwise it is sent back and counted (D39). |
-| `cargo xtask gh -- <args>` | Runs gh as the agent App with a token from the broker, revoked when gh exits. Agents create, merge and change things on GitHub only through this; the guard blocks plain `gh pr create`, `gh pr merge` and `gh api` writes. |
+| `cargo xtask gh -- <args>` | Runs gh as the agent App with a token from the broker, revoked when gh exits. Agents merge and change things on GitHub only through this or `cargo xtask pr`; the guard blocks plain `gh pr merge` and `gh api` writes. |
+| `cargo xtask pr open --title <t> --body <file>` / `pr update <number> --body <file>` | Opens a pull request from the pushed branch, or replaces one's description, through the REST API as the agent App. First it refuses a tree with uncommitted changes, a `## Test changes` section that misses a test integrity flags or names one it does not, a diff over the review's limit counting the title and description, and, when `.github/` changed, rulesets that fail `rulesets check`. When someone else pushed the pull request's head last (the maintainer's workflow commits), `update` refuses unless HEAD changes the diff (`git diff --quiet`), since GitHub counts no other push as reviewable, and says to push it. The guard blocks `gh pr create` and `gh pr edit`, through `cargo xtask gh` too. |
+| `cargo xtask pr test-changes` | Prints the `## Test changes` section for the current branch, naming every test integrity flags; only the reasons are left to write. |
+| `cargo xtask pr checks <number>` | Lists the failing, cancelled and running checks of the pull request's head and of its latest merge-queue run, with each failing check's annotations: two API calls and one App token, read from GitHub's API, which agent VMs reach, unlike job logs. |
 | `cargo xtask git-credential <op>` | git's credential helper for github.com in agent VMs (`xtask/vm/gitconfig`): it answers with an agent App token from the broker. Never run it yourself. |
 | `cargo xtask broker --session <name>` | Started by `cargo xtask vm start`, one per session, from a build of main installed outside any checkout: serves that agent VM's App tokens, at most 120 an hour, and revokes them all when the session stops; the one process that reads the App's key. |
 | `cargo xtask vm start\|shell\|auth\|sync\|push\|stop <worktree>`, `vm image`, `vm ls` | For the maintainer only, from the main clone: runs agent sessions in microsandbox microVMs, one per worktree (D37; CONTRIBUTING.md). |
@@ -167,7 +170,8 @@ A PR that deletes, skips or weakens a test explains each one in its description,
 `## Test changes` section: one entry per test, naming the test in backticks as the integrity check
 reports it (`<file>::<test>`, or the file for a deleted test file), then the requirement or
 behaviour that changed. An entry for a test the check does not flag fails it too. A test change
-that only makes the code pass is not a reason; the Gemini review blocks it. `.github/pull_request_template.md` has the section, with "None" for a PR that
+that only makes the code pass is not a reason; the Gemini review blocks it. `cargo xtask pr
+test-changes` prints the section with every flagged test. `.github/pull_request_template.md` has the section, with "None" for a PR that
 changes no tests.
 
 ```markdown
@@ -194,7 +198,8 @@ every other branch, and the `tags` ruleset every tag. git tokens cannot change w
 a change that needs one goes to the maintainer.
 
 The git guard in the agent hooks catches accidents: force pushes, git or gh commands it cannot
-read, and gh changes made as the user instead of through `cargo xtask gh`. It cannot stop a
+read, gh changes made as the user instead of through `cargo xtask gh`, and pull requests opened or
+edited with gh instead of `cargo xtask pr`. It cannot stop a
 deliberate bypass, since no text check of a shell command can, and it does not try to. Enforcement
 is on GitHub: the ruleset on `main` forbids force pushes and deletion and requires a code owner's
 approval and every check, and agents act as the getabc-dev-agent GitHub App with limited

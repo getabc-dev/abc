@@ -257,17 +257,32 @@ fn run_with(
 
 /// The findings since a merge base, and how a description explains them.
 #[derive(Debug)]
-struct Review {
+pub(crate) struct Review {
     found: Vec<Finding>,
     explained: Explained,
 }
 
 impl Review {
     /// The findings from `commit` to the working tree of `root`, against `description`.
-    fn of(root: &Path, commit: &str, description: Option<&str>) -> anyhow::Result<Self> {
+    pub(crate) fn of(root: &Path, commit: &str, description: Option<&str>) -> anyhow::Result<Self> {
         let found = findings(root, commit)?;
         let explained = reasons::explained(&flagged(&found), description.unwrap_or_default());
         Ok(Self { found, explained })
+    }
+
+    /// Whether the description gives a reason for every flagged test and names no other.
+    pub(crate) const fn explained(&self) -> bool {
+        self.explained.complete()
+    }
+
+    /// What the description lacks or names in excess, as `integrity` reports it.
+    pub(crate) fn report(&self, out: &mut impl Write) -> std::io::Result<()> {
+        self.explained.report(out)
+    }
+
+    /// A "## Test changes" section naming every flagged test, its reason left to write.
+    pub(crate) fn skeleton(&self) -> String {
+        reasons::skeleton(&flagged(&self.found))
     }
 
     /// An annotation for each finding, saying whether the description gives its reason, and

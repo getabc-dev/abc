@@ -7,11 +7,13 @@ mod check;
 mod coverage;
 mod fuzz;
 mod git;
+mod github;
 mod guard;
 mod hook;
 mod integrity;
 mod mutants;
 mod postgres;
+mod pr;
 mod review;
 mod rulesets;
 mod shell;
@@ -132,6 +134,12 @@ enum Task {
         /// Arguments passed to gh.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<OsString>,
+    },
+    /// Pull requests as the agent App: open or update one after the checks integrity, the review
+    /// and the rulesets would make, or list what fails on one. One App token per command.
+    Pr {
+        #[command(subcommand)]
+        action: pr::Action,
     },
     /// Serve agent App tokens to one agent VM (D3): the one process that reads the App's key.
     /// `cargo xtask vm start` starts it, one per session, from a build of main installed outside
@@ -354,6 +362,7 @@ fn run(
             &args,
             report,
         ),
+        Task::Pr { action } => run_pr(action, root, &env, report),
         Task::Rulesets { action } => run_rulesets(action, root, report),
         Task::Work { action } => run_task(action, root, report),
         Task::Setup {
@@ -448,6 +457,40 @@ fn integrity(
     let payload = pr.and_then(|_| env("GITHUB_EVENT_PATH").map(PathBuf::from));
     let event = integrity::event(description, payload)?;
     integrity::run(root, base, pull_request.as_ref(), &event, mode, report)
+}
+
+/// `cargo xtask pr`: checks `action` in `root`, then carries it out as the agent App with one
+/// token from the broker `env` names; what it says goes to stdout.
+fn run_pr(
+    action: pr::Action,
+    root: &Path,
+    env: &impl Fn(&str) -> Option<OsString>,
+    report: &mut impl Write,
+) -> anyhow::Result<ExitCode> {
+    let mut said = String::new();
+    let prepared = pr::prepare(action, root, &mut said);
+    write!(io::stdout().lock(), "{said}")?;
+    let Some(plan) = prepared? else {
+        return Ok(ExitCode::SUCCESS);
+    };
+    let repo = github::Repo::of(root)?;
+    let mut done = String::new();
+    let result = github::with_token(
+        || broker::token_from(env, app::Scope::Gh),
+        |token| app::revoke(app::GITHUB_API, token),
+        report,
+        |token| {
+            pr::send(
+                plan,
+                root,
+                &repo,
+                &mut github::http(app::GITHUB_API, token),
+                &mut done,
+            )
+        },
+    );
+    write!(io::stdout().lock(), "{done}")?;
+    Ok(verdict(result?))
 }
 
 /// `cargo xtask rulesets`: checks the rulesets in `root` against CI, or applies them with the
@@ -678,6 +721,63 @@ mod tests {
             serve_tokens(&temp.path().join("bin/xtask"), temp.path(), "../x").unwrap_err()
         );
         assert!(named.contains("is not a session's name"), "{named}");
+    }
+
+    #[test]
+    fn pr_checks_locally_first_and_asks_the_broker_for_one_token() {
+        let temp = tempfile::tempdir().unwrap();
+        let checkout = crate::testing::clone_with_origin(temp.path());
+        let no_env = |_: &str| None;
+        let pr = |action| Task::Pr { action };
+        assert_eq!(
+            dispatch(
+                pr(crate::pr::Action::TestChanges),
+                &checkout,
+                &checkout,
+                &no_env
+            )
+            .unwrap(),
+            ExitCode::SUCCESS,
+            "the section needs no token"
+        );
+        let unread = format!(
+            "{:#}",
+            dispatch(
+                pr(crate::pr::Action::Open {
+                    title: "t".to_owned(),
+                    body: temp.path().join("missing.md"),
+                }),
+                &checkout,
+                &checkout,
+                &no_env
+            )
+            .unwrap_err()
+        );
+        assert!(
+            unread.starts_with("could not read the description"),
+            "{unread}"
+        );
+        let checks = || pr(crate::pr::Action::Checks { number: 7 });
+        let local = format!(
+            "{:#}",
+            dispatch(checks(), &checkout, &checkout, &no_env).unwrap_err()
+        );
+        assert!(
+            local.starts_with("origin is not a github.com repository"),
+            "{local}"
+        );
+        git(
+            &checkout,
+            &["remote", "set-url", "origin", "https://github.com/o/r.git"],
+        );
+        let no_broker = format!(
+            "{:#}",
+            dispatch(checks(), &checkout, &checkout, &no_env).unwrap_err()
+        );
+        assert!(
+            no_broker.contains("is not set: agent App tokens come from the token broker"),
+            "the broker comes from the invocation's environment: {no_broker}"
+        );
     }
 
     #[test]

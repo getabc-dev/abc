@@ -129,9 +129,7 @@ impl Explained {
                 "integrity: failed; {problem} these test changes. Add one entry per test, saying \
                  which requirement or behaviour changed:\n\n## {HEADING}\n"
             )?;
-            for test in &self.unexplained {
-                writeln!(out, "- `{test}`: <which requirement or behaviour changed>")?;
-            }
+            write!(out, "{}", entries_for(&self.unexplained))?;
         }
         for test in &self.extra {
             writeln!(
@@ -142,6 +140,25 @@ impl Explained {
         }
         Ok(())
     }
+}
+
+/// An entry for each of `tests`, its reason left to write.
+fn entries_for(tests: &[String]) -> String {
+    let mut text = String::new();
+    for test in tests {
+        text.push_str("- `");
+        text.push_str(test);
+        text.push_str("`: <which requirement or behaviour changed>\n");
+    }
+    text
+}
+
+/// A "## Test changes" section naming each of the `flagged` tests, or saying "None".
+pub(super) fn skeleton(flagged: &[String]) -> String {
+    if flagged.is_empty() {
+        return format!("## {HEADING}\n\nNone\n");
+    }
+    format!("## {HEADING}\n\n{}", entries_for(flagged))
 }
 
 /// Checks that `description` gives a reason for each of the `flagged` tests.
@@ -232,7 +249,7 @@ pub(crate) fn event(file: Option<&Path>, payload_path: Option<PathBuf>) -> anyho
 mod tests {
     use std::fs;
 
-    use super::{Event, Explained, entries, event, explained};
+    use super::{Event, Explained, entries, event, explained, skeleton};
 
     fn report(result: &Explained) -> String {
         let mut out = Vec::new();
@@ -327,6 +344,27 @@ mod tests {
         assert!(
             explained(&[], "no section").complete(),
             "nothing flagged needs no section"
+        );
+    }
+
+    #[test]
+    fn the_skeleton_names_every_flagged_test_and_parses_back() {
+        let section = skeleton(&flagged());
+        assert_eq!(
+            section,
+            "## Test changes\n\n- `src/a.rs::tests::one`: <which requirement or behaviour \
+             changed>\n- `src/a.rs::tests::two`: <which requirement or behaviour changed>\n- \
+             `src/gone.rs`: <which requirement or behaviour changed>\n"
+        );
+        let parsed = explained(&flagged(), &section);
+        assert!(
+            parsed.section && parsed.extra.is_empty(),
+            "every entry names a flagged test"
+        );
+        assert_eq!(skeleton(&[]), "## Test changes\n\nNone\n");
+        assert!(
+            explained(&[], &skeleton(&[])).complete(),
+            "None names no test"
         );
     }
 

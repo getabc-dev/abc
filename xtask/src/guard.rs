@@ -91,6 +91,8 @@ enum Violation {
     Unreadable(String),
     /// A GitHub action run with the user's own gh login instead of as the agent App.
     AsUser(String),
+    /// A pull request opened or edited with gh rather than `cargo xtask pr`.
+    PrByHand(String),
 }
 
 impl Violation {
@@ -107,6 +109,13 @@ impl Violation {
             Self::AsUser(action) => format!(
                 "Blocked: `{action}` would act as the user rather than as the abc agent App. Run it \
                  through `cargo xtask gh -- ...`, which gives gh an App token."
+            ),
+            Self::PrByHand(action) => format!(
+                "Blocked: `{action}` sends a description nothing has checked, and `gh pr edit` \
+                 breaks on GitHub's retired Projects classic. Use `cargo xtask pr open --title \
+                 <t> --body <file>` or `cargo xtask pr update <number> --body <file>`, which \
+                 check the \"## Test changes\" section, the review size and the rulesets first; \
+                 `cargo xtask pr test-changes` prints the section."
             ),
         }
     }
@@ -349,8 +358,16 @@ fn gh_violation(words: &[Word]) -> Option<Violation> {
         .and_then(|previous| words.get(previous))
         .is_some_and(|word| basename(word) == "xtask")
     {
-        // `cargo xtask gh` runs gh as the App.
-        return None;
+        // `cargo xtask gh` runs gh as the App, but pull requests go through `cargo xtask pr`.
+        let rest: Vec<&Word> = words
+            .iter()
+            .skip(start.saturating_add(1))
+            .skip_while(|word| word.text == "--")
+            .collect();
+        return rest
+            .split_first()
+            .and_then(|(first, rest)| (first.text == "pr").then_some(rest))
+            .and_then(pr_by_hand);
     }
     let (gh, fed) = invocation(words, "gh")?;
     let mut args = gh.iter().skip(1);
@@ -371,15 +388,27 @@ fn gh_violation(words: &[Word]) -> Option<Violation> {
 /// request, or an API call that writes.
 fn acting_as_user(subcommand: &str, rest: &[&Word]) -> Option<Violation> {
     let action = match subcommand {
-        "pr" => rest
-            .first()
-            .map(|word| word.text.as_str())
-            .filter(|action| matches!(*action, "create" | "merge"))
-            .map(|action| format!("gh pr {action}")),
+        "pr" => {
+            if let Some(violation) = pr_by_hand(rest) {
+                return Some(violation);
+            }
+            rest.first()
+                .map(|word| word.text.as_str())
+                .filter(|action| *action == "merge")
+                .map(|action| format!("gh pr {action}"))
+        }
         "api" => api_write(rest).map(|method| format!("gh api -X {method}")),
         _ => None,
     }?;
     Some(Violation::AsUser(action))
+}
+
+/// `gh pr create` or `gh pr edit`, from the words after `pr`: `cargo xtask pr` does both.
+fn pr_by_hand(rest: &[&Word]) -> Option<Violation> {
+    rest.first()
+        .map(|word| word.text.as_str())
+        .filter(|action| matches!(*action, "create" | "edit"))
+        .map(|action| Violation::PrByHand(format!("gh pr {action}")))
 }
 
 /// The writing HTTP method of a `gh api` call: named with `-X` or `--method`, or POST, gh's
@@ -675,7 +704,6 @@ mod tests {
     #[test]
     fn blocks_gh_changes_made_as_the_user() {
         for (command, action) in [
-            ("gh pr create --title x --body y", "gh pr create"),
             ("gh pr merge 3 --squash", "gh pr merge"),
             ("gh api -X POST repos/o/r/issues", "gh api -X POST"),
             (
@@ -693,11 +721,41 @@ mod tests {
             assert_blocked(command, &Violation::AsUser(action.to_owned()));
         }
         assert!(
-            Violation::AsUser("gh pr create".to_owned())
+            Violation::AsUser("gh pr merge".to_owned())
                 .message()
                 .contains("cargo xtask gh -- ..."),
             "the message says how to run it as the App"
         );
+    }
+
+    #[test]
+    fn sends_pull_requests_through_cargo_xtask_pr() {
+        for (command, action) in [
+            ("gh pr create --title x --body y", "gh pr create"),
+            ("gh pr edit 3 --body-file b.md", "gh pr edit"),
+            (
+                "cargo xtask gh -- pr create --title x --body \"$(cat <<'EOF'\nbody\nEOF\n)\"",
+                "gh pr create",
+            ),
+            ("cargo xtask gh pr edit 25 --body-file b.md", "gh pr edit"),
+        ] {
+            assert_blocked(command, &Violation::PrByHand(action.to_owned()));
+        }
+        let message = Violation::PrByHand("gh pr edit".to_owned()).message();
+        assert!(
+            message.contains("cargo xtask pr update <number> --body <file>")
+                && message.contains("Projects classic"),
+            "the message names the way: {message}"
+        );
+        for command in [
+            "cargo xtask gh -- pr view 3",
+            "cargo xtask gh -- pr merge 3 --squash",
+            "cargo xtask gh -- api repos/o/r/pulls",
+            "cargo xtask gh",
+            "cargo xtask pr open --title x --body b.md",
+        ] {
+            assert_allowed(command);
+        }
     }
 
     #[test]
@@ -744,7 +802,6 @@ mod tests {
             "git -C /tmp/git push origin main",
             "git config user.name agent",
             "find . -name '*.rs' | xargs git add",
-            "cargo xtask gh -- pr create --title x --body \"$(cat <<'EOF'\nbody\nEOF\n)\"",
             "cargo xtask gh pr merge 3 --squash",
             "gh pr view 3",
             "gh api -X GET repos/o/r/pulls",

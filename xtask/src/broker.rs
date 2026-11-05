@@ -96,7 +96,10 @@ pub(crate) fn token(scope: Scope) -> anyhow::Result<String> {
 }
 
 /// A token for `scope` from the broker whose socket [`ENV`] names in the environment `env`.
-fn token_from(env: impl Fn(&str) -> Option<OsString>, scope: Scope) -> anyhow::Result<String> {
+pub(crate) fn token_from(
+    env: impl Fn(&str) -> Option<OsString>,
+    scope: Scope,
+) -> anyhow::Result<String> {
     let socket = env(ENV).filter(|socket| !socket.is_empty()).with_context(|| {
         format!(
             "{ENV} is not set: agent App tokens come from the token broker, which only agent VMs \

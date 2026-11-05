@@ -160,13 +160,20 @@ fn generated(files: &[String]) -> String {
     section
 }
 
-/// Fails when the diff is over [`MAX_DIFF_BYTES`].
-pub(crate) fn check_size(diff: &str) -> anyhow::Result<()> {
+/// What the review counts against [`MAX_DIFF_BYTES`]: the diff with the title and description
+/// sent beside it.
+pub(crate) const fn size(title: &str, description: &str, diff: &str) -> usize {
+    diff.len()
+        .saturating_add(title.len())
+        .saturating_add(description.len())
+}
+
+/// Fails when `what`, `bytes` long, is over [`MAX_DIFF_BYTES`].
+pub(crate) fn check_size(what: &str, bytes: usize) -> anyhow::Result<()> {
     ensure!(
-        diff.len() <= MAX_DIFF_BYTES,
-        "the diff is {} bytes, too large for automated review (the limit is {MAX_DIFF_BYTES}); \
-         split the PR",
-        diff.len()
+        bytes <= MAX_DIFF_BYTES,
+        "{what} is {bytes} bytes, too large for automated review (the limit is \
+         {MAX_DIFF_BYTES}); split the PR"
     );
     Ok(())
 }
@@ -188,7 +195,10 @@ pub(crate) fn review(
             request.generated.len()
         ),
     );
-    check_size(&request.diff)?;
+    check_size(
+        "the diff with the title and description",
+        size(&request.title, &request.description, &request.diff),
+    )?;
     let url = format!("{ENDPOINT}/{MODEL}:generateContent");
     let sent = body(request).to_string();
     say(
@@ -1040,6 +1050,29 @@ mod tests {
             assert!(outcome.is_ok(), "HTTP {status} is retried");
             assert_eq!(calls, 2, "HTTP {status} is retried once here");
         }
+    }
+
+    #[test]
+    fn the_title_and_description_count_toward_the_size() {
+        let mut near = request(&"+".repeat(MAX_DIFF_BYTES - 100));
+        near.title = String::new();
+        near.description = "d".repeat(101);
+        let error = review(
+            &near,
+            "test-key",
+            &mut |_: &str, _: &str, _: &str| panic!("an oversized review is never sent"),
+            &mut Vec::new(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "the diff with the title and description is {} bytes, too large for automated \
+                 review (the limit is {MAX_DIFF_BYTES}); split the PR",
+                MAX_DIFF_BYTES + 1
+            )
+        );
+        assert_eq!(super::size("ab", "c", "def"), 6);
     }
 
     #[test]
