@@ -4,7 +4,8 @@
 //! state directory holding only the worktree's branch and `origin/main`, laid out as the common
 //! directory of a linked worktree. The VM mounts it at [`GUEST_GIT`], and its entrypoint links the
 //! main clone's git directory path there, where the worktree's `.git` file points, so git inside
-//! works unchanged. Commits made in the VM come back with [`Session::sync`].
+//! works unchanged. Commits made in the VM come back with [`Session::sync`]; commits made on the
+//! host go into a running VM with [`Session::push`].
 //!
 //! Everything the VM can write is hostile to the host: the worktree's files, its `.git` file, and
 //! the session repository with its config, hooks and administrative files. So the host
@@ -16,7 +17,8 @@
 //!   and every setting that runs a program pinned off, and rewrites that repository's config,
 //!   empties its hooks and drops its alternates before it uses it;
 //! - writes the session repository's files only while the VM is stopped, replacing whatever the VM
-//!   left there, symlinks included, without following it.
+//!   left there, symlinks included, without following it. While it runs, the host only reads the
+//!   repository; commits it pushes travel as a bundle the VM's own git fetches ([`APPLY_PUSH`]).
 
 use std::ffi::OsStr;
 use std::fs;
@@ -52,6 +54,32 @@ const SEALED: [&str; 17] = [
     "submodule.recurse=false",
     "fetch.recurseSubmodules=false",
 ];
+
+/// What the VM runs, as the agent in the worktree, to take a [`Push`]: the bundle on stdin, the
+/// branch as `$1`. Without `+` git moves the branch only forward, and refuses when the VM's branch
+/// moved meanwhile. The files are already the host's, so the index follows the new commit.
+pub(crate) const APPLY_PUSH: &str = "set -eu
+bundle=$(mktemp)
+trap 'rm -f \"$bundle\"' EXIT
+cat > \"$bundle\"
+git fetch --no-tags --update-head-ok \"$bundle\" \"refs/heads/$1:refs/heads/$1\"
+git reset --quiet
+";
+
+/// Commits of the worktree's branch for a running VM, from [`Session::push`].
+#[derive(Debug)]
+pub(crate) enum Push {
+    /// The VM's branch already has them; what to tell the user.
+    Current(String),
+    /// A bundle of the commits the VM's branch lacks, for [`APPLY_PUSH`].
+    Bundle {
+        branch: String,
+        /// The VM's commit and the worktree's.
+        from: String,
+        to: String,
+        bundle: Vec<u8>,
+    },
+}
 
 /// git for a repository the VM can write: no system or global config, no inherited git
 /// environment, and [`SEALED`] settings.
@@ -369,6 +397,83 @@ impl Session {
         run(reset, "reset")?;
         Ok(format!("{branch}: {} -> {}", short(&ours), short(&theirs)))
     }
+
+    /// The commits the worktree's branch has and the VM's lacks, as a bundle for a running VM,
+    /// when its branch is behind the worktree's. Refuses, saying why, when the VM's branch has
+    /// commits the worktree's lacks. Reads the session repository and writes nothing to it.
+    pub(crate) fn push(&self) -> anyhow::Result<Push> {
+        let repo = self.git_dir();
+        let (branch, ours) = self.head()?;
+        let Some(branch) = branch else {
+            bail!(
+                "{} is on no branch; check one out first",
+                self.worktree.display()
+            );
+        };
+        ensure!(
+            repo.is_dir(),
+            "{} has no session repository; `cargo xtask vm start` creates it",
+            self.worktree.display()
+        );
+        let mut parse = sealed(&repo);
+        parse.args([
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{branch}^{{commit}}"),
+        ]);
+        let theirs = run(parse, "rev-parse")
+            .with_context(|| format!("the session repository has no {branch}"))?
+            .trim()
+            .to_owned();
+        if theirs == ours {
+            return Ok(Push::Current(format!(
+                "the VM's {branch} is already at {}",
+                short(&ours)
+            )));
+        }
+        let mut known = self.worktree_git();
+        known.args(["cat-file", "-e", &format!("{theirs}^{{commit}}")]);
+        ensure!(
+            known
+                .output()
+                .context("could not run git")?
+                .status
+                .success(),
+            "the VM's {branch} has commits the worktree's lacks; `cargo xtask vm sync` takes \
+             them, or says the branches diverged"
+        );
+        let mut ancestor = self.worktree_git();
+        ancestor.args(["merge-base", "--is-ancestor", &theirs, &ours]);
+        ensure!(
+            ancestor.status().context("could not run git")?.success(),
+            "the VM's {branch} ({}) is not behind the worktree's ({}): the branches diverged; \
+             merge them by hand",
+            short(&theirs),
+            short(&ours)
+        );
+        let mut bundle = self.worktree_git();
+        bundle.args([
+            "bundle",
+            "create",
+            "--quiet",
+            "-",
+            &format!("refs/heads/{branch}"),
+            &format!("^{theirs}"),
+        ]);
+        let output = bundle.output().context("could not run git")?;
+        ensure!(
+            output.status.success(),
+            "git bundle failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+        Ok(Push::Bundle {
+            branch,
+            from: theirs,
+            to: ours,
+            bundle: output.stdout,
+        })
+    }
 }
 
 /// git config of the main clone, whose git directory is `common`: trusted, the host's own.
@@ -451,7 +556,7 @@ fn slug(name: &str) -> String {
 }
 
 /// The first twelve characters of a commit's name.
-fn short(commit: &str) -> &str {
+pub(crate) fn short(commit: &str) -> &str {
     commit.get(..12).unwrap_or(commit)
 }
 

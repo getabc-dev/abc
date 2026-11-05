@@ -2,7 +2,8 @@
 //!
 //! cargo-mutants changes each changed function in small ways (returns a default, flips an
 //! operator) and runs the tests against every change. A mutant the tests do not catch means a
-//! behaviour no test pins down; the gate fails on any and lists them.
+//! behaviour no test pins down; the gate fails on any and lists them, and in GitHub Actions
+//! annotates each on its line.
 
 use std::ffi::OsString;
 use std::fs;
@@ -12,6 +13,7 @@ use std::process::Command;
 
 use anyhow::{Context, bail, ensure};
 
+use crate::annotation::{self, Annotation, Mode};
 use crate::check::{self, PROPTEST_RNG_SEED, Workspace};
 use crate::git;
 use crate::tools;
@@ -33,7 +35,7 @@ const fn timeout_multiplier(jobs: u32) -> u32 {
 
 /// How cargo-mutants ended, from its exit code. It exits with [`Outcome::TimedOut`] when any
 /// mutant timed out, even if others were missed, so the result files decide the verdict.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Outcome {
     AllCaught,
     Missed,
@@ -85,6 +87,8 @@ pub(crate) struct Options {
     pub(crate) jobs: u32,
     /// The share of the mutants to test; all of them when `None`.
     pub(crate) shard: Option<Shard>,
+    /// Whether to annotate each missed mutant for GitHub too.
+    pub(crate) mode: Mode,
 }
 
 /// Runs cargo-mutants, with the cargo-mutants and cargo-nextest executables given, on the Rust
@@ -265,12 +269,22 @@ impl Run<'_> {
         // Whatever cargo-mutants left behind goes, so repeated runs never fill the disk.
         fs::remove_dir_all(&scratch)
             .with_context(|| format!("could not remove {}", scratch.display()))?;
-        let result = outcome(status?.code())?;
+        self.report(&results, outcome(status?.code())?, out)
+    }
+
+    /// Reads the results cargo-mutants wrote in `results` and reports them, with its `result`;
+    /// whether the tests caught every mutant.
+    fn report(
+        &self,
+        results: &Path,
+        result: Outcome,
+        out: &mut impl Write,
+    ) -> anyhow::Result<bool> {
         let named = |line: String| {
-            if in_place {
-                format!("{}/{line}", self.workspace.dir())
-            } else {
+            if self.workspace.dir().is_empty() {
                 line
+            } else {
+                format!("{}/{line}", self.workspace.dir())
             }
         };
         let missed: Vec<String> = listed(&results.join("missed.txt"))?
@@ -283,6 +297,12 @@ impl Run<'_> {
             .collect();
         let passed = missed.is_empty() && result != Outcome::Missed;
         write!(out, "{}", describe(passed, &missed, &timed_out))?;
+        let annotations: Vec<Annotation> = missed.iter().map(|line| annotate(line)).collect();
+        write!(
+            out,
+            "{}",
+            annotation::commands(self.options.mode, &annotations)
+        )?;
         Ok(passed)
     }
 }
@@ -335,6 +355,31 @@ fn listed(path: &Path) -> anyhow::Result<Vec<String>> {
     }
 }
 
+/// A missed mutant as cargo-mutants lists it, `<file>:<line>:<column>: <mutation>`, as an
+/// annotation on its line; on no line when the list says none.
+fn annotate(missed: &str) -> Annotation {
+    let mut parts = missed.splitn(4, ':');
+    let (file, line, mutation) = match (parts.next(), parts.next(), parts.next(), parts.next()) {
+        (Some(file), Some(line), Some(_column), Some(mutation)) => {
+            (file, line.parse::<u64>().ok(), mutation.trim())
+        }
+        _ => ("", None, missed),
+    };
+    let annotation = Annotation::error(
+        file,
+        "Missed mutant",
+        format!("No test fails when the code is mutated: {mutation}."),
+    );
+    match line {
+        Some(line) => annotation.at(line, line),
+        None => Annotation {
+            file: None,
+            message: format!("No test fails when the code is mutated: {missed}."),
+            ..annotation
+        },
+    }
+}
+
 fn describe(passed: bool, missed: &[String], timed_out: &[String]) -> String {
     let mut text = String::new();
     for (label, mutants) in [
@@ -363,9 +408,10 @@ mod tests {
     use std::path::Path;
 
     use super::{
-        Options, Outcome, Shard, changes_rust, describe, listed, outcome, run, test_env_config,
-        timeout_multiplier,
+        Options, Outcome, Shard, annotate, changes_rust, describe, listed, outcome, run,
+        test_env_config, timeout_multiplier,
     };
+    use crate::annotation::Mode;
     use crate::testing::{repository_with_change, script};
 
     #[test]
@@ -393,6 +439,7 @@ mod tests {
     const TWO: Options = Options {
         jobs: 2,
         shard: None,
+        mode: Mode::Plain,
     };
 
     #[test]
@@ -477,6 +524,10 @@ mod tests {
             text.contains("missed: src/a.rs:1:18: replace a -> bool with false"),
             "{text}"
         );
+        assert!(
+            !text.contains("::error"),
+            "no annotations outside GitHub Actions"
+        );
 
         let mixed = temp.path().join("mixed");
         script(
@@ -505,6 +556,7 @@ mod tests {
         let sharded = Options {
             jobs: 2,
             shard: Some(Shard::parse("1/4").unwrap()),
+            mode: Mode::Plain,
         };
         assert!(
             run(&repo, "base", &sharded, &caught, &nextest, &mut Vec::new()).unwrap(),
@@ -567,9 +619,20 @@ mod tests {
             ),
         );
         let mut out = Vec::new();
-        let passed = run(&repo, "base", &TWO, &mutants, &nextest, &mut out).unwrap();
+        let actions = Options {
+            mode: Mode::Actions,
+            ..TWO
+        };
+        let passed = run(&repo, "base", &actions, &mutants, &nextest, &mut out).unwrap();
         let text = String::from_utf8(out).unwrap();
         assert!(!passed, "{text}");
+        assert!(
+            text.ends_with(
+                "::error file=xtask/src/a.rs,line=1,title=Missed mutant::No test fails when the \
+                 code is mutated: replace a -> bool with false.\n"
+            ),
+            "annotated in GitHub Actions, named from the repository root: {text}"
+        );
         assert!(
             text.contains("missed: xtask/src/a.rs:1:18: replace a -> bool with false"),
             "named from the repository root: {text}"
@@ -591,6 +654,25 @@ mod tests {
                 repo.join("target/mutants/xtask").display()
             )),
             "{called}"
+        );
+    }
+
+    #[test]
+    fn annotates_a_missed_mutant_on_its_line() {
+        assert_eq!(
+            annotate("src/a.rs:3:5: replace f -> bool with true").to_string(),
+            "::error file=src/a.rs,line=3,title=Missed mutant::No test fails when the code is \
+             mutated: replace f -> bool with true."
+        );
+        assert_eq!(
+            annotate("something else").to_string(),
+            "::error title=Missed mutant::No test fails when the code is mutated: something else.",
+            "a line it cannot read is annotated whole"
+        );
+        assert_eq!(
+            annotate("src/a.rs:x:5: replace f with ()").to_string(),
+            "::error title=Missed mutant::No test fails when the code is mutated: src/a.rs:x:5: \
+             replace f with ().",
         );
     }
 

@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use super::{Session, sealed, short, slug};
+use super::{APPLY_PUSH, Push, Session, sealed, short, slug};
 use crate::testing::{git, repository, script};
 
 /// A main clone with an `origin/main` and a linked worktree on branch `feature`; returns the main
@@ -373,6 +373,147 @@ fn diverged_branches_are_left_to_the_user() {
     );
     let error = format!("{:#}", session.sync().unwrap_err());
     assert!(error.contains("merge them by hand"), "{error}");
+}
+
+/// Runs [`APPLY_PUSH`] on `bundle` as the VM does, in the worktree through the session
+/// repository; returns whether git took it and what it said.
+fn apply_in_vm(session: &Session, branch: &str, bundle: &[u8]) -> (bool, String) {
+    use std::io::Write as _;
+    let admin = session.git_dir().join("worktrees").join(&session.id);
+    let mut child = std::process::Command::new("sh")
+        .args(["-c", APPLY_PUSH, "sh", branch])
+        .env("GIT_DIR", &admin)
+        .env("GIT_WORK_TREE", &session.worktree)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .current_dir(&session.worktree)
+        .stdin(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(bundle).unwrap();
+    let output = child.wait_with_output().unwrap();
+    (
+        output.status.success(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
+
+/// The bundle a push must produce, with the commits it moves between.
+fn bundle(push: Push) -> (String, String, String, Vec<u8>) {
+    match push {
+        Push::Bundle {
+            branch,
+            from,
+            to,
+            bundle,
+        } => (branch, from, to, bundle),
+        Push::Current(note) => panic!("nothing to push: {note}"),
+    }
+}
+
+#[test]
+fn commits_made_on_the_host_go_into_the_vm_only_forward() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_, session) = open(dir.path());
+    let worktree = session.worktree.clone();
+    let error = format!("{:#}", session.push().unwrap_err());
+    assert!(
+        error.contains("`cargo xtask vm start` creates it"),
+        "{error}"
+    );
+    session.prepare_git().unwrap();
+    let vm_head = session_git(&session, &["rev-parse", "refs/heads/feature"]);
+    match session.push().unwrap() {
+        Push::Current(note) => assert_eq!(
+            note,
+            format!("the VM's feature is already at {}", short(vm_head.trim()))
+        ),
+        Push::Bundle { .. } => panic!("nothing is new yet"),
+    }
+    fs::write(worktree.join("host.txt"), "from the host\n").unwrap();
+    git(&worktree, &["add", "host.txt"]);
+    git(&worktree, &["commit", "--quiet", "-m", "on the host"]);
+    let host_head = git(&worktree, &["rev-parse", "HEAD"]);
+    let (branch, from, to, bytes) = bundle(session.push().unwrap());
+    assert_eq!(
+        (branch.as_str(), from.as_str(), to.as_str()),
+        ("feature", vm_head.trim(), host_head.trim())
+    );
+    assert_eq!(
+        session_git(&session, &["rev-parse", "refs/heads/feature"]),
+        vm_head,
+        "building the push writes nothing to the session repository"
+    );
+    let (took, said) = apply_in_vm(&session, &branch, &bytes);
+    assert!(took, "{said}");
+    assert_eq!(
+        session_git(&session, &["rev-parse", "refs/heads/feature"]),
+        host_head
+    );
+    let admin = session.git_dir().join("worktrees").join(&session.id);
+    let status = std::process::Command::new("git")
+        .args(["status", "--porcelain"])
+        .env("GIT_DIR", &admin)
+        .env("GIT_WORK_TREE", &worktree)
+        .current_dir(&worktree)
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&status.stdout),
+        "",
+        "the VM's index follows the new commit"
+    );
+    assert!(matches!(session.push().unwrap(), Push::Current(_)));
+
+    git(
+        &worktree,
+        &["commit", "--quiet", "--allow-empty", "-m", "second"],
+    );
+    let (_, _, _, stale) = bundle(session.push().unwrap());
+    commit_in_vm(&session, "meanwhile in the vm");
+    let (refused, why) = apply_in_vm(&session, "feature", &stale);
+    assert!(!refused, "the VM's git moves its branch only forward");
+    assert!(why.contains("non-fast-forward"), "{why}");
+    let ahead = format!("{:#}", session.push().unwrap_err());
+    assert!(
+        ahead.contains("has commits the worktree's lacks; `cargo xtask vm sync`"),
+        "{ahead}"
+    );
+}
+
+#[test]
+fn a_push_refuses_branches_that_diverged() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_, session) = open(dir.path());
+    let worktree = session.worktree.clone();
+    session.prepare_git().unwrap();
+    git(
+        &worktree,
+        &["commit", "--quiet", "--allow-empty", "-m", "on the host"],
+    );
+    let (branch, _, _, bytes) = bundle(session.push().unwrap());
+    assert!(apply_in_vm(&session, &branch, &bytes).0);
+    git(
+        &worktree,
+        &[
+            "commit",
+            "--quiet",
+            "--amend",
+            "--allow-empty",
+            "-m",
+            "rewritten",
+        ],
+    );
+    let diverged = format!("{:#}", session.push().unwrap_err());
+    assert!(
+        diverged.contains("is not behind the worktree's")
+            && diverged.contains("merge them by hand"),
+        "{diverged}"
+    );
+    git(&worktree, &["checkout", "--quiet", "--detach"]);
+    let detached = format!("{:#}", session.push().unwrap_err());
+    assert!(detached.contains("on no branch"), "{detached}");
 }
 
 #[test]

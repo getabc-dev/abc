@@ -16,6 +16,7 @@ use std::time::Duration;
 use anyhow::{Context, bail, ensure};
 use serde::Deserialize;
 
+use crate::annotation::{self, Annotation, Level, Mode};
 use crate::git;
 
 /// The model, pinned: Gemini's newest stable Flash model, on the project's paid key.
@@ -159,13 +160,20 @@ fn generated(files: &[String]) -> String {
     section
 }
 
-/// Fails when the diff is over [`MAX_DIFF_BYTES`].
-pub(crate) fn check_size(diff: &str) -> anyhow::Result<()> {
+/// What the review counts against [`MAX_DIFF_BYTES`]: the diff with the title and description
+/// sent beside it.
+pub(crate) const fn size(title: &str, description: &str, diff: &str) -> usize {
+    diff.len()
+        .saturating_add(title.len())
+        .saturating_add(description.len())
+}
+
+/// Fails when `what`, `bytes` long, is over [`MAX_DIFF_BYTES`].
+pub(crate) fn check_size(what: &str, bytes: usize) -> anyhow::Result<()> {
     ensure!(
-        diff.len() <= MAX_DIFF_BYTES,
-        "the diff is {} bytes, too large for automated review (the limit is {MAX_DIFF_BYTES}); \
-         split the PR",
-        diff.len()
+        bytes <= MAX_DIFF_BYTES,
+        "{what} is {bytes} bytes, too large for automated review (the limit is \
+         {MAX_DIFF_BYTES}); split the PR"
     );
     Ok(())
 }
@@ -187,7 +195,10 @@ pub(crate) fn review(
             request.generated.len()
         ),
     );
-    check_size(&request.diff)?;
+    check_size(
+        "the diff with the title and description",
+        size(&request.title, &request.description, &request.diff),
+    )?;
     let url = format!("{ENDPOINT}/{MODEL}:generateContent");
     let sent = body(request).to_string();
     say(
@@ -378,6 +389,36 @@ pub(crate) fn retrying<'a>(
     }
 }
 
+/// Each finding as an annotation on its line: errors for blocking findings, warnings for major
+/// ones and notices for the rest.
+fn annotations(verdict: &Verdict) -> Vec<Annotation> {
+    verdict
+        .findings
+        .iter()
+        .map(|finding| {
+            let level = match finding.severity.as_str() {
+                "blocking" => Level::Error,
+                "major" => Level::Warning,
+                _ => Level::Notice,
+            };
+            let rule = finding
+                .rule_id
+                .as_deref()
+                .map(|rule| format!(" {rule}"))
+                .unwrap_or_default();
+            Annotation {
+                level,
+                ..Annotation::error(
+                    &finding.file,
+                    &format!("{}{rule}: {}", finding.severity, finding.title),
+                    finding.detail.clone(),
+                )
+                .at(finding.line, finding.line)
+            }
+        })
+        .collect()
+}
+
 /// The verdict as Markdown for the job summary.
 fn summary(verdict: &Verdict) -> String {
     let decision = match (&verdict.verdict, verdict.blocks()) {
@@ -487,23 +528,33 @@ fn plan(event: &Event, key: Option<&str>, local_title: &str) -> anyhow::Result<P
     })
 }
 
+/// Where the result goes besides the output: the job summary, and annotations.
+pub(crate) struct Destination<'a> {
+    /// The job summary's file, when there is one.
+    pub(crate) summary: Option<&'a PathBuf>,
+    /// Whether each finding is annotated.
+    pub(crate) mode: Mode,
+}
+
 /// Runs the review of the changes since the merge base with `base`, writing progress lines to
-/// `out` as it works, then the result to `summary_path` (the job summary) when given and to `out`.
+/// `out` as it works, then the result to `to.summary` (the job summary) when given and to `out`,
+/// and in `to.mode` each finding as an annotation.
 pub(crate) fn run(
     root: &Path,
     base: &str,
     event: &Event,
     key: Option<&str>,
-    summary_path: Option<&PathBuf>,
+    to: &Destination<'_>,
     out: &mut impl Write,
     post: &mut impl FnMut(&str, &str, &str) -> anyhow::Result<(u16, String)>,
 ) -> anyhow::Result<bool> {
     let result = review_changes(root, base, event, key, post, out);
     let report = match &result {
-        Ok((text, _)) => text.clone(),
+        Ok(Reviewed::Skipped(reason)) => format!("## Gemini review: skipped\n\n{reason}\n"),
+        Ok(Reviewed::Judged(verdict)) => summary(verdict),
         Err(error) => format!("## Gemini review: failed\n\n{error:#}\n"),
     };
-    if let Some(path) = summary_path {
+    if let Some(path) = to.summary {
         let mut file = fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -513,7 +564,24 @@ pub(crate) fn run(
             .context("could not write the job summary")?;
     }
     write!(out, "{report}")?;
-    result.map(|(_, passed)| passed)
+    match result? {
+        Reviewed::Skipped(_) => Ok(true),
+        Reviewed::Judged(verdict) => {
+            write!(
+                out,
+                "{}",
+                annotation::commands(to.mode, &annotations(&verdict))
+            )?;
+            Ok(!verdict.blocks())
+        }
+    }
+}
+
+/// What came of a review.
+enum Reviewed {
+    /// No review, for the reason given.
+    Skipped(String),
+    Judged(Verdict),
 }
 
 fn review_changes(
@@ -523,12 +591,10 @@ fn review_changes(
     key: Option<&str>,
     post: &mut impl FnMut(&str, &str, &str) -> anyhow::Result<(u16, String)>,
     progress: &mut impl Write,
-) -> anyhow::Result<(String, bool)> {
+) -> anyhow::Result<Reviewed> {
     let local_title = git::git(root, &["log", "-1", "--format=%s"])?;
     let (title, description) = match plan(event, key, local_title.trim())? {
-        Plan::Skip(reason) => {
-            return Ok((format!("## Gemini review: skipped\n\n{reason}\n"), true));
-        }
+        Plan::Skip(reason) => return Ok(Reviewed::Skipped(reason)),
         Plan::Review { title, description } => (title, description),
     };
     let commit = git::merge_base(root, base)?;
@@ -543,8 +609,12 @@ fn review_changes(
         diff,
         generated,
     };
-    let verdict = review(&request, key.unwrap_or_default(), post, progress)?;
-    Ok((summary(&verdict), !verdict.blocks()))
+    Ok(Reviewed::Judged(review(
+        &request,
+        key.unwrap_or_default(),
+        post,
+        progress,
+    )?))
 }
 
 /// [`run`], with the event, the key and the job summary's path read from GitHub Actions'
@@ -563,7 +633,10 @@ pub(crate) fn run_from(
         base,
         &Event::from_lookup(lookup)?,
         key.as_deref(),
-        summary_path.as_ref(),
+        &Destination {
+            summary: summary_path.as_ref(),
+            mode: Mode::from_env(lookup),
+        },
         out,
         post,
     )
@@ -575,9 +648,10 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        Decision, Event, MAX_DIFF_BYTES, MODEL, Plan, Request, Verdict, body, plan, post_gemini,
-        post_within, retrying, review, run, run_from, summary,
+        Decision, Destination, Event, MAX_DIFF_BYTES, MODEL, Plan, Request, Verdict, annotations,
+        body, plan, post_gemini, post_within, retrying, review, run, run_from, summary,
     };
+    use crate::annotation::{self, Mode};
     use crate::testing::{git, repository, serve_once};
 
     fn request(diff: &str) -> Request {
@@ -979,6 +1053,29 @@ mod tests {
     }
 
     #[test]
+    fn the_title_and_description_count_toward_the_size() {
+        let mut near = request(&"+".repeat(MAX_DIFF_BYTES - 100));
+        near.title = String::new();
+        near.description = "d".repeat(101);
+        let error = review(
+            &near,
+            "test-key",
+            &mut |_: &str, _: &str, _: &str| panic!("an oversized review is never sent"),
+            &mut Vec::new(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "the diff with the title and description is {} bytes, too large for automated \
+                 review (the limit is {MAX_DIFF_BYTES}); split the PR",
+                MAX_DIFF_BYTES + 1
+            )
+        );
+        assert_eq!(super::size("ab", "c", "def"), 6);
+    }
+
+    #[test]
     fn refuses_an_oversized_diff_before_calling_gemini() {
         let diff = "+".repeat(MAX_DIFF_BYTES + 1);
         let error = review(
@@ -1125,6 +1222,7 @@ mod tests {
                 "GITHUB_EVENT_PATH" => Some(event_path.clone().into_os_string()),
                 "GEMINI_API_KEY" => Some("test-key".into()),
                 "GITHUB_STEP_SUMMARY" => Some(summary_path.clone().into_os_string()),
+                "GITHUB_ACTIONS" => Some("true".into()),
                 _ => None,
             }
         };
@@ -1146,16 +1244,25 @@ mod tests {
             );
             Ok((200, recorded(BLOCK)))
         };
+        let mut annotated = Vec::new();
         assert!(
             !run_from(
                 &repo,
                 "base",
                 &variables("pull_request"),
-                &mut Vec::new(),
+                &mut annotated,
                 &mut post
             )
             .unwrap(),
             "the verdict decides"
+        );
+        let annotated = String::from_utf8(annotated).unwrap();
+        assert!(
+            annotated.ends_with(
+                "::error file=src/a.rs,line=12,title=blocking P2%3A No test | none::parse() \
+                 changed without a test\n"
+            ),
+            "in GitHub Actions each finding is annotated: {annotated}"
         );
         assert!(
             fs::read_to_string(&summary_path)
@@ -1203,7 +1310,10 @@ mod tests {
             "base",
             &event("local", serde_json::Value::Null),
             Some("test-key"),
-            Some(&summary_path),
+            &Destination {
+                summary: Some(&summary_path),
+                mode: Mode::Plain,
+            },
             &mut out,
             &mut answering(200, recorded(BLOCK)),
         )
@@ -1219,6 +1329,10 @@ mod tests {
             "then the verdict: {printed}"
         );
         assert!(
+            !printed.contains("::error"),
+            "no annotations outside GitHub Actions"
+        );
+        assert!(
             fs::read_to_string(&summary_path)
                 .unwrap()
                 .contains("## Gemini review: block"),
@@ -1230,7 +1344,10 @@ mod tests {
             "base",
             &event("local", serde_json::Value::Null),
             Some("test-key"),
-            Some(&summary_path),
+            &Destination {
+                summary: Some(&summary_path),
+                mode: Mode::Actions,
+            },
             &mut Vec::new(),
             &mut answering(429, String::new()),
         );
@@ -1242,6 +1359,22 @@ mod tests {
             "and the summary says why"
         );
     }
+    #[test]
+    fn annotates_each_finding_at_its_severity() {
+        let verdict: Verdict = serde_json::from_str(
+            r#"{"verdict": "pass", "findings": [
+                {"severity": "major", "rule_id": "S4", "file": "a.rs", "line": 3, "title": "Dead code", "detail": "f is unused,\nsee g"},
+                {"severity": "minor", "file": "b.rs", "line": 9, "title": "Wording", "detail": "d"}
+            ]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            annotation::commands(Mode::Actions, &annotations(&verdict)),
+            "::warning file=a.rs,line=3,title=major S4%3A Dead code::f is unused,%0Asee g\n\
+             ::notice file=b.rs,line=9,title=minor%3A Wording::d\n"
+        );
+    }
+
     #[test]
     fn reports_its_progress_as_it_works() {
         let mut with_generated = request("+fn a() {}");

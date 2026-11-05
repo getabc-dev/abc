@@ -109,21 +109,24 @@ watchdog compares the diff with that task and the rules above, and keeps it work
 
 | Command | What it does |
 | --- | --- |
-| `cargo xtask setup [TOOLS]` | Installs the tools pinned in `xtask/tools.toml` into `.tools/`, checking the sha256 of each archive or crate and of the executable. Run it in every new clone or worktree, and after the list changes. It never touches git config. |
-| `cargo xtask doctor [TOOLS]` | Fails unless every pinned tool, or each one named, is installed, matches its pinned sha256 and reports its pinned version. |
+| `cargo xtask setup [--for-tests] [TOOLS]` | Installs the tools pinned in `xtask/tools.toml` into `.tools/`, checking the sha256 of each archive or crate and of the executable. Run it in every new clone or worktree, and after the list changes. It never touches git config. `--for-tests` installs the tools marked `for-tests`, those the tests run, with any named; every CI job that runs tests uses it, and `rulesets check` fails one that does not. |
+| `cargo xtask doctor [--for-tests] [TOOLS]` | Fails unless every pinned tool, or each one named or marked `for-tests`, is installed, matches its pinned sha256 and reports its pinned version. |
 | `cargo xtask check` | Format check, clippy (`--all-targets --locked -D warnings`), nextest, sqlx's query cache check, doctests and rustdoc with warnings denied, on both workspaces, the main one and xtask's, and the pinned shellcheck on the shell scripts. Property tests run with a fixed seed. Database tests use the warm Postgres 18 container (below). It first fails when the changes since the merge base with the default branch are larger than the Gemini review accepts (the diff `review` sends, without generated files), so an oversized change is split before CI; files not yet added to git are not counted. |
 | `cargo xtask check --changed` | The same, limited to the crates affected by changes since the merge base with the default branch (`upstream/HEAD`, else `origin/HEAD`). |
 | `cargo xtask fuzz [--seconds N]` | Fuzzes protocol message decoding (target `decode` in `fuzz/`, a Cargo workspace of its own so normal builds never compile libFuzzer) with the pinned cargo-fuzz for N seconds (default 60), starting from the committed seeds in `fuzz/seeds/decode/`. It first runs rustfmt and clippy (`--locked`, warnings denied) on `fuzz/`, which `check` does not cover; `fuzz/Cargo.toml` copies the root's lints, and an xtask test keeps them equal. A failing input is saved under `fuzz/artifacts/decode/`; once fixed, add it to the seeds. |
-| `cargo xtask integrity --base <rev> [--description <file>]` | Lists deleted test files and tests, newly skipped or `should_panic` tests, tests with fewer assertions, and changed gate files since the merge base. In CI it fails on any of them unless an approver listed in `.github/integrity-approvers` at the merge base labelled the PR `integrity-approved` after its last push and last description edit; a run for a description edit treats any earlier label as stale. Each flagged test change also needs a reason in the PR description, label or not (below). |
+| `cargo xtask integrity --base <rev> [--description <file>]` | Lists deleted test files and tests, tests a commit of the branch added and a later one deleted, newly skipped or `should_panic` tests, tests with fewer assertions, and changed gate files since the merge base. In CI it fails on any of them unless an approver listed in `.github/integrity-approvers` at the merge base labelled the PR `integrity-approved` after its last push and last description edit; a run for a description edit treats any earlier label as stale. Each flagged test change also needs a reason in the PR description, label or not, and the description names no test it does not flag (below). |
 | `cargo xtask coverage --base <rev>` | Runs the tests of both workspaces under cargo-llvm-cov and fails unless 90% of the changed, instrumented lines of shipped code are covered, listing the ones that are not. Test code (`#[cfg(test)]` items, test functions, test modules in their own files, `tests/`) does not count. |
 | `cargo xtask mutants --base <rev> [--jobs N] [--shard k/n]` | Runs cargo-mutants on the Rust lines changed since the merge base, or one shard of them, and fails on any missed mutant: a change to the code that no test notices. A mutant whose tests hang counts as caught. The main workspace's mutants build in copies of the tree; xtask's are tested in place, one at a time, because its tests read the repository around it. |
 | `cargo xtask review --base <rev>` | Gemini reviews the diff, the PR's title and description against this file as it stands at the merge base. Runs in CI; it blocks on a `block` verdict or any blocking finding, and fails closed on quota, size and missing-key errors. |
 | `cargo xtask task set "<text>"` / `show` / `clear` | Records, prints or forgets the current task in `.abc/task.md` (not committed), for the watchdog. |
 | `cargo xtask task blocked "<text>"` | Declares the task BLOCKED, in the stop hook's state (`.abc/stop-state.json`): what is missing and what was tried. The next Stop logs it in `.abc/blocked-log.md` and asks the watchdog whether the blocker is outside the agent's control; if so, or after 5 blocked stops in a row, the stop is allowed with this handoff, and otherwise it is sent back and counted (D39). |
-| `cargo xtask gh -- <args>` | Runs gh as the agent App with a token from the broker, revoked when gh exits. Agents create, merge and change things on GitHub only through this; the guard blocks plain `gh pr create`, `gh pr merge` and `gh api` writes. |
+| `cargo xtask gh -- <args>` | Runs gh as the agent App with a token from the broker, revoked when gh exits. Agents merge and change things on GitHub only through this or `cargo xtask pr`; the guard blocks plain `gh pr merge` and `gh api` writes. |
+| `cargo xtask pr open --title <t> --body <file>` / `pr update <number> --body <file>` | Opens a pull request from the pushed branch, or replaces one's description, through the REST API as the agent App. First it refuses a tree with uncommitted changes, a `## Test changes` section that misses a test integrity flags or names one it does not, a diff over the review's limit counting the title and description, and, when `.github/` changed, rulesets that fail `rulesets check`. When someone else pushed the pull request's head last (the maintainer's workflow commits), `update` refuses unless HEAD changes the diff (`git diff --quiet`), since GitHub counts no other push as reviewable, and says to push it. The guard blocks `gh pr create` and `gh pr edit`, through `cargo xtask gh` too. |
+| `cargo xtask pr test-changes` | Prints the `## Test changes` section for the current branch, naming every test integrity flags; only the reasons are left to write. |
+| `cargo xtask pr checks <number>` | Lists the failing, cancelled and running checks of the pull request's head and of its latest merge-queue run, with each failing check's annotations: two API calls and one App token, read from GitHub's API, which agent VMs reach, unlike job logs. |
 | `cargo xtask git-credential <op>` | git's credential helper for github.com in agent VMs (`xtask/vm/gitconfig`): it answers with an agent App token from the broker. Never run it yourself. |
 | `cargo xtask broker --session <name>` | Started by `cargo xtask vm start`, one per session, from a build of main installed outside any checkout: serves that agent VM's App tokens, at most 120 an hour, and revokes them all when the session stops; the one process that reads the App's key. |
-| `cargo xtask vm start\|shell\|auth\|sync\|stop <worktree>`, `vm image`, `vm ls` | For the maintainer only, from the main clone: runs agent sessions in microsandbox microVMs, one per worktree (D37; CONTRIBUTING.md). |
+| `cargo xtask vm start\|shell\|auth\|sync\|push\|stop <worktree>`, `vm image`, `vm ls` | For the maintainer only, from the main clone: runs agent sessions in microsandbox microVMs, one per worktree (D37; CONTRIBUTING.md). |
 | `cargo xtask rulesets check` | Checks `.github/rulesets/main.json` against the CI workflows: every job that runs on pull requests and in the merge queue is a required check. |
 | `cargo xtask rulesets apply` | For the maintainer only, with their own gh login: puts `.github/rulesets/` on GitHub (`main`, the `agent/*` branch limit and the tag rule), replacing the rulesets they supersede. Agents never run it. |
 | `cargo xtask tool <name> [args]` | Runs a pinned tool from `.tools/`, such as `cargo xtask tool cargo-deny check`. Never run these tools from `PATH`. |
@@ -158,13 +161,17 @@ xtask tool zizmor --pedantic .github`, `cargo xtask tool pinact run --check --ve
 `main`. Integrity, Coverage, Mutants and Gemini review run the base commit's xtask on the pull
 request's tree (`--root`), so a pull request cannot change the gates that judge it; a pull request
 that adds a gate fails that gate, which says it is bootstrapping. Only the review job has
-`GEMINI_API_KEY`, and it runs nothing from the pull request's tree.
+`GEMINI_API_KEY`, and it runs nothing from the pull request's tree. Inside GitHub Actions
+(`GITHUB_ACTIONS=true`), `review`, `mutants`, `coverage` and `integrity` also print their findings
+as annotations, at most ten of each level per step as GitHub keeps them; elsewhere their output is
+unchanged.
 
 A PR that deletes, skips or weakens a test explains each one in its description, in a
 `## Test changes` section: one entry per test, naming the test in backticks as the integrity check
 reports it (`<file>::<test>`, or the file for a deleted test file), then the requirement or
-behaviour that changed. A test change that only makes the code pass is not a reason; the Gemini
-review blocks it. `.github/pull_request_template.md` has the section, with "None" for a PR that
+behaviour that changed. An entry for a test the check does not flag fails it too. A test change
+that only makes the code pass is not a reason; the Gemini review blocks it. `cargo xtask pr
+test-changes` prints the section with every flagged test. `.github/pull_request_template.md` has the section, with "None" for a PR that
 changes no tests.
 
 ```markdown
@@ -191,7 +198,8 @@ every other branch, and the `tags` ruleset every tag. git tokens cannot change w
 a change that needs one goes to the maintainer.
 
 The git guard in the agent hooks catches accidents: force pushes, git or gh commands it cannot
-read, and gh changes made as the user instead of through `cargo xtask gh`. It cannot stop a
+read, gh changes made as the user instead of through `cargo xtask gh`, and pull requests opened or
+edited with gh instead of `cargo xtask pr`. It cannot stop a
 deliberate bypass, since no text check of a shell command can, and it does not try to. Enforcement
 is on GitHub: the ruleset on `main` forbids force pushes and deletion and requires a code owner's
 approval and every check, and agents act as the getabc-dev-agent GitHub App with limited

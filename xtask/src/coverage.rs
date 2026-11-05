@@ -2,7 +2,8 @@
 //!
 //! cargo-llvm-cov runs the test suite with coverage instrumentation and writes lcov. The gate
 //! reads that and the diff from the merge base, and fails when fewer than [`THRESHOLD_PERCENT`]
-//! of the changed lines that compile to code are covered, listing the ones that are not.
+//! of the changed lines that compile to code are covered, listing the ones that are not; in GitHub
+//! Actions, also as annotations, one per range of lines.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -13,6 +14,7 @@ use std::process::Command;
 
 use anyhow::{Context, ensure};
 
+use crate::annotation::{self, Annotation, Mode};
 use crate::check::{self, PROPTEST_RNG_SEED};
 use crate::git;
 use crate::integrity::{self, TestCode};
@@ -29,12 +31,14 @@ const LCOV_DIR: &str = "target/coverage";
 type Hits = BTreeMap<String, BTreeMap<u32, u64>>;
 
 /// Runs the tests of every workspace under coverage, with the cargo-llvm-cov and cargo-nextest
-/// executables given, and checks the lines changed since the merge base with `base`.
+/// executables given, and checks the lines changed since the merge base with `base`, annotating
+/// the lines no test runs in `mode`.
 pub(crate) fn run(
     root: &Path,
     base: &str,
     llvm_cov: &Path,
     nextest: &Path,
+    mode: Mode,
     out: &mut impl Write,
 ) -> anyhow::Result<bool> {
     let dir = root.join(LCOV_DIR);
@@ -79,6 +83,11 @@ pub(crate) fn run(
     let changed = without_tests(root, git::added_lines(&git::diff(root, &commit, 0)?))?;
     let measured = measure(&changed, &parse_lcov(&report, root));
     write!(out, "{}", measured.describe())?;
+    write!(
+        out,
+        "{}",
+        annotation::commands(mode, &measured.annotations())
+    )?;
     Ok(measured.passes())
 }
 
@@ -245,10 +254,28 @@ impl Measured {
         text.push_str(verdict);
         text
     }
+
+    /// One annotation per range of changed lines no test runs.
+    fn annotations(&self) -> Vec<Annotation> {
+        self.uncovered
+            .iter()
+            .flat_map(|(file, lines)| {
+                spans(lines).into_iter().map(move |(first, last)| {
+                    let message = if first == last {
+                        format!("Line {first} changed and no test runs it.")
+                    } else {
+                        format!("Lines {first}-{last} changed and no test runs them.")
+                    };
+                    Annotation::error(file, "Not covered", message)
+                        .at(u64::from(first), u64::from(last))
+                })
+            })
+            .collect()
+    }
 }
 
-/// Lines as comma-separated numbers and ranges, such as `3, 7-9`.
-fn ranges(lines: &BTreeSet<u32>) -> String {
+/// Lines as runs of consecutive numbers, each its first and last.
+fn spans(lines: &BTreeSet<u32>) -> Vec<(u32, u32)> {
     let mut spans: Vec<(u32, u32)> = Vec::new();
     for &line in lines {
         match spans.last_mut() {
@@ -257,6 +284,11 @@ fn ranges(lines: &BTreeSet<u32>) -> String {
         }
     }
     spans
+}
+
+/// Lines as comma-separated numbers and ranges, such as `3, 7-9`.
+fn ranges(lines: &BTreeSet<u32>) -> String {
+    spans(lines)
         .iter()
         .map(|&(start, end)| {
             if start == end {
@@ -275,6 +307,7 @@ mod tests {
     use std::path::Path;
 
     use super::{Measured, measure, parse_lcov, ranges, run, without_tests};
+    use crate::annotation::Mode;
     use crate::testing::{repository_with_change, script};
 
     const LCOV: &str = "TN:\nSF:/repo/src/a.rs\nFN:1,a\nDA:1,3\nDA:2,0\nDA:3,0\nDA:4,1\nDA:4,0\nend_of_record\nSF:/elsewhere/dep.rs\nDA:1,0\nend_of_record\nSF:/repo/src/b.rs\nDA:7,0,abc\nend_of_record\n";
@@ -348,6 +381,13 @@ mod tests {
         assert!(
             text.ends_with("coverage: failed; add tests that run the lines above\n"),
             "{text}"
+        );
+        assert_eq!(
+            crate::annotation::commands(Mode::Actions, &failing.annotations()),
+            "::error file=src/a.rs,line=2,endLine=3,title=Not covered::Lines 2-3 changed and no \
+             test runs them.\n::error file=src/a.rs,line=9,title=Not covered::Line 9 changed and \
+             no test runs it.\n",
+            "one annotation per range"
         );
         assert!(
             measured(0, 0).describe().contains("(100%)"),
@@ -442,24 +482,41 @@ mod tests {
             "base",
             &fake_llvm_cov(temp.path(), false),
             &nextest,
+            Mode::Actions,
             &mut out,
         )
         .unwrap();
         let text = String::from_utf8(out).unwrap();
         assert!(!half, "half the changed lines covered fails: {text}");
         assert!(text.contains("not covered: src/a.rs:2"), "{text}");
+        assert!(
+            text.ends_with(
+                "coverage: failed; add tests that run the lines above\n::error \
+                 file=src/a.rs,line=2,title=Not covered::Line 2 changed and no test runs it.\n"
+            ),
+            "in GitHub Actions the lines are annotated too: {text}"
+        );
         let full = run(
             &repo,
             "base",
             &fake_llvm_cov(temp.path(), true),
             &nextest,
+            Mode::Plain,
             &mut Vec::new(),
         )
         .unwrap();
         assert!(full, "every changed line covered passes");
         let failing = temp.path().join("failing");
         script(&failing, "exit 1\n");
-        let error = run(&repo, "base", &failing, &nextest, &mut Vec::new()).unwrap_err();
+        let error = run(
+            &repo,
+            "base",
+            &failing,
+            &nextest,
+            Mode::Plain,
+            &mut Vec::new(),
+        )
+        .unwrap_err();
         assert!(
             error
                 .to_string()
@@ -482,9 +539,13 @@ mod tests {
             "manifest=main\nwhile [ $# -gt 0 ]; do case \"$1\" in --output-path) out=$2 ;; --manifest-path) manifest=$2 ;; esac; shift; done\nif [ \"$manifest\" = xtask/Cargo.toml ]; then printf 'SF:%s/xtask/src/b.rs\\nDA:1,1\\nDA:2,0\\nend_of_record\\n' \"$PWD\" > \"$out\"; else printf 'SF:%s/src/a.rs\\nDA:1,1\\nend_of_record\\n' \"$PWD\" > \"$out\"; fi\n",
         );
         let mut out = Vec::new();
-        let passed = run(&repo, "base", &llvm_cov, &nextest, &mut out).unwrap();
+        let passed = run(&repo, "base", &llvm_cov, &nextest, Mode::Plain, &mut out).unwrap();
         let text = String::from_utf8(out).unwrap();
         assert!(!passed, "xtask's uncovered line counts: {text}");
+        assert!(
+            !text.contains("::error"),
+            "no annotations outside GitHub Actions"
+        );
         assert!(text.contains("not covered: xtask/src/b.rs:2"), "{text}");
         assert!(
             text.contains("the tests of the main workspace")

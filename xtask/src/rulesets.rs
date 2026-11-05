@@ -234,6 +234,60 @@ fn check_text(ruleset: &str, workflows: &[(String, String)]) -> anyhow::Result<(
     Ok(())
 }
 
+/// The gates whose runs include the tests, as `cargo xtask` subcommands.
+const TEST_GATES: [&str; 3] = ["check", "coverage", "mutants"];
+
+/// Fails when a job of `workflows` runs a gate that runs the tests without first installing the
+/// tools the tests need with `cargo xtask setup --for-tests`.
+fn installs_test_tools(workflows: &[(String, String)]) -> anyhow::Result<()> {
+    let mut missing = Vec::new();
+    for (file, text) in workflows {
+        let documents =
+            YamlLoader::load_from_str(text).with_context(|| format!("{file} is not YAML"))?;
+        let Some(jobs) = documents
+            .first()
+            .and_then(|workflow| workflow["jobs"].as_hash())
+        else {
+            continue;
+        };
+        for (id, job) in jobs {
+            let mut ready = false;
+            for run in job["steps"]
+                .as_vec()
+                .into_iter()
+                .flatten()
+                .filter_map(|step| step["run"].as_str())
+            {
+                let commands: Vec<Vec<&str>> = run
+                    .lines()
+                    .map(|line| line.split_whitespace().collect())
+                    .collect();
+                for words in commands {
+                    match words.as_slice() {
+                        ["cargo", "xtask", "setup", rest @ ..] if rest.contains(&"--for-tests") => {
+                            ready = true;
+                        }
+                        ["cargo", "xtask", gate, ..] if !ready && TEST_GATES.contains(gate) => {
+                            missing.push(format!(
+                                "{file}: job {} runs `cargo xtask {gate}`",
+                                id.as_str().unwrap_or("?")
+                            ));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+    ensure!(
+        missing.is_empty(),
+        "these jobs run the tests without the tools they need; run `cargo xtask setup \
+         --for-tests` in an earlier step: {}",
+        missing.join("; ")
+    );
+    Ok(())
+}
+
 /// The workflows in `.github/workflows`, as file names and texts.
 fn workflows(root: &Path) -> anyhow::Result<Vec<(String, String)>> {
     let dir = root.join(".github/workflows");
@@ -258,7 +312,9 @@ pub(crate) fn check(root: &Path) -> anyhow::Result<()> {
     let read = |file: &str| {
         fs::read_to_string(root.join(file)).with_context(|| format!("could not read {file}"))
     };
-    check_text(&read(RULESET)?, &workflows(root)?)?;
+    let workflows = workflows(root)?;
+    check_text(&read(RULESET)?, &workflows)?;
+    installs_test_tools(&workflows)?;
     check_refs(&read(BRANCHES)?, Refs::Branches).with_context(|| BRANCHES.to_owned())?;
     check_refs(&read(TAGS)?, Refs::Tags).with_context(|| TAGS.to_owned())
 }
@@ -490,7 +546,7 @@ mod tests {
 
     use super::{
         Action, BRANCHES, Existing, REPLACED, Refs, TAGS, apply, check, check_refs, check_text,
-        github_error, plan, repository, required_checks,
+        github_error, installs_test_tools, plan, repository, required_checks,
     };
     use crate::testing::{git, repository as new_repository};
 
@@ -659,6 +715,40 @@ mod tests {
             error.contains("lint"),
             "a job missing from the ruleset: {error}"
         );
+    }
+
+    #[test]
+    fn a_job_that_runs_the_tests_installs_their_tools_first() {
+        let job = |steps: &str| {
+            vec![(
+                "ci.yml".to_owned(),
+                format!("on: [pull_request]\njobs:\n  coverage:\n    steps:\n{steps}"),
+            )]
+        };
+        // #25's Coverage job: it installed cargo-nextest alone, and the tests needed shellcheck.
+        let error = format!(
+            "{:#}",
+            installs_test_tools(&job(
+                "      - run: cargo xtask setup cargo-nextest\n      - run: cargo xtask coverage --base \"$BASE\"\n"
+            ))
+            .unwrap_err()
+        );
+        assert!(
+            error.contains("ci.yml: job coverage runs `cargo xtask coverage`"),
+            "{error}"
+        );
+        assert!(
+            installs_test_tools(&job(
+                "      - run: cargo xtask check\n      - run: cargo xtask setup --for-tests\n"
+            ))
+            .is_err(),
+            "installed too late"
+        );
+        installs_test_tools(&job(
+            "      - uses: ./a\n      - run: |\n          cargo xtask setup --for-tests cargo-sqlx\n          cargo xtask mutants --shard 0/8\n",
+        ))
+        .unwrap();
+        installs_test_tools(&job("      - run: cargo xtask review --base x\n")).unwrap();
     }
 
     #[test]

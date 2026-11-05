@@ -108,6 +108,10 @@ pub(crate) struct Tool {
     /// expect their own name first. `--version` when absent.
     #[serde(rename = "version-args")]
     version_args: Option<Vec<String>>,
+    /// Whether the tests run the tool, so every CI job that runs tests installs it with
+    /// `cargo xtask setup --for-tests`.
+    #[serde(rename = "for-tests", default)]
+    pub(crate) for_tests: bool,
 }
 
 /// Where a tool comes from.
@@ -182,9 +186,10 @@ impl Manifest {
         Ok(Self { tools: raw.tool })
     }
 
-    /// The tools named in `only`, or all of them when it is empty.
-    fn select(self, only: &[String]) -> anyhow::Result<Self> {
-        if only.is_empty() {
+    /// The tools named in `only` and, with `for_tests`, those the tests run; all of them when
+    /// neither names any.
+    fn select(self, only: &[String], for_tests: bool) -> anyhow::Result<Self> {
+        if only.is_empty() && !for_tests {
             return Ok(self);
         }
         for name in only {
@@ -194,7 +199,7 @@ impl Manifest {
             tools: self
                 .tools
                 .into_iter()
-                .filter(|tool| only.contains(&tool.name))
+                .filter(|tool| only.contains(&tool.name) || (for_tests && tool.for_tests))
                 .collect(),
         })
     }
@@ -596,9 +601,15 @@ enum Status {
     },
 }
 
-/// `cargo xtask setup`: installs every pinned tool, or the `only` ones, that is missing or drifted.
-pub(crate) fn setup(root: &Path, only: &[String], out: &mut impl Write) -> anyhow::Result<()> {
-    let manifest = Manifest::load(root)?.select(only)?;
+/// `cargo xtask setup`: installs every pinned tool, or the `only` ones and with `for_tests` those
+/// the tests run, that is missing or drifted.
+pub(crate) fn setup(
+    root: &Path,
+    only: &[String],
+    for_tests: bool,
+    out: &mut impl Write,
+) -> anyhow::Result<()> {
+    let manifest = Manifest::load(root)?.select(only, for_tests)?;
     install_unready(root, &manifest, Target::host()?, out, &mut download)
 }
 
@@ -624,14 +635,15 @@ fn install_unready(
     Ok(())
 }
 
-/// `cargo xtask doctor`: reports the state of each tool, or the `only` ones, and fails unless all
-/// are ready.
+/// `cargo xtask doctor`: reports the state of each tool, or the `only` ones and with `for_tests`
+/// those the tests run, and fails unless all are ready.
 pub(crate) fn doctor(
     root: &Path,
     only: &[String],
+    for_tests: bool,
     out: &mut impl Write,
 ) -> anyhow::Result<ExitCode> {
-    let manifest = Manifest::load(root)?.select(only)?;
+    let manifest = Manifest::load(root)?.select(only, for_tests)?;
     report(root, &manifest, Target::host()?, out)
 }
 
@@ -2316,22 +2328,50 @@ targets.aarch64-unknown-linux-gnu = {{ platform = "linux-arm64", sha256 = "{sha2
         let root = crate::repo_root().unwrap();
         let unknown = ["no-such-tool".to_owned()];
         assert!(
-            setup(&root, &unknown, &mut Vec::new()).is_err(),
+            setup(&root, &unknown, false, &mut Vec::new()).is_err(),
             "setup refuses a tool that is not pinned"
         );
         assert!(
-            doctor(&root, &unknown, &mut Vec::new()).is_err(),
+            doctor(&root, &unknown, true, &mut Vec::new()).is_err(),
             "so does doctor"
         );
         let manifest = Manifest::parse(&manifest_text(SHA_A, SHA_B)).unwrap();
         let only = vec!["fake".to_owned()];
-        assert_eq!(manifest.select(&only).unwrap().tools.len(), 1, "selected");
+        assert_eq!(
+            manifest.select(&only, false).unwrap().tools.len(),
+            1,
+            "selected"
+        );
         let error = Manifest::parse(&manifest_text(SHA_A, SHA_B))
             .unwrap()
-            .select(&["other".to_owned()])
+            .select(&["other".to_owned()], false)
             .unwrap_err()
             .to_string();
         assert!(error.contains("other is not a pinned tool"), "{error}");
+    }
+
+    #[test]
+    fn for_tests_selects_exactly_the_tools_the_tests_run() {
+        let names = |only: &[&str], for_tests: bool| -> Vec<String> {
+            let only: Vec<String> = only.iter().map(|&name| name.to_owned()).collect();
+            Manifest::load(&crate::repo_root().unwrap())
+                .unwrap()
+                .select(&only, for_tests)
+                .unwrap()
+                .tools
+                .into_iter()
+                .map(|tool| tool.name)
+                .collect()
+        };
+        // #25's Coverage and Mutants jobs installed only cargo-nextest, and xtask's tests failed
+        // there for want of shellcheck.
+        assert_eq!(names(&[], true), ["cargo-nextest", "shellcheck"]);
+        assert_eq!(
+            names(&["cargo-sqlx"], true),
+            ["cargo-nextest", "cargo-sqlx", "shellcheck"],
+            "named tools join them"
+        );
+        assert!(names(&[], false).len() > 3, "all of them, with neither");
     }
 
     #[test]

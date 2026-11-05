@@ -28,7 +28,8 @@ Claude included.
   (`.abc/hook-holds`), never honouring a declaration, and denies git and gh commands while letting
   everything else run. Read-only subagents (Explore, Plan and the like) and Claude Code's internal
   agents are exempt. The PreToolUse hook on Bash and Monitor is the git guard: it catches
-  accidental force pushes, git or gh commands it cannot read, and gh changes made as the user;
+  accidental force pushes, git or gh commands it cannot read, gh changes made as the user,
+  and pull requests opened or edited with gh rather than `cargo xtask pr`;
   GitHub's ruleset and the agent App's permissions are the enforcement. In an agent VM it first
   runs the image's `abc-xtask vm billing`, the one check made with code the agent cannot change.
   Outside this repository, or in a checkout without these hooks, the hooks check nothing.
@@ -41,9 +42,11 @@ Claude included.
 - **Agent VMs.** Sessions run in a microVM per worktree (`cargo xtask vm`, D37). You see only
   this worktree and a git repository holding its branch and `origin/main`; the network reaches
   only `xtask/vm/egress-allow.txt`; Postgres 18 runs in the VM on 127.0.0.1 as `abc_test`
-  (`ABC_TEST_DATABASE_URL` is set). git pushes and `cargo xtask gh -- <args>` act as the
-  getabc-dev-agent App, with a token per use from the host's broker (`ABC_AGENT_BROKER`), scoped
-  to this repository and the permissions each use needs. Push only `agent/<topic>` branches;
+  (`ABC_TEST_DATABASE_URL` is set). git pushes, `cargo xtask gh -- <args>` and `cargo xtask pr`
+  act as the getabc-dev-agent App, with a token per use from the host's broker
+  (`ABC_AGENT_BROKER`), scoped to this repository and the permissions each use needs. Open and
+  update pull requests with `cargo xtask pr`, and read a pull request's failures with
+  `cargo xtask pr checks <number>`: job logs are out of the VM's reach. Push only `agent/<topic>` branches;
   GitHub refuses the App any other branch, any tag and any workflow change. Claude Code here runs on the
   maintainer's subscription token only; the VM refuses any API key or other route, before every
   tool call too.

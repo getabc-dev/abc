@@ -48,10 +48,10 @@ jobs:
           workspaces: |
             . -> target
             xtask -> ../target
-      - name: Install the pinned tools
-        run: cargo xtask setup cargo-nextest cargo-sqlx shellcheck
+      - name: Install the pinned tools the tests run, and cargo-sqlx
+        run: cargo xtask setup --for-tests cargo-sqlx
       - name: Check the installed tools against their pins
-        run: cargo xtask doctor cargo-nextest cargo-sqlx shellcheck
+        run: cargo xtask doctor --for-tests cargo-sqlx
       - name: Format, clippy, tests, query caches, doctests, docs and shell scripts, in both workspaces
         run: cargo xtask check
 
@@ -171,8 +171,8 @@ jobs:
           workspaces: |
             . -> target
             xtask -> ../target
-      - name: Install the pinned cargo-nextest and shellcheck the pull request's tests use
-        run: cargo xtask setup cargo-nextest shellcheck
+      - name: Install the pinned tools the pull request's tests run
+        run: cargo xtask setup --for-tests
       - name: 90% of changed lines covered
         working-directory: ${{ runner.temp }}/base
         run: cargo xtask coverage --root "$GITHUB_WORKSPACE" --base "$BASE"
@@ -223,8 +223,8 @@ jobs:
           workspaces: |
             . -> target
             xtask -> ../target
-      - name: Install the pinned cargo-nextest and shellcheck the pull request's tests use
-        run: cargo xtask setup cargo-nextest shellcheck
+      - name: Install the pinned tools the pull request's tests run
+        run: cargo xtask setup --for-tests
       - name: No missed mutants in this shard of the changed code
         working-directory: ${{ runner.temp }}/base
         run: cargo xtask mutants --root "$GITHUB_WORKSPACE" --base "$BASE" --jobs 2 --shard "$SHARD/8"

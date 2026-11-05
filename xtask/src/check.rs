@@ -301,7 +301,7 @@ fn review_size(root: &Path, out: &mut impl Write) -> anyhow::Result<bool> {
     };
     let merge_base = crate::git::merge_base(root, &branch)?;
     let (diff, _) = crate::git::reviewable_diff(root, &merge_base, 3)?;
-    if let Err(error) = crate::review::check_size(&diff) {
+    if let Err(error) = crate::review::check_size("the diff", diff.len()) {
         writeln!(out, "xtask: since {branch}, {error}")?;
         return Ok(false);
     }
@@ -695,8 +695,7 @@ mod tests {
         review_size, run, test_command,
     };
     use crate::git::default_branch;
-    use crate::testing::{git, repository};
-    use crate::tools::Manifest;
+    use crate::testing::{clone_with_origin, git, repository};
 
     fn package(name: &str, dir: &str, library: bool, path_dependencies: &[&str]) -> Package {
         Package {
@@ -992,17 +991,6 @@ mod tests {
     }
 
     /// A clone whose origin's default branch is `main`, at the clone's first commit.
-    fn clone_with_origin(temp: &Path) -> PathBuf {
-        let work = repository(&temp.join("work"));
-        let bare = temp.join("origin.git");
-        git(temp, &["init", "--quiet", "--bare", bare.to_str().unwrap()]);
-        git(&work, &["remote", "add", "origin", bare.to_str().unwrap()]);
-        git(&work, &["push", "--quiet", "origin", "HEAD:main"]);
-        git(&work, &["fetch", "--quiet", "origin"]);
-        git(&work, &["remote", "set-head", "origin", "main"]);
-        work
-    }
-
     #[test]
     fn a_change_within_the_review_limit_passes_and_reports_its_size() {
         let temp = tempfile::tempdir().unwrap();
@@ -1193,18 +1181,12 @@ mod tests {
 
     /// Runs the whole check on `fixture` with Postgres reached through `postgres`.
     fn check_in(fixture: &TempDir, postgres: &super::Postgres<'_>) -> (bool, String) {
-        let repo = crate::repo_root().unwrap();
-        let nextest = Manifest::load(&repo)
-            .unwrap()
-            .tool("cargo-nextest")
-            .unwrap()
-            .installed(&repo)
-            .unwrap();
+        let nextest = crate::testing::pinned_for_tests("cargo-nextest");
         let target_dir = fixture.path().join("target");
         let mut out = Vec::new();
         let tools = Tools {
             nextest,
-            shellcheck: crate::tools::pinned(&repo, "shellcheck").unwrap(),
+            shellcheck: crate::testing::pinned_for_tests("shellcheck"),
         };
         let tree = Tree {
             workspaces: &[MAIN],
@@ -1278,10 +1260,9 @@ mod tests {
 
     /// Runs only the shellcheck step on `scripts` of `dir`.
     fn shellcheck_in(dir: &Path, scripts: &[&str]) -> (bool, String) {
-        let repo = crate::repo_root().unwrap();
         let tools = Tools {
             nextest: PathBuf::from("unused"),
-            shellcheck: crate::tools::pinned(&repo, "shellcheck").unwrap(),
+            shellcheck: crate::testing::pinned_for_tests("shellcheck"),
         };
         let unused = |_: &mut dyn std::io::Write| anyhow::bail!("no database");
         let no_sqlx = || anyhow::bail!("no query cache");

@@ -24,6 +24,8 @@ struct Fake {
     calls: RefCell<Vec<String>>,
     /// What each exec received on stdin.
     stdin: RefCell<Vec<Vec<u8>>>,
+    /// Whether the VM's git refuses the commits `vm push` sends.
+    refuses_push: bool,
 }
 
 fn output(code: i32, stdout: &str) -> Output {
@@ -73,6 +75,9 @@ impl Backend for Fake {
         Ok(match command.as_str() {
             "test -e /run/abc/ready" => output(i32::from(!self.ready), ""),
             "agent-exec claude auth status --json" => output(0, &self.auth),
+            pushed if pushed.starts_with("agent-exec sh -c ") => {
+                output(i32::from(self.refuses_push), "")
+            }
             _ => output(0, ""),
         })
     }
@@ -368,6 +373,57 @@ fn a_running_session_is_reused() {
         !world.root.join("state/w/git").exists(),
         "the host leaves a running VM's repository alone"
     );
+}
+
+#[test]
+fn pushes_host_commits_into_a_running_vm_only() {
+    let world = world("t");
+    let push = || Action::Push {
+        worktree: world.worktree.clone(),
+    };
+    let stopped = subscribed();
+    start_ok(&world, &stopped);
+    let error = format!("{:#}", act(&world, &stopped, push()).0.unwrap_err());
+    assert!(error.contains("abc-w is not running"), "{error}");
+    let running = Fake {
+        running: true,
+        ..subscribed()
+    };
+    let (current, already) = act(&world, &running, push());
+    current.unwrap();
+    assert!(already.contains("already at"), "{already}");
+    git(
+        &world.worktree,
+        &["commit", "--quiet", "--allow-empty", "-m", "on the host"],
+    );
+    let (result, out) = act(&world, &running, push());
+    result.unwrap();
+    assert!(
+        out.starts_with("vm: the VM's feature: ") && out.contains("index now matches"),
+        "{out}"
+    );
+    let calls = running.calls.borrow();
+    let last = calls.last().unwrap();
+    assert!(
+        last.starts_with("exec abc-w agent-exec sh -c set -eu") && last.ends_with(" sh feature"),
+        "{last}"
+    );
+    assert!(
+        running
+            .stdin
+            .borrow()
+            .last()
+            .unwrap()
+            .starts_with(b"# v2 git bundle\n"),
+        "the commits go in as a bundle on stdin"
+    );
+    let refusing = Fake {
+        running: true,
+        refuses_push: true,
+        ..subscribed()
+    };
+    let refused = format!("{:#}", act(&world, &refusing, push()).0.unwrap_err());
+    assert_eq!(refused, "the VM did not take the commits: said no");
 }
 
 /// The reserved guest directories this host refuses to mount over.

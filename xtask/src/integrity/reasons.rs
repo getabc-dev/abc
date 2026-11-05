@@ -12,9 +12,11 @@
 //! - `xtask/src/old.rs`: the old parser was removed with its tests.
 //! ```
 //!
-//! A test is named `<file>::<test>`, or by its file alone when the whole file was deleted. HTML
-//! comments, such as the hints in `.github/pull_request_template.md`, are not read, and "None" (the
-//! template's default) names no test, so it passes only when no test change was flagged. The
+//! A test is named `<file>::<test>`, or by its file alone when the whole file was deleted. An entry
+//! for a test the check does not flag fails too: a stale entry hides which changes need a reason
+//! (#25 carried three). HTML comments, such as the hints in `.github/pull_request_template.md`, are
+//! not read, and "None" (the template's default) names no test, so it passes only when no test
+//! change was flagged. The
 //! `integrity-approved` label approves a stated reason, so the reasons are required with or
 //! without it.
 
@@ -109,13 +111,14 @@ pub(super) struct Explained {
 }
 
 impl Explained {
+    /// Whether every flagged test has a reason and every entry names a flagged test.
     pub(super) const fn complete(&self) -> bool {
-        self.unexplained.is_empty()
+        self.unexplained.is_empty() && self.extra.is_empty()
     }
 
-    /// Tells the author what is missing, and notes entries for tests that were not flagged.
+    /// Tells the author what is missing, and which entries name tests that were not flagged.
     pub(super) fn report(&self, out: &mut impl Write) -> io::Result<()> {
-        if !self.complete() {
+        if !self.unexplained.is_empty() {
             let problem = if self.section {
                 format!("the \"## {HEADING}\" section gives no reason for")
             } else {
@@ -126,18 +129,36 @@ impl Explained {
                 "integrity: failed; {problem} these test changes. Add one entry per test, saying \
                  which requirement or behaviour changed:\n\n## {HEADING}\n"
             )?;
-            for test in &self.unexplained {
-                writeln!(out, "- `{test}`: <which requirement or behaviour changed>")?;
-            }
+            write!(out, "{}", entries_for(&self.unexplained))?;
         }
         for test in &self.extra {
             writeln!(
                 out,
-                "integrity: note: \"## {HEADING}\" names `{test}`, which has no flagged change"
+                "integrity: failed; \"## {HEADING}\" names `{test}`, which has no flagged \
+                 change; remove the entry, or name the test as the findings above do"
             )?;
         }
         Ok(())
     }
+}
+
+/// An entry for each of `tests`, its reason left to write.
+fn entries_for(tests: &[String]) -> String {
+    let mut text = String::new();
+    for test in tests {
+        text.push_str("- `");
+        text.push_str(test);
+        text.push_str("`: <which requirement or behaviour changed>\n");
+    }
+    text
+}
+
+/// A "## Test changes" section naming each of the `flagged` tests, or saying "None".
+pub(super) fn skeleton(flagged: &[String]) -> String {
+    if flagged.is_empty() {
+        return format!("## {HEADING}\n\nNone\n");
+    }
+    format!("## {HEADING}\n\n{}", entries_for(flagged))
 }
 
 /// Checks that `description` gives a reason for each of the `flagged` tests.
@@ -228,7 +249,7 @@ pub(crate) fn event(file: Option<&Path>, payload_path: Option<PathBuf>) -> anyho
 mod tests {
     use std::fs;
 
-    use super::{Event, Explained, entries, event, explained};
+    use super::{Event, Explained, entries, event, explained, skeleton};
 
     fn report(result: &Explained) -> String {
         let mut out = Vec::new();
@@ -302,18 +323,48 @@ mod tests {
     }
 
     #[test]
-    fn extra_entries_are_noted_but_pass() {
+    fn an_entry_for_a_test_that_is_not_flagged_fails() {
         let description = "## Test changes\n- `src/a.rs::tests::one`: a\n- `src/a.rs::tests::two`: b\n- `src/gone.rs`: c\n- `src/b.rs::tests::three`: d\n";
         let result = explained(&flagged(), description);
-        assert!(result.complete(), "every flagged test is explained");
-        assert_eq!(result.extra, ["src/b.rs::tests::three"], "the extra entry");
         assert!(
-            report(&result).contains("names `src/b.rs::tests::three`, which has no flagged change"),
-            "noted"
+            result.unexplained.is_empty(),
+            "every flagged test is explained"
         );
+        assert_eq!(result.extra, ["src/b.rs::tests::three"], "the extra entry");
+        assert!(!result.complete(), "#25 carried three stale entries");
+        let text = report(&result);
+        assert!(
+            text.starts_with(
+                "integrity: failed; \"## Test changes\" names `src/b.rs::tests::three`, which has \
+                 no flagged change"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("gives no reason"), "{text}");
         assert!(
             explained(&[], "no section").complete(),
             "nothing flagged needs no section"
+        );
+    }
+
+    #[test]
+    fn the_skeleton_names_every_flagged_test_and_parses_back() {
+        let section = skeleton(&flagged());
+        assert_eq!(
+            section,
+            "## Test changes\n\n- `src/a.rs::tests::one`: <which requirement or behaviour \
+             changed>\n- `src/a.rs::tests::two`: <which requirement or behaviour changed>\n- \
+             `src/gone.rs`: <which requirement or behaviour changed>\n"
+        );
+        let parsed = explained(&flagged(), &section);
+        assert!(
+            parsed.section && parsed.extra.is_empty(),
+            "every entry names a flagged test"
+        );
+        assert_eq!(skeleton(&[]), "## Test changes\n\nNone\n");
+        assert!(
+            explained(&[], &skeleton(&[])).complete(),
+            "None names no test"
         );
     }
 
