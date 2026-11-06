@@ -56,6 +56,19 @@ function freePort(): Promise<number> {
   });
 }
 
+/**
+ * Every process the tests started that has not exited. The fixtures stop theirs in teardown,
+ * pass or fail; if the Playwright worker exits first, it kills what is left, so no process outlives
+ * the run and the run's database can be dropped after them.
+ */
+const running = new Set<ChildProcess>();
+
+process.once("exit", () => {
+  for (const child of running) {
+    child.kill("SIGKILL");
+  }
+});
+
 /** Starts `abc` with `args` and `env`, appending its output to `log` under `target/e2e`. */
 function run(args: readonly string[], env: Record<string, string>, log: string): ChildProcess {
   mkdirSync(out, { recursive: true });
@@ -63,6 +76,10 @@ function run(args: readonly string[], env: Record<string, string>, log: string):
   const child = spawn(binary, args, {
     env: { PATH, ...env },
     stdio: ["pipe", "pipe", "pipe"],
+  });
+  running.add(child);
+  child.once("exit", () => {
+    running.delete(child);
   });
   child.stdout?.pipe(file);
   child.stderr?.pipe(file);
@@ -84,7 +101,9 @@ function exited(child: ChildProcess): Promise<number | null> {
 /** Stops `child` as a service manager does, with SIGTERM, and waits for it. */
 async function stop(child: ChildProcess): Promise<void> {
   const done = exited(child);
-  child.kill("SIGTERM");
+  if (child.exitCode === null && child.signalCode === null) {
+    child.kill("SIGTERM");
+  }
   await done;
 }
 
@@ -114,12 +133,29 @@ async function complete(
   return stdout;
 }
 
-/** Waits until the server's ops listener says it is ready, or it exits. */
-async function ready(server: ChildProcess, ops: number): Promise<void> {
-  const deadline = Date.now() + READY_WITHIN_MS;
+/**
+ * Waits until the server's ops listener on port `ops` says it is ready. A server that exits first,
+ * or is not ready within `withinMs`, is stopped and reported, pointing at its log.
+ */
+export async function ready(
+  server: ChildProcess,
+  ops: number,
+  withinMs = READY_WITHIN_MS,
+): Promise<void> {
+  try {
+    await poll(server, ops, withinMs);
+  } catch (error: unknown) {
+    await stop(server);
+    throw error;
+  }
+}
+
+async function poll(server: ChildProcess, ops: number, withinMs: number): Promise<void> {
+  const deadline = Date.now() + withinMs;
   while (Date.now() < deadline) {
-    if (server.exitCode !== null) {
-      throw new Error(`abc server exited with ${server.exitCode}; see ${join(out, "server.log")}`);
+    if (server.exitCode !== null || server.signalCode !== null) {
+      const status = server.exitCode ?? server.signalCode;
+      throw new Error(`abc server exited with ${status}; see ${join(out, "server.log")}`);
     }
     // Each poll waits for the last; the server is ready when one answers 200.
     // oxlint-disable-next-line eslint/no-await-in-loop -- polls run one after another
@@ -130,7 +166,9 @@ async function ready(server: ChildProcess, ops: number): Promise<void> {
     // oxlint-disable-next-line eslint/no-await-in-loop -- a tenth of a second between polls
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
-  throw new Error(`abc server was not ready within a minute; see ${join(out, "server.log")}`);
+  throw new Error(
+    `abc server was not ready within ${withinMs / 1000} s; see ${join(out, "server.log")}`,
+  );
 }
 
 /** The run's server, which a test can restart. */
@@ -151,7 +189,12 @@ export class Server {
       "server.log",
     );
     this.#process = server;
-    await ready(server, ops);
+    try {
+      await ready(server, ops);
+    } catch (error: unknown) {
+      this.#process = null;
+      throw error;
+    }
   }
 
   /** Stops the server with SIGTERM, as a service manager does. */
@@ -173,8 +216,8 @@ export class Server {
   }
 }
 
-/** A machine with a worker home of its own. */
-export class Machine {
+/** A machine with a worker home of its own. Tests get one from the `machine` fixture. */
+class Machine {
   readonly #home = mkdtempSync(join(out, "worker-"));
   readonly #hostname: string;
   #process: ChildProcess | null = null;
@@ -221,19 +264,43 @@ export function screenshot(name: string): string {
 const ANSWERED = /^Failed to load resource: the server responded with a status of \d+/u;
 
 /**
+ * Whether `url` is the API's, on the app's origin. Its refusals are answers the tests ask for (a
+ * wrong code, a stream while the server restarts); any other failed load, such as the app's own
+ * script, style, font or `theme.js`, is a broken page.
+ */
+function isApi(url: string): boolean {
+  const parsed = new URL(url);
+  return parsed.origin === new URL(ORIGIN).origin && parsed.pathname.startsWith("/api/");
+}
+
+/**
  * Playwright's test, with the run's server started for each Playwright worker. Every page a test
  * opens is watched: a console error or an uncaught exception, such as a script or style the CSP
  * refused, fails the test.
  */
-export const test = base.extend<{ context: BrowserContext }, { server: Server }>({
+export const test = base.extend<
+  { context: BrowserContext; machine: (hostname: string) => Machine },
+  { server: Server }
+>({
   context: async ({ context }, use) => {
     const seen: string[] = [];
     const watch = (page: Page) => {
       page.on("console", (message) => {
-        // An API's refusal is an answer the tests ask for (a wrong code, a restarting server);
-        // Chrome logs each one, and those alone are not the page's errors.
-        if (message.type() === "error" && !ANSWERED.test(message.text())) {
-          seen.push(`${page.url()}: ${message.text()}`);
+        // Chrome logs every answer that is not a success; only the API's are exempt, as the
+        // response listener below decides by URL.
+        const refused = ANSWERED.test(message.text()) && isApi(message.location().url);
+        if (message.type() === "error" && !refused) {
+          seen.push(`${page.url()}: ${message.text()} (${message.location().url})`);
+        }
+      });
+      page.on("response", (response) => {
+        if (response.status() >= 400 && !isApi(response.url())) {
+          seen.push(`${page.url()}: ${response.url()} answered ${response.status()}`);
+        }
+      });
+      page.on("requestfailed", (request) => {
+        if (!isApi(request.url())) {
+          seen.push(`${page.url()}: ${request.url()} failed: ${request.failure()?.errorText}`);
         }
       });
       page.on("pageerror", (error) => {
@@ -252,12 +319,31 @@ export const test = base.extend<{ context: BrowserContext }, { server: Server }>
     async ({}, use) => {
       /* oxlint-enable eslint/no-empty-pattern */
       const server = new Server();
-      await server.start();
-      await use(server);
-      await server.stop();
+      try {
+        await server.start();
+        await use(server);
+      } finally {
+        await server.stop();
+      }
     },
     { scope: "worker", auto: true },
   ],
+  // Every machine a test makes is stopped when the test ends, pass or fail.
+  /* oxlint-disable eslint/no-empty-pattern -- Playwright requires the pattern */
+  // biome-ignore lint/correctness/noEmptyPattern: Playwright requires the pattern
+  machine: async ({}, use) => {
+    /* oxlint-enable eslint/no-empty-pattern */
+    const made: Machine[] = [];
+    try {
+      await use((hostname) => {
+        const machine = new Machine(hostname);
+        made.push(machine);
+        return machine;
+      });
+    } finally {
+      await Promise.all(made.map((machine) => machine.stop()));
+    }
+  },
 });
 
 export { expect };

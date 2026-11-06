@@ -130,6 +130,7 @@ export function AppShell({
   person,
   machines,
   navigation,
+  notice,
   children,
 }: {
   /** The workspace's name. */
@@ -139,6 +140,8 @@ export function AppShell({
   /** The workspace's machines, or `null` while they load. */
   readonly machines: readonly MachinePill[] | null;
   readonly navigation: readonly NavItem[];
+  /** A line under the header about the whole app, or `null`. */
+  readonly notice: ReactNode;
   readonly children: ReactNode;
 }) {
   return (
@@ -183,6 +186,7 @@ export function AppShell({
           <ThemeMenu />
           <Person name={person} />
         </header>
+        {notice}
         <main className="flex-1 px-4 pt-5 pb-24 md:px-6 md:pt-6 md:pb-8">{children}</main>
       </div>
     </SidebarProvider>

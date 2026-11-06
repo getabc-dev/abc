@@ -4,14 +4,19 @@
 
 import { useSyncExternalStore } from "react";
 
-export type ThemeChoice = "light" | "dark" | "system";
+/** The choices, in the menu's order. public/theme.js cannot import them; a test keeps it in step. */
+export const THEME_CHOICES = ["light", "dark", "system"] as const;
 
-export const THEME_CHOICES: readonly ThemeChoice[] = ["light", "dark", "system"];
+export type ThemeChoice = (typeof THEME_CHOICES)[number];
+
+export function isThemeChoice(value: unknown): value is ThemeChoice {
+  return THEME_CHOICES.some((choice) => choice === value);
+}
 
 /** The theme chosen in this browser, as public/theme.js says it on <html>. */
 export function themeChoice(): ThemeChoice {
   const said = document.documentElement.getAttribute("data-theme");
-  return said === "light" || said === "dark" ? said : "system";
+  return isThemeChoice(said) ? said : "system";
 }
 
 /** Asks public/theme.js to apply and keep `choice`. */

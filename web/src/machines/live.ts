@@ -49,6 +49,14 @@ export type Effect =
   | { readonly type: "connect"; readonly workspace: WorkspaceId; readonly after: Position | null }
   | { readonly type: "wait"; readonly ms: number };
 
+/**
+ * Whether `machine` can take work: enrolled and not revoked. The one definition the shell's pills
+ * and the Machines screen's "first machine" both follow.
+ */
+export function usable(machine: MachineCard): boolean {
+  return !machine.revoked;
+}
+
 /** The wait before resume attempt `attempt` (from 1): half a second, doubling, at most 8. */
 export function backoff(attempt: number): number {
   return Math.min(500 * 2 ** (attempt - 1), 8000);
@@ -137,6 +145,11 @@ export function update(model: Model, message: Message): Step<Model, Effect> {
       return receive(model, message.update);
     case "ended":
     case "failed": {
+      // A failed state is final until the person retries: the end that follows ended access, or
+      // a failure racing it, resumes nothing.
+      if (model.connection.state === "failed") {
+        return [model, []];
+      }
       const problem: Problem =
         message.type === "ended"
           ? { code: "network", message: "the server closed the connection" }

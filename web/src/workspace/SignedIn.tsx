@@ -12,7 +12,7 @@ import { type Dispatch, useProgram } from "../elm";
 import type { SessionView } from "../generated/SessionView";
 import type { WorkspaceSummary } from "../generated/WorkspaceSummary";
 
-import { liveMachines, type Message, type Model } from "../machines/live";
+import { liveMachines, type Message, type Model, usable } from "../machines/live";
 import { Centered } from "../session/Centered";
 
 /** What the pages of a signed-in person reach. */
@@ -53,12 +53,14 @@ function Shell({
   origin,
   person,
   workspace,
+  notice,
   children,
 }: {
   readonly api: ApiClient;
   readonly origin: string;
   readonly person: string;
   readonly workspace: WorkspaceSummary;
+  readonly notice: ReactNode;
   readonly children: ReactNode;
 }) {
   const [live, dispatch] = useProgram(liveMachines(api, workspace.id));
@@ -68,7 +70,7 @@ function Shell({
       live.head === null
         ? null
         : live.machines
-            .filter((machine) => !machine.revoked)
+            .filter(usable)
             .map((machine) => ({ id: machine.worker, name: machine.name, online: machine.online })),
     [live.head, live.machines],
   );
@@ -79,7 +81,13 @@ function Shell({
   );
   return (
     <WorkspaceContext value={value}>
-      <AppShell workspace={workspace.name} person={person} machines={machines} navigation={pages}>
+      <AppShell
+        workspace={workspace.name}
+        person={person}
+        machines={machines}
+        navigation={pages}
+        notice={notice}
+      >
         {children}
       </AppShell>
     </WorkspaceContext>
@@ -90,11 +98,14 @@ export function SignedIn({
   api,
   origin,
   view,
+  notice,
   children,
 }: {
   readonly api: ApiClient;
   readonly origin: string;
   readonly view: Extract<SessionView, { state: "member" }>;
+  /** Shown under the shell's header, such as a failed check of the session; `null` for none. */
+  readonly notice: ReactNode;
   readonly children: ReactNode;
 }) {
   // The claim makes one workspace; choosing among several comes with a workspace switcher.
@@ -117,6 +128,7 @@ export function SignedIn({
       origin={origin}
       person={view.display_name}
       workspace={workspace}
+      notice={notice}
     >
       {children}
     </Shell>

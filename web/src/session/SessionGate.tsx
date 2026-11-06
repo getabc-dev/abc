@@ -15,6 +15,26 @@ import { Centered } from "./Centered";
 /** The session query's key. */
 const SESSION = ["session"] as const;
 
+/** Says that asking for the session again failed, under the shell's header, with a retry. */
+function SessionNotice({
+  message,
+  onRetry,
+}: {
+  readonly message: string;
+  readonly onRetry: () => void;
+}) {
+  return (
+    <output className="flex flex-wrap items-center gap-x-3 gap-y-1 border-b bg-warning-tint px-4 py-1.5 text-warning-foreground text-xs md:px-5">
+      <p className="min-w-0 flex-1">
+        abc could not check your session ({message}). The page shows what it last knew.
+      </p>
+      <Button variant="ghost" size="sm" onClick={onRetry}>
+        Check again
+      </Button>
+    </output>
+  );
+}
+
 export function SessionGate({
   api,
   origin,
@@ -26,7 +46,16 @@ export function SessionGate({
   /** The routes, which a member sees inside the shell. */
   readonly children: ReactNode;
 }) {
-  const session = useQuery({ queryKey: SESSION, queryFn: ({ signal }) => api.session(signal) });
+  const session = useQuery({
+    queryKey: SESSION,
+    queryFn: ({ signal }) => api.session(signal),
+    // Coming back to the window asks again, so a claim, a new membership or ended access shows
+    // without a reload.
+    refetchOnWindowFocus: true,
+    // A failure is shown at once: before any answer, as the error screen with its retry; after
+    // one, as a notice in the shell, which the next focus or the person's retry asks again.
+    retry: false,
+  });
   if (session.isPending) {
     return (
       <Centered>
@@ -36,7 +65,9 @@ export function SessionGate({
       </Centered>
     );
   }
-  if (session.isError) {
+  // Only a session with no answer yet is an error screen. A failed refetch keeps what the server
+  // last said, and the signed-in shell with its live stream stays up under a notice.
+  if (session.isLoadingError) {
     return (
       <Centered>
         <TitledCard title="The server did not answer" level={1}>
@@ -60,7 +91,21 @@ export function SessionGate({
       return <ClaimScreen api={api} login={view.login} />;
     case "member":
       return (
-        <SignedIn api={api} origin={origin} view={view}>
+        <SignedIn
+          api={api}
+          origin={origin}
+          view={view}
+          notice={
+            session.isRefetchError ? (
+              <SessionNotice
+                message={session.error.message}
+                onRetry={() => {
+                  void session.refetch();
+                }}
+              />
+            ) : null
+          }
+        >
           {children}
         </SignedIn>
       );

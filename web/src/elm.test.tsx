@@ -134,3 +134,40 @@ test("settle dispatches the message for a value or for a failure", async () => {
   );
   expect(seen).toEqual(["done 2", "failed no"]);
 });
+
+test("after leaves no abort listener behind once its timer fires, and still cancels on abort", () => {
+  vi.useFakeTimers();
+  try {
+    const controller = new AbortController();
+    const listening = new Set<unknown>();
+    const { signal } = controller;
+    const add = signal.addEventListener.bind(signal);
+    const remove = signal.removeEventListener.bind(signal);
+    vi.spyOn(signal, "addEventListener").mockImplementation((type, listener, options) => {
+      listening.add(listener);
+      add(type, listener, options);
+    });
+    vi.spyOn(signal, "removeEventListener").mockImplementation((type, listener, options) => {
+      listening.delete(listener);
+      remove(type, listener, options);
+    });
+    const seen: number[] = [];
+    const dispatch = (message: number) => {
+      seen.push(message);
+    };
+    for (let wait = 0; wait < 100; wait += 1) {
+      after(10, wait, dispatch, signal);
+      vi.advanceTimersByTime(10);
+    }
+    expect(seen).toHaveLength(100);
+    expect(listening.size).toBe(0);
+
+    after(10, -1, dispatch, signal);
+    expect(listening.size).toBe(1);
+    controller.abort();
+    vi.advanceTimersByTime(10);
+    expect(seen).not.toContain(-1);
+  } finally {
+    vi.useRealTimers();
+  }
+});

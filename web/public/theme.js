@@ -16,9 +16,13 @@
   const root = document.documentElement;
   const system = window.matchMedia("(prefers-color-scheme: dark)");
 
+  // src/theme.ts's THEME_CHOICES, which this script cannot import; src/theme.test.ts keeps them
+  // equal.
+  /** @type {readonly ("light" | "dark" | "system")[]} */
+  const CHOICES = ["light", "dark", "system"];
+
   /** @param {unknown} value @returns {"light" | "dark" | "system"} */
-  // oxlint-disable-next-line unicorn/consistent-function-scoping -- outside the block it is global
-  const parse = (value) => (value === "light" || value === "dark" ? value : "system");
+  const parse = (value) => CHOICES.find((choice) => choice === value) ?? "system";
 
   /** @returns {"light" | "dark" | "system"} */
   const stored = () => {

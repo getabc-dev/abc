@@ -5,8 +5,9 @@
 
 import { afterEach, describe, expect, test, vi } from "vitest";
 
+import themeScript from "../public/theme.js?raw";
 import { stubMatchMedia } from "./testing";
-import { chooseTheme, themeChoice } from "./theme";
+import { chooseTheme, isThemeChoice, THEME_CHOICES, themeChoice } from "./theme";
 
 const root = document.documentElement;
 
@@ -84,5 +85,38 @@ describe("public/theme.js", () => {
     chooseTheme("light");
     expect(themeChoice()).toBe("light");
     expect(root.classList.contains("dark")).toBe(false);
+  });
+});
+
+describe("the theme choices", () => {
+  test("are one list, which the app's guard accepts and nothing else", () => {
+    expect(THEME_CHOICES).toEqual(["light", "dark", "system"]);
+    for (const choice of THEME_CHOICES) {
+      expect(isThemeChoice(choice)).toBe(true);
+    }
+    for (const other of ["sepia", "", null, undefined, 1, "Dark"]) {
+      expect(isThemeChoice(other)).toBe(false);
+    }
+  });
+
+  test("public/theme.js, which cannot import the list, takes the same choices", async () => {
+    await load(false);
+    for (const choice of THEME_CHOICES) {
+      chooseTheme(choice);
+      expect(root.getAttribute("data-theme")).toBe(choice);
+    }
+    document.dispatchEvent(new CustomEvent("abc-theme", { detail: "sepia" }));
+    expect(root.getAttribute("data-theme")).toBe("system");
+    // Every choice type it declares names exactly the list.
+    const declared = [...themeScript.matchAll(/\{("[a-z]+"(?: \| "[a-z]+")*)\}/gu)].map(
+      (match) => match[1],
+    );
+    expect(declared.length).toBeGreaterThan(0);
+    expect(themeScript).toContain(
+      `const CHOICES = [${THEME_CHOICES.map((choice) => `"${choice}"`).join(", ")}];`,
+    );
+    for (const union of declared) {
+      expect(union).toBe(THEME_CHOICES.map((choice) => `"${choice}"`).join(" | "));
+    }
   });
 });

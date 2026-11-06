@@ -143,11 +143,15 @@ describe("live machines", () => {
   });
 
   test("ended access stops the stream for good", () => {
-    const model = replay(snapshot, received({ type: "access_ended", head: 5 }));
-    expect(model.connection).toEqual({
+    const stopped = replay(snapshot, received({ type: "access_ended", head: 5 }));
+    expect(stopped.connection).toEqual({
       state: "failed",
       problem: { code: "access_ended", message: "Your access to this workspace ended." },
     });
+    // The server closes the stream after saying access ended, and a failure may race it: a
+    // failed state is final until the person retries, so neither resumes it.
+    expect(update(stopped, { type: "ended" })).toEqual([stopped, []]);
+    expect(update(stopped, { type: "failed", error: restarting })).toEqual([stopped, []]);
   });
 
   test("a resume or retry out of turn does nothing", () => {

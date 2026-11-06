@@ -29,7 +29,7 @@ export default defineConfig({
   projects: [
     {
       name: "unclaimed",
-      testMatch: /(home|origin|theme)\.test\.ts/,
+      testMatch: /(fixture|home|origin|theme)\.test\.ts/,
       use: devices["Desktop Chrome"],
     },
     {

@@ -190,7 +190,8 @@ look.
     person's initials). On the phone, as the canvas's Home does: a top bar (the workspace's name,
     one pill counting the machines online, the theme and the initials), the page, and the same
     navigation as a tab bar at the bottom. One `nav` is both. The rail is as wide as its widest
-    entry and never narrower than 80px, so no label overflows it.
+    entry and never narrower than 80px, so no label overflows it. A notice about the whole app,
+    such as a failed check of the session, sits in a slim warning band under the header.
   - **ThemeMenu**: DropdownMenu with a radio group of Light, Dark and System.
   - **TextField**: Field, FieldLabel, Input, FieldDescription and FieldError, with the label,
     description and error tied to the input by id; shadcn's Field leaves that to its user.

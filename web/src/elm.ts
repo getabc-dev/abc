@@ -88,10 +88,12 @@ export function after<Message>(
   dispatch: Dispatch<Message>,
   signal: AbortSignal,
 ): void {
+  const cancel = () => {
+    clearTimeout(timer);
+  };
   const timer = setTimeout(() => {
+    signal.removeEventListener("abort", cancel);
     dispatch(message);
   }, ms);
-  signal.addEventListener("abort", () => {
-    clearTimeout(timer);
-  });
+  signal.addEventListener("abort", cancel, { once: true });
 }

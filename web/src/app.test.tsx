@@ -3,11 +3,11 @@
 // The whole app in a DOM, over a stand-in server: the session gate, the claim, the shell and the
 // live Machines screen.
 
-import { QueryClient } from "@tanstack/react-query";
+import { focusManager, QueryClient } from "@tanstack/react-query";
 import { createMemoryHistory } from "@tanstack/react-router";
 import { act, cleanup, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { afterEach, expect, test } from "vitest";
+import { afterEach, expect, test, vi } from "vitest";
 
 import { apiClient, type Fetch } from "./api/client";
 import { App, createAppRouter } from "./app";
@@ -190,6 +190,42 @@ test("a session that fails is shown with a retry", async () => {
   await screen.findByRole("heading", { level: 1, name: "No tailnet identity" });
 });
 
+test("a failed refetch of the session keeps the shell and its stream, with a notice", async () => {
+  const live = stream();
+  const sessions: Response[] = [
+    refusal(503, "unavailable", "the database is down"),
+    json(200, member),
+  ];
+  let asked = 0;
+  const { fetcher, requests } = server(({ path }) => {
+    if (path === "/api/session") {
+      asked += 1;
+      return asked === 1 ? json(200, member) : (sessions.shift() ?? json(200, member));
+    }
+    return live.response;
+  });
+  mount("/machines", fetcher);
+  live.send({ type: "snapshot", head: 1, machines: [card("lab box", "w1", true)] });
+  await screen.findByRole("region", { name: "lab box" });
+  // Coming back to the window asks again; this time the server fails.
+  act(() => {
+    focusManager.setFocused(false);
+    focusManager.setFocused(true);
+  });
+  const notice = await screen.findByText(/could not check your session/);
+  expect(notice.closest("output")?.textContent).toContain("the database is down");
+  expect(screen.getByRole("region", { name: "lab box" })).toBeDefined();
+  expect(screen.queryByRole("heading", { name: "The server did not answer" })).toBeNull();
+  await userEvent.click(screen.getByRole("button", { name: "Check again" }));
+  await vi.waitFor(() => {
+    expect(screen.queryByText(/could not check your session/)).toBeNull();
+  });
+  expect(screen.getByRole("region", { name: "lab box" })).toBeDefined();
+  expect(asked).toBe(3);
+  expect(requests.filter((request) => request.path.endsWith("/live"))).toHaveLength(1);
+  focusManager.setFocused(undefined);
+});
+
 test("machines appear live in the shell and on their screen, and go offline", async () => {
   const live = stream();
   const { fetcher, requests } = server(({ path }) =>
@@ -337,4 +373,20 @@ test("an unknown path says there is no page there, inside the shell, and links h
   expect(screen.getByRole("navigation", { name: "Main" })).toBeDefined();
   await userEvent.click(screen.getByRole("link", { name: "Go home" }));
   await screen.findByRole("heading", { level: 1, name: "Machines" });
+});
+
+test("a workspace with only revoked machines offers the first enrolment", async () => {
+  const live = stream();
+  mount(
+    "/machines",
+    server(({ path }) => (path === "/api/session" ? json(200, member) : live.response)).fetcher,
+  );
+  live.send({
+    type: "snapshot",
+    head: 1,
+    machines: [{ ...card("old box", "w1", false), revoked: true }],
+  });
+  await screen.findByRole("heading", { name: "Enrol your first machine" });
+  expect(screen.getByText("No machines")).toBeDefined();
+  expect(screen.getByRole("region", { name: "old box" })).toBeDefined();
 });

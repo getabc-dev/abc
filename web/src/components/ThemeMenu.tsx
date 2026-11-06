@@ -13,7 +13,13 @@ import {
   DropdownMenuRadioItem,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
-import { chooseTheme, THEME_CHOICES, type ThemeChoice, useThemeChoice } from "@/theme";
+import {
+  chooseTheme,
+  isThemeChoice,
+  THEME_CHOICES,
+  type ThemeChoice,
+  useThemeChoice,
+} from "@/theme";
 
 const LABELS: Record<ThemeChoice, string> = { light: "Light", dark: "Dark", system: "System" };
 
@@ -26,10 +32,6 @@ function ThemeIcon({ choice }: { readonly choice: ThemeChoice }) {
     case "system":
       return <MonitorIcon aria-hidden="true" />;
   }
-}
-
-function isChoice(value: unknown): value is ThemeChoice {
-  return THEME_CHOICES.some((choice) => choice === value);
 }
 
 export function ThemeMenu() {
@@ -49,7 +51,7 @@ export function ThemeMenu() {
           <DropdownMenuRadioGroup
             value={choice}
             onValueChange={(value: unknown) => {
-              if (isChoice(value)) {
+              if (isThemeChoice(value)) {
                 chooseTheme(value);
               }
             }}

@@ -5,7 +5,7 @@
 
 import type { Page } from "@playwright/test";
 
-import { expect, Machine, ORIGIN, test } from "./abc.ts";
+import { expect, ORIGIN, test } from "./abc.ts";
 import { capture } from "./look.ts";
 
 const PHONE = { width: 390, height: 844 };
@@ -25,6 +25,7 @@ async function shoot(page: Page, name: string): Promise<void> {
 test("a machine enrols, comes online, goes offline, and the page resumes after a restart", async ({
   page,
   server,
+  machine: makeMachine,
 }) => {
   test.setTimeout(120_000);
   const streams: (string | undefined)[] = [];
@@ -50,7 +51,7 @@ test("a machine enrols, comes online, goes offline, and the page resumes after a
     Reflect.set(window, "abcE2eLoad", "first");
   });
 
-  const machine = new Machine("e2e-host");
+  const machine = makeMachine("e2e-host");
   expect(await machine.enrol(token)).toContain("Enrolled this machine as e2e machine");
   const card = page.getByRole("region", { name: "e2e machine" });
   await expect(card).toBeVisible();

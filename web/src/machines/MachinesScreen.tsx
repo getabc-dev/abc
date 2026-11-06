@@ -16,7 +16,7 @@ import type { MachineCard } from "../generated/MachineCard";
 import { useWorkspace } from "../workspace/SignedIn";
 import { type Message as EnrolMessage, type Model as Enrolment, enrolment } from "./enrol";
 import { describeMachine, formatInstant } from "./format";
-import type { Connection } from "./live";
+import { type Connection, usable } from "./live";
 
 function connectionPill(connection: Connection): { tone: Tone; label: string } {
   switch (connection.state) {
@@ -189,7 +189,8 @@ export function MachinesScreen() {
   } else if (head === null) {
     body = <output className="block text-muted-foreground">Loading machines…</output>;
   } else {
-    const first = machines.length === 0;
+    // Revoked machines stay listed, but only a usable one means the first is enrolled.
+    const first = !machines.some(usable);
     body = (
       <div className="flex flex-col gap-4">
         {connection.state === "reconnecting" ? (
@@ -211,7 +212,7 @@ export function MachinesScreen() {
         {first || enrol.open ? (
           <EnrolPanel first={first} origin={origin} model={enrol} dispatch={enrolDispatch} />
         ) : null}
-        {first ? null : (
+        {machines.length === 0 ? null : (
           <ul aria-label="Enrolled machines" className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
             {machines.map((machine) => (
               <li key={machine.worker}>
@@ -228,7 +229,7 @@ export function MachinesScreen() {
       <div className="flex flex-wrap items-center gap-3">
         <h1 className="font-semibold text-xl">Machines</h1>
         <Status {...pill} />
-        {head !== null && machines.length > 0 && !enrol.open ? (
+        {head !== null && machines.some(usable) && !enrol.open ? (
           <Button
             variant="outline"
             className="ml-auto"

@@ -203,6 +203,7 @@ async function shell(machines: readonly MachinePill[] | null) {
           person="Ada Lovelace"
           machines={machines}
           navigation={navigation}
+          notice={null}
         >
           <h1>Page</h1>
         </AppShell>

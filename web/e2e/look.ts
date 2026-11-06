@@ -97,16 +97,15 @@ async function showIn(page: Page, theme: Theme): Promise<void> {
     .toBe(theme === "dark");
 }
 
-/**
- * Checks the page as it is shown now against DESIGN.md's rules, in both themes, and saves it as
- * `target/e2e-screens/<name>-light.png` and `<name>-dark.png`.
- */
 /** Checks and saves the page in `theme`, and says where everything sits. */
 async function look(page: Page, name: string, theme: Theme): Promise<string[]> {
   await showIn(page, theme);
-  // Measured at rest: a menu opens with a zoom, which shrinks its items until it ends.
+  // Measured at rest: a menu opens with a zoom, which shrinks its items until it ends. An animation
+  // cancelled meanwhile, such as a colour transition the theme change replaced, is at rest too.
   await page.evaluate(() =>
-    Promise.all(document.getAnimations().map((animation) => animation.finished)),
+    Promise.all(
+      document.getAnimations().map((animation) => animation.finished.catch(() => undefined)),
+    ),
   );
   expect(await problems(page), `${name} in the ${theme} theme`).toEqual([]);
   const places = await layout(page);
