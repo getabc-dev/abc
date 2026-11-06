@@ -1,0 +1,342 @@
+name: Release
+
+# A tag `v*` the maintainer pushes releases abc (brief decision 52). The build, formula and install
+# jobs are the dry run's (release-dry-run.yml) without its caches, so a published build starts
+# from nothing; an xtask test (release::tests) keeps them the same. The build also checks that the
+# tag is the workspace's version, on a commit of main. Once every platform installed, the release
+# attests every archive and SHA256SUMS, verifies the attestations and publishes the GitHub
+# Release, resuming one an earlier attempt left unfinished; then it pushes the formula to
+# getabc-dev/homebrew-tap, never to an older version than the tap holds.
+#
+# No job that holds a token able to write builds or runs code from crates or packages: the
+# publish job runs only .github/release/publish.sh with gh, and the tap job only gh, on the
+# formula the tap-formula job rendered and planned without any write token.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions: {}
+
+# Releases queue across tags rather than run at once, so two never race for the release or the
+# tap. GitHub keeps one run waiting: a third tag pushed meanwhile cancels the waiting one, which a
+# maintainer re-runs.
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    container: ${{ matrix.container }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            runner: macos-26
+            container: ""
+          - target: x86_64-apple-darwin
+            runner: macos-26
+            container: ""
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+            container: almalinux:8.10@sha256:2d0f2eb2a83cc09dbc2eb92fade4dbe8f709628149e81aa00aec70630406603b
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-26.04
+            container: almalinux:8.10@sha256:2d0f2eb2a83cc09dbc2eb92fade4dbe8f709628149e81aa00aec70630406603b
+    steps:
+      # The container has no compiler, git or Rust. rustup-init is pinned by version and sha256;
+      # it then installs the toolchain rust-toolchain.toml pins. The checkout belongs to the
+      # runner's user, not the container's root, so git is told to trust it.
+      - name: Install the C compiler, git and rustup in the AlmaLinux 8 container
+        if: runner.os == 'Linux'
+        run: |
+          dnf install --assumeyes --setopt=install_weak_deps=False gcc git tar gzip
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          case "$(uname -m)" in
+            x86_64) sum=b1c8cb14e30889e7e2999e6b69e62d9e9b9ffc0f4df8180564d306d9680e6c55 ;;
+            aarch64) sum=9f608c142e0e38a78957d0661ba1dfaf0b6fb37184cfaa4b9a0aa57af6184282 ;;
+            *) echo "no pinned rustup-init for $(uname -m)" >&2; exit 1 ;;
+          esac
+          curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+            --output /tmp/rustup-init \
+            "https://static.rust-lang.org/rustup/archive/1.29.3/$(uname -m)-unknown-linux-gnu/rustup-init"
+          echo "$sum  /tmp/rustup-init" | sha256sum --check --strict
+          chmod +x /tmp/rustup-init
+          /tmp/rustup-init -y --no-modify-path --profile minimal --default-toolchain none
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the pinned Rust toolchain
+        run: rustup toolchain install --no-self-update
+      - name: Install the pinned node and pnpm
+        run: cargo xtask setup node pnpm
+      - name: Check the installed tools against their pins
+        run: cargo xtask doctor node pnpm
+      - name: The tag releases the workspace's version, on a commit of main
+        run: cargo xtask release check-tag "$GITHUB_REF_NAME"
+      - name: Fetch Tailscale's source at the pinned tag and commit
+        run: cargo xtask release tailscale-source
+      - name: Install the Go Tailscale names, checked against go.dev's sha256
+        run: cargo xtask release go
+      - name: Build and package abc and tailscaled
+        run: cargo xtask release package --target "$TARGET"
+        env:
+          TARGET: ${{ matrix.target }}
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-${{ matrix.target }}
+          path: target/dist/*.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  formula:
+    name: Render the Homebrew formula
+    needs: build
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the pinned Rust toolchain
+        run: rustup toolchain install --no-self-update
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/dist
+      # Every install job puts the archives at the same path, so one formula serves them all.
+      - name: Render the formula for the archives at file:///tmp/abc-release
+        run: >-
+          cargo xtask release formula --dist "$RUNNER_TEMP/dist"
+          --base-url file:///tmp/abc-release --out "$RUNNER_TEMP/abc.rb"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: homebrew-formula
+          path: ${{ runner.temp }}/abc.rb
+          if-no-files-found: error
+          retention-days: 7
+
+  install:
+    name: Install with Homebrew on ${{ matrix.os }}
+    needs: [build, formula]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        # Each platform on a native runner, so no archive is published without being installed
+        # and run where it is meant to run.
+        include:
+          - os: macOS arm64
+            runner: macos-26
+          - os: macOS x86_64
+            runner: macos-15-intel
+          - os: Linux x86_64
+            runner: ubuntu-26.04
+          - os: Linux arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: /tmp/abc-release
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: homebrew-formula
+          path: ${{ runner.temp }}/formula
+      # Homebrew installs formulae only from taps, so the rendered formula goes into a local one.
+      # A Linux runner without Homebrew gets it from Homebrew's installer at a pinned commit.
+      - name: Install, test and lint the formula with Homebrew
+        run: |
+          if [ "$RUNNER_OS" = Linux ]; then
+            if [ ! -x /home/linuxbrew/.linuxbrew/bin/brew ]; then
+              curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+                --output "$RUNNER_TEMP/install-homebrew.sh" \
+                https://raw.githubusercontent.com/Homebrew/install/7986efac25016e41eed7e471666140c06f9d97cf/install.sh
+              NONINTERACTIVE=1 bash "$RUNNER_TEMP/install-homebrew.sh"
+            fi
+            eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
+          fi
+          before=$(command -v tailscale || echo none)
+          brew tap-new --no-git abc-release/dry-run
+          cp "$RUNNER_TEMP/formula/abc.rb" "$(brew --repository abc-release/dry-run)/Formula/abc.rb"
+          brew install --formula abc-release/dry-run/abc
+          brew test abc-release/dry-run/abc
+          brew style abc-release/dry-run/abc
+          linked=$(find "$(brew --prefix)/bin" -name 'tailscale*' -print)
+          if [ -n "$linked" ]; then
+            echo "the formula linked tailscale onto the PATH: $linked" >&2
+            exit 1
+          fi
+          after=$(command -v tailscale || echo none)
+          if [ "$after" != "$before" ]; then
+            echo "the tailscale command changed from $before to $after" >&2
+            exit 1
+          fi
+          abc --version
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+          HOMEBREW_NO_INSTALL_CLEANUP: "1"
+          HOMEBREW_NO_ANALYTICS: "1"
+          HOMEBREW_NO_ENV_HINTS: "1"
+
+  attest:
+    name: Attest the release
+    needs: [build, install]
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    permissions:
+      id-token: write # Sigstore signs the attestation with this job's OIDC identity.
+      attestations: write # Stores the attestations with the repository.
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: dist
+      - name: Write SHA256SUMS
+        working-directory: dist
+        run: sha256sum -- *.tar.gz > SHA256SUMS
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            dist/*.tar.gz
+            dist/SHA256SUMS
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-checksums
+          path: dist/SHA256SUMS
+          if-no-files-found: error
+
+  release:
+    name: Publish the release
+    needs: attest
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    permissions:
+      contents: write # Creates the GitHub Release and uploads its assets.
+      attestations: read # gh attestation verify reads the attestations back.
+    steps:
+      # The publish script alone: nothing is built or installed in a job that can write.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/release
+      # Every target's archives, and release-checksums' SHA256SUMS.
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/dist
+      - name: Verify every artifact's attestation
+        run: |
+          for artifact in "$RUNNER_TEMP"/dist/*; do
+            gh attestation verify "$artifact" --repo "$GITHUB_REPOSITORY" \
+              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" \
+              --source-ref "$GITHUB_REF"
+          done
+        env:
+          GH_TOKEN: ${{ github.token }}
+      - name: Publish the GitHub Release, resuming one an earlier attempt left unfinished
+        run: sh .github/release/publish.sh "$GITHUB_REF_NAME" "$RUNNER_TEMP/dist"
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+  tap-formula:
+    name: Render the tap's formula
+    needs: [build, install]
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      # The tap is public; this read needs no token of the tap's. It runs before anything is
+      # built, so no build step shares a step with a token.
+      - name: Read the tap's current formula
+        run: |
+          file=repos/getabc-dev/homebrew-tap/contents/Formula/abc.rb
+          if gh api "$file" > "$RUNNER_TEMP/tap-current.json" 2> "$RUNNER_TEMP/tap-error"; then
+            echo "The tap has a formula."
+          elif grep -q 'HTTP 404' "$RUNNER_TEMP/tap-error"; then
+            echo "The tap has no formula yet."
+            rm "$RUNNER_TEMP/tap-current.json"
+          else
+            cat "$RUNNER_TEMP/tap-error" >&2
+            exit 1
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the pinned Rust toolchain
+        run: rustup toolchain install --no-self-update
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/dist
+      - name: Render the formula for the release's archives and plan the tap's update
+        run: |
+          mkdir "$RUNNER_TEMP/tap"
+          cargo xtask release formula --dist "$RUNNER_TEMP/dist" \
+            --base-url "https://github.com/$GITHUB_REPOSITORY/releases/download/$GITHUB_REF_NAME" \
+            --out "$RUNNER_TEMP/tap/abc.rb"
+          if [ -f "$RUNNER_TEMP/tap-current.json" ]; then
+            set -- --current "$RUNNER_TEMP/tap-current.json"
+          fi
+          cargo xtask release tap-plan --formula "$RUNNER_TEMP/tap/abc.rb" \
+            --out "$RUNNER_TEMP/tap/plan" "$@"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: tap-formula
+          path: ${{ runner.temp }}/tap/
+          if-no-files-found: error
+          retention-days: 7
+
+  tap:
+    name: Update the Homebrew tap
+    needs: [release, tap-formula]
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    # The tap token lives in this environment's secrets, which a maintainer limits to tags v*.
+    environment: release
+    permissions: {}
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: tap-formula
+          path: ${{ runner.temp }}/tap
+      # The token reaches only this step, and only gh reads it; no checkout and no build. The
+      # contents API replaces the file in one commit, and refuses an update whose blob sha the tap
+      # no longer holds, so the plan's check against the tap's version stands.
+      - name: Push the formula to getabc-dev/homebrew-tap
+        run: |
+          read -r action sha < "$RUNNER_TEMP/tap/plan"
+          case "$action" in
+            keep) echo "The tap holds this formula already."; exit 0 ;;
+            create) set -- ;;
+            update) set -- -f "sha=$sha" ;;
+            *) echo "unknown tap plan: $action" >&2; exit 1 ;;
+          esac
+          gh api --method PUT repos/getabc-dev/homebrew-tap/contents/Formula/abc.rb --silent \
+            -f "message=abc ${GITHUB_REF_NAME#v}" \
+            -f "content=$(base64 --wrap=0 "$RUNNER_TEMP/tap/abc.rb")" "$@"
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
