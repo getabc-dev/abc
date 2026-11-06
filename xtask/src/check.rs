@@ -40,6 +40,10 @@ pub(crate) struct Workspace {
     dirs: &'static [&'static str],
 }
 
+/// nextest's configuration for every workspace, from the repository root: no retries, a timeout
+/// for hung tests and the `JUnit` report ([`crate::junit::REPORT`]).
+pub(crate) const NEXTEST_CONFIG: &str = ".config/nextest.toml";
+
 /// The main workspace: the crates abc ships.
 pub(crate) const MAIN: Workspace = Workspace {
     dir: "",
@@ -85,6 +89,16 @@ impl Workspace {
     /// workspace.
     pub(crate) const fn dir(self) -> &'static str {
         self.dir
+    }
+
+    /// The arguments that give nextest the repository's configuration, `root`/[`NEXTEST_CONFIG`],
+    /// whichever workspace it runs: by default nextest reads `.config/nextest.toml` beside the
+    /// workspace's root manifest, which xtask's workspace, and any copy of it, does not have.
+    pub(crate) fn nextest_config_args(root: &Path) -> [OsString; 2] {
+        [
+            "--config-file".into(),
+            root.join(NEXTEST_CONFIG).into_os_string(),
+        ]
     }
 
     /// The arguments that point cargo at this workspace from the repository root.
@@ -257,7 +271,8 @@ struct Run<'a, W> {
     postgres: &'a Postgres<'a>,
     /// Builds go here when given, and wherever cargo is configured to otherwise.
     target_dir: Option<&'a Path>,
-    mode: Mode,
+    /// The step's annotations, across every workspace's failing tests.
+    annotations: crate::annotation::Step,
     out: &'a mut W,
     failures: Vec<Failure>,
     /// node and pnpm, when the tree holds the web app.
@@ -299,35 +314,14 @@ pub(crate) fn run(
         tools,
         postgres,
         target_dir,
-        mode,
+        annotations: crate::annotation::Step::new(mode),
         out,
         failures: Vec::new(),
         web,
     };
-    run.shellcheck(tree.scripts)?;
-    if let Some(toolchain) = web {
-        match &changed_files {
-            _ if !crate::web::present(root) => writeln!(
-                run.out,
-                "xtask: the tree holds no web app (web/package.json); skipping the web gates"
-            )?,
-            Some(files) if !files.iter().any(|path| crate::web::affected_by(path)) => writeln!(
-                run.out,
-                "xtask: nothing under web/ changed; skipping the web gates"
-            )?,
-            Some(_) | None => run.web_gates(toolchain)?,
-        }
-    }
-    for &workspace in tree.workspaces {
-        let (scope, packages) = match &changed_files {
-            Some(files) => {
-                let packages = workspace_packages(root, workspace)?;
-                (affected(workspace, &packages, files), Some(packages))
-            }
-            None => (Scope::Workspace, None),
-        };
-        run.workspace(workspace, &scope, packages)?;
-    }
+    let gates = run.gates(tree, changed_files.as_deref());
+    write!(run.out, "{}", run.annotations.finish())?;
+    gates?;
     let Run { failures, .. } = run;
     if failures.is_empty() {
         writeln!(out, "xtask check: passed")?;
@@ -387,6 +381,36 @@ fn database(root: &Path, scope: &Scope, packages: &[Package]) -> Database {
 }
 
 impl<W: Write> Run<'_, W> {
+    /// Runs every gate of `tree`: shellcheck, the web app's gates when it holds the web app, then
+    /// each workspace's, limited to `changed_files` when given.
+    fn gates(&mut self, tree: Tree<'_>, changed_files: Option<&[PathBuf]>) -> anyhow::Result<()> {
+        self.shellcheck(tree.scripts)?;
+        if let Some(toolchain) = self.web {
+            match changed_files {
+                _ if !crate::web::present(self.root) => writeln!(
+                    self.out,
+                    "xtask: the tree holds no web app (web/package.json); skipping the web gates"
+                )?,
+                Some(files) if !files.iter().any(|path| crate::web::affected_by(path)) => writeln!(
+                    self.out,
+                    "xtask: nothing under web/ changed; skipping the web gates"
+                )?,
+                Some(_) | None => self.web_gates(toolchain)?,
+            }
+        }
+        for &workspace in tree.workspaces {
+            let (scope, packages) = match changed_files {
+                Some(files) => {
+                    let packages = workspace_packages(self.root, workspace)?;
+                    (affected(workspace, &packages, files), Some(packages))
+                }
+                None => (Scope::Workspace, None),
+            };
+            self.workspace(workspace, &scope, packages)?;
+        }
+        Ok(())
+    }
+
     /// Lints `scripts` with shellcheck, which follows what they source.
     fn shellcheck(&mut self, scripts: &[&str]) -> anyhow::Result<()> {
         if scripts.is_empty() {
@@ -585,20 +609,19 @@ impl<W: Write> Run<'_, W> {
     fn tests(&mut self, workspace: Workspace, scope: &Scope) -> anyhow::Result<()> {
         let report = self.root.join(workspace.dir()).join(crate::junit::REPORT);
         crate::junit::clear(&report)?;
-        if !self.step(&mut test_command(&self.tools.nextest, workspace, scope))? {
+        if !self.step(&mut test_command(
+            &self.tools.nextest,
+            self.root,
+            workspace,
+            scope,
+        ))? {
             self.failures.push(Failure::new(
                 "tests",
                 workspace,
                 "fix the cause of each failing test above; never skip or weaken a test",
             ));
-            if self.mode == Mode::Actions {
-                let failed = crate::junit::annotations(&report, workspace.dir(), "tests");
-                write!(
-                    self.out,
-                    "{}",
-                    crate::annotation::commands(Mode::Actions, &failed)
-                )?;
-            }
+            let failed = crate::junit::annotations(&report, workspace.dir(), "tests");
+            write!(self.out, "{}", self.annotations.emit(&failed))?;
         }
         Ok(())
     }
@@ -639,12 +662,13 @@ impl<W: Write> Run<'_, W> {
     }
 }
 
-/// The nextest run for `scope` of `workspace`, with property tests seeded by
-/// [`PROPTEST_RNG_SEED`].
-fn test_command(nextest: &Path, workspace: Workspace, scope: &Scope) -> Command {
+/// The nextest run for `scope` of `workspace` in the repository at `root`, with its nextest
+/// configuration and property tests seeded by [`PROPTEST_RNG_SEED`].
+fn test_command(nextest: &Path, root: &Path, workspace: Workspace, scope: &Scope) -> Command {
     let mut command = Command::new(nextest);
     command
         .args(["nextest", "run"])
+        .args(Workspace::nextest_config_args(root))
         .args(workspace.manifest_args())
         .args(scope.cargo_args())
         .arg("--locked")
@@ -1273,6 +1297,12 @@ mod tests {
             root.join("rust-toolchain.toml"),
         )
         .unwrap();
+        fs::create_dir(root.join(".config")).unwrap();
+        fs::write(
+            root.join(super::NEXTEST_CONFIG),
+            crate::testing::read_in_repository(super::NEXTEST_CONFIG),
+        )
+        .unwrap();
         fs::create_dir(root.join("src")).unwrap();
         fs::write(root.join("src/lib.rs"), lib).unwrap();
         dir
@@ -1636,19 +1666,26 @@ mod tests {
             MAIN.manifest_args().is_empty(),
             "the main workspace is the root's"
         );
-        let command = test_command(Path::new("cargo-nextest"), XTASK, &Scope::Workspace);
+        let command = test_command(
+            Path::new("cargo-nextest"),
+            Path::new("/work/abc"),
+            XTASK,
+            &Scope::Workspace,
+        );
         let args: Vec<&OsStr> = command.get_args().collect();
         assert_eq!(
             args,
             [
                 "nextest",
                 "run",
+                "--config-file",
+                "/work/abc/.config/nextest.toml",
                 "--manifest-path",
                 "xtask/Cargo.toml",
                 "--workspace",
                 "--locked"
             ],
-            "nextest runs xtask's own tests"
+            "nextest runs xtask's own tests with the repository's configuration"
         );
     }
 
@@ -1708,12 +1745,6 @@ mod tests {
             "failing-annotated",
             &CLEAN.replace("add_one(1), 2", "add_one(1), 3"),
         );
-        fs::create_dir_all(fixture.path().join(".config")).unwrap();
-        fs::write(
-            fixture.path().join(".config/nextest.toml"),
-            crate::testing::read_in_repository(".config/nextest.toml"),
-        )
-        .unwrap();
         let no_postgres = |_: &mut dyn std::io::Write| anyhow::bail!("fixtures use no database");
         let no_sqlx = || anyhow::bail!("fixtures keep no query cache");
         let postgres = super::Postgres {
@@ -1770,7 +1801,12 @@ mod tests {
 
     #[test]
     fn property_tests_run_with_a_fixed_seed() {
-        let command = test_command(Path::new("cargo-nextest"), MAIN, &Scope::Workspace);
+        let command = test_command(
+            Path::new("cargo-nextest"),
+            Path::new("/work/abc"),
+            MAIN,
+            &Scope::Workspace,
+        );
         let seed = command
             .get_envs()
             .find(|(name, _)| *name == "PROPTEST_RNG_SEED")

@@ -62,6 +62,9 @@ pub(crate) fn run(
         "the web app did not build; run `cargo xtask check` and fix it first"
     );
     let (llvm_cov, nextest) = (&tools.llvm_cov, &tools.nextest);
+    // The step's annotations: a workspace's failing tests end the run, and only a run whose tests
+    // all pass annotates its untested lines.
+    let mut step = annotation::Step::new(mode);
     let mut report = String::new();
     for &workspace in check::REPOSITORY.workspaces {
         let name = if workspace.dir().is_empty() {
@@ -78,6 +81,7 @@ pub(crate) fn run(
         crate::junit::clear(&junit)?;
         let status = Command::new(llvm_cov)
             .args(["llvm-cov", "nextest"])
+            .args(check::Workspace::nextest_config_args(root))
             .args(workspace.manifest_args())
             .args(["--workspace", "--locked", "--lcov"])
             .arg("--output-path")
@@ -87,9 +91,9 @@ pub(crate) fn run(
             .current_dir(root)
             .status()
             .context("could not run cargo-llvm-cov")?;
-        if !status.success() && mode == Mode::Actions {
+        if !status.success() {
             let failed = crate::junit::annotations(&junit, workspace.dir(), "coverage's tests");
-            write!(out, "{}", annotation::commands(mode, &failed))?;
+            write!(out, "{}{}", step.emit(&failed), step.finish())?;
         }
         ensure!(
             status.success(),
@@ -110,8 +114,9 @@ pub(crate) fn run(
     write!(out, "{}", measured.describe())?;
     write!(
         out,
-        "{}",
-        annotation::commands(mode, &measured.annotations())
+        "{}{}",
+        step.emit(&measured.annotations()),
+        step.finish()
     )?;
     Ok(measured.passes())
 }

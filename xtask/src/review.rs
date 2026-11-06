@@ -1054,7 +1054,7 @@ mod tests {
     }
 
     /// The review job holds `GEMINI_API_KEY` and checks the pull request out on disk. A tracked
-    /// symlink (`xtask/.config` is one) that the pull request retargets at a secret outside the
+    /// symlink (`xtask/.config` was one) that the pull request retargets at a secret outside the
     /// tree is a modified file; read through the filesystem, the secret went to Gemini.
     #[test]
     fn a_retargeted_symlink_never_reads_what_it_points_at() {

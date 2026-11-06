@@ -117,6 +117,8 @@ pub(crate) fn run(
     let commit = git::merge_base(root, base)?;
     let mut passed = true;
     let mut mutated = false;
+    // The step's annotations, across every workspace's missed mutants.
+    let mut step = annotation::Step::new(options.mode);
     for &workspace in check::REPOSITORY.workspaces {
         let diff = workspace_diff(root, &commit, workspace)?;
         if !changes_rust(&diff) {
@@ -136,11 +138,16 @@ pub(crate) fn run(
             mutants,
             nextest,
         };
-        passed &= run.mutate(&diff, out)?;
+        let result = run.mutate(&diff, &mut step, out);
+        if result.is_err() {
+            write!(out, "{}", step.finish())?;
+        }
+        passed &= result?;
     }
     if !mutated {
         writeln!(out, "mutants: no Rust lines changed; nothing to mutate")?;
     }
+    write!(out, "{}", step.finish())?;
     Ok(passed)
 }
 
@@ -194,7 +201,12 @@ impl Run<'_> {
     }
 
     /// Mutates the lines `diff` changes and reports whether the tests caught every mutant.
-    fn mutate(&self, diff: &str, out: &mut impl Write) -> anyhow::Result<bool> {
+    fn mutate(
+        &self,
+        diff: &str,
+        step: &mut annotation::Step,
+        out: &mut impl Write,
+    ) -> anyhow::Result<bool> {
         let root = self.root;
         let output = self.output();
         fs::create_dir_all(&output)
@@ -222,14 +234,16 @@ impl Run<'_> {
         // cargo-mutants copies the tree, once per job, into the temporary directory and builds
         // each copy there. That directory is small in an agent VM, where the build output has the
         // room.
-        let scratch = scratch(root);
-        fs::create_dir_all(&scratch)
-            .with_context(|| format!("could not create {}", scratch.display()))?;
+        let scratch = Scratch::create(scratch(root))?;
         let test_env = output.join("test-env.toml");
         fs::write(&test_env, test_env_config(&std::env::temp_dir(), root)?)
             .with_context(|| format!("could not write {}", test_env.display()))?;
         let mut cargo_config = OsString::from("--cargo-arg=--config=");
         cargo_config.push(&test_env);
+        // A copy of xtask/ alone has no .config/: nextest gets the checkout's configuration by
+        // name, or it would run without its timeouts and write no report.
+        let mut nextest_config = OsString::from("--cargo-test-arg=--config-file=");
+        nextest_config.push(root.join(check::NEXTEST_CONFIG));
         let mut command = Command::new(self.mutants);
         command
             .arg("mutants")
@@ -243,6 +257,7 @@ impl Run<'_> {
                 "never",
             ])
             .arg(&cargo_config)
+            .arg(&nextest_config)
             .arg("--timeout-multiplier")
             .arg(timeout_multiplier(self.options.jobs).to_string())
             .args(["--minimum-test-timeout", MINIMUM_TEST_TIMEOUT]);
@@ -273,7 +288,7 @@ impl Run<'_> {
             .arg(&output)
             .env("PATH", tools::path_with(self.nextest)?)
             .env("PROPTEST_RNG_SEED", PROPTEST_RNG_SEED)
-            .env("TMPDIR", &scratch)
+            .env("TMPDIR", scratch.path())
             // Each copy builds into its own target/: a copy of xtask/ alone has no .cargo/, and
             // cargo, looking up from it, would read the checkout's and build every mutant into the
             // checkout's target/, the jobs overwriting each other's binaries. cargo-mutants runs
@@ -281,19 +296,16 @@ impl Run<'_> {
             .env("CARGO_TARGET_DIR", "target")
             .current_dir(root)
             .status()
-            .context("could not run cargo-mutants");
-        if self.options.mode == Mode::Actions
-            && status
-                .as_ref()
-                .is_ok_and(|status| status.code() == Some(BASELINE_FAILED))
-        {
-            let failed = baseline_failures(&scratch, self.workspace.dir())?;
-            write!(out, "{}", annotation::commands(Mode::Actions, &failed))?;
+            .context("could not run cargo-mutants")?;
+        if self.options.mode == Mode::Actions && status.code() == Some(BASELINE_FAILED) {
+            let failed = baseline_failures(scratch.path(), self.workspace.dir());
+            write!(out, "{}", step.emit(&failed))?;
         }
-        // Whatever cargo-mutants left behind goes, so repeated runs never fill the disk.
-        fs::remove_dir_all(&scratch)
-            .with_context(|| format!("could not remove {}", scratch.display()))?;
-        self.report(&results, outcome(status?.code())?, out)
+        // The outcome's error, such as a failing baseline, comes first; the scratch directory
+        // goes on every path, so repeated runs never fill the disk.
+        let result = outcome(status.code())?;
+        scratch.remove()?;
+        self.report(&results, result, step, out)
     }
 
     /// Reads the results cargo-mutants wrote in `results` and reports them, with its `result`;
@@ -302,6 +314,7 @@ impl Run<'_> {
         &self,
         results: &Path,
         result: Outcome,
+        step: &mut annotation::Step,
         out: &mut impl Write,
     ) -> anyhow::Result<bool> {
         let named = |line: String| {
@@ -322,11 +335,7 @@ impl Run<'_> {
         let passed = missed.is_empty() && result != Outcome::Missed;
         write!(out, "{}", describe(passed, &missed, &timed_out))?;
         let annotations: Vec<Annotation> = missed.iter().map(|line| annotate(line)).collect();
-        write!(
-            out,
-            "{}",
-            annotation::commands(self.options.mode, &annotations)
-        )?;
+        write!(out, "{}", step.emit(&annotations))?;
         Ok(passed)
     }
 }
@@ -360,32 +369,107 @@ fn test_env_config(temp: &Path, root: &Path) -> anyhow::Result<String> {
 }
 
 /// The annotations for the tests that failed in cargo-mutants' unmutated copy, from the `JUnit`
-/// report nextest wrote in it, among the copies in
-/// `scratch`, of the workspace at `dir`.
-fn baseline_failures(scratch: &Path, dir: &str) -> anyhow::Result<Vec<Annotation>> {
-    let mut copies: Vec<PathBuf> = fs::read_dir(scratch)
-        .with_context(|| format!("could not read {}", scratch.display()))?
-        .map(|entry| entry.map(|entry| entry.path()))
-        .collect::<Result<_, _>>()
-        .with_context(|| format!("could not read {}", scratch.display()))?;
-    copies.sort();
+/// report nextest wrote in it, among this run's copies in `scratch`, of the workspace at `dir`.
+/// They only explain the failure cargo-mutants reports, so a directory that cannot be read
+/// becomes an annotation saying so, never an error in its place.
+fn baseline_failures(scratch: &Path, dir: &str) -> Vec<Annotation> {
     let what = "mutants' unmutated tests";
+    let copies: std::io::Result<Vec<PathBuf>> = fs::read_dir(scratch).and_then(|entries| {
+        entries
+            .map(|entry| entry.map(|entry| entry.path()))
+            .collect()
+    });
+    let mut copies = match copies {
+        Ok(copies) => copies,
+        Err(error) => {
+            return vec![Annotation {
+                file: None,
+                ..Annotation::error(
+                    "",
+                    &format!("Test failed: {what}"),
+                    format!(
+                        "the tests failed without any mutation, and the copies in {} could not \
+                         be read: {error}",
+                        scratch.display()
+                    ),
+                )
+            }];
+        }
+    };
+    copies.sort();
     let reports: Vec<PathBuf> = copies
         .into_iter()
         .map(|copy| copy.join(crate::junit::REPORT))
         .filter(|report| report.is_file())
         .collect();
     if reports.is_empty() {
-        return Ok(crate::junit::annotations(
+        return crate::junit::annotations(
             &scratch.join("cargo-mutants left no test report here"),
             dir,
             what,
-        ));
+        );
     }
-    Ok(reports
+    reports
         .iter()
         .flat_map(|report| crate::junit::annotations(report, dir, what))
-        .collect())
+        .collect()
+}
+
+/// cargo-mutants' scratch directory for one run: emptied when the run starts, so copies a killed
+/// run leaked (`--leak-dirs`) are never read as this run's, and removed when it ends, on every
+/// path, so they never fill the disk.
+struct Scratch {
+    path: PathBuf,
+    removed: bool,
+}
+
+impl Scratch {
+    /// Empties, or creates, the directory at `path`.
+    fn create(path: PathBuf) -> anyhow::Result<Self> {
+        remove(&path).with_context(|| {
+            format!("could not empty {}, left by an earlier run", path.display())
+        })?;
+        fs::create_dir_all(&path)
+            .with_context(|| format!("could not create {}", path.display()))?;
+        Ok(Self {
+            path,
+            removed: false,
+        })
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Removes the directory, failing when it cannot.
+    fn remove(mut self) -> anyhow::Result<()> {
+        self.removed = true;
+        remove(&self.path).with_context(|| format!("could not remove {}", self.path.display()))
+    }
+}
+
+/// Removes whatever is at `path`, a directory with its content or anything else; nothing there is
+/// fine.
+fn remove(path: &Path) -> std::io::Result<()> {
+    let removed = match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() => fs::remove_dir_all(path),
+        Ok(_) => fs::remove_file(path),
+        Err(error) => Err(error),
+    };
+    match removed {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        other => other,
+    }
+}
+
+impl Drop for Scratch {
+    /// Removes the directory when the run ends early with an error, which stays the one reported.
+    /// A directory that cannot be removed here is emptied by the next run ([`Scratch::create`]).
+    fn drop(&mut self) {
+        if !self.removed {
+            let _left_for_the_next_run = remove(&self.path);
+        }
+    }
 }
 
 /// Where cargo-mutants copies and builds the tree: under the checkout's build output.
@@ -844,12 +928,265 @@ mod tests {
         );
         let empty = temp.path().join("empty");
         fs::create_dir_all(empty.join("cargo-mutants-a.tmp")).unwrap();
-        let none = super::baseline_failures(&empty, "xtask").unwrap();
+        let none = super::baseline_failures(&empty, "xtask");
         assert!(
             none[0]
                 .message
                 .contains("cargo-mutants left no test report"),
             "{none:?}"
+        );
+    }
+
+    /// #33's annotations never fired for xtask's mutants: a copy of xtask/ alone took its
+    /// `.config` symlink to `../.config`, which dangles there, so nextest ran with its defaults,
+    /// with no timeouts for hung tests and no `JUnit` report. This runs the real pinned nextest in
+    /// such a copy, as cargo-mutants runs it, with the arguments the run gives cargo-mutants.
+    #[test]
+    fn a_copy_of_xtask_runs_nextest_with_the_repository_configuration() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = crate::testing::read_in_repository(crate::check::NEXTEST_CONFIG);
+        let toolchain = crate::testing::read_in_repository("rust-toolchain.toml");
+        let repo = repository_with_change(
+            &temp.path().join("repo"),
+            &[
+                (".config/nextest.toml", &config),
+                (
+                    "xtask/Cargo.toml",
+                    "[package]\nname = \"copied\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[workspace]\n",
+                ),
+                ("xtask/rust-toolchain.toml", &toolchain),
+                (
+                    "xtask/src/lib.rs",
+                    "#[test]\nfn fails_without_a_mutation() {\n    assert_eq!(1, 2, \"the baseline fails\");\n}\n",
+                ),
+            ],
+        );
+        let mutants = temp.path().join("cargo-mutants");
+        script(
+            &mutants,
+            "dir=.\ntest_args=\nwhile [ $# -gt 0 ]; do case \"$1\" in --dir) dir=$2 ;; --cargo-arg=--config=*) config=${1#--cargo-arg=--config=} ;; --cargo-test-arg=*) test_args=\"$test_args ${1#--cargo-test-arg=}\" ;; esac; shift; done\n\
+             copy=\"$TMPDIR/cargo-mutants-copied-baseline.tmp\"\nmkdir -p \"$copy\" && cp -R \"$dir\"/. \"$copy\" && cd \"$copy\" || exit 9\n\
+             cargo --config \"$config\" nextest run $test_args >/dev/null 2>&1 && exit 0\nexit 4\n",
+        );
+        let actions = Options {
+            jobs: 1,
+            shard: None,
+            mode: Mode::Actions,
+        };
+        let mut out = Vec::new();
+        let error = run(
+            &repo,
+            "base",
+            &actions,
+            &mutants,
+            &crate::testing::pinned_for_tests("cargo-nextest"),
+            &no_web(),
+            &mut out,
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("fail without any mutation"),
+            "{error}"
+        );
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains(
+                "::error file=xtask/src/lib.rs,line=3,title=Test failed%3A copied \
+                 fails_without_a_mutation::"
+            ),
+            "the copy's nextest wrote its report, so the failing test is annotated: {text}"
+        );
+    }
+
+    /// With `--leak-dirs`, the copies of a killed earlier run stayed in the scratch directory,
+    /// and a failing baseline read their reports as this run's.
+    #[test]
+    fn a_killed_runs_copies_are_never_read_as_this_runs() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = repository_with_change(
+            &temp.path().join("repo"),
+            &[("xtask/src/a.rs", "fn a() -> bool { true }\n")],
+        );
+        let stale = repo.join("target/mutants-tmp/cargo-mutants-xtask-killed.tmp");
+        let report = stale.join(crate::junit::REPORT);
+        fs::create_dir_all(report.parent().unwrap()).unwrap();
+        fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/nextest-junit-33.xml"),
+            &report,
+        )
+        .unwrap();
+        let mutants = temp.path().join("cargo-mutants");
+        script(
+            &mutants,
+            "[ -e \"$TMPDIR/cargo-mutants-xtask-killed.tmp\" ] && exit 9\n\
+             mkdir -p \"$TMPDIR/cargo-mutants-xtask-now.tmp\"\nexit 4\n",
+        );
+        let actions = Options {
+            mode: Mode::Actions,
+            ..TWO
+        };
+        let mut out = Vec::new();
+        let error = run(
+            &repo,
+            "base",
+            &actions,
+            &mutants,
+            &temp.path().join("cargo-nextest"),
+            &no_web(),
+            &mut out,
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("fail without any mutation"),
+            "{error}"
+        );
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            !text.contains("a_client_has_its_patience_in_all_not_per_read"),
+            "the killed run's failure is not this run's: {text}"
+        );
+        assert!(text.contains("cargo-mutants left no test report"), "{text}");
+        assert!(
+            !repo.join("target/mutants-tmp").exists(),
+            "and nothing is left"
+        );
+    }
+
+    /// An error between starting cargo-mutants and removing its scratch directory returned
+    /// before the removal, leaving gigabytes of copies behind, and replaced cargo-mutants' own
+    /// error with its own.
+    #[test]
+    fn an_error_leaves_no_copies_and_stays_the_one_reported() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = repository_with_change(
+            &temp.path().join("repo"),
+            &[("xtask/src/a.rs", "fn a() -> bool { true }\n")],
+        );
+        let unreadable = temp.path().join("unreadable");
+        script(
+            &unreadable,
+            "rm -rf \"$TMPDIR\" && echo 'not a directory' > \"$TMPDIR\"\nexit 4\n",
+        );
+        let actions = Options {
+            mode: Mode::Actions,
+            ..TWO
+        };
+        let mut out = Vec::new();
+        let error = run(
+            &repo,
+            "base",
+            &actions,
+            &unreadable,
+            &temp.path().join("cargo-nextest"),
+            &no_web(),
+            &mut out,
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("fail without any mutation"),
+            "cargo-mutants' error, not the scratch directory's: {error}"
+        );
+        assert!(
+            String::from_utf8(out)
+                .unwrap()
+                .contains("could not be read"),
+            "the annotation says why it names no test"
+        );
+
+        let crashing = temp.path().join("crashing");
+        script(
+            &crashing,
+            "mkdir -p \"$TMPDIR/cargo-mutants-xtask-a.tmp/target\"\nexit 70\n",
+        );
+        let crashed = run(
+            &repo,
+            "base",
+            &TWO,
+            &crashing,
+            &temp.path().join("cargo-nextest"),
+            &no_web(),
+            &mut Vec::new(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            crashed.to_string(),
+            "cargo-mutants failed with exit code 70"
+        );
+        assert!(
+            !repo.join("target/mutants-tmp").exists(),
+            "the copies go on the error's path too"
+        );
+
+        let missing = run(
+            &repo,
+            "base",
+            &TWO,
+            &temp.path().join("absent"),
+            &temp.path().join("cargo-nextest"),
+            &no_web(),
+            &mut Vec::new(),
+        )
+        .unwrap_err();
+        assert!(
+            missing.to_string().contains("could not run cargo-mutants"),
+            "{missing}"
+        );
+        assert!(!repo.join("target/mutants-tmp").exists(), "{missing}");
+    }
+
+    /// Each workspace's missed mutants were annotated on their own, so one step could print more
+    /// than the ten errors GitHub keeps, and it dropped the rest without a note.
+    #[test]
+    fn one_step_annotates_ten_across_the_workspaces() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = repository_with_change(
+            &temp.path().join("repo"),
+            &[
+                ("src/a.rs", "fn a() -> bool { true }\n"),
+                ("xtask/src/a.rs", "fn a() -> bool { true }\n"),
+            ],
+        );
+        let mutants = temp.path().join("cargo-mutants");
+        script(
+            &mutants,
+            "count=10\nwhile [ $# -gt 0 ]; do case \"$1\" in --output) out=$2 ;; --dir) count=3 ;; esac; shift; done\n\
+             mkdir -p \"$out/mutants.out\"\n\
+             for n in $(seq 1 $count); do echo \"src/a.rs:$n:1: replace a -> bool with false\"; done > \"$out/mutants.out/missed.txt\"\n\
+             exit 2\n",
+        );
+        let actions = Options {
+            mode: Mode::Actions,
+            ..TWO
+        };
+        let mut out = Vec::new();
+        assert!(
+            !run(
+                &repo,
+                "base",
+                &actions,
+                &mutants,
+                &temp.path().join("cargo-nextest"),
+                &no_web(),
+                &mut out,
+            )
+            .unwrap()
+        );
+        let text = String::from_utf8(out).unwrap();
+        let errors: Vec<&str> = text
+            .lines()
+            .filter(|line| line.starts_with("::error"))
+            .collect();
+        assert_eq!(errors.len(), 10, "what GitHub keeps for the step: {text}");
+        assert_eq!(
+            errors.last().copied(),
+            Some(
+                "::error title=4 more::4 more findings of this level; the job's log lists every one"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("missed: xtask/src/a.rs:3:1"),
+            "the log lists every one: {text}"
         );
     }
 

@@ -1283,12 +1283,17 @@ mod tests {
     }
 
     #[test]
-    fn the_xtask_workspace_shares_the_nextest_configuration() {
+    fn no_symlink_is_tracked() {
         let root = repo_root().unwrap();
-        assert_eq!(
-            fs::read_link(root.join("xtask/.config")).unwrap(),
-            Path::new("../.config"),
-            "nextest reads .config/ from the workspace root; xtask's is the repository's"
+        let listing = crate::git::git(&root, &["ls-files", "--stage", "-z"]).unwrap();
+        let links: Vec<&str> = listing
+            .split('\0')
+            .filter(|entry| entry.starts_with("120000 "))
+            .collect();
+        assert!(
+            links.is_empty(),
+            "a symlink dangles in a copy of part of the tree (xtask/.config did in mutants' \
+             copies of xtask/), and the review job's checkout follows it: {links:?}"
         );
     }
 

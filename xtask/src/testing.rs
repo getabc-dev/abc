@@ -230,6 +230,12 @@ pub(crate) fn abc_tree(root: &Path) {
         root.join("rust-toolchain.toml"),
     )
     .unwrap();
+    fs::create_dir_all(root.join(".config")).unwrap();
+    fs::write(
+        root.join(crate::check::NEXTEST_CONFIG),
+        read_in_repository(crate::check::NEXTEST_CONFIG),
+    )
+    .unwrap();
     fs::write(
         root.join("src/main.rs"),
         "use std::io::{Read as _, Write as _};\n\nfn main() {\n    let ops = std::env::var(\"ABC_OPS_ADDR\").unwrap_or_default();\n    let Ok(listener) = std::net::TcpListener::bind(&ops) else {\n        return;\n    };\n    for mut stream in listener.incoming().flatten() {\n        let mut request = [0_u8; 1024];\n        let _read = stream.read(&mut request);\n        let _written = stream.write_all(b\"HTTP/1.1 200 OK\\r\\nContent-Length: 0\\r\\n\\r\\n\");\n    }\n}\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn builds() {}\n}\n",
