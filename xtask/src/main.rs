@@ -86,10 +86,11 @@ enum Task {
         /// (upstream/HEAD, else origin/HEAD), including uncommitted and untracked files.
         #[arg(long)]
         changed: bool,
-        /// When another gate holds the gate lock, exit at once with status 75 (`EX_TEMPFAIL`),
-        /// naming it, instead of waiting for it; the stop hook runs check this way.
-        #[arg(long)]
-        no_wait: bool,
+        /// When another gate holds the gate lock, wait at most SECONDS for it, then exit with
+        /// status 75 (`EX_TEMPFAIL`), naming it; without, wait until it ends. The stop hook runs
+        /// check this way.
+        #[arg(long, value_name = "SECONDS")]
+        wait_at_most: Option<u64>,
     },
     /// Run the tests under coverage and require 90% of the changed, instrumented lines covered.
     Coverage {
@@ -442,12 +443,11 @@ fn perform(
 /// The gate lock `task` takes, if it is a heavy gate, and whether it waits for another gate.
 const fn gate_of(task: &Task) -> Option<(gate::Gate, gate::Wait)> {
     match task {
-        Task::Check { no_wait, .. } => Some((
+        Task::Check { wait_at_most, .. } => Some((
             gate::Gate::Check,
-            if *no_wait {
-                gate::Wait::No
-            } else {
-                gate::Wait::Yes
+            match wait_at_most {
+                Some(seconds) => gate::Wait::AtMost(std::time::Duration::from_secs(*seconds)),
+                None => gate::Wait::Yes,
             },
         )),
         Task::Coverage { .. } => Some((gate::Gate::Coverage, gate::Wait::Yes)),
@@ -975,7 +975,7 @@ mod tests {
                 "check",
                 Task::Check {
                     changed: false,
-                    no_wait: false,
+                    wait_at_most: None,
                 },
             ),
         ] {
@@ -1131,7 +1131,7 @@ mod tests {
             dispatch(
                 Task::Check {
                     changed: false,
-                    no_wait: false,
+                    wait_at_most: None,
                 },
                 &home,
                 &root,

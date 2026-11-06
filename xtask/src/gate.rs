@@ -6,8 +6,8 @@
 //! both times. In-place xtask mutants also edit xtask's sources while they run, which a `check`
 //! beside them would build. So each of these gates takes one exclusive lock, [`LOCK`] under the
 //! checkout's `target/`, for the whole run. A second gate waits for it and says once who holds it;
-//! the stop hook does not wait (`check --no-wait`), and sends the stop back naming the gate to
-//! wait for.
+//! the stop hook waits only so long (`check --wait-at-most`, `hook::GATE_WAIT`), and then sends
+//! the stop back naming the gate to wait for.
 //!
 //! The lock is the operating system's (`flock` on Unix), so it dies with the process that holds
 //! it: a gate that was killed never blocks the next. The file records the holder, its gate, pid
@@ -16,7 +16,7 @@
 use std::fs::{self, File, TryLockError};
 use std::io::{Read as _, Seek as _, SeekFrom, Write};
 use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
@@ -24,7 +24,8 @@ use serde::{Deserialize, Serialize};
 /// The lock's file, relative to the checkout.
 pub(crate) const LOCK: &str = "target/gate.lock";
 
-/// The exit status of `check --no-wait` when another gate holds the lock (`EX_TEMPFAIL`).
+/// The exit status of `check --wait-at-most` when another gate still holds the lock at the end of
+/// the wait (`EX_TEMPFAIL`).
 pub(crate) const BUSY_STATUS: u8 = 75;
 
 /// The gates that take the lock.
@@ -72,19 +73,25 @@ pub(crate) struct Held {
 #[derive(Debug)]
 pub(crate) enum Taken {
     Held(Held),
-    /// Another gate holds the lock and the caller would not wait: who, in words.
+    /// Another gate held the lock all the while the caller would wait: who, in words.
     Busy(String),
 }
 
-/// Whether [`take`] waits for a lock another gate holds.
+/// How long [`take`] waits for a lock another gate holds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Wait {
+    /// Until the other gate ends.
     Yes,
-    No,
+    /// At most this long; no time at all is not waiting.
+    AtMost(Duration),
 }
 
+/// How often a wait with a limit tries the lock again.
+const RETRY: Duration = Duration::from_millis(500);
+
 /// Takes the gate lock of the checkout at `root` for `gate`. When another gate holds it, says so
-/// once in `out` and waits for it, or with [`Wait::No`] returns who holds it.
+/// once in `out` and waits for it, or with [`Wait::AtMost`] returns who holds it once that time
+/// has passed.
 pub(crate) fn take(
     root: &Path,
     gate: Gate,
@@ -106,16 +113,30 @@ fn take_at(
         Ok(()) => {}
         Err(TryLockError::WouldBlock) => {
             let holder = describe(&mut file, now);
-            if wait == Wait::No {
-                return Ok(Taken::Busy(holder));
+            match wait {
+                Wait::AtMost(limit) if limit.is_zero() => return Ok(Taken::Busy(holder)),
+                Wait::AtMost(limit) => {
+                    writeln!(
+                        out,
+                        "xtask: waiting at most {} s for {holder} to finish: one gate runs at a \
+                         time ({LOCK})",
+                        limit.as_secs()
+                    )?;
+                    out.flush()?;
+                    if !retry(&file, path, limit)? {
+                        return Ok(Taken::Busy(describe(&mut file, self::now())));
+                    }
+                }
+                Wait::Yes => {
+                    writeln!(
+                        out,
+                        "xtask: waiting for {holder} to finish: one gate runs at a time ({LOCK})"
+                    )?;
+                    out.flush()?;
+                    file.lock()
+                        .with_context(|| format!("could not lock {}", path.display()))?;
+                }
             }
-            writeln!(
-                out,
-                "xtask: waiting for {holder} to finish: one gate runs at a time ({LOCK})"
-            )?;
-            out.flush()?;
-            file.lock()
-                .with_context(|| format!("could not lock {}", path.display()))?;
         }
         Err(TryLockError::Error(error)) => {
             return Err(error).with_context(|| format!("could not lock {}", path.display()));
@@ -133,6 +154,25 @@ fn take_at(
         .and_then(|()| file.flush())
         .with_context(|| format!("could not record the holder in {}", path.display()))?;
     Ok(Taken::Held(Held { _file: file }))
+}
+
+/// Tries to lock `file`, at `path`, every [`RETRY`] for at most `limit`; whether it got the lock.
+fn retry(file: &File, path: &Path, limit: Duration) -> anyhow::Result<bool> {
+    let started = Instant::now();
+    loop {
+        let left = limit.saturating_sub(started.elapsed());
+        if left.is_zero() {
+            return Ok(false);
+        }
+        std::thread::sleep(left.min(RETRY));
+        match file.try_lock() {
+            Ok(()) => return Ok(true),
+            Err(TryLockError::WouldBlock) => {}
+            Err(TryLockError::Error(error)) => {
+                return Err(error).with_context(|| format!("could not lock {}", path.display()));
+            }
+        }
+    }
 }
 
 /// Opens the lock's file, creating it and its directory.
@@ -203,13 +243,66 @@ mod tests {
         }
     }
 
+    /// The stop hook's check waits only so long for another gate, then reports it busy; one that
+    /// ends within the wait lets the check start.
+    #[test]
+    fn a_wait_with_a_limit_takes_the_lock_if_it_comes_in_time() {
+        let root = tempfile::tempdir().unwrap();
+        let held = take(root.path(), Gate::Coverage, Wait::Yes, &mut Vec::new()).unwrap();
+        let started = std::time::Instant::now();
+        let mut said = Vec::new();
+        let holder = busy(
+            take(
+                root.path(),
+                Gate::Check,
+                Wait::AtMost(Duration::from_millis(700)),
+                &mut said,
+            )
+            .unwrap(),
+        );
+        assert!(started.elapsed() >= Duration::from_millis(700));
+        assert!(holder.contains("`cargo xtask coverage`"), "{holder}");
+        let said = String::from_utf8(said).unwrap();
+        assert!(
+            said.starts_with("xtask: waiting at most 0 s for `cargo xtask coverage`"),
+            "{said}"
+        );
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            drop(held);
+        });
+        let taken = take(
+            root.path(),
+            Gate::Check,
+            Wait::AtMost(Duration::from_secs(10)),
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert!(matches!(taken, Taken::Held(_)), "{taken:?}");
+        releaser.join().unwrap();
+    }
+
     #[test]
     fn a_second_gate_is_told_which_gate_holds_the_lock() {
         let root = tempfile::tempdir().unwrap();
-        let held = take(root.path(), Gate::Coverage, Wait::No, &mut Vec::new()).unwrap();
+        let held = take(
+            root.path(),
+            Gate::Coverage,
+            Wait::AtMost(Duration::ZERO),
+            &mut Vec::new(),
+        )
+        .unwrap();
         assert!(matches!(held, Taken::Held(_)));
         let mut said = Vec::new();
-        let holder = busy(take(root.path(), Gate::Check, Wait::No, &mut said).unwrap());
+        let holder = busy(
+            take(
+                root.path(),
+                Gate::Check,
+                Wait::AtMost(Duration::ZERO),
+                &mut said,
+            )
+            .unwrap(),
+        );
         assert_eq!(
             holder,
             format!(
@@ -224,7 +317,13 @@ mod tests {
         drop(held);
         assert!(
             matches!(
-                take(root.path(), Gate::Check, Wait::No, &mut Vec::new()).unwrap(),
+                take(
+                    root.path(),
+                    Gate::Check,
+                    Wait::AtMost(Duration::ZERO),
+                    &mut Vec::new()
+                )
+                .unwrap(),
                 Taken::Held(_)
             ),
             "released when dropped, and free for the next gate"
@@ -260,7 +359,13 @@ mod tests {
         assert!(said.contains("`cargo xtask coverage`"), "{said}");
         assert!(
             matches!(
-                take(root.path(), Gate::Fuzz, Wait::No, &mut Vec::new()).unwrap(),
+                take(
+                    root.path(),
+                    Gate::Fuzz,
+                    Wait::AtMost(Duration::ZERO),
+                    &mut Vec::new()
+                )
+                .unwrap(),
                 Taken::Held(_)
             ),
             "the waiter released it at its end"
@@ -280,7 +385,15 @@ mod tests {
             .stdin(Stdio::from(file))
             .spawn()
             .unwrap();
-        let holder = busy(take(root.path(), Gate::Check, Wait::No, &mut Vec::new()).unwrap());
+        let holder = busy(
+            take(
+                root.path(),
+                Gate::Check,
+                Wait::AtMost(Duration::ZERO),
+                &mut Vec::new(),
+            )
+            .unwrap(),
+        );
         assert!(
             holder.starts_with("`cargo xtask mutants` (pid 1, running for "),
             "{holder}"
@@ -289,7 +402,13 @@ mod tests {
         child.wait().unwrap();
         assert!(
             matches!(
-                take(root.path(), Gate::Check, Wait::No, &mut Vec::new()).unwrap(),
+                take(
+                    root.path(),
+                    Gate::Check,
+                    Wait::AtMost(Duration::ZERO),
+                    &mut Vec::new()
+                )
+                .unwrap(),
                 Taken::Held(_)
             ),
             "the lock died with its holder"
@@ -313,7 +432,14 @@ mod tests {
     fn the_holder_is_recorded_for_the_next_gate() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("nested/lock");
-        let _held = take_at(&path, Gate::E2e, Wait::No, 0, &mut Vec::new()).unwrap();
+        let _held = take_at(
+            &path,
+            Gate::E2e,
+            Wait::AtMost(Duration::ZERO),
+            0,
+            &mut Vec::new(),
+        )
+        .unwrap();
         let record: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(record["gate"], "e2e");

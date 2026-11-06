@@ -246,6 +246,7 @@ mod tests {
             .arg(project.join("xtask/hooks/hook.sh"))
             .arg(event)
             .env("CLAUDE_PROJECT_DIR", project)
+            .env("XTASK_HOOK_GATE_WAIT", "2")
             .env_remove("ABC_VM")
             .env_remove("CARGO_TARGET_DIR")
             .env_remove("RUSTUP_TOOLCHAIN")
@@ -371,8 +372,21 @@ mod tests {
         .unwrap();
 
         let stop = r#"{"hook_event_name":"Stop","stop_hook_active":false}"#;
+        // xtask is built before the clock starts, so the time measured is the hook's own.
+        launch(
+            &copy,
+            "pre-tool-use",
+            r#"{"tool_name":"Read","tool_input":{}}"#,
+        );
+        let started = std::time::Instant::now();
         let (stopped, answer, log) = launch(&copy, "stop", stop);
         assert_eq!(stopped, Some(0), "{log}");
+        assert!(
+            started.elapsed() >= std::time::Duration::from_secs(2),
+            "the hook waits for the gate (here 2 s, XTASK_HOOK_GATE_WAIT) before sending the stop \
+             back: a stop during a long gate came back at once and counted, {:?}",
+            started.elapsed()
+        );
         let held: serde_json::Value = serde_json::from_str(&answer).unwrap();
         assert_eq!(held["decision"], "block", "{answer}");
         let reason = held["reason"].as_str().unwrap();

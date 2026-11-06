@@ -73,6 +73,16 @@ pub(crate) const UNKEPT_STATUS: u8 = 3;
 /// (`watchdog::TIMEOUT`, 240 s) and the build of xtask room before it.
 const CHECK_DEADLINE: Duration = Duration::from_secs(600);
 
+/// How long a stop's `check` waits for another gate to finish before the stop is sent back to
+/// wait for it, out of [`CHECK_DEADLINE`], which leaves the check itself the rest. Without the
+/// wait, a stop during a long gate came back at once and counted, so an agent could reach the
+/// backstop in seconds. [`GATE_WAIT_ENV`] shortens it, for tests.
+const GATE_WAIT: Duration = Duration::from_secs(300);
+
+/// The variable that sets [`GATE_WAIT`] in seconds instead; the hook's tests use it, so that a
+/// test of a busy gate does not wait five minutes.
+const GATE_WAIT_ENV: &str = "XTASK_HOOK_GATE_WAIT";
+
 /// Marks a hook handed over by another checkout, which must not be handed on again.
 const DELEGATED: &str = "XTASK_HOOK_DELEGATED";
 
@@ -541,11 +551,15 @@ impl Steps for Real<'_> {
         if let Some(failure) = &self.failure {
             bail!("{failure}");
         }
+        let wait = std::env::var(GATE_WAIT_ENV)
+            .ok()
+            .and_then(|seconds| seconds.parse().ok())
+            .unwrap_or(GATE_WAIT.as_secs());
         let mut command = Command::new(std::env::current_exe().context("could not find xtask")?);
         command
             .arg("--root")
             .arg(self.root)
-            .args(["check", "--changed", "--no-wait"])
+            .args(["check", "--changed", "--wait-at-most", &wait.to_string()])
             .current_dir(self.root);
         Ok(check_result(run_bounded(command, CHECK_DEADLINE, out)?))
     }
@@ -561,7 +575,7 @@ impl Steps for Real<'_> {
     }
 }
 
-/// What `check --no-wait` came to, from how it exited: `None` when it was stopped at its deadline.
+/// What `check --wait-at-most` came to, from how it exited: `None` when it was stopped at its deadline.
 fn check_result(status: Option<ExitStatus>) -> CheckResult {
     match status.and_then(|status| status.code()) {
         Some(0) => CheckResult::Passed,
@@ -632,8 +646,9 @@ fn run_bounded(
 }
 
 /// What an agent whose stop found another gate running does.
-const WAIT: &str = "Another gate holds the gate lock (target/gate.lock), so check did not start: \
-                    wait for that gate to finish, starting no other gate, then stop again.";
+const WAIT: &str = "Another gate held the gate lock (target/gate.lock) all the while the hook \
+                    waited, so check did not start: wait for that gate to finish, starting no \
+                    other gate, then stop again.";
 
 /// How to declare a task BLOCKED, for the main agent.
 const DECLARE: &str = "If what stops you is outside your control, declare it: cargo xtask task \

@@ -5,3 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc a0a298e9143fe10fded67600590ff658d10ebe909deada88bc298e1699cd01a1 # shrinks to steps = [Declare, Stop { agent: 0, active: false }]
+cc 493dcc2f3245d94bc9a08453a2d318ce4e0084ede397a2809e0294f4f43e1e78 # shrinks to steps = [Stop { agent: 0, active: false }, Checked { agent: 0, result: GateBusy }, Stop { agent: 0, active: false }]
