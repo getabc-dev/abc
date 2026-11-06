@@ -319,8 +319,12 @@ mod tests {
         assert_eq!(record["gate"], "e2e");
         assert_eq!(record["pid"], std::process::id());
         let since = record["since"].as_u64().unwrap();
+        let clock = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
         assert!(
-            super::now().abs_diff(since) < 60,
+            clock.abs_diff(since) < 60,
             "the real time, in seconds since the epoch: {record}"
         );
     }
