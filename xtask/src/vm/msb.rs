@@ -2,7 +2,8 @@
 //! own per version, since microsandbox is beta and its releases break compatibility.
 
 use std::ffi::OsString;
-use std::io::Read;
+use std::io::{BufRead as _, BufReader, Read, Write};
+use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Output, Stdio};
 
@@ -139,6 +140,49 @@ impl Backend for Msb {
             .with_context(|| format!("could not run {}", self.exe.display()))
     }
 
+    /// `msb exec --stream`: without it, msb keeps a command's output that does not go to a
+    /// terminal in memory until the command exits, so a log stayed empty for hours (microsandbox
+    /// 0.7.13, `crates/cli/lib/commands/exec.rs`); with it, msb writes and flushes each chunk as
+    /// it comes. `--no-stdin` gives the command no input, which `--stream` needs.
+    fn stream(
+        &self,
+        name: &str,
+        command: &[OsString],
+        log: &mut dyn Write,
+    ) -> anyhow::Result<ExitStatus> {
+        let (reader, writer) = std::io::pipe().context("could not make a pipe")?;
+        let mut exec = self.command();
+        exec.args(["exec", "--stream", "--no-stdin"])
+            .arg(name)
+            .arg("--")
+            .args(command)
+            .stdin(Stdio::null())
+            .stdout(writer.try_clone().context("could not share the pipe")?)
+            .stderr(writer);
+        let mut child = exec
+            .spawn()
+            .with_context(|| format!("could not run {}", self.exe.display()))?;
+        // The command holds the pipe's write end until it is dropped, and the reader ends with it.
+        drop(exec);
+        let mut lines = BufReader::new(reader);
+        let mut line = Vec::new();
+        loop {
+            line.clear();
+            let read = lines
+                .read_until(b'\n', &mut line)
+                .context("could not read the command's output")?;
+            if read == 0 {
+                break;
+            }
+            log.write_all(&line)
+                .and_then(|()| log.flush())
+                .context("could not write the log")?;
+        }
+        child
+            .wait()
+            .context("could not wait for the command in the VM")
+    }
+
     fn remove(&self, name: &str) -> anyhow::Result<()> {
         let output = self.run(&["rm".into(), "--force".into(), name.into()])?;
         let said = String::from_utf8_lossy(&output.stderr);
@@ -161,6 +205,29 @@ impl Backend for Msb {
             );
         }
         Ok(())
+    }
+
+    /// The volumes under msb's home, each a directory named for it, and the blocks their files
+    /// take: their disks are sparse, so their sizes overstate it.
+    fn volumes(&self) -> anyhow::Result<Vec<(String, u64)>> {
+        let dir = self.home.join("volumes");
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => {
+                return Err(error).with_context(|| format!("could not read {}", dir.display()));
+            }
+        };
+        let mut volumes = Vec::new();
+        for entry in entries {
+            let entry = entry.with_context(|| format!("could not read {}", dir.display()))?;
+            volumes.push((
+                entry.file_name().to_string_lossy().into_owned(),
+                disk_usage(&entry.path())?,
+            ));
+        }
+        volumes.sort();
+        Ok(volumes)
     }
 
     fn list(&self) -> anyhow::Result<String> {
@@ -188,6 +255,22 @@ impl Backend for Msb {
         ensure!(taken, "msb load exited before reading the whole image");
         Ok(())
     }
+}
+
+/// The bytes the files under `path` take on disk, counted in blocks, without following links.
+fn disk_usage(path: &Path) -> anyhow::Result<u64> {
+    let metadata = std::fs::symlink_metadata(path)
+        .with_context(|| format!("could not read {}", path.display()))?;
+    let mut bytes = metadata.blocks().saturating_mul(512);
+    if metadata.is_dir() {
+        for entry in
+            std::fs::read_dir(path).with_context(|| format!("could not read {}", path.display()))?
+        {
+            let entry = entry.with_context(|| format!("could not read {}", path.display()))?;
+            bytes = bytes.saturating_add(disk_usage(&entry.path())?);
+        }
+    }
+    Ok(bytes)
 }
 
 /// Where microsandbox keeps the state of `version`, under the data directory `data`.
@@ -388,6 +471,93 @@ mod tests {
         assert!(
             log.contains("exec abc-w -- claude -p\n"),
             "no --tty without a terminal: {log}"
+        );
+    }
+
+    /// A session driven from a script once sat for hours with an empty log: without `--stream`
+    /// msb held the output back until the command exited. A line reaches the log while the
+    /// command still runs.
+    #[test]
+    fn streams_each_line_to_the_log_while_the_command_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let go = dir.path().join("go");
+        let msb = fake(
+            dir.path(),
+            &format!(
+                "echo first\necho oops >&2\nwhile [ ! -e {go} ]; do sleep 0.05; done\nprintf last\nexit 4\n",
+                go = go.display()
+            ),
+        );
+        let log_path = dir.path().join("run.log");
+        let status = std::thread::scope(|scope| {
+            let running = scope.spawn(|| {
+                let mut log = std::fs::File::create(&log_path).unwrap();
+                msb.stream("abc-w", &[OsString::from("claude"), "-p".into()], &mut log)
+                    .unwrap()
+            });
+            let started = std::time::Instant::now();
+            while !std::fs::read_to_string(&log_path)
+                .is_ok_and(|text| text.contains("first\n") && text.contains("oops\n"))
+            {
+                assert!(
+                    started.elapsed() < std::time::Duration::from_secs(20),
+                    "no line reached the log while the command ran"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            assert!(!running.is_finished(), "the command is still running");
+            std::fs::write(&go, "").unwrap();
+            running.join().unwrap()
+        });
+        assert_eq!(status.code(), Some(4), "the command's exit status");
+        let text = std::fs::read_to_string(&log_path).unwrap();
+        assert!(
+            text.ends_with("last"),
+            "a last line without a newline: {text}"
+        );
+        assert!(
+            log(dir.path()).contains("exec --stream --no-stdin abc-w -- claude -p\n"),
+            "{}",
+            log(dir.path())
+        );
+        let missing = Msb {
+            exe: dir.path().join("none"),
+            home: dir.path().to_path_buf(),
+        };
+        assert!(
+            missing
+                .stream("abc-w", &[], &mut Vec::new())
+                .is_err_and(|error| error.to_string().contains("could not run"))
+        );
+    }
+
+    #[test]
+    fn measures_each_volume_by_the_blocks_it_takes() {
+        let dir = tempfile::tempdir().unwrap();
+        let msb = fake(dir.path(), "exit 0\n");
+        assert!(msb.volumes().unwrap().is_empty(), "no volumes yet");
+        let volumes = dir.path().join("home/volumes");
+        std::fs::create_dir_all(volumes.join("abc-w-target/nested")).unwrap();
+        std::fs::write(
+            volumes.join("abc-w-target/nested/disk"),
+            vec![7_u8; 1 << 20],
+        )
+        .unwrap();
+        // A sparse disk image: a gigabyte long, nothing written.
+        std::fs::File::create(volumes.join("abc-w-home"))
+            .unwrap()
+            .set_len(1 << 30)
+            .unwrap();
+        std::os::unix::fs::symlink("/", volumes.join("abc-w-tools")).unwrap();
+        let measured = msb.volumes().unwrap();
+        let names: Vec<&str> = measured.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(names, ["abc-w-home", "abc-w-target", "abc-w-tools"]);
+        let bytes = |name: &str| measured.iter().find(|(n, _)| n == name).unwrap().1;
+        assert!(bytes("abc-w-target") >= 1 << 20, "{measured:?}");
+        assert!(bytes("abc-w-home") < 1 << 20, "sparse: {measured:?}");
+        assert!(
+            bytes("abc-w-tools") < 1 << 20,
+            "a link is not followed: {measured:?}"
         );
     }
 }

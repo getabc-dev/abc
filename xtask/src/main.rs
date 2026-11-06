@@ -674,9 +674,11 @@ fn serve_tokens(exe: &Path, home: &Path, session: &str) -> anyhow::Result<ExitCo
     broker::refuse_checkout(exe)?;
     broker::check_session(session)?;
     let app = app::App::load(&app::config_dir()?)?;
+    let files = broker::files(home, session);
+    broker::stop_on_signals(files.control.clone())?;
     broker::serve(
         session,
-        &broker::sockets(home, session),
+        &files,
         |scope| app.token(app::GITHUB_API, scope),
         |token| app::revoke(app::GITHUB_API, token),
         broker::MAX_PER_HOUR,

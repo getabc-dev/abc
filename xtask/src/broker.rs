@@ -8,8 +8,11 @@
 //! session's sockets under [`DIR`]. The token socket is forwarded into the VM over vsock, where
 //! [`ENV`] names the guest end, and `cargo xtask git-credential` and `cargo xtask gh` ask it for a
 //! token per use. The control socket stays on the host: `cargo xtask vm stop` asks the broker
-//! there to revoke every token it minted and to exit. Each line the broker logs names its
-//! session, and it mints at most [`MAX_PER_HOUR`] tokens an hour.
+//! there to revoke every token it minted and to exit ([`shut_down`]). A broker that does not
+//! answer gets SIGTERM through the pid file it writes beside its sockets, and on SIGTERM it stops
+//! as if asked ([`stop_on_signals`]): it revokes its tokens and removes its sockets and pid file.
+//! Each line the broker logs names its session, and it mints at most [`MAX_PER_HOUR`] tokens an
+//! hour.
 //!
 //! The protocol is one line each way: the client sends a scope's name (`git` or `gh`), and the
 //! broker answers `token <token>`, a fresh installation token for that scope alone that expires
@@ -20,9 +23,10 @@ use std::collections::VecDeque;
 use std::ffi::OsString;
 use std::fs;
 use std::io::{BufRead as _, BufReader, Read, Write};
-use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
+use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _, PermissionsExt as _};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -37,8 +41,9 @@ pub(crate) const DIR: &str = ".config/abc/agent-broker";
 /// The most tokens one session's broker mints in an hour, the life of a token.
 pub(crate) const MAX_PER_HOUR: usize = 120;
 
-/// How long a client waits for the broker to stop, revoking its tokens.
-const STOP_PATIENCE: Duration = Duration::from_secs(60);
+/// How long `cargo xtask vm stop` waits for the broker to answer `stop`, revoking its tokens, and
+/// then for a broker that did not answer to exit after SIGTERM, before it kills it.
+pub(crate) const STOP_PATIENCE: Duration = Duration::from_secs(60);
 
 /// The variable naming the broker's socket where a client runs: inside an agent VM, the guest end
 /// of the vsock forward.
@@ -58,21 +63,30 @@ const MAX_REQUEST: u64 = 64;
 /// How many reads of a kilobyte the broker makes to drop what is left of a refused request.
 const MAX_DRAIN_READS: usize = 64;
 
-/// One session's broker sockets.
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) struct Sockets {
+/// One session's broker files: its sockets and its pid file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Files {
     /// Where the session's VM asks for tokens, forwarded into it.
     pub(crate) tokens: PathBuf,
     /// Where the host stops the broker; never forwarded.
     pub(crate) control: PathBuf,
+    /// The broker's process id, while it serves, for a stop it does not answer.
+    pub(crate) pid: PathBuf,
 }
 
-/// The sockets of session `session`'s broker under the home directory `home`.
-pub(crate) fn sockets(home: &Path, session: &str) -> Sockets {
+impl Files {
+    fn all(&self) -> [&Path; 3] {
+        [&self.tokens, &self.control, &self.pid]
+    }
+}
+
+/// The files of session `session`'s broker under the home directory `home`.
+pub(crate) fn files(home: &Path, session: &str) -> Files {
     let dir = home.join(DIR);
-    Sockets {
+    Files {
         tokens: dir.join(format!("{session}.sock")),
         control: dir.join(format!("{session}.ctl")),
+        pid: dir.join(format!("{session}.pid")),
     }
 }
 
@@ -190,23 +204,25 @@ impl Ledger {
     }
 }
 
-/// Serves session `session`'s tokens from `mint`, at most `limit` an hour, on `sockets` until a
-/// client of the control socket says `stop`; then revokes every token it minted with `revoke`,
-/// tells that client how many, and returns. Each request is noted in `log`.
+/// Serves session `session`'s tokens from `mint`, at most `limit` an hour, on the sockets of
+/// `files` until a client of the control socket says `stop`; then revokes every token it minted
+/// with `revoke`, tells that client how many, removes its files and returns. While it serves, its
+/// pid file names this process. Each request is noted in `log`.
 pub(crate) fn serve(
     session: &str,
-    sockets: &Sockets,
+    files: &Files,
     mint: impl Fn(Scope) -> anyhow::Result<String> + Sync,
     revoke: impl Fn(&str) -> anyhow::Result<()>,
     limit: usize,
     log: &mut (impl Write + Send),
 ) -> anyhow::Result<()> {
-    let tokens = bind(&sockets.tokens)?;
-    let control = bind(&sockets.control)?;
+    let tokens = bind(&files.tokens)?;
+    let control = bind(&files.control)?;
+    write_pid(&files.pid)?;
     writeln!(
         log,
         "broker {session}: serving agent App tokens on {}",
-        sockets.tokens.display()
+        files.tokens.display()
     )?;
     let log = Mutex::new(log);
     let ledger = Mutex::new(Ledger::default());
@@ -240,7 +256,7 @@ pub(crate) fn serve(
         let asker = await_stop(&control);
         stopping.store(true, Ordering::SeqCst);
         // Wakes the token loop, which then sees it is stopping.
-        let _woken = UnixStream::connect(&sockets.tokens);
+        let _woken = UnixStream::connect(&files.tokens);
         asker
     })?;
     let minted = std::mem::take(
@@ -252,11 +268,41 @@ pub(crate) fn serve(
     let revoked = minted.iter().filter(|token| revoke(token).is_ok()).count();
     let summary = format!("revoked {revoked} of {} tokens", minted.len());
     note_line(&log, &format!("broker {session}: stopped; {summary}"));
-    // The client may be gone; the tokens are revoked either way.
-    let _told = writeln!(asker, "stopped {summary}");
-    for socket in [&sockets.tokens, &sockets.control] {
-        let _removed = fs::remove_file(socket);
+    for file in files.all() {
+        let _removed = fs::remove_file(file);
     }
+    // The client may be gone; the tokens are revoked either way. It is told last, so that once it
+    // reads the answer the broker's files are gone.
+    let _told = writeln!(asker, "stopped {summary}");
+    Ok(())
+}
+
+/// Writes this process's id to `path`, readable only by its owner.
+fn write_pid(path: &Path) -> anyhow::Result<()> {
+    fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .mode(0o600)
+        .open(path)
+        .and_then(|mut file| writeln!(file, "{}", std::process::id()))
+        .with_context(|| format!("could not write {}", path.display()))
+}
+
+/// Makes SIGTERM, SIGINT and SIGHUP stop this broker as `stop` on its control socket `control`
+/// would: it revokes its tokens and removes its files before it exits. A signal that comes before
+/// the broker listens is retried on the next.
+pub(crate) fn stop_on_signals(control: PathBuf) -> anyhow::Result<()> {
+    use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
+    let mut signals = signal_hook::iterator::Signals::new([SIGTERM, SIGINT, SIGHUP])
+        .context("could not handle the stop signals")?;
+    std::thread::spawn(move || {
+        for _ in signals.forever() {
+            if stop_at(&control, STOP_PATIENCE).is_ok() {
+                break;
+            }
+        }
+    });
     Ok(())
 }
 
@@ -277,20 +323,162 @@ fn await_stop(control: &UnixListener) -> anyhow::Result<UnixStream> {
     bail!("the broker's control socket closed")
 }
 
-/// Stops the broker whose control socket is `control`, which revokes its tokens; returns what it
-/// says it revoked.
-pub(crate) fn stop(control: &Path) -> anyhow::Result<String> {
+/// Stops the broker whose control socket is `control`, which revokes its tokens, waiting
+/// `patience` for its answer; returns what it says it revoked.
+fn stop_at(control: &Path, patience: Duration) -> anyhow::Result<String> {
     let mut stream = UnixStream::connect(control)
         .with_context(|| format!("no broker listens on {}", control.display()))?;
-    stream.set_read_timeout(Some(STOP_PATIENCE))?;
+    stream.set_read_timeout(Some(patience))?;
     stream.write_all(b"stop\n")?;
     let mut answer = String::new();
-    BufReader::new(stream).read_line(&mut answer)?;
+    match BufReader::new(stream).read_line(&mut answer) {
+        Ok(_) => {}
+        // A read that times out says it would block (EAGAIN).
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+            bail!(
+                "the broker did not answer `stop` within {} s",
+                patience.as_secs()
+            )
+        }
+        Err(error) => return Err(error).context("could not read the broker's answer to `stop`"),
+    }
     answer
         .trim_end()
         .strip_prefix("stopped ")
         .map(str::to_owned)
         .with_context(|| format!("the broker did not stop: {answer:?}"))
+}
+
+/// Stops session `session`'s broker, whose files are `files`, so that none is left running and
+/// no file of it is left behind: asked on its control socket first, which revokes its tokens;
+/// when it does not answer within `patience`, SIGTERM to the pid its pid file names, once `ps`
+/// shows that process is still that session's broker, which stops it the same way; when it is
+/// still running `patience` later, SIGKILL, and its tokens expire within the hour. Returns what
+/// happened, for the user.
+pub(crate) fn shut_down(files: &Files, session: &str, patience: Duration) -> String {
+    let mut said = Vec::new();
+    if files.control.exists() {
+        match stop_at(&files.control, patience) {
+            Ok(summary) => {
+                said.push(format!("stopped the token broker; {summary}"));
+            }
+            Err(error) => said.push(format!("{error:#}")),
+        }
+    }
+    if said
+        .first()
+        .is_some_and(|first| first.starts_with("stopped"))
+    {
+        // It removes its own files; wait for it to finish.
+        await_gone(files, patience);
+    } else if let Some(pid) = read_pid(&files.pid) {
+        said.push(signal_broker(pid, session, patience));
+    }
+    let mut removed = Vec::new();
+    for file in files.all() {
+        if fs::remove_file(file).is_ok() {
+            removed.push(
+                file.file_name()
+                    .map_or_else(String::new, |name| name.to_string_lossy().into_owned()),
+            );
+        }
+    }
+    if !removed.is_empty() {
+        said.push(format!("removed its leftover {}", removed.join(", ")));
+    }
+    if said.is_empty() {
+        said.push(String::from("no token broker was running"));
+    }
+    said.join("; ")
+}
+
+/// Waits up to `patience` for the files of a broker that is stopping to go.
+fn await_gone(files: &Files, patience: Duration) {
+    let started = Instant::now();
+    while files.all().iter().any(|file| file.exists()) && started.elapsed() < patience {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// The process id in the pid file at `path`, if there is one.
+fn read_pid(path: &Path) -> Option<u32> {
+    fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
+/// Sends SIGTERM to `pid`, then SIGKILL if it is still running `patience` later, once `ps` shows
+/// it is session `session`'s broker; says what it did.
+fn signal_broker(pid: u32, session: &str, patience: Duration) -> String {
+    if !is_broker(pid, session) {
+        return format!("process {pid} is no longer the token broker of {session}; left alone");
+    }
+    if !signal(pid, "TERM") {
+        return format!("could not signal the token broker (pid {pid})");
+    }
+    let started = Instant::now();
+    while started.elapsed() < patience {
+        if !alive(pid) {
+            return format!("stopped the token broker (pid {pid}) with SIGTERM");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    if signal(pid, "KILL") {
+        format!(
+            "killed the token broker (pid {pid}), which outlived SIGTERM by {} s; its tokens \
+             were not revoked and expire within the hour",
+            patience.as_secs()
+        )
+    } else {
+        format!("could not kill the token broker (pid {pid})")
+    }
+}
+
+/// Whether process `pid` runs `broker --session <session>`, by its command line as `ps` shows it.
+fn is_broker(pid: u32, session: &str) -> bool {
+    let Ok(output) = Command::new("ps")
+        .args(["-o", "command=", "-p", &pid.to_string()])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+    else {
+        return false;
+    };
+    let command = String::from_utf8_lossy(&output.stdout);
+    let words: Vec<&str> = command.split_whitespace().collect();
+    output.status.success()
+        && words
+            .windows(3)
+            .any(|window| window == ["broker", "--session", session])
+}
+
+/// Whether process `pid` is still running: `kill -0` finds it, and `ps` does not show it as a
+/// zombie, which has exited but was not yet reaped.
+fn alive(pid: u32) -> bool {
+    let found = Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success());
+    found
+        && !Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .stdin(Stdio::null())
+            .output()
+            .is_ok_and(|output| {
+                String::from_utf8_lossy(&output.stdout)
+                    .trim()
+                    .starts_with('Z')
+            })
+}
+
+/// Sends `signal` to `pid` with `kill`; whether it was delivered.
+fn signal(pid: u32, signal: &str) -> bool {
+    Command::new("kill")
+        .args(["-s", signal, &pid.to_string()])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
 }
 
 /// Answers each of `clients` with a token from `mint`, each on its own thread and at most `max` at
@@ -447,10 +635,11 @@ mod tests {
     use std::os::unix::net::UnixStream;
     use std::path::Path;
     use std::sync::Mutex;
+    use std::time::Duration;
 
     use super::{
-        DIR, Ledger, Sockets, answer, answer_all, check_session, exchange, request, serve, sockets,
-        stop,
+        DIR, Files, Ledger, STOP_PATIENCE, answer, answer_all, check_session, exchange, files,
+        request, serve, stop_at,
     };
     use crate::app::Scope;
 
@@ -752,12 +941,13 @@ mod tests {
     }
 
     #[test]
-    fn each_session_has_its_own_sockets() {
+    fn each_session_has_its_own_files() {
         assert_eq!(
-            sockets(Path::new("/home/a"), "abc-w"),
-            Sockets {
+            files(Path::new("/home/a"), "abc-w"),
+            Files {
                 tokens: Path::new("/home/a").join(DIR).join("abc-w.sock"),
                 control: Path::new("/home/a").join(DIR).join("abc-w.ctl"),
+                pid: Path::new("/home/a").join(DIR).join("abc-w.pid"),
             }
         );
         check_session("abc-s0-microvm").unwrap();
@@ -785,9 +975,9 @@ mod tests {
             error,
             "2 tokens were minted in the last hour, the most a session gets"
         );
-        let almost = start + std::time::Duration::from_secs(3599);
+        let almost = start + Duration::from_secs(3599);
         assert!(ledger.admit(almost, 2).is_err(), "not yet an hour");
-        let later = start + std::time::Duration::from_secs(3600);
+        let later = start + Duration::from_secs(3600);
         ledger.admit(later, 2).unwrap();
         assert_eq!(ledger.recent.len(), 1, "the old ones aged out");
     }
@@ -798,15 +988,12 @@ mod tests {
         dir: &Path,
         limit: usize,
     ) -> (
-        Sockets,
+        Files,
         std::sync::Arc<Mutex<Vec<String>>>,
         std::thread::JoinHandle<String>,
     ) {
-        let sockets = sockets(dir, "abc-w");
-        let paths = Sockets {
-            tokens: sockets.tokens.clone(),
-            control: sockets.control.clone(),
-        };
+        let sockets = files(dir, "abc-w");
+        let paths = sockets.clone();
         let revoked = std::sync::Arc::new(Mutex::new(Vec::new()));
         let record = std::sync::Arc::clone(&revoked);
         let thread = std::thread::spawn(move || {
@@ -834,7 +1021,7 @@ mod tests {
             String::from_utf8(log).unwrap()
         });
         while UnixStream::connect(&sockets.control).is_err() {
-            std::thread::sleep(std::time::Duration::from_millis(10));
+            std::thread::sleep(Duration::from_millis(10));
         }
         (sockets, revoked, thread)
     }
@@ -858,6 +1045,12 @@ mod tests {
         let mode = |file: &Path| std::fs::metadata(file).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode(&sockets.tokens), 0o600, "the token socket");
         assert_eq!(mode(&sockets.control), 0o600, "the control socket");
+        assert_eq!(mode(&sockets.pid), 0o600, "the pid file");
+        assert_eq!(
+            std::fs::read_to_string(&sockets.pid).unwrap(),
+            format!("{}\n", std::process::id()),
+            "naming this process"
+        );
         assert_eq!(
             mode(sockets.tokens.parent().unwrap()),
             0o700,
@@ -868,7 +1061,10 @@ mod tests {
         let mut said = String::new();
         wrong.read_to_string(&mut said).unwrap();
         assert!(said.starts_with("error "), "{said}");
-        assert_eq!(stop(&sockets.control).unwrap(), "revoked 1 of 2 tokens");
+        assert_eq!(
+            stop_at(&sockets.control, STOP_PATIENCE).unwrap(),
+            "revoked 1 of 2 tokens"
+        );
         let log = thread.join().unwrap();
         assert_eq!(*revoked.lock().unwrap(), ["ghs_git0", "ghs_git1"]);
         assert!(log.contains("broker abc-w: minted a git token"), "{log}");
@@ -878,17 +1074,20 @@ mod tests {
         );
         assert!(!log.contains("ghs_"), "no token is logged: {log}");
         assert!(
-            !sockets.tokens.exists() && !sockets.control.exists(),
-            "sockets removed"
+            !sockets.tokens.exists() && !sockets.control.exists() && !sockets.pid.exists(),
+            "sockets and pid file removed"
         );
-        let gone = format!("{:#}", stop(&sockets.control).unwrap_err());
+        let gone = format!(
+            "{:#}",
+            stop_at(&sockets.control, STOP_PATIENCE).unwrap_err()
+        );
         assert!(gone.contains("no broker listens"), "{gone}");
     }
 
     #[test]
     fn refuses_a_second_broker_and_replaces_a_stale_socket() {
         let dir = tempfile::tempdir().unwrap();
-        let stale = sockets(dir.path(), "abc-w");
+        let stale = files(dir.path(), "abc-w");
         std::fs::create_dir_all(stale.tokens.parent().unwrap()).unwrap();
         drop(std::os::unix::net::UnixListener::bind(&stale.tokens).unwrap());
         let (sockets, _, thread) = broker(dir.path(), 5);
@@ -906,7 +1105,7 @@ mod tests {
             .unwrap_err()
         );
         assert!(again.contains("already listening"), "{again}");
-        stop(&sockets.control).unwrap();
+        stop_at(&sockets.control, STOP_PATIENCE).unwrap();
         thread.join().unwrap();
     }
 
@@ -927,7 +1126,141 @@ mod tests {
         let path = sockets.tokens.clone();
         let named = |name: &str| (name == super::ENV).then(|| path.clone().into_os_string());
         assert_eq!(super::token_from(named, Scope::Git).unwrap(), "ghs_git0");
-        stop(&sockets.control).unwrap();
+        stop_at(&sockets.control, STOP_PATIENCE).unwrap();
         thread.join().unwrap();
+    }
+
+    /// A stop signal stops the broker as `stop` does: tokens revoked, files removed.
+    #[test]
+    fn sigterm_stops_the_broker_as_stop_does() {
+        let dir = tempfile::tempdir().unwrap();
+        let (sockets, revoked, thread) = broker(dir.path(), 5);
+        assert_eq!(request(&sockets.tokens, Scope::Git).unwrap(), "ghs_git0");
+        super::stop_on_signals(sockets.control.clone()).unwrap();
+        // nextest runs each test in a process of its own, so this signals this test alone.
+        let sent = std::process::Command::new("kill")
+            .args(["-s", "TERM", &std::process::id().to_string()])
+            .status()
+            .unwrap();
+        assert!(sent.success());
+        let log = thread.join().unwrap();
+        assert!(
+            log.contains("broker abc-w: stopped; revoked 1 of 1 tokens"),
+            "{log}"
+        );
+        assert_eq!(*revoked.lock().unwrap(), ["ghs_git0"]);
+        for file in [&sockets.tokens, &sockets.control, &sockets.pid] {
+            assert!(!file.exists(), "{} is left behind", file.display());
+        }
+    }
+
+    /// A process that looks like session abc-w's broker to `ps`: it exits on SIGTERM unless
+    /// `stubborn`, and never answers on a control socket.
+    fn fake_broker(stubborn: bool) -> std::process::Child {
+        let trap = if stubborn { "''" } else { "'exit 0'" };
+        std::process::Command::new("sh")
+            .args([
+                "-c",
+                &format!("trap {trap} TERM; while :; do sleep 0.05; done"),
+                "sh",
+                "broker",
+                "--session",
+                "abc-w",
+            ])
+            .spawn()
+            .unwrap()
+    }
+
+    /// The files of a broker that hung, as on 2026-11-06: a control socket that takes the
+    /// connection and never answers, its token socket and its pid file naming `pid`.
+    fn hung(dir: &Path, pid: u32) -> (Files, std::os::unix::net::UnixListener) {
+        let files = files(dir, "abc-w");
+        std::fs::create_dir_all(files.control.parent().unwrap()).unwrap();
+        let control = std::os::unix::net::UnixListener::bind(&files.control).unwrap();
+        drop(std::os::unix::net::UnixListener::bind(&files.tokens).unwrap());
+        std::fs::write(&files.pid, format!("{pid}\n")).unwrap();
+        (files, control)
+    }
+
+    /// 2026-11-06: `vm stop` failed with `Resource temporarily unavailable`, because the broker
+    /// never answered `stop`, and it had to be stopped and its files deleted by hand. Now it gets
+    /// SIGTERM through its pid file, and nothing is left behind.
+    #[test]
+    fn a_broker_that_does_not_answer_is_stopped_with_sigterm() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut child = fake_broker(false);
+        let (files, _control) = hung(dir.path(), child.id());
+        let said = super::shut_down(&files, "abc-w", Duration::from_secs(1));
+        assert!(
+            said.starts_with("the broker did not answer `stop` within 1 s; ")
+                && said.contains(&format!(
+                    "stopped the token broker (pid {}) with SIGTERM",
+                    child.id()
+                ))
+                && said.ends_with("removed its leftover abc-w.sock, abc-w.ctl, abc-w.pid"),
+            "{said}"
+        );
+        assert!(child.wait().unwrap().success(), "it exited on SIGTERM");
+        for file in files.all() {
+            assert!(!file.exists(), "{} is left behind", file.display());
+        }
+    }
+
+    #[test]
+    fn a_broker_that_outlives_sigterm_is_killed() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut child = fake_broker(true);
+        let (files, _control) = hung(dir.path(), child.id());
+        let said = super::shut_down(&files, "abc-w", Duration::from_millis(500));
+        assert!(
+            said.contains(&format!(
+                "killed the token broker (pid {}), which outlived SIGTERM",
+                child.id()
+            )),
+            "{said}"
+        );
+        assert!(!child.wait().unwrap().success(), "killed");
+        assert!(files.all().iter().all(|file| !file.exists()));
+    }
+
+    #[test]
+    fn a_pid_that_is_not_the_broker_is_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut other = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let (files, control) = hung(dir.path(), other.id());
+        drop(control);
+        let said = super::shut_down(&files, "abc-w", Duration::from_secs(1));
+        assert!(
+            said.starts_with("no broker listens on ")
+                && said.contains(&format!(
+                    "process {} is no longer the token broker of abc-w; left alone",
+                    other.id()
+                ))
+                && said.ends_with("removed its leftover abc-w.sock, abc-w.ctl, abc-w.pid"),
+            "a stale socket and a reused pid: {said}"
+        );
+        assert!(other.try_wait().unwrap().is_none(), "never signalled");
+        other.kill().unwrap();
+        other.wait().unwrap();
+        assert_eq!(
+            super::shut_down(&files, "abc-w", Duration::from_secs(1)),
+            "no token broker was running"
+        );
+    }
+
+    #[test]
+    fn shutting_down_a_broker_that_answers_asks_it_and_waits_for_its_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let (sockets, revoked, thread) = broker(dir.path(), 5);
+        request(&sockets.tokens, Scope::Git).unwrap();
+        assert_eq!(
+            super::shut_down(&sockets, "abc-w", STOP_PATIENCE),
+            "stopped the token broker; revoked 1 of 1 tokens"
+        );
+        thread.join().unwrap();
+        assert_eq!(revoked.lock().unwrap().len(), 1);
     }
 }

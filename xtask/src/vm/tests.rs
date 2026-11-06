@@ -26,6 +26,8 @@ struct Fake {
     stdin: RefCell<Vec<Vec<u8>>>,
     /// Whether the VM's git refuses the commits `vm push` sends.
     refuses_push: bool,
+    /// What the backend's volumes are and take.
+    volumes: Vec<(String, u64)>,
 }
 
 fn output(code: i32, stdout: &str) -> Output {
@@ -95,11 +97,28 @@ impl Backend for Fake {
         Ok(())
     }
 
+    fn stream(
+        &self,
+        name: &str,
+        command: &[OsString],
+        log: &mut dyn std::io::Write,
+    ) -> anyhow::Result<ExitStatus> {
+        self.calls
+            .borrow_mut()
+            .push(format!("stream {name} {}", shown(command)));
+        log.write_all(b"one\ntwo\n")?;
+        Ok(ExitStatus::from_raw(6 << 8))
+    }
+
     fn remove_volumes(&self, names: &[String]) -> anyhow::Result<()> {
         self.calls
             .borrow_mut()
             .push(format!("remove_volumes {}", names.join(" ")));
         Ok(())
+    }
+
+    fn volumes(&self) -> anyhow::Result<Vec<(String, u64)>> {
+        Ok(self.volumes.clone())
     }
 
     fn list(&self) -> anyhow::Result<String> {
@@ -132,9 +151,9 @@ struct World {
 
 /// A broker for session `abc-w` under `home` that answers every stop as the real one does.
 fn fake_broker(home: &Path) -> std::thread::JoinHandle<()> {
-    let sockets = crate::broker::sockets(home, "abc-w");
-    std::fs::create_dir_all(sockets.control.parent().unwrap()).unwrap();
-    let control = UnixListener::bind(&sockets.control).unwrap();
+    let files = crate::broker::files(home, "abc-w");
+    std::fs::create_dir_all(files.control.parent().unwrap()).unwrap();
+    let control = UnixListener::bind(&files.control).unwrap();
     std::thread::spawn(move || {
         for client in control.incoming() {
             let Ok(mut client) = client else { return };
@@ -206,6 +225,8 @@ fn world(token: &str) -> World {
         ),
         builder: root.join("container"),
         patience: 3,
+        broker_patience: std::time::Duration::from_millis(200),
+        github_cli: root.join("gh"),
         // Scratch worktrees live in the system's temporary directory, which the production policy
         // reserves on Linux; the policy itself is tested on its own.
         reserved: Vec::new(),
@@ -313,10 +334,7 @@ fn starts_a_session_with_its_token_and_checks_the_subscription() {
     );
     assert_eq!(
         spec.vsock,
-        (
-            crate::broker::sockets(&world.host.home, "abc-w").tokens,
-            5000
-        ),
+        (crate::broker::files(&world.host.home, "abc-w").tokens, 5000),
         "the session's own broker"
     );
     let env: Vec<String> = spec.env.iter().map(|(k, v)| format!("{k}={v}")).collect();
@@ -620,6 +638,240 @@ fn shells_auths_syncs_lists_and_stops() {
     assert!(
         calls.contains(&"remove_volumes abc-w-target abc-w-tools abc-w-home".to_owned()),
         "{calls:?}"
+    );
+}
+
+#[test]
+fn runs_a_command_into_a_log_without_a_terminal() {
+    let world = world("t");
+    let backend = subscribed();
+    start_ok(&world, &backend);
+    let log = world.root.join("logs/run.log");
+    let run = || {
+        act(
+            &world,
+            &backend,
+            Action::Run {
+                worktree: world.worktree.clone(),
+                log: log.clone(),
+                command: vec!["claude".into(), "-p".into(), "hi".into()],
+            },
+        )
+    };
+    let missing = format!("{:#}", run().0.unwrap_err());
+    assert!(missing.starts_with("could not create "), "{missing}");
+    std::fs::create_dir(world.root.join("logs")).unwrap();
+    std::fs::write(&log, "an older run\n").unwrap();
+    let (code, out) = run();
+    assert_eq!(code.unwrap(), ExitCode::from(6), "the command's exit code");
+    assert_eq!(out, "", "the output goes to the log alone");
+    assert_eq!(
+        std::fs::read_to_string(&log).unwrap(),
+        "one\ntwo\n",
+        "the log is the run's own"
+    );
+    assert!(
+        backend
+            .calls
+            .borrow()
+            .contains(&"stream abc-w agent-exec claude -p hi".to_owned()),
+        "as the agent: {:?}",
+        backend.calls.borrow()
+    );
+}
+
+/// The worktree's commit, as `vm gc` compares it with a merged pull request's.
+fn head(worktree: &Path) -> String {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(worktree)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .unwrap();
+    String::from_utf8(output.stdout).unwrap().trim().to_owned()
+}
+
+/// A GitHub CLI that lists the pull request merged from `feature` as `merged`, a JSON list, and
+/// none from any other branch.
+fn github_merged(world: &World, merged: &str) {
+    script(
+        &world.host.github_cli,
+        &format!(
+            "[ \"$1 $2 $3 $4 $5\" = 'pr list --state merged --head' ] || exit 9\n\
+             [ \"$7 $8\" = '--json number,headRefOid' ] || exit 9\n\
+             [ \"$6\" = feature ] && echo '{merged}' || echo '[]'\n"
+        ),
+    );
+}
+
+fn gc(world: &World, backend: &Fake, yes: bool) -> String {
+    let (result, out) = act(world, backend, Action::Gc { yes });
+    result.unwrap();
+    out
+}
+
+/// 233 GB sat in the disks of finished sessions, three of them merged PRs' target disks of about
+/// 57 GB. `vm gc` lists the sessions whose worktree is gone or whose branch GitHub merged, with
+/// their disk, and purges them only with --yes.
+#[test]
+fn gc_lists_finished_sessions_and_purges_them_only_when_told() {
+    let world = world("t");
+    let backend = Fake {
+        volumes: vec![
+            ("abc-w-target".to_owned(), 57_000_000_000),
+            ("abc-w-tools".to_owned(), 2_000_000_000),
+            ("abc-w-home".to_owned(), 300_000_000),
+            ("abc-gone-target".to_owned(), 41_250_000_000),
+            ("abc-gone-home".to_owned(), 100_000_000),
+            ("someone-elses".to_owned(), 9_000_000_000),
+        ],
+        ..subscribed()
+    };
+    start_ok(&world, &backend);
+    std::fs::create_dir_all(world.root.join("state/old/git")).unwrap();
+    github_merged(
+        &world,
+        &format!(
+            "[{{\"number\":32,\"headRefOid\":\"{}\"}}]",
+            head(&world.worktree)
+        ),
+    );
+    let listed = gc(&world, &backend, false);
+    assert_eq!(
+        listed,
+        "abc-gone\t41.3 GB\tits worktree is gone\n\
+         abc-old\t0.0 GB\tits worktree is gone\n\
+         abc-w\t59.3 GB\tfeature merged in #32\n\
+         vm gc: 3 finished sessions hold 100.6 GB; `cargo xtask vm gc --yes` purges them\n"
+    );
+    assert!(
+        !backend
+            .calls
+            .borrow()
+            .iter()
+            .any(|call| call.starts_with("remove")),
+        "nothing purged without --yes"
+    );
+    let purged = gc(&world, &backend, true);
+    assert!(purged.contains("vm gc: purged abc-gone; "), "{purged}");
+    assert!(purged.ends_with("vm gc: freed 100.6 GB\n"), "{purged}");
+    let calls = backend.calls.borrow();
+    for name in ["abc-gone", "abc-old", "abc-w"] {
+        assert!(calls.contains(&format!("remove {name}")), "{calls:?}");
+        assert!(
+            calls.contains(&format!(
+                "remove_volumes {name}-target {name}-tools {name}-home"
+            )),
+            "{calls:?}"
+        );
+    }
+    assert!(!world.root.join("state/w").exists(), "as stop --purge does");
+    assert!(!world.root.join("state/old").exists());
+}
+
+#[test]
+fn gc_keeps_running_and_unmerged_sessions_and_commits_made_after_the_merge() {
+    let world = world("t");
+    let volumes = vec![("abc-w-target".to_owned(), 1_000_000_000)];
+    let backend = Fake {
+        volumes: volumes.clone(),
+        ..subscribed()
+    };
+    start_ok(&world, &backend);
+    let commit = head(&world.worktree);
+    let none = "vm gc: no finished session to purge\n";
+    github_merged(&world, "[]");
+    assert_eq!(gc(&world, &backend, true), none, "not merged");
+    github_merged(
+        &world,
+        "[{\"number\":7,\"headRefOid\":\"0123456789012345678901234567890123456789\"}]",
+    );
+    assert_eq!(
+        gc(&world, &backend, true),
+        none,
+        "merged at another commit: the worktree has commits since"
+    );
+    github_merged(
+        &world,
+        &format!("[{{\"number\":7,\"headRefOid\":\"{commit}\"}}]"),
+    );
+    let running = Fake {
+        running: true,
+        volumes,
+        ..subscribed()
+    };
+    assert_eq!(gc(&world, &running, true), none, "running");
+    // The VM committed after the merge: its repository's branch moved on.
+    let repo = world.root.join("state/w/git");
+    let empty = std::process::Command::new("git")
+        .arg("--git-dir")
+        .arg(&repo)
+        .args([
+            "commit-tree",
+            "-m",
+            "made in the VM",
+            "-p",
+            "refs/heads/feature",
+            "refs/heads/feature^{tree}",
+        ])
+        .env("GIT_AUTHOR_NAME", "a")
+        .env("GIT_AUTHOR_EMAIL", "a@example.com")
+        .env("GIT_COMMITTER_NAME", "a")
+        .env("GIT_COMMITTER_EMAIL", "a@example.com")
+        .output()
+        .unwrap();
+    assert!(empty.status.success(), "{empty:?}");
+    let later = String::from_utf8(empty.stdout).unwrap();
+    let updated = std::process::Command::new("git")
+        .arg("--git-dir")
+        .arg(&repo)
+        .args(["update-ref", "refs/heads/feature", later.trim()])
+        .status()
+        .unwrap();
+    assert!(updated.success());
+    assert_eq!(
+        gc(&world, &backend, true),
+        none,
+        "the VM's commits after the merge are kept"
+    );
+    script(&world.host.github_cli, "echo 'not logged in' >&2\nexit 4\n");
+    let failed = format!(
+        "{:#}",
+        act(&world, &backend, Action::Gc { yes: true })
+            .0
+            .unwrap_err()
+    );
+    assert!(
+        failed.ends_with("pr list failed: not logged in"),
+        "{failed}"
+    );
+    assert!(
+        !backend
+            .calls
+            .borrow()
+            .iter()
+            .any(|call| call.starts_with("remove")),
+        "nothing purged"
+    );
+}
+
+#[test]
+fn stop_says_what_became_of_the_broker() {
+    let world = world("t");
+    let backend = subscribed();
+    let (result, out) = act(
+        &world,
+        &backend,
+        Action::Stop {
+            worktree: world.worktree.clone(),
+            purge: false,
+        },
+    );
+    result.unwrap();
+    assert!(
+        out.starts_with("vm: stopped the token broker; revoked 0 of 0 tokens")
+            && out.ends_with(&format!("vm: stopped {}\n", world.worktree.display())),
+        "{out}"
     );
 }
 

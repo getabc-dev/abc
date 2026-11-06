@@ -33,10 +33,22 @@ pub(crate) enum Action {
     /// Start the session for WORKTREE: its git repository, its VM with Postgres, the Claude Code
     /// subscription token from the keychain, and a check that Claude Code uses only that.
     Start { worktree: PathBuf },
-    /// Run COMMAND in the session as the agent; Claude Code when none is given.
+    /// Run COMMAND in the session as the agent; Claude Code when none is given. With a terminal
+    /// this is the interactive way in; `vm run` drives a session from a script.
     Shell {
         worktree: PathBuf,
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        command: Vec<OsString>,
+    },
+    /// Run COMMAND in the session as the agent with no pseudo-terminal, writing its stdout and
+    /// stderr to LOG line by line while it runs, and exit with its status:
+    /// `vm run <worktree> --log run.log -- claude -p "..."`.
+    Run {
+        worktree: PathBuf,
+        /// The file the output goes to, replaced if it exists.
+        #[arg(long)]
+        log: PathBuf,
+        #[arg(last = true, required = true)]
         command: Vec<OsString>,
     },
     /// Show how Claude Code in the session is signed in, without secrets.
@@ -46,12 +58,18 @@ pub(crate) enum Action {
     /// Bring the worktree branch's commits made on the host into the running session's
     /// repository, fast-forward only; refuses when the session's branch has diverged.
     Push { worktree: PathBuf },
-    /// Stop the session's VM and delete it with its logs; --purge also deletes its volumes and
-    /// git repository.
+    /// Stop the session's VM and its token broker, and delete the VM with its logs; --purge also
+    /// deletes its volumes and git repository.
     Stop {
         worktree: PathBuf,
         #[arg(long)]
         purge: bool,
+    },
+    /// List the sessions that are not running and whose worktree is gone or whose branch GitHub
+    /// merged, with the disk their volumes take; --yes purges them as `vm stop --purge` does.
+    Gc {
+        #[arg(long)]
+        yes: bool,
     },
     /// Build the agent image from xtask/vm/Containerfile and load it into microsandbox.
     Image,
@@ -61,6 +79,9 @@ pub(crate) enum Action {
     #[command(hide = true)]
     Billing,
 }
+
+/// The GitHub CLI, which `vm gc` asks which branches GitHub merged.
+const GITHUB_CLI: &str = "gh";
 
 /// The image every session runs.
 const IMAGE: &str = "abc-agent:latest";
@@ -103,6 +124,14 @@ pub(crate) struct Volume {
     pub(crate) size: &'static str,
 }
 
+/// The names of session `session`'s volumes.
+fn volume_names(session: &str) -> Vec<String> {
+    volumes(Path::new("/"))
+        .iter()
+        .map(|volume| format!("{session}-{}", volume.name))
+        .collect()
+}
+
 /// The volumes of a session in `worktree`.
 fn volumes(worktree: &Path) -> Vec<Volume> {
     vec![
@@ -133,9 +162,19 @@ pub(crate) trait Backend {
     /// Runs `command` as root in VM `name` with this process's stdin, stdout and stderr. With
     /// `tty` the VM gives it a pseudo-terminal; without, the streams pass through as they are.
     fn attach(&self, name: &str, command: &[OsString], tty: bool) -> anyhow::Result<ExitStatus>;
+    /// Runs `command` as root in VM `name` with no stdin and no pseudo-terminal, writing its
+    /// stdout and stderr to `log` a line at a time as they come.
+    fn stream(
+        &self,
+        name: &str,
+        command: &[OsString],
+        log: &mut dyn Write,
+    ) -> anyhow::Result<ExitStatus>;
     /// Stops and deletes VM `name` with its logs; a VM that is gone is fine.
     fn remove(&self, name: &str) -> anyhow::Result<()>;
     fn remove_volumes(&self, names: &[String]) -> anyhow::Result<()>;
+    /// Every volume's name and the bytes it takes on the host's disk.
+    fn volumes(&self) -> anyhow::Result<Vec<(String, u64)>>;
     fn list(&self) -> anyhow::Result<String>;
     fn load_image(&self, archive: &mut dyn Read, tag: &str) -> anyhow::Result<()>;
 }
@@ -200,6 +239,10 @@ pub(crate) struct Host {
     pub(crate) builder: PathBuf,
     /// How long to wait for a VM, in tries a fifth of a second apart.
     pub(crate) patience: u32,
+    /// How long to wait for a token broker to stop when asked, then after SIGTERM.
+    pub(crate) broker_patience: Duration,
+    /// The GitHub CLI, which says which branches GitHub merged.
+    pub(crate) github_cli: PathBuf,
     /// Guest directories no mount may cover: [`RESERVED`].
     pub(crate) reserved: Vec<PathBuf>,
     /// Whether stdin is a terminal: `shell` attaches a pseudo-terminal only then, so a headless
@@ -230,6 +273,8 @@ impl Host {
             secret: (PathBuf::from(program), args),
             builder: PathBuf::from(os.builder()),
             patience: 150,
+            broker_patience: crate::broker::STOP_PATIENCE,
+            github_cli: PathBuf::from(GITHUB_CLI),
             reserved: RESERVED.iter().map(PathBuf::from).collect(),
             terminal: std::io::stdin().is_terminal(),
         })
@@ -323,15 +368,20 @@ pub(crate) fn run(
             let session = Session::open(&worktree, &host.repo, &host.state)?;
             writeln!(out, "vm: {}", push(&session, backend)?)?;
         }
-        Action::Stop { worktree, purge } => {
-            stop(
-                &Session::open(&worktree, &host.repo, &host.state)?,
-                host,
-                backend,
-                purge,
-            )?;
-            writeln!(out, "vm: stopped {}", worktree.display())?;
+        Action::Run {
+            worktree,
+            log,
+            command,
+        } => {
+            let session = Session::open(&worktree, &host.repo, &host.state)?;
+            return run_logged(&session, backend, command, &log);
         }
+        Action::Stop { worktree, purge } => {
+            let session = Session::open(&worktree, &host.repo, &host.state)?;
+            let broker = stop(&session.name, &session.state, host, backend, purge)?;
+            writeln!(out, "vm: {broker}\nvm: stopped {}", worktree.display())?;
+        }
+        Action::Gc { yes } => gc(host, backend, yes, out)?,
         Action::Image => image(host, backend, out)?,
         Action::Ls => write!(out, "{}", backend.list()?)?,
         Action::Billing => billing(env)?,
@@ -358,8 +408,8 @@ fn start(
 ) -> anyhow::Result<()> {
     let token = subscription_token(host)?;
     check_mount_paths(&[&session.worktree, &session.common], &host.reserved)?;
-    let sockets = crate::broker::sockets(&host.home, &session.name);
-    ensure_broker(host, &session.name, &sockets)?;
+    let broker = crate::broker::files(&host.home, &session.name);
+    ensure_broker(host, &session.name, &broker)?;
     if backend.is_running(&session.name)? {
         writeln!(
             out,
@@ -379,7 +429,7 @@ fn start(
             &std::fs::read_to_string(host.repo.join(egress::FILE))
                 .with_context(|| format!("could not read {}", egress::FILE))?,
         )?;
-        backend.start(&spec(session, &sockets.tokens, egress))?;
+        backend.start(&spec(session, &broker.tokens, egress))?;
     }
     wait_ready(session, backend, host.patience)?;
     let handed = backend.exec(
@@ -462,14 +512,10 @@ fn subscription_token(host: &Host) -> anyhow::Result<Vec<u8>> {
     Ok(token)
 }
 
-/// Makes sure session `session`'s token broker listens on `sockets`, starting the installed one
-/// when it does not.
-fn ensure_broker(
-    host: &Host,
-    session: &str,
-    sockets: &crate::broker::Sockets,
-) -> anyhow::Result<()> {
-    let listening = || std::os::unix::net::UnixStream::connect(&sockets.control).is_ok();
+/// Makes sure session `session`'s token broker listens on the sockets of `files`, starting the
+/// installed one when it does not.
+fn ensure_broker(host: &Host, session: &str, files: &crate::broker::Files) -> anyhow::Result<()> {
+    let listening = || std::os::unix::net::UnixStream::connect(&files.control).is_ok();
     if listening() {
         return Ok(());
     }
@@ -600,6 +646,22 @@ fn shell(
     Ok(ExitCode::from(crate::tools::status_code(status)))
 }
 
+/// `vm run`: runs `command` in `session` as the agent with no pseudo-terminal, its output going to
+/// the file `log` a line at a time while it runs; exits with its status.
+fn run_logged(
+    session: &Session,
+    backend: &dyn Backend,
+    command: Vec<OsString>,
+    log: &Path,
+) -> anyhow::Result<ExitCode> {
+    let mut file = std::fs::File::create(log)
+        .with_context(|| format!("could not create {}", log.display()))?;
+    let mut full = vec![OsString::from("agent-exec")];
+    full.extend(command);
+    let status = backend.stream(&session.name, &full, &mut file)?;
+    Ok(ExitCode::from(crate::tools::status_code(status)))
+}
+
 /// Brings the worktree branch's new commits into the running VM of `session`: the VM's own git
 /// fetches them from a bundle piped in, so the host never runs git in the repository the VM is
 /// writing. Returns what changed, for the user.
@@ -633,27 +695,172 @@ fn push(session: &Session, backend: &dyn Backend) -> anyhow::Result<String> {
     ))
 }
 
-fn stop(session: &Session, host: &Host, backend: &dyn Backend, purge: bool) -> anyhow::Result<()> {
-    let control = crate::broker::sockets(&host.home, &session.name).control;
-    if control.exists() {
-        crate::broker::stop(&control).context("could not stop the session's token broker")?;
-    }
-    backend.remove(&session.name)?;
+/// Stops session `name`'s token broker and VM, and deletes the VM; with `purge`, also its volumes
+/// and its directory `state`. A broker that does not answer is stopped by signal, so this always
+/// stops ([`crate::broker::shut_down`]). Returns what happened to the broker, for the user.
+fn stop(
+    name: &str,
+    state: &Path,
+    host: &Host,
+    backend: &dyn Backend,
+    purge: bool,
+) -> anyhow::Result<String> {
+    let broker = crate::broker::shut_down(
+        &crate::broker::files(&host.home, name),
+        name,
+        host.broker_patience,
+    );
+    backend.remove(name)?;
     if purge {
-        let names: Vec<String> = volumes(&session.worktree)
-            .iter()
-            .map(|volume| format!("{}-{}", session.name, volume.name))
-            .collect();
-        backend.remove_volumes(&names)?;
-        match std::fs::remove_dir_all(&session.state) {
+        backend.remove_volumes(&volume_names(name))?;
+        match std::fs::remove_dir_all(state) {
             Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
-                return Err(error)
-                    .with_context(|| format!("could not delete {}", session.state.display()));
+                return Err(error).with_context(|| format!("could not delete {}", state.display()));
             }
             _ => {}
         }
     }
+    Ok(broker)
+}
+
+/// Why `vm gc` purges a session.
+#[derive(Debug, PartialEq, Eq)]
+enum Finished {
+    /// No worktree of the main clone is named for it.
+    WorktreeGone,
+    /// GitHub merged pull request `number` from its worktree's branch, at the commit the worktree
+    /// and the session's own repository are at.
+    Merged { branch: String, number: u64 },
+}
+
+/// `vm gc`: lists the sessions that are not running and are finished, with the disk their
+/// volumes take, and purges them with `yes`.
+///
+/// "Merged" is GitHub's merged state of a pull request from the worktree's branch, not ancestry
+/// in `origin/main`: pull requests are squash-merged, so a merged branch's commits are never
+/// ancestors of main. The pull request must have been merged at the commit both the worktree's
+/// branch and the session's own repository are at, so commits made after the merge, on the host
+/// or in the VM, are never purged.
+fn gc(host: &Host, backend: &dyn Backend, yes: bool, out: &mut impl Write) -> anyhow::Result<()> {
+    let worktrees = session::worktrees(&host.repo)?;
+    let volumes = backend.volumes()?;
+    let mut names: std::collections::BTreeSet<String> = volumes
+        .iter()
+        .filter_map(|(volume, _)| {
+            volume_names("")
+                .iter()
+                .find_map(|suffix| volume.strip_suffix(suffix.as_str()))
+                .filter(|name| crate::broker::check_session(name).is_ok())
+                .map(str::to_owned)
+        })
+        .collect();
+    if let Ok(entries) = std::fs::read_dir(&host.state) {
+        for entry in entries.filter_map(Result::ok) {
+            if entry.path().is_dir() {
+                let name = format!("abc-{}", entry.file_name().to_string_lossy());
+                if crate::broker::check_session(&name).is_ok() {
+                    names.insert(name);
+                }
+            }
+        }
+    }
+    let mut finished = Vec::new();
+    for name in names {
+        if backend.is_running(&name)? {
+            continue;
+        }
+        let state = host.state.join(name.trim_start_matches("abc-"));
+        let why = match worktrees.iter().find(|worktree| worktree.session == name) {
+            None => Some(Finished::WorktreeGone),
+            Some(worktree) => merged(host, worktree, &state)?,
+        };
+        if let Some(why) = why {
+            let bytes: u64 = volumes
+                .iter()
+                .filter(|(volume, _)| volume_names(&name).contains(volume))
+                .map(|(_, bytes)| bytes)
+                .sum();
+            finished.push((name, state, why, bytes));
+        }
+    }
+    if finished.is_empty() {
+        writeln!(out, "vm gc: no finished session to purge")?;
+        return Ok(());
+    }
+    for (name, _, why, bytes) in &finished {
+        let why = match why {
+            Finished::WorktreeGone => String::from("its worktree is gone"),
+            Finished::Merged { branch, number } => format!("{branch} merged in #{number}"),
+        };
+        writeln!(out, "{name}\t{}\t{why}", size(*bytes))?;
+    }
+    let total = size(finished.iter().map(|(.., bytes)| bytes).sum());
+    if !yes {
+        writeln!(
+            out,
+            "vm gc: {} finished sessions hold {total}; `cargo xtask vm gc --yes` purges them",
+            finished.len()
+        )?;
+        return Ok(());
+    }
+    for (name, state, ..) in &finished {
+        let broker = stop(name, state, host, backend, true)?;
+        writeln!(out, "vm gc: purged {name}; {broker}")?;
+    }
+    writeln!(out, "vm gc: freed {total}")?;
     Ok(())
+}
+
+/// A pull request GitHub merged, as its CLI lists it.
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Pull {
+    number: u64,
+    head_ref_oid: String,
+}
+
+/// Why `worktree`'s session, whose state is `state`, is finished, if GitHub merged its branch at
+/// the commit the worktree and the session's repository are at.
+fn merged(
+    host: &Host,
+    worktree: &session::Worktree,
+    state: &Path,
+) -> anyhow::Result<Option<Finished>> {
+    let Some(branch) = &worktree.branch else {
+        return Ok(None);
+    };
+    let program = host.github_cli.display();
+    let output = Command::new(&host.github_cli)
+        .args(["pr", "list", "--state", "merged", "--head", branch])
+        .args(["--json", "number,headRefOid", "--limit", "1"])
+        .current_dir(&host.repo)
+        .stdin(Stdio::null())
+        .output()
+        .with_context(|| format!("could not run {program}"))?;
+    ensure!(
+        output.status.success(),
+        "{program} pr list failed: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    let pulls: Vec<Pull> = serde_json::from_slice(&output.stdout)
+        .with_context(|| format!("{program} pr list printed no list of pull requests"))?;
+    let Some(pull) = pulls.into_iter().next() else {
+        return Ok(None);
+    };
+    let at_merge = |commit: Option<String>| commit.is_none_or(|commit| commit == pull.head_ref_oid);
+    Ok(
+        (worktree.commit == pull.head_ref_oid && at_merge(session::branch_commit(state, branch)?))
+            .then(|| Finished::Merged {
+                branch: branch.clone(),
+                number: pull.number,
+            }),
+    )
+}
+
+/// `bytes` in gigabytes, to a tenth.
+fn size(bytes: u64) -> String {
+    let tenths = bytes / 100_000_000;
+    format!("{}.{} GB", tenths / 10, tenths % 10)
 }
 
 /// Builds the agent image with the host's OCI builder and loads it into the backend.

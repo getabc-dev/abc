@@ -555,6 +555,81 @@ fn slug(name: &str) -> String {
         .to_owned()
 }
 
+/// A worktree of the main clone, as `vm gc` sees it.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Worktree {
+    /// The name of its session's VM.
+    pub(crate) session: String,
+    /// The branch checked out in it, without `refs/heads/`; none when its HEAD is detached.
+    pub(crate) branch: Option<String>,
+    /// The commit checked out in it.
+    pub(crate) commit: String,
+}
+
+/// The linked worktrees of the main clone `main`, from `git worktree list --porcelain`: the host's
+/// own record, never a file a VM can write.
+pub(crate) fn worktrees(main: &Path) -> anyhow::Result<Vec<Worktree>> {
+    let mut command = Command::new("git");
+    command
+        .arg("-C")
+        .arg(main)
+        .args(["worktree", "list", "--porcelain"]);
+    let listing = run(command, "worktree list")?;
+    let mut worktrees = Vec::new();
+    // The first entry is the main clone itself.
+    for entry in listing.split("\n\n").skip(1) {
+        let mut session = None;
+        let mut branch = None;
+        let mut commit = None;
+        for line in entry.lines() {
+            if let Some(path) = line.strip_prefix("worktree ") {
+                session = Path::new(path)
+                    .file_name()
+                    .and_then(OsStr::to_str)
+                    .map(slug)
+                    .filter(|slug| !slug.is_empty())
+                    .map(|slug| format!("abc-{slug}"));
+            } else if let Some(name) = line.strip_prefix("branch refs/heads/") {
+                branch = Some(name.to_owned());
+            } else if let Some(head) = line.strip_prefix("HEAD ") {
+                commit = Some(head.to_owned());
+            }
+        }
+        if let (Some(session), Some(commit)) = (session, commit) {
+            worktrees.push(Worktree {
+                session,
+                branch,
+                commit,
+            });
+        }
+    }
+    Ok(worktrees)
+}
+
+/// The commit of `branch` in the session repository under the session directory `state`; none
+/// when there is no such repository or branch. The VM can write that repository, so it is read
+/// only through [`sealed`] git.
+pub(crate) fn branch_commit(state: &Path, branch: &str) -> anyhow::Result<Option<String>> {
+    let repo = state.join("git");
+    if !repo.is_dir() {
+        return Ok(None);
+    }
+    let output = sealed(&repo)
+        .args(["rev-parse", "--verify", "--quiet", "--end-of-options"])
+        .arg(format!("refs/heads/{branch}^{{commit}}"))
+        .output()
+        .context("could not run git")?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    Ok(Some(
+        String::from_utf8(output.stdout)
+            .context("git printed text that is not UTF-8")?
+            .trim()
+            .to_owned(),
+    ))
+}
+
 /// The first twelve characters of a commit's name.
 pub(crate) fn short(commit: &str) -> &str {
     commit.get(..12).unwrap_or(commit)

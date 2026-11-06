@@ -98,6 +98,13 @@ cargo xtask check --changed  # the same, limited to the crates your change affec
 cargo xtask pnpm exec biome check --write   # format the web app and apply Biome's safe fixes
 ```
 
+Run gates one at a time, in the foreground. `check`, `coverage`, `mutants`, `fuzz` and `e2e`
+share one lock, `target/gate.lock`: a second gate waits for the first and says once which gate it
+waits for, and the Stop hook sends the agent back to wait rather than start `check` beside
+another gate. The lock is the operating system's, so a gate that was killed leaves nothing that
+blocks the next. Two gates at once do not fit in an agent VM's memory: in S0 PR 5a the
+out-of-memory killer took the linker, twice.
+
 CI runs more gates on every PR: End-to-end (`cargo xtask e2e`), Integrity, Coverage, Mutants, a
 Gemini review and the dependency, secret and workflow scans. The Commands section of [AGENTS.md](AGENTS.md#commands) lists them with
 the command behind each.
@@ -186,11 +193,33 @@ Per session:
 git worktree add ../abc-my-change -b agent/my-change origin/main
 cargo xtask vm start ../abc-my-change    # starts the broker if needed; a few seconds
 cargo xtask vm shell ../abc-my-change    # Claude Code as the agent; add `bash` for a shell
+cargo xtask vm run ../abc-my-change --log run.log -- claude -p "..."
+                                         # no terminal needed: the output reaches run.log line by
+                                         # line while it runs, and it exits with the command's status
 cargo xtask vm auth ../abc-my-change     # how Claude Code is signed in, without secrets
 cargo xtask vm sync ../abc-my-change     # move the worktree's branch to the VM's commits
 cargo xtask vm push ../abc-my-change     # bring commits made on the host into the running VM
 cargo xtask vm stop ../abc-my-change     # revokes its tokens; --purge also drops its volumes
+cargo xtask vm gc                        # lists stopped sessions whose worktree is gone or whose
+                                         # branch GitHub merged, with their disk; --yes purges them
 ```
+
+`vm shell` is the interactive way in. To drive a session from a script or another agent, use
+`vm run`: it needs no pseudo-terminal, so no `script` wrapper, and writes stdout and stderr to the
+log as they come (microsandbox holds back the output of a command without a terminal unless asked
+to stream it, which `vm run` does).
+
+The session's `target/` and `.tools/` are disks of the VM's own, mounted over those directories of
+the worktree. **Never delete or move `target/` or `.tools/` in a worktree while its VM runs**:
+the VM loses the disk, and builds would land on the worktree mount it shares with the host. The VM
+notices: every tool call and stop fails, naming the fix, until you run `cargo xtask vm stop` and
+`cargo xtask vm start` for the worktree. To reclaim their space, stop the session and purge it
+(`vm stop --purge`, or `vm gc --yes` once its branch is merged).
+
+`vm stop` always stops the session's token broker: one that does not answer within a minute gets
+SIGTERM, which makes it revoke its tokens and remove its sockets and pid file in
+`~/.config/abc/agent-broker/`, and SIGKILL a minute later if it still runs; its tokens then expire
+within the hour.
 
 `start` refuses unless `claude auth status` in the VM reports the subscription token
 (`authMethod` `oauth_token`). The launcher strips `ANTHROPIC_API_KEY` and every other API route
