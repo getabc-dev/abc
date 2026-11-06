@@ -1,11 +1,10 @@
 import type { QueryClient } from "@tanstack/react-query";
-import { createRootRouteWithContext, Outlet, useRouter } from "@tanstack/react-router";
-import { RouterProvider } from "react-aria-components";
+import { createRootRouteWithContext, Link, Outlet } from "@tanstack/react-router";
+
+import { TitledCard } from "@/components/TitledCard";
 
 import type { ApiClient } from "../api/client";
 import { SessionGate } from "../session/SessionGate";
-import { Card } from "../ui/Card";
-import { Link } from "../ui/Link";
 
 /** What every route can reach. */
 type RouterContext = {
@@ -16,29 +15,24 @@ type RouterContext = {
 };
 
 function Root() {
-  const router = useRouter();
   const { api, origin } = Route.useRouteContext();
   return (
-    // React Aria's links navigate through the router, without a page load.
-    <RouterProvider
-      navigate={(href) => {
-        router.history.push(href);
-      }}
-    >
-      <SessionGate api={api} origin={origin}>
-        <Outlet />
-      </SessionGate>
-    </RouterProvider>
+    <SessionGate api={api} origin={origin}>
+      <Outlet />
+    </SessionGate>
   );
 }
 
 function NotFound() {
   return (
-    <Card title="No page here" level={1}>
-      <p className="text-ink-muted">
-        abc has no page at this address. <Link href="/">Go home</Link>
+    <TitledCard title="No page here" level={1}>
+      <p className="text-muted-foreground">
+        abc has no page at this address.{" "}
+        <Link to="/" className="text-primary underline underline-offset-4">
+          Go home
+        </Link>
       </p>
-    </Card>
+    </TitledCard>
   );
 }
 

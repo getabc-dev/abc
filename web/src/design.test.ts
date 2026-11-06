@@ -1,56 +1,87 @@
-// DESIGN.md is the source of the look: its token tables and the stylesheet's `@theme` must say the
-// same, and every text pair it lists must reach 4.5:1.
+// DESIGN.md is the source of the look: its token tables and the stylesheet must say the same, every
+// pair it lists must reach its contrast in both themes, and no component writes a colour of its own.
 
 /// <reference types="node" />
 
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 
 import { describe, expect, test } from "vitest";
 
-// Read from disk: Vitest hands stylesheets to tests empty, whatever the query.
-const design = readFileSync(new URL("../../DESIGN.md", import.meta.url), "utf8");
-const styles = readFileSync(new URL("styles.css", import.meta.url), "utf8");
+const WEB = new URL("..", import.meta.url).pathname;
 
-/** The rows of DESIGN.md's tables whose first two cells are code: `| \`a\` | \`b\` | ... |`. */
-function codeRows(markdown: string): (readonly [string, string])[] {
-  const rows: (readonly [string, string])[] = [];
-  for (const line of markdown.split("\n")) {
-    const match = /^\| `([^`]+)` \| `([^`]+)` \|/.exec(line);
-    if (match?.[1] !== undefined && match[2] !== undefined) {
-      rows.push([match[1], match[2]]);
-    }
+// Read from disk: Vitest hands stylesheets to tests empty, whatever the query.
+const design = readFileSync(join(WEB, "../DESIGN.md"), "utf8");
+const styles = readFileSync(join(WEB, "src/styles.css"), "utf8");
+
+/** The text of DESIGN.md's section `## <title>`, up to the next one. */
+function section(title: string): string {
+  const start = design.indexOf(`\n## ${title}\n`);
+  if (start === -1) {
+    throw new Error(`DESIGN.md has no section "${title}"`);
   }
-  return rows;
+  const end = design.indexOf("\n## ", start + 1);
+  return design.slice(start, end === -1 ? undefined : end);
 }
 
-/** DESIGN.md's tokens: the rows whose first cell is a CSS variable and second is not one. */
-function designTokens(): Map<string, string> {
+/** The rows of `markdown`'s tables, as the code in their cells: `| \`a\` | \`b\` | ... |`. */
+function codeRows(markdown: string): string[][] {
+  return markdown
+    .split("\n")
+    .filter((line) => line.startsWith("| `"))
+    .map((line) =>
+      line
+        .split(" | ")
+        .map((cell) => /^\|? ?`([^`]+)`/u.exec(cell)?.[1])
+        .filter((cell) => cell !== undefined),
+    );
+}
+
+type Theme = "light" | "dark";
+
+/** DESIGN.md's colours, by theme: name to value, in upper case as the table writes them. */
+function designColours(theme: Theme): Map<string, string> {
   return new Map(
-    codeRows(design).filter(([name, value]) => name.startsWith("--") && !value.startsWith("--")),
+    codeRows(section("Colour")).map(([name = "", light = "", dark = ""]) => [
+      name,
+      theme === "light" ? light : dark,
+    ]),
   );
 }
 
-/** DESIGN.md's contrast pairs: the rows whose cells are both variables. */
-function contrastPairs(): (readonly [string, string])[] {
-  return codeRows(design).filter(([, background]) => background.startsWith("--"));
+/** DESIGN.md's other tokens: the rows of its Type and Space sections. */
+function designTokens(): Map<string, string> {
+  return new Map(
+    [...codeRows(section("Type")), ...codeRows(section("Space, radius and elevation"))].map(
+      ([name = "", value = ""]) => [name, value],
+    ),
+  );
 }
 
-/** The declarations of styles.css's `@theme`, without the resets. */
-function themeTokens(): Map<string, string> {
-  const theme = /@theme \{([^}]*)\}/.exec(styles)?.[1] ?? "";
-  const tokens = new Map<string, string>();
-  for (const match of theme.matchAll(/(--[a-z0-9-]+):\s*([^;]+);/g)) {
-    const [, name, value] = match;
+/** The declarations of the stylesheet's first block that opens with `opening`. */
+function declarations(opening: string): Map<string, string> {
+  const start = styles.indexOf(`${opening} {`);
+  if (start === -1) {
+    throw new Error(`styles.css has no "${opening}" block`);
+  }
+  const body = styles.slice(start, styles.indexOf("\n}", start));
+  const found = new Map<string, string>();
+  for (const [, name, value] of body.matchAll(/(--[a-z0-9-]+):\s*([^;]+);/gu)) {
     if (name !== undefined && value !== undefined && value !== "initial") {
-      tokens.set(name, value.trim());
+      found.set(name, value.trim());
     }
   }
-  return tokens;
+  return found;
 }
 
-/** Orders `[name, value]` rows by name. */
-function byName(first: string[], second: string[]): number {
-  return (first[0] ?? "").localeCompare(second[0] ?? "");
+/** Each colour, by theme, as the stylesheet sets it, in upper case. */
+function styledColours(theme: Theme): Map<string, string> {
+  const block = declarations(theme === "light" ? ":root" : ".dark");
+  return new Map([...block].map(([name, value]) => [name, value.toUpperCase()]));
+}
+
+function sorted(map: Map<string, string>): [string, string][] {
+  return [...map].toSorted(([first], [second]) => first.localeCompare(second));
 }
 
 /** A colour's relative luminance (WCAG 2.2). */
@@ -68,12 +99,60 @@ function contrast(first: string, second: string): number {
   return ((light ?? 0) + 0.05) / ((dark ?? 0) + 0.05);
 }
 
+/** The pairs of the table after `heading` in the Contrast section that fall below `least`. */
+function shortfalls(heading: "| Text |" | "| Edge |", least: number): string[] {
+  const contrastSection = section("Contrast");
+  const start = contrastSection.indexOf(heading);
+  const table = contrastSection.slice(start, contrastSection.indexOf("\n\n", start));
+  const pairs = codeRows(table);
+  expect(pairs.length).toBeGreaterThan(5);
+  return (["light", "dark"] as const).flatMap((theme) => {
+    const colours = designColours(theme);
+    return pairs.flatMap(([front = "", back = ""]) => {
+      const ratio = contrast(colours.get(front) ?? "", colours.get(back) ?? "");
+      const known = colours.has(front) && colours.has(back);
+      return known && ratio >= least
+        ? []
+        : [`${theme}: ${front} on ${back} is ${ratio.toFixed(2)}`];
+    });
+  });
+}
+
+/** Every component's source: abc's and the registry's. */
+function componentSources(): { path: string; source: string }[] {
+  return readdirSync(join(WEB, "src"), { recursive: true, encoding: "utf8" })
+    .filter((path) => path.endsWith(".tsx") && !path.endsWith(".test.tsx"))
+    .map((path) => ({ path, source: readFileSync(join(WEB, "src", path), "utf8") }));
+}
+
 describe("DESIGN.md and the stylesheet", () => {
-  test("declare the same tokens with the same values", () => {
-    const declared = [...designTokens()].map(([name, value]) => [name, value.toLowerCase()]);
-    const themed = [...themeTokens()].map(([name, value]) => [name, value.toLowerCase()]);
-    expect(themed.toSorted(byName)).toEqual(declared.toSorted(byName));
-    expect(declared.length).toBeGreaterThan(30);
+  test("set the same colours, in both themes", () => {
+    for (const theme of ["light", "dark"] as const) {
+      expect(sorted(styledColours(theme))).toEqual(sorted(designColours(theme)));
+    }
+    expect(designColours("light").size).toBeGreaterThan(30);
+    expect(
+      [...designColours("dark").values()].filter((value) => !/^#[0-9A-F]{6}$/u.test(value)),
+    ).toEqual([]);
+  });
+
+  test("make every colour, and only those, a Tailwind colour", () => {
+    const utilities = declarations("@theme inline");
+    expect(sorted(utilities)).toEqual(
+      sorted(
+        new Map(
+          [...designColours("light").keys()].map((name) => [
+            `--color-${name.slice(2)}`,
+            `var(${name})`,
+          ]),
+        ),
+      ),
+    );
+  });
+
+  test("declare the same other tokens with the same values", () => {
+    expect(sorted(declarations("@theme"))).toEqual(sorted(designTokens()));
+    expect(designTokens().size).toBeGreaterThan(20);
   });
 
   test("reset Tailwind's own colours, fonts, sizes, radii and shadows", () => {
@@ -82,38 +161,27 @@ describe("DESIGN.md and the stylesheet", () => {
     }
   });
 
-  test("every listed text pair reaches 4.5:1", () => {
-    const tokens = designTokens();
-    const pairs = contrastPairs();
-    expect(pairs.length).toBeGreaterThan(10);
-    const ratios = pairs.map(([text, background]) => {
-      const foreground = tokens.get(text) ?? "";
-      const behind = tokens.get(background) ?? "";
-      return {
-        pair: `${text} on ${background}`,
-        colours: `${foreground} ${behind}`,
-        ratio: contrast(foreground, behind),
-      };
-    });
-    expect(ratios.filter(({ colours }) => !/^#[0-9A-F]{6} #[0-9A-F]{6}$/.test(colours))).toEqual(
-      [],
-    );
-    expect(ratios.filter(({ ratio }) => ratio < 4.5)).toEqual([]);
+  test("every listed text pair reaches 4.5:1 in both themes", () => {
+    expect(shortfalls("| Text |", 4.5)).toEqual([]);
   });
 
-  test("a field's edge reaches 3:1 against every surface it sits on", () => {
-    const tokens = designTokens();
-    const control = tokens.get("--color-control") ?? "";
-    const ratios = ["--color-ground", "--color-surface", "--color-sunken"].map((surface) => ({
-      surface,
-      ratio: contrast(control, tokens.get(surface) ?? ""),
-    }));
-    expect(ratios.filter(({ ratio }) => ratio < 3)).toEqual([]);
+  test("every listed edge and focus ring reaches 3:1 in both themes", () => {
+    expect(shortfalls("| Edge |", 3)).toEqual([]);
   });
 
   test("contrast is computed as WCAG defines it", () => {
     expect(contrast("#000000", "#FFFFFF")).toBeCloseTo(21, 5);
     expect(contrast("#FFFFFF", "#FFFFFF")).toBe(1);
     expect(contrast("#767676", "#FFFFFF")).toBeCloseTo(4.54, 2);
+  });
+
+  test("no component writes a colour of its own", () => {
+    const literal =
+      /#[0-9a-fA-F]{3,8}\b|\b(?:rgba?|hsla?|oklch|oklab|lab|lch|color)\(|\b(?:bg|text|border|ring|fill|stroke)-(?:black|white)\b/u;
+    const sources = componentSources();
+    expect(sources.length).toBeGreaterThan(20);
+    expect(sources.filter(({ source }) => literal.test(source)).map(({ path }) => path)).toEqual(
+      [],
+    );
   });
 });

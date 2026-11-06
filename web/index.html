@@ -7,10 +7,11 @@
     <!-- An empty icon: without a link, the browser asks the server for /favicon.ico. -->
     <link rel="icon" href="data:," />
     <!--
-      React Aria adds a <style> for pressable elements unless an element with this id exists; the
-      CSP (style-src 'self') would block it, so the rule is in src/styles.css and this marks it.
+      The theme, before the first paint (public/theme.js): a classic script blocks rendering until it
+      has run, so the page never flashes in the other theme. It is one of the app's own files, as the
+      CSP (script-src 'self') requires.
     -->
-    <meta id="react-aria-pressable-style" name="abc-pressable-style" content="src/styles.css" />
+    <script src="/theme.js"></script>
   </head>
   <body>
     <div id="root"></div>

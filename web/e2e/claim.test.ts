@@ -4,7 +4,8 @@
 
 import type { Page } from "@playwright/test";
 
-import { expect, screenshot, test } from "./abc.ts";
+import { expect, test } from "./abc.ts";
+import { capture } from "./look.ts";
 
 const PHONE = { width: 390, height: 844 };
 
@@ -21,15 +22,15 @@ test("a wrong code is refused on the code field", async ({ page, server }) => {
   await server.setupCode();
   await page.goto("/");
   await expect(page.getByRole("heading", { level: 1 })).toHaveText("Claim this server");
-  await page.screenshot({ path: screenshot("claim"), fullPage: true });
+  await capture(page, "claim");
   await page.setViewportSize(PHONE);
-  await page.screenshot({ path: screenshot("claim-phone"), fullPage: true });
+  await capture(page, "claim-phone");
   await fill(page, "AAAA-BBBB-CCCC-DDDD-EEEE");
   await page.getByRole("button", { name: "Claim this server" }).click();
   const code = page.getByRole("textbox", { name: "Setup code" });
   await expect(code).toHaveAttribute("aria-invalid", "true");
   await expect(page.getByText("This is not the server's current setup code.")).toBeVisible();
-  await page.screenshot({ path: screenshot("claim-wrong-code-phone"), fullPage: true });
+  await capture(page, "claim-wrong-code-phone");
 });
 
 test("the host's code claims the server and lands on home; a second tab learns it is taken", async ({
@@ -50,7 +51,7 @@ test("the host's code claims the server and lands on home; a second tab learns i
   await expect(late.getByRole("heading", { level: 1 })).toHaveText(
     "This server already has an owner",
   );
-  await late.screenshot({ path: screenshot("claim-already-claimed"), fullPage: true });
+  await capture(late, "claim-already-claimed");
   await late.getByRole("button", { name: "Continue" }).click();
   await expect(late.getByRole("heading", { level: 1 })).toHaveText("Machines");
 });

@@ -27,7 +27,11 @@ export default defineConfig({
   // The tests share the run's one server and database, so what one does the next sees, as on a
   // real server: the unclaimed server first, then the claim, then the claimed server's machines.
   projects: [
-    { name: "unclaimed", testMatch: /(home|origin)\.test\.ts/, use: devices["Desktop Chrome"] },
+    {
+      name: "unclaimed",
+      testMatch: /(home|origin|theme)\.test\.ts/,
+      use: devices["Desktop Chrome"],
+    },
     {
       name: "claim",
       testMatch: /claim\.test\.ts/,

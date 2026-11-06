@@ -3,15 +3,16 @@
 
 import { useQueryClient } from "@tanstack/react-query";
 import { useRouter } from "@tanstack/react-router";
-import { Form } from "react-aria-components";
+
+import { TextField } from "@/components/TextField";
+import { TitledCard } from "@/components/TitledCard";
+import { Alert, AlertDescription } from "@/components/ui/alert";
+import { Button } from "@/components/ui/button";
 
 import { type ApiClient, asApiError } from "../api/client";
 import { type Program, settle, useProgram } from "../elm";
 import type { TailnetLogin } from "../generated/TailnetLogin";
 import { Centered } from "../session/Centered";
-import { Button } from "../ui/Button";
-import { Card } from "../ui/Card";
-import { TextField } from "../ui/TextField";
 import { type Effect, init, type Message, type Model, update } from "./claim";
 
 /** The claim program, claiming over `api` and going home through `goHome`. */
@@ -38,9 +39,9 @@ function claiming(api: ApiClient, goHome: () => void): Program<Model, Message, E
 }
 
 /** A command, set in mono, for the person to run. */
-function Command({ children }: { readonly children: string }) {
+function CommandText({ children }: { readonly children: string }) {
   return (
-    <code className="rounded-chip bg-sunken px-1 py-0.5 font-mono text-ink text-sm">
+    <code className="rounded-sm bg-muted px-1 py-0.5 font-mono text-foreground text-xs">
       {children}
     </code>
   );
@@ -66,38 +67,34 @@ export function ClaimScreen({
     case "expired":
       return (
         <Centered>
-          <Card title="This setup code has expired" level={1}>
+          <TitledCard title="This setup code has expired" level={1}>
             <div className="flex flex-col items-start gap-4">
-              <p className="text-ink-muted">
-                A setup code works for an hour. Run <Command>abc server setup-code</Command> on the
-                server's host again for a new one.
+              <p className="text-muted-foreground">
+                A setup code works for an hour. Run <CommandText>abc server setup-code</CommandText>{" "}
+                on the server's host again for a new one.
               </p>
-              <Button variant="primary" onPress={() => dispatch({ type: "start_over" })}>
-                Enter a new code
-              </Button>
+              <Button onClick={() => dispatch({ type: "start_over" })}>Enter a new code</Button>
             </div>
-          </Card>
+          </TitledCard>
         </Centered>
       );
     case "already_claimed":
       return (
         <Centered>
-          <Card title="This server already has an owner" level={1}>
+          <TitledCard title="This server already has an owner" level={1}>
             <div className="flex flex-col items-start gap-4">
-              <p className="text-ink-muted">
+              <p className="text-muted-foreground">
                 Someone claimed it while this page was open, perhaps you in another tab.
               </p>
-              <Button variant="primary" onPress={() => dispatch({ type: "continue" })}>
-                Continue
-              </Button>
+              <Button onClick={() => dispatch({ type: "continue" })}>Continue</Button>
             </div>
-          </Card>
+          </TitledCard>
         </Centered>
       );
     case "claimed":
       return (
         <Centered>
-          <output className="block text-center text-ink-muted">
+          <output className="block text-center text-muted-foreground">
             Claimed. Opening your workspace…
           </output>
         </Centered>
@@ -108,14 +105,15 @@ export function ClaimScreen({
       const problem = phase.state === "editing" ? phase.problem : null;
       return (
         <Centered>
-          <Card title="Claim this server" level={1}>
+          <TitledCard title="Claim this server" level={1}>
             <div className="flex flex-col gap-5">
-              <p className="text-ink-muted">
-                You are signed in as <span className="font-medium text-ink">{login}</span>, and
-                become this server's owner. Run <Command>abc server setup-code</Command> on its host
-                for the code.
+              <p className="text-muted-foreground">
+                You are signed in as <span className="font-medium text-foreground">{login}</span>,
+                and become this server's owner. Run <CommandText>abc server setup-code</CommandText>{" "}
+                on its host for the code.
               </p>
-              <Form
+              <form
+                noValidate
                 className="flex flex-col gap-4"
                 onSubmit={(event) => {
                   event.preventDefault();
@@ -148,16 +146,16 @@ export function ClaimScreen({
                   error={errors.workspaceName}
                 />
                 {problem === null ? null : (
-                  <p role="alert" className="rounded-control bg-danger-tint px-3 py-2 text-danger">
-                    {problem}
-                  </p>
+                  <Alert variant="destructive">
+                    <AlertDescription>{problem}</AlertDescription>
+                  </Alert>
                 )}
-                <Button type="submit" variant="primary" isPending={phase.state === "claiming"}>
+                <Button type="submit" disabled={phase.state === "claiming"} focusableWhenDisabled>
                   {phase.state === "claiming" ? "Claiming…" : "Claim this server"}
                 </Button>
-              </Form>
+              </form>
             </div>
-          </Card>
+          </TitledCard>
         </Centered>
       );
     }

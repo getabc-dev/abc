@@ -3,17 +3,17 @@
 // person is signed in, so moving between pages keeps one stream.
 
 import { useRouterState } from "@tanstack/react-router";
+import { MonitorSmartphoneIcon } from "lucide-react";
 import { createContext, type ReactNode, use, useMemo } from "react";
-
+import { AppShell, type NavItem } from "@/components/AppShell";
+import { TitledCard } from "@/components/TitledCard";
 import type { ApiClient } from "../api/client";
 import { type Dispatch, useProgram } from "../elm";
 import type { SessionView } from "../generated/SessionView";
 import type { WorkspaceSummary } from "../generated/WorkspaceSummary";
+
 import { liveMachines, type Message, type Model } from "../machines/live";
 import { Centered } from "../session/Centered";
-import { AppShell, type NavItem } from "../ui/AppShell";
-import { Card } from "../ui/Card";
-import { MachinesIcon } from "../ui/icons";
 
 /** What the pages of a signed-in person reach. */
 export type Workspace = {
@@ -40,9 +40,9 @@ export function useWorkspace(): Workspace {
 function navigation(pathname: string): NavItem[] {
   return [
     {
-      href: "/machines",
+      to: "/machines",
       label: "Machines",
-      icon: <MachinesIcon />,
+      icon: <MonitorSmartphoneIcon aria-hidden="true" />,
       current: pathname === "/machines" || pathname.startsWith("/machines/"),
     },
   ];
@@ -102,11 +102,11 @@ export function SignedIn({
   if (workspace === undefined) {
     return (
       <Centered>
-        <Card title="No workspace" level={1}>
-          <p className="text-ink-muted">
+        <TitledCard title="No workspace" level={1}>
+          <p className="text-muted-foreground">
             {view.display_name} belongs to no workspace on this server any more.
           </p>
-        </Card>
+        </TitledCard>
       </Centered>
     );
   }

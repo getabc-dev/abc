@@ -10,7 +10,7 @@ import { createWriteStream, mkdirSync, mkdtempSync } from "node:fs";
 import { createServer } from "node:net";
 import { join } from "node:path";
 
-import { test as base } from "@playwright/test";
+import { type BrowserContext, test as base, expect, type Page } from "@playwright/test";
 
 function required(name: string): string {
   const value = process.env[name];
@@ -217,8 +217,34 @@ export function screenshot(name: string): string {
   return join(screens, `${name}.png`);
 }
 
-/** Playwright's test, with the run's server started for each Playwright worker. */
-export const test = base.extend<object, { server: Server }>({
+/** Chrome's console line for an HTTP answer that is not a success. */
+const ANSWERED = /^Failed to load resource: the server responded with a status of \d+/u;
+
+/**
+ * Playwright's test, with the run's server started for each Playwright worker. Every page a test
+ * opens is watched: a console error or an uncaught exception, such as a script or style the CSP
+ * refused, fails the test.
+ */
+export const test = base.extend<{ context: BrowserContext }, { server: Server }>({
+  context: async ({ context }, use) => {
+    const seen: string[] = [];
+    const watch = (page: Page) => {
+      page.on("console", (message) => {
+        // An API's refusal is an answer the tests ask for (a wrong code, a restarting server);
+        // Chrome logs each one, and those alone are not the page's errors.
+        if (message.type() === "error" && !ANSWERED.test(message.text())) {
+          seen.push(`${page.url()}: ${message.text()}`);
+        }
+      });
+      page.on("pageerror", (error) => {
+        seen.push(`${page.url()}: ${error.message}`);
+      });
+    };
+    context.pages().forEach(watch);
+    context.on("page", watch);
+    await use(context);
+    expect(seen, "the console's errors").toEqual([]);
+  },
   server: [
     // Playwright reads a fixture's needs from its first parameter's pattern; this one needs none.
     /* oxlint-disable eslint/no-empty-pattern -- Playwright requires the pattern */
@@ -234,4 +260,4 @@ export const test = base.extend<object, { server: Server }>({
   ],
 });
 
-export { expect } from "@playwright/test";
+export { expect };

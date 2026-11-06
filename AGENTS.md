@@ -82,8 +82,9 @@ brief.
 - **Server and worker:** Rust in one Cargo workspace, shipped as one signed binary
   (`abc server`, `abc worker`).
 - **Web app and phone:** React with strict TypeScript 7 (the native compiler), Vite, TanStack
-  Router and Query, Tailwind CSS v4 with its tokens as CSS variables in `@theme`, and React Aria
-  Components; pnpm, and an installable PWA. It lives in `web/`; each screen follows the Elm
+  Router and Query, Tailwind CSS v4 with its tokens as CSS variables in `@theme`, and shadcn/ui on
+  Base UI primitives: a component shadcn's registry offers is added with its CLI, never written by
+  hand (`DESIGN.md`); pnpm, and an installable PWA. It lives in `web/`; each screen follows the Elm
   architecture: a discriminated-union message type, a pure `update(model, message)` and effects at
   the edge. The `abc` binary embeds the built app (`web/dist`) and serves it beside the API.
   Biome, Oxlint with type-aware rules, `tsc`, knip and Vitest gate it, and Playwright runs it in

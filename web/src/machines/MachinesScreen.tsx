@@ -2,16 +2,17 @@
 // shell), and the enrolment panel (enrol.ts). Its states: loading, error with retry, empty (how to
 // enrol the first machine), live, and offline while the stream resumes.
 
+import { LaptopIcon, ServerIcon } from "lucide-react";
 import type { ReactNode } from "react";
-import { Heading } from "react-aria-components";
+
+import { Status, type Tone } from "@/components/Status";
+import { TextField } from "@/components/TextField";
+import { TitledCard } from "@/components/TitledCard";
+import { Alert, AlertDescription } from "@/components/ui/alert";
+import { Button } from "@/components/ui/button";
 
 import { useProgram } from "../elm";
 import type { MachineCard } from "../generated/MachineCard";
-import { Button } from "../ui/Button";
-import { Card } from "../ui/Card";
-import { LaptopIcon, ServerIcon } from "../ui/icons";
-import { StatusPill, type Tone } from "../ui/StatusPill";
-import { TextField } from "../ui/TextField";
 import { useWorkspace } from "../workspace/SignedIn";
 import { type Message as EnrolMessage, type Model as Enrolment, enrolment } from "./enrol";
 import { describeMachine, formatInstant } from "./format";
@@ -42,38 +43,52 @@ function machinePill(machine: MachineCard): { tone: Tone; label: string } {
 function Machine({ machine }: { readonly machine: MachineCard }) {
   const pill = machinePill(machine);
   return (
-    <Card title={machine.name} status={pill} className={machine.revoked ? "opacity-70" : ""}>
+    <TitledCard
+      title={machine.name}
+      status={pill}
+      className={machine.revoked ? "opacity-70" : undefined}
+    >
       <div className="flex items-center gap-3">
-        <span className="flex size-9 shrink-0 items-center justify-center rounded-nav border border-rule bg-sunken text-ink-muted">
-          {machine.os === "macos" ? <LaptopIcon /> : <ServerIcon />}
+        <span className="flex size-9 shrink-0 items-center justify-center rounded-lg border bg-sunken text-muted-foreground">
+          {machine.os === "macos" ? (
+            <LaptopIcon aria-hidden="true" className="size-4.5" />
+          ) : (
+            <ServerIcon aria-hidden="true" className="size-4.5" />
+          )}
         </span>
         <div className="min-w-0">
-          <p className="text-ink">{describeMachine(machine)}</p>
-          <p className="truncate font-mono text-ink-subtle text-sm">{machine.hostname}</p>
+          <p className="text-foreground">{describeMachine(machine)}</p>
+          <p className="truncate font-mono text-subtle-foreground text-xs">{machine.hostname}</p>
         </div>
       </div>
-      <dl className="mt-4 grid grid-cols-[auto_1fr] gap-x-4 gap-y-1 border-rule border-t pt-3 text-sm">
-        <dt className="font-mono text-ink-subtle text-label uppercase tracking-label">Last seen</dt>
-        <dd className="text-ink-muted">
+      <dl className="mt-4 grid grid-cols-[auto_1fr] gap-x-4 gap-y-1 border-t pt-3 text-xs">
+        <dt className="font-mono text-2xs text-subtle-foreground uppercase tracking-label">
+          Last seen
+        </dt>
+        <dd className="text-muted-foreground">
           {machine.online
             ? "Now"
             : machine.last_seen_at === null
               ? "Never connected"
               : formatInstant(machine.last_seen_at)}
         </dd>
-        <dt className="font-mono text-ink-subtle text-label uppercase tracking-label">Enrolled</dt>
-        <dd className="text-ink-muted">{formatInstant(machine.enrolled_at)}</dd>
-        <dt className="font-mono text-ink-subtle text-label uppercase tracking-label">Release</dt>
-        <dd className="font-mono text-ink-muted">{machine.build}</dd>
+        <dt className="font-mono text-2xs text-subtle-foreground uppercase tracking-label">
+          Enrolled
+        </dt>
+        <dd className="text-muted-foreground">{formatInstant(machine.enrolled_at)}</dd>
+        <dt className="font-mono text-2xs text-subtle-foreground uppercase tracking-label">
+          Release
+        </dt>
+        <dd className="font-mono text-muted-foreground">{machine.build}</dd>
       </dl>
-    </Card>
+    </TitledCard>
   );
 }
 
 /** A command to run, set in mono in a well. */
-function Command({ children }: { readonly children: string }) {
+function CommandLine({ children }: { readonly children: string }) {
   return (
-    <pre className="mt-1.5 overflow-x-auto rounded-control border border-rule bg-sunken px-3 py-2 font-mono text-ink text-sm">
+    <pre className="mt-1.5 overflow-x-auto rounded-lg border bg-sunken px-3 py-2 font-mono text-foreground text-xs">
       <code>{children}</code>
     </pre>
   );
@@ -95,36 +110,36 @@ function EnrolPanel({
   const title = first ? "Enrol your first machine" : "Enrol a machine";
   if (step.state === "issued") {
     return (
-      <Card title={title}>
-        <ol className="flex list-decimal flex-col gap-4 pl-5 text-ink">
+      <TitledCard title={title} className="w-full max-w-xl">
+        <ol className="flex list-decimal flex-col gap-4 pl-5 text-foreground">
           <li>
             On the machine, with abc installed, run:
-            <Command>{`abc worker enrol ${origin}`}</Command>
+            <CommandLine>{`abc worker enrol ${origin}`}</CommandLine>
           </li>
           <li>
             When it asks, paste this token. It works once, until{" "}
-            {formatInstant(step.token.expires_at)}:<Command>{step.token.token}</Command>
+            {formatInstant(step.token.expires_at)}:<CommandLine>{step.token.token}</CommandLine>
           </li>
           <li>
             Then start the worker, which keeps the machine online:
-            <Command>abc worker</Command>
+            <CommandLine>abc worker</CommandLine>
           </li>
         </ol>
-        <p className="mt-4 text-ink-muted text-sm">
+        <p className="mt-4 text-muted-foreground text-xs">
           abc shows the token only now and does not keep it. The machine appears here once it
           enrols.
         </p>
-        <Button className="mt-4" onPress={() => dispatch({ type: "closed" })}>
+        <Button variant="outline" className="mt-4" onClick={() => dispatch({ type: "closed" })}>
           Done
         </Button>
-      </Card>
+      </TitledCard>
     );
   }
   const error = step.state === "asking" ? step.error : null;
   return (
-    <Card title={title}>
+    <TitledCard title={title} className="w-full max-w-xl">
       <div className="flex flex-col gap-4">
-        <p className="text-ink-muted">
+        <p className="text-muted-foreground">
           A machine runs abc's agents for you. Create a one-time token, then run the commands it
           comes with on the machine.
         </p>
@@ -132,22 +147,26 @@ function EnrolPanel({
           label="Machine name"
           description="Shown on its card. Leave it blank to use the machine's hostname."
           value={model.label}
-          isDisabled={step.state === "issuing"}
+          disabled={step.state === "issuing"}
           onChange={(label) => dispatch({ type: "labelled", label })}
           error={error ?? undefined}
         />
         <div className="flex gap-2">
           <Button
-            variant="primary"
-            isPending={step.state === "issuing"}
-            onPress={() => dispatch({ type: "requested" })}
+            disabled={step.state === "issuing"}
+            focusableWhenDisabled
+            onClick={() => dispatch({ type: "requested" })}
           >
             Create enrolment token
           </Button>
-          {first ? null : <Button onPress={() => dispatch({ type: "closed" })}>Cancel</Button>}
+          {first ? null : (
+            <Button variant="outline" onClick={() => dispatch({ type: "closed" })}>
+              Cancel
+            </Button>
+          )}
         </div>
       </div>
-    </Card>
+    </TitledCard>
   );
 }
 
@@ -156,41 +175,38 @@ export function MachinesScreen() {
   const [enrol, enrolDispatch] = useProgram(enrolment(api, workspace.id));
   const { connection, machines, head } = live;
   const pill = connectionPill(connection);
-  const retry = (
-    <Button variant="primary" onPress={() => dispatch({ type: "retry" })}>
-      Try again
-    </Button>
-  );
+  const retry = <Button onClick={() => dispatch({ type: "retry" })}>Try again</Button>;
   let body: ReactNode;
   if (head === null && connection.state === "failed") {
     body = (
-      <Card title="The machines could not be loaded">
+      <TitledCard title="The machines could not be loaded">
         <div className="flex flex-col items-start gap-4">
-          <p className="text-ink-muted">{connection.problem.message}</p>
+          <p className="text-muted-foreground">{connection.problem.message}</p>
           {retry}
         </div>
-      </Card>
+      </TitledCard>
     );
   } else if (head === null) {
-    body = <output className="block text-ink-muted">Loading machines…</output>;
+    body = <output className="block text-muted-foreground">Loading machines…</output>;
   } else {
     const first = machines.length === 0;
     body = (
       <div className="flex flex-col gap-4">
         {connection.state === "reconnecting" ? (
-          <output className="block rounded-control border border-warning bg-warning-tint px-3 py-2 text-warning-ink">
-            Offline: the connection to the server dropped ({connection.problem.message}). Resuming
-            where it stopped; the cards may be out of date.
-          </output>
+          <Alert className="border-warning bg-warning-tint text-warning-foreground">
+            <AlertDescription className="text-warning-foreground">
+              Offline: the connection to the server dropped ({connection.problem.message}). Resuming
+              where it stopped; the cards may be out of date.
+            </AlertDescription>
+          </Alert>
         ) : null}
         {connection.state === "failed" ? (
-          <div
-            role="alert"
-            className="flex flex-wrap items-center justify-between gap-3 rounded-control bg-danger-tint px-3 py-2 text-danger"
-          >
-            <p>{connection.problem.message} The cards may be out of date.</p>
-            {retry}
-          </div>
+          <Alert variant="destructive" className="bg-destructive-tint">
+            <AlertDescription className="flex flex-wrap items-center justify-between gap-3">
+              <p>{connection.problem.message} The cards may be out of date.</p>
+              {retry}
+            </AlertDescription>
+          </Alert>
         ) : null}
         {first || enrol.open ? (
           <EnrolPanel first={first} origin={origin} model={enrol} dispatch={enrolDispatch} />
@@ -210,12 +226,14 @@ export function MachinesScreen() {
   return (
     <div className="flex flex-col gap-5">
       <div className="flex flex-wrap items-center gap-3">
-        <Heading level={1} className="font-semibold text-xl">
-          Machines
-        </Heading>
-        <StatusPill {...pill} />
+        <h1 className="font-semibold text-xl">Machines</h1>
+        <Status {...pill} />
         {head !== null && machines.length > 0 && !enrol.open ? (
-          <Button className="ml-auto" onPress={() => enrolDispatch({ type: "opened" })}>
+          <Button
+            variant="outline"
+            className="ml-auto"
+            onClick={() => enrolDispatch({ type: "opened" })}
+          >
             Enrol a machine
           </Button>
         ) : null}

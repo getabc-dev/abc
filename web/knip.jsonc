@@ -5,5 +5,7 @@
   "entry": ["src/routes/**/*.tsx"],
   "project": ["src/**/*.{ts,tsx,css}", "e2e/**/*.ts", "*.config.ts"],
   // Written by ts-rs from Rust: every API type, used or not yet.
-  "ignore": ["src/generated/**"]
+  "ignore": ["src/generated/**"],
+  // shadcn/ui's registry files export every part of a component, used or not (DESIGN.md).
+  "ignoreIssues": { "src/components/ui/**": ["exports", "types"] }
 }

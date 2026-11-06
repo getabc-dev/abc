@@ -5,7 +5,8 @@
 
 import type { Page } from "@playwright/test";
 
-import { expect, Machine, ORIGIN, screenshot, test } from "./abc.ts";
+import { expect, Machine, ORIGIN, test } from "./abc.ts";
+import { capture } from "./look.ts";
 
 const PHONE = { width: 390, height: 844 };
 const DESKTOP = { width: 1440, height: 900 };
@@ -15,9 +16,9 @@ const LIVE = { timeout: 30_000 };
 
 async function shoot(page: Page, name: string): Promise<void> {
   await page.setViewportSize(DESKTOP);
-  await page.screenshot({ path: screenshot(name), fullPage: true });
+  await capture(page, name);
   await page.setViewportSize(PHONE);
-  await page.screenshot({ path: screenshot(`${name}-phone`), fullPage: true });
+  await capture(page, `${name}-phone`);
   await page.setViewportSize(DESKTOP);
 }
 
@@ -74,7 +75,7 @@ test("a machine enrols, comes online, goes offline, and the page resumes after a
   await server.stop();
   await expect(page.getByText(/^Offline: the connection to the server dropped/)).toBeVisible(LIVE);
   await expect(page.getByText("Reconnecting", { exact: true })).toBeVisible();
-  await page.screenshot({ path: screenshot("machines-reconnecting"), fullPage: true });
+  await capture(page, "machines-reconnecting");
   await server.start();
   await expect(page.getByText("Live", { exact: true })).toBeVisible(LIVE);
   await expect(page.getByText(/^Offline: the connection/)).toBeHidden();
@@ -87,4 +88,34 @@ test("a machine enrols, comes online, goes offline, and the page resumes after a
   machine.start();
   await expect(card.getByText("Online", { exact: true })).toBeVisible(LIVE);
   await machine.stop();
+});
+
+test("the shell's theme menu chooses Dark over a light system, kept across a reload", async ({
+  page,
+}) => {
+  await page.setViewportSize(PHONE);
+  await page.emulateMedia({ colorScheme: "light" });
+  await page.goto("/");
+  await expect(page.getByRole("heading", { level: 1 })).toHaveText("Machines");
+  const dark = () => page.evaluate(() => document.documentElement.classList.contains("dark"));
+  expect(await dark()).toBe(false);
+
+  await page.getByRole("button", { name: "Theme: System" }).focus();
+  await page.keyboard.press("Enter");
+  const menu = page.getByRole("menu");
+  await expect(menu.getByRole("menuitemradio")).toHaveText(["Light", "Dark", "System"]);
+  // The open menu's items are touch targets too, in both themes.
+  await capture(page, "theme-menu-phone");
+  await menu.getByRole("menuitemradio", { name: "Dark" }).click();
+  await expect(page.getByRole("button", { name: "Theme: Dark" })).toBeFocused();
+  expect(await dark()).toBe(true);
+
+  await page.reload();
+  await expect(page.getByRole("button", { name: "Theme: Dark" })).toBeVisible();
+  expect(await dark()).toBe(true);
+
+  await page.getByRole("button", { name: "Theme: Dark" }).click();
+  await page.getByRole("menuitemradio", { name: "System" }).click();
+  await expect(page.getByRole("button", { name: "Theme: System" })).toBeVisible();
+  expect(await dark()).toBe(false);
 });

@@ -4,10 +4,11 @@
 import { useQuery } from "@tanstack/react-query";
 import type { ReactNode } from "react";
 
+import { TitledCard } from "@/components/TitledCard";
+import { Button } from "@/components/ui/button";
+
 import type { ApiClient } from "../api/client";
 import { ClaimScreen } from "../claim/ClaimScreen";
-import { Button } from "../ui/Button";
-import { Card } from "../ui/Card";
 import { SignedIn } from "../workspace/SignedIn";
 import { Centered } from "./Centered";
 
@@ -29,26 +30,27 @@ export function SessionGate({
   if (session.isPending) {
     return (
       <Centered>
-        <output className="block text-center text-ink-muted">Asking the server who you are…</output>
+        <output className="block text-center text-muted-foreground">
+          Asking the server who you are…
+        </output>
       </Centered>
     );
   }
   if (session.isError) {
     return (
       <Centered>
-        <Card title="The server did not answer" level={1}>
+        <TitledCard title="The server did not answer" level={1}>
           <div className="flex flex-col items-start gap-4">
-            <p className="text-ink-muted">{session.error.message}</p>
+            <p className="text-muted-foreground">{session.error.message}</p>
             <Button
-              variant="primary"
-              onPress={() => {
+              onClick={() => {
                 void session.refetch();
               }}
             >
               Try again
             </Button>
           </div>
-        </Card>
+        </TitledCard>
       </Centered>
     );
   }
@@ -65,22 +67,22 @@ export function SessionGate({
     case "no_identity":
       return (
         <Centered>
-          <Card title="No tailnet identity" level={1}>
-            <p className="text-ink-muted">
+          <TitledCard title="No tailnet identity" level={1}>
+            <p className="text-muted-foreground">
               This device reaches abc without a signed-in Tailscale user, as tagged devices do. Open
               abc from a device signed in as a person.
             </p>
-          </Card>
+          </TitledCard>
         </Centered>
       );
     case "not_a_member":
       return (
         <Centered>
-          <Card title="Not a member" level={1}>
-            <p className="text-ink-muted">
+          <TitledCard title="Not a member" level={1}>
+            <p className="text-muted-foreground">
               {view.login} belongs to no workspace on this server. Ask its owner to add you.
             </p>
-          </Card>
+          </TitledCard>
         </Centered>
       );
   }

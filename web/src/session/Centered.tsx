@@ -3,11 +3,11 @@
 
 import type { ReactNode } from "react";
 
-import { Logo } from "../ui/Logo";
+import { Logo } from "@/components/Logo";
 
 export function Centered({ children }: { readonly children: ReactNode }) {
   return (
-    <main className="flex min-h-dvh flex-col items-center bg-ground px-4 py-10 text-ink md:justify-center">
+    <main className="flex min-h-dvh flex-col items-center bg-background px-4 py-10 text-foreground md:justify-center">
       <div className="flex w-full max-w-md flex-col gap-6">
         <div className="self-center">
           <Logo />

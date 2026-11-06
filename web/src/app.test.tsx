@@ -13,10 +13,12 @@ import { apiClient, type Fetch } from "./api/client";
 import { App, createAppRouter } from "./app";
 import type { LiveUpdate } from "./generated/LiveUpdate";
 import type { SessionView } from "./generated/SessionView";
-import { card } from "./testing";
+import { card, stubMatchMedia } from "./testing";
 
 // The router restores scroll positions, which jsdom cannot do.
 Reflect.set(window, "scrollTo", () => undefined);
+// The shell's sidebar asks whether the window is phone-sized, which jsdom cannot say.
+stubMatchMedia(false);
 
 afterEach(cleanup);
 

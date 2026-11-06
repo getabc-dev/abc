@@ -18,3 +18,33 @@ export function card(name: string, worker: string, online: boolean): MachineCard
     changed_at: 3,
   };
 }
+
+/**
+ * Gives jsdom, which has none, a `window.matchMedia` whose every query matches while `matching` is
+ * set, as `(prefers-color-scheme: dark)` does on a dark system; `set` changes it and tells the
+ * listeners, as the browser does when the system's scheme or the window's width changes.
+ */
+export function stubMatchMedia(matching = false): { set: (matches: boolean) => void } {
+  let matches = matching;
+  const listeners = new Set<() => void>();
+  Reflect.set(window, "matchMedia", (media: string) => ({
+    media,
+    get matches() {
+      return matches;
+    },
+    addEventListener: (_type: "change", listener: () => void) => {
+      listeners.add(listener);
+    },
+    removeEventListener: (_type: "change", listener: () => void) => {
+      listeners.delete(listener);
+    },
+  }));
+  return {
+    set(next: boolean) {
+      matches = next;
+      for (const listener of listeners) {
+        listener();
+      }
+    },
+  };
+}
