@@ -6,6 +6,7 @@ import { type ApiClient, type ApiError, asApiError } from "../api/client";
 import { type Dispatch, type Program, type Step, settle } from "../elm";
 import type { TokenIssuedResponse } from "../generated/TokenIssuedResponse";
 import type { WorkspaceId } from "../generated/WorkspaceId";
+import { nameProblem } from "../names";
 
 type Stage =
   | { readonly state: "asking"; readonly error: string | null }
@@ -35,9 +36,6 @@ export type Effect = {
   readonly label: string | null;
 };
 
-/** The longest machine name the server accepts, in characters (`NAME_MAX` in abc-core). */
-const LABEL_MAX = 64;
-
 const asking: Stage = { state: "asking", error: null };
 
 export function init(workspace: WorkspaceId): Step<Model, Effect> {
@@ -58,14 +56,10 @@ export function update(model: Model, message: Message): Step<Model, Effect> {
         return [model, []];
       }
       const label = model.label.trim();
-      if (Array.from(label).length > LABEL_MAX) {
-        return [
-          {
-            ...model,
-            step: { state: "asking", error: `Use at most ${LABEL_MAX} characters for the name.` },
-          },
-          [],
-        ];
+      // Blank asks for the machine's hostname; anything else follows the server's rule.
+      const problem = label === "" ? null : nameProblem("MachineLabel", label, "the name");
+      if (problem !== null) {
+        return [{ ...model, step: { state: "asking", error: problem } }, []];
       }
       // Open from here on, so the commands stay up once the machine appears, until "Done".
       return [

@@ -5,6 +5,7 @@
 import type { ApiError } from "../api/client";
 import type { Step } from "../elm";
 import type { ClaimRequest } from "../generated/ClaimRequest";
+import { nameProblem } from "../names";
 
 /** The form's fields, as typed. */
 export type Fields = {
@@ -50,26 +51,10 @@ export type Effect =
   /** Reload who the visitor is and go home, where the app now shows what they may see. */
   | { readonly type: "go_home" };
 
-/** The longest name the server accepts, in characters (`NAME_MAX` in abc-core). */
-const NAME_MAX = 64;
-
 const editing: Phase = { state: "editing", errors: {}, problem: null };
 
 export function init(): Step<Model, Effect> {
   return [{ fields: { code: "", displayName: "", workspaceName: "" }, phase: editing }, []];
-}
-
-/** A name's problem, by the server's rule: 1 to 64 characters after trimming. */
-function nameError(value: string, what: string): string | undefined {
-  // Characters as the server counts them: code points.
-  const length = Array.from(value.trim()).length;
-  if (length === 0) {
-    return `Enter ${what}.`;
-  }
-  if (length > NAME_MAX) {
-    return `Use at most ${NAME_MAX} characters for ${what}.`;
-  }
-  return undefined;
 }
 
 /** What is wrong with `fields`, before asking the server. */
@@ -78,12 +63,12 @@ export function validate(fields: Fields): FieldErrors {
   if (fields.code.trim() === "") {
     errors.code = "Enter the setup code from the server's host.";
   }
-  const displayName = nameError(fields.displayName, "your name");
-  if (displayName !== undefined) {
+  const displayName = nameProblem("DisplayName", fields.displayName, "your name");
+  if (displayName !== null) {
     errors.displayName = displayName;
   }
-  const workspaceName = nameError(fields.workspaceName, "a workspace name");
-  if (workspaceName !== undefined) {
+  const workspaceName = nameProblem("WorkspaceName", fields.workspaceName, "a workspace name");
+  if (workspaceName !== null) {
     errors.workspaceName = workspaceName;
   }
   return errors;

@@ -262,7 +262,9 @@
     },
     "DisplayName": {
       "description": "How a person or worker is shown: an actor's display name.",
-      "type": "string"
+      "type": "string",
+      "maxLength": 64,
+      "minLength": 1
     },
     "EnrolmentTokenId": {
       "description": "An enrolment token, and the stream of its lifecycle events.",
@@ -436,7 +438,9 @@
     },
     "MachineLabel": {
       "description": "A note the owner attaches to an enrolment token, such as \"work laptop\". It becomes the\nenrolled worker's display name.",
-      "type": "string"
+      "type": "string",
+      "maxLength": 64,
+      "minLength": 1
     },
     "Os": {
       "description": "The operating systems abc ships for.",
@@ -712,7 +716,9 @@
     },
     "WorkspaceName": {
       "description": "A workspace's name.",
-      "type": "string"
+      "type": "string",
+      "maxLength": 64,
+      "minLength": 1
     },
     "WorkspaceSummary": {
       "description": "One of a person's workspaces.",
