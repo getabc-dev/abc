@@ -728,7 +728,10 @@ fn gc_lists_finished_sessions_and_purges_them_only_when_told() {
         ..subscribed()
     };
     start_ok(&world, &backend);
-    std::fs::create_dir_all(world.root.join("state/old/git")).unwrap();
+    // A session repository that holds no branch.
+    let old = world.root.join("state/old/git");
+    std::fs::create_dir_all(&old).unwrap();
+    git(&old, &["init", "--quiet", "--bare"]);
     github_merged(
         &world,
         &format!(
@@ -1112,4 +1115,158 @@ fn the_image_installs_the_chromium_of_the_playwright_the_web_app_pins() {
             "the image installs Chromium into its fixed path: {line}"
         );
     }
+}
+
+/// Makes a bare repository at `repo` whose branch `branch` holds one commit, `subject`, that no
+/// remote has; returns the commit.
+fn unpushed(repo: &Path, branch: &str, subject: &str) -> String {
+    std::fs::create_dir_all(repo).unwrap();
+    let git = |args: &[&str]| {
+        let output = std::process::Command::new("git")
+            .arg("--git-dir")
+            .arg(repo)
+            .args(args)
+            .env("GIT_AUTHOR_NAME", "a")
+            .env("GIT_AUTHOR_EMAIL", "a@example.com")
+            .env("GIT_COMMITTER_NAME", "a")
+            .env("GIT_COMMITTER_EMAIL", "a@example.com")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    };
+    git(&["init", "--quiet", "--bare"]);
+    let tree = git(&["mktree"]);
+    let commit = git(&["commit-tree", "-m", subject, &tree]);
+    git(&["update-ref", &format!("refs/heads/{branch}"), &commit]);
+    commit
+}
+
+/// `vm gc` named a session's state by stripping every leading `abc-` from its name: the session
+/// of worktree `abc-cli` (`abc-abc-cli`) got `<state>/cli`, another session's, and the session of
+/// worktree `abc` got `<state>/` itself, so `--yes` deleted every session's state. Each session's
+/// name and state come from its slug alone.
+#[test]
+fn gc_purges_only_each_sessions_own_state() {
+    let world = world("t");
+    git(
+        &world.host.repo,
+        &[
+            "worktree",
+            "add",
+            "--quiet",
+            "-b",
+            "cli",
+            world.root.join("cli").to_str().unwrap(),
+        ],
+    );
+    github_merged(&world, "[]");
+    let state = &world.host.state;
+    std::fs::create_dir_all(state.join("cli")).unwrap();
+    std::fs::write(state.join("cli/kept"), "the live session cli's").unwrap();
+    std::fs::create_dir_all(state.join("w")).unwrap();
+    std::fs::write(state.join("w/kept"), "the live session w's").unwrap();
+    std::fs::create_dir_all(state.join("abc-cli")).unwrap();
+    std::fs::create_dir_all(state.join("abc")).unwrap();
+    let backend = Fake {
+        volumes: vec![
+            ("abc-abc-cli-target".to_owned(), 1_000_000_000),
+            ("abc-abc-home".to_owned(), 1_000_000_000),
+        ],
+        ..subscribed()
+    };
+    let listed = gc(&world, &backend, false);
+    assert_eq!(
+        listed,
+        "abc-abc\t1.0 GB\tits worktree is gone\n\
+         abc-abc-cli\t1.0 GB\tits worktree is gone\n\
+         vm gc: 2 finished sessions hold 2.0 GB; `cargo xtask vm gc --yes` purges them\n"
+    );
+    gc(&world, &backend, true);
+    assert!(state.join("cli/kept").is_file(), "session abc-cli's state");
+    assert!(state.join("w/kept").is_file(), "session abc-w's state");
+    assert!(!state.join("abc-cli").exists(), "session abc-abc-cli's own");
+    assert!(!state.join("abc").exists(), "session abc-abc's own");
+    let calls = backend.calls.borrow();
+    for name in ["abc-abc", "abc-abc-cli"] {
+        assert!(calls.contains(&format!("remove {name}")), "{calls:?}");
+    }
+    assert!(!calls.contains(&"remove abc-cli".to_owned()), "{calls:?}");
+}
+
+/// The session repository of a session whose worktree is gone may hold the only copy of commits
+/// made in the VM. `vm gc` keeps such a session, naming the commits, and purges the others.
+#[test]
+fn gc_keeps_a_gone_sessions_commits_that_are_nowhere_else() {
+    let world = world("t");
+    github_merged(&world, "[]");
+    let state = &world.host.state;
+    let lost = unpushed(&state.join("gone/git"), "feature", "only in the VM");
+    unpushed(&state.join("done/git"), "other", "pushed");
+    let pushed = std::process::Command::new("git")
+        .arg("--git-dir")
+        .arg(state.join("done/git"))
+        .args([
+            "update-ref",
+            "refs/remotes/origin/other",
+            "refs/heads/other",
+        ])
+        .status()
+        .unwrap();
+    assert!(pushed.success());
+    std::fs::create_dir_all(state.join("broken/git")).unwrap();
+    let backend = subscribed();
+    let listed = gc(&world, &backend, false);
+    assert!(
+        listed.contains(
+            "abc-broken\t0.0 GB\tkept: its worktree is gone, but its repository cannot be read: "
+        ),
+        "{listed}"
+    );
+    let kept = format!(
+        "abc-gone\t0.0 GB\tkept: its worktree is gone, but its repository has commits on neither \
+         origin nor a merged pull request: {} only in the VM\n",
+        super::session::short(&lost)
+    );
+    assert!(
+        listed.contains("abc-done\t0.0 GB\tits worktree is gone\n"),
+        "{listed}"
+    );
+    assert!(listed.contains(&kept), "{listed}");
+    let (result, out) = act(&world, &backend, Action::Gc { yes: true });
+    let error = format!("{:#}", result.unwrap_err());
+    assert!(out.contains("vm gc: purged abc-done; "), "{out}");
+    assert!(error.contains("kept abc-gone"), "{error}");
+    assert!(state.join("gone/git").is_dir(), "its commits are kept");
+    assert!(!state.join("done").exists());
+    assert!(
+        !backend
+            .calls
+            .borrow()
+            .contains(&"remove abc-gone".to_owned()),
+        "{:?}",
+        backend.calls.borrow()
+    );
+}
+
+/// A session whose repository lacks the worktree's branch was counted as merged: no commit there
+/// compared with the merged pull request's. Only a branch at that commit is merged.
+#[test]
+fn gc_needs_the_sessions_branch_at_the_merged_commit() {
+    let world = world("t");
+    github_merged(
+        &world,
+        &format!(
+            "[{{\"number\":32,\"headRefOid\":\"{}\"}}]",
+            head(&world.worktree)
+        ),
+    );
+    let backend = Fake {
+        volumes: vec![("abc-w-target".to_owned(), 1_000_000_000)],
+        ..subscribed()
+    };
+    assert_eq!(
+        gc(&world, &backend, true),
+        "vm gc: no finished session to purge\n"
+    );
 }

@@ -204,6 +204,10 @@ cargo xtask vm gc                        # lists stopped sessions whose worktree
                                          # branch GitHub merged, with their disk; --yes purges them
 ```
 
+`vm gc` keeps a finished session whose own repository holds commits that are on no branch of
+`origin` and in no merged pull request, naming them: the VM may have committed work nobody synced.
+Fetch them from the repository it names, delete that repository, and run `vm gc --yes` again.
+
 `vm shell` is the interactive way in. To drive a session from a script or another agent, use
 `vm run`: it needs no pseudo-terminal, so no `script` wrapper, and writes stdout and stderr to the
 log as they come (microsandbox holds back the output of a command without a terminal unless asked

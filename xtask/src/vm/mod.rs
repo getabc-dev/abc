@@ -733,6 +733,26 @@ enum Finished {
     Merged { branch: String, number: u64 },
 }
 
+impl std::fmt::Display for Finished {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::WorktreeGone => write!(f, "its worktree is gone"),
+            Self::Merged { branch, number } => write!(f, "{branch} merged in #{number}"),
+        }
+    }
+}
+
+/// A finished session `vm gc` found.
+struct Candidate {
+    name: String,
+    state: PathBuf,
+    why: Finished,
+    /// The bytes its volumes take.
+    bytes: u64,
+    /// Why it is kept, when its repository holds commits found nowhere else.
+    kept: Option<String>,
+}
+
 /// `vm gc`: lists the sessions that are not running and are finished, with the disk their
 /// volumes take, and purges them with `yes`.
 ///
@@ -740,75 +760,136 @@ enum Finished {
 /// in `origin/main`: pull requests are squash-merged, so a merged branch's commits are never
 /// ancestors of main. The pull request must have been merged at the commit both the worktree's
 /// branch and the session's own repository are at, so commits made after the merge, on the host
-/// or in the VM, are never purged.
+/// or in the VM, are never purged. A finished session whose repository holds commits that neither
+/// `origin` nor a merged pull request has is kept, naming them, and `--yes` then fails after
+/// purging the others.
 fn gc(host: &Host, backend: &dyn Backend, yes: bool, out: &mut impl Write) -> anyhow::Result<()> {
+    let candidates = finished(host, backend)?;
+    if candidates.is_empty() {
+        writeln!(out, "vm gc: no finished session to purge")?;
+        return Ok(());
+    }
+    for candidate in &candidates {
+        let size = size(candidate.bytes);
+        match &candidate.kept {
+            None => writeln!(out, "{}\t{size}\t{}", candidate.name, candidate.why)?,
+            Some(kept) => writeln!(
+                out,
+                "{}\t{size}\tkept: {}, but {kept}",
+                candidate.name, candidate.why
+            )?,
+        }
+    }
+    let (purge, kept): (Vec<_>, Vec<_>) = candidates
+        .into_iter()
+        .partition(|candidate| candidate.kept.is_none());
+    if !purge.is_empty() {
+        let total = size(purge.iter().map(|candidate| candidate.bytes).sum());
+        if !yes {
+            writeln!(
+                out,
+                "vm gc: {} finished sessions hold {total}; `cargo xtask vm gc --yes` purges them",
+                purge.len()
+            )?;
+            return Ok(());
+        }
+        for candidate in &purge {
+            let broker = stop(&candidate.name, &candidate.state, host, backend, true)?;
+            writeln!(out, "vm gc: purged {}; {broker}", candidate.name)?;
+        }
+        writeln!(out, "vm gc: freed {total}")?;
+    }
+    if yes && !kept.is_empty() {
+        bail!(
+            "vm gc: {}; fetch their commits from those repositories, delete them, and run \
+             `cargo xtask vm gc --yes` again",
+            kept.iter()
+                .map(|candidate| format!(
+                    "kept {} ({})",
+                    candidate.name,
+                    candidate.state.join("git").display()
+                ))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    Ok(())
+}
+
+/// The sessions that are not running and are finished, each with whether it must be kept.
+fn finished(host: &Host, backend: &dyn Backend) -> anyhow::Result<Vec<Candidate>> {
     let worktrees = session::worktrees(&host.repo)?;
     let volumes = backend.volumes()?;
-    let mut names: std::collections::BTreeSet<String> = volumes
+    let mut ids: std::collections::BTreeSet<session::Id> = volumes
         .iter()
         .filter_map(|(volume, _)| {
             volume_names("")
                 .iter()
                 .find_map(|suffix| volume.strip_suffix(suffix.as_str()))
-                .filter(|name| crate::broker::check_session(name).is_ok())
-                .map(str::to_owned)
+                .and_then(session::Id::of_name)
         })
         .collect();
     if let Ok(entries) = std::fs::read_dir(&host.state) {
         for entry in entries.filter_map(Result::ok) {
-            if entry.path().is_dir() {
-                let name = format!("abc-{}", entry.file_name().to_string_lossy());
-                if crate::broker::check_session(&name).is_ok() {
-                    names.insert(name);
-                }
+            if entry.path().is_dir()
+                && let Some(id) = entry.file_name().to_str().and_then(session::Id::of_slug)
+            {
+                ids.insert(id);
             }
         }
     }
-    let mut finished = Vec::new();
-    for name in names {
+    let mut candidates = Vec::new();
+    for id in ids {
+        let name = id.name();
         if backend.is_running(&name)? {
             continue;
         }
-        let state = host.state.join(name.trim_start_matches("abc-"));
-        let why = match worktrees.iter().find(|worktree| worktree.session == name) {
+        let state = id.state(&host.state);
+        let why = match worktrees.iter().find(|worktree| worktree.session == id) {
             None => Some(Finished::WorktreeGone),
             Some(worktree) => merged(host, worktree, &state)?,
         };
-        if let Some(why) = why {
-            let bytes: u64 = volumes
-                .iter()
-                .filter(|(volume, _)| volume_names(&name).contains(volume))
-                .map(|(_, bytes)| bytes)
-                .sum();
-            finished.push((name, state, why, bytes));
+        let Some(why) = why else { continue };
+        let kept = only_here(host, &state)?;
+        let bytes: u64 = volumes
+            .iter()
+            .filter(|(volume, _)| volume_names(&name).contains(volume))
+            .map(|(_, bytes)| bytes)
+            .sum();
+        candidates.push(Candidate {
+            name,
+            state,
+            why,
+            bytes,
+            kept,
+        });
+    }
+    Ok(candidates)
+}
+
+/// Why the finished session whose state is `state` must be kept, if it must: its repository
+/// holds commits on no branch of `origin` and in no pull request GitHub merged from one of its
+/// branches, or cannot be read.
+fn only_here(host: &Host, state: &Path) -> anyhow::Result<Option<String>> {
+    let unreadable = |error: anyhow::Error| format!("its repository cannot be read: {error:#}");
+    let branches = match session::branches(state) {
+        Ok(branches) => branches,
+        Err(error) => return Ok(Some(unreadable(error))),
+    };
+    let mut merged = Vec::new();
+    for (branch, _) in branches {
+        if let Some(pull) = merged_pull(host, &branch)? {
+            merged.push(pull.head_ref_oid);
         }
     }
-    if finished.is_empty() {
-        writeln!(out, "vm gc: no finished session to purge")?;
-        return Ok(());
-    }
-    for (name, _, why, bytes) in &finished {
-        let why = match why {
-            Finished::WorktreeGone => String::from("its worktree is gone"),
-            Finished::Merged { branch, number } => format!("{branch} merged in #{number}"),
-        };
-        writeln!(out, "{name}\t{}\t{why}", size(*bytes))?;
-    }
-    let total = size(finished.iter().map(|(.., bytes)| bytes).sum());
-    if !yes {
-        writeln!(
-            out,
-            "vm gc: {} finished sessions hold {total}; `cargo xtask vm gc --yes` purges them",
-            finished.len()
-        )?;
-        return Ok(());
-    }
-    for (name, state, ..) in &finished {
-        let broker = stop(name, state, host, backend, true)?;
-        writeln!(out, "vm gc: purged {name}; {broker}")?;
-    }
-    writeln!(out, "vm gc: freed {total}")?;
-    Ok(())
+    Ok(match session::unshared(state, &merged) {
+        Ok(commits) if commits.is_empty() => None,
+        Ok(commits) => Some(format!(
+            "its repository has commits on neither origin nor a merged pull request: {}",
+            commits.join(", ")
+        )),
+        Err(error) => Some(unreadable(error)),
+    })
 }
 
 /// A pull request GitHub merged, as its CLI lists it.
@@ -819,16 +900,8 @@ struct Pull {
     head_ref_oid: String,
 }
 
-/// Why `worktree`'s session, whose state is `state`, is finished, if GitHub merged its branch at
-/// the commit the worktree and the session's repository are at.
-fn merged(
-    host: &Host,
-    worktree: &session::Worktree,
-    state: &Path,
-) -> anyhow::Result<Option<Finished>> {
-    let Some(branch) = &worktree.branch else {
-        return Ok(None);
-    };
+/// The pull request GitHub merged from `branch`, if any.
+fn merged_pull(host: &Host, branch: &str) -> anyhow::Result<Option<Pull>> {
     let program = host.github_cli.display();
     let output = Command::new(&host.github_cli)
         .args(["pr", "list", "--state", "merged", "--head", branch])
@@ -844,17 +917,32 @@ fn merged(
     );
     let pulls: Vec<Pull> = serde_json::from_slice(&output.stdout)
         .with_context(|| format!("{program} pr list printed no list of pull requests"))?;
-    let Some(pull) = pulls.into_iter().next() else {
+    Ok(pulls.into_iter().next())
+}
+
+/// Why `worktree`'s session, whose state is `state`, is finished, if GitHub merged its branch at
+/// the commit the worktree is at and the session repository's branch is at too. A session
+/// repository without the branch is not at the merge: nothing shows what it holds is merged.
+fn merged(
+    host: &Host,
+    worktree: &session::Worktree,
+    state: &Path,
+) -> anyhow::Result<Option<Finished>> {
+    let Some(branch) = &worktree.branch else {
         return Ok(None);
     };
-    let at_merge = |commit: Option<String>| commit.is_none_or(|commit| commit == pull.head_ref_oid);
-    Ok(
-        (worktree.commit == pull.head_ref_oid && at_merge(session::branch_commit(state, branch)?))
-            .then(|| Finished::Merged {
-                branch: branch.clone(),
-                number: pull.number,
-            }),
-    )
+    let Some(pull) = merged_pull(host, branch)? else {
+        return Ok(None);
+    };
+    let in_session = session::branches(state)?
+        .into_iter()
+        .find_map(|(name, commit)| (name == *branch).then_some(commit));
+    Ok((worktree.commit == pull.head_ref_oid
+        && in_session.as_deref() == Some(pull.head_ref_oid.as_str()))
+    .then(|| Finished::Merged {
+        branch: branch.clone(),
+        number: pull.number,
+    }))
 }
 
 /// `bytes` in gigabytes, to a tenth.

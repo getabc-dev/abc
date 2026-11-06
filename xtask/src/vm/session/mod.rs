@@ -82,7 +82,8 @@ pub(crate) enum Push {
 }
 
 /// git for a repository the VM can write: no system or global config, no inherited git
-/// environment, and [`SEALED`] settings.
+/// environment, and [`SEALED`] settings. The repository is `dir` itself (`GIT_DIR`), never one
+/// git finds by searching up from it; a caller working on a worktree sets its own `GIT_DIR`.
 pub(crate) fn sealed(dir: &Path) -> Command {
     let mut command = Command::new("git");
     for (key, _) in std::env::vars_os() {
@@ -94,6 +95,7 @@ pub(crate) fn sealed(dir: &Path) -> Command {
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_DIR", dir)
         .arg("-C")
         .arg(dir);
     for setting in SEALED {
@@ -111,6 +113,43 @@ fn run(mut command: Command, what: &str) -> anyhow::Result<String> {
         String::from_utf8_lossy(&output.stderr).trim()
     );
     String::from_utf8(output.stdout).context("git printed text that is not UTF-8")
+}
+
+/// What names a session: the slug of its worktree's directory name. Its VM's name, its volumes'
+/// names and its state directory all derive from it here, and nowhere else.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct Id(String);
+
+/// What every session's VM name starts with.
+const PREFIX: &str = "abc-";
+
+impl Id {
+    /// The session of a worktree whose directory is named `name`; none when the name has no
+    /// letters or digits.
+    pub(crate) fn of_worktree(name: &str) -> Option<Self> {
+        Self::of_slug(&slug(name))
+    }
+
+    /// The session whose slug is `slug`, as its state directory is named; none unless `slug` is
+    /// one: lowercase letters, digits and inner dashes.
+    pub(crate) fn of_slug(slug: &str) -> Option<Self> {
+        (!slug.is_empty() && self::slug(slug) == slug).then(|| Self(slug.to_owned()))
+    }
+
+    /// The session whose VM is named `name`; none unless it is one.
+    pub(crate) fn of_name(name: &str) -> Option<Self> {
+        name.strip_prefix(PREFIX).and_then(Self::of_slug)
+    }
+
+    /// Its VM's name, which also prefixes its volumes' names and its broker's files.
+    pub(crate) fn name(&self) -> String {
+        format!("{PREFIX}{}", self.0)
+    }
+
+    /// Its own directory under the state root `root`.
+    pub(crate) fn state(&self, root: &Path) -> PathBuf {
+        root.join(&self.0)
+    }
 }
 
 /// One agent session's names and places.
@@ -184,15 +223,15 @@ impl Session {
             common.display()
         );
         let id = name_of(&admin)?;
-        let slug = slug(&name_of(&worktree)?);
-        ensure!(
-            !slug.is_empty(),
-            "{} has no letters or digits to name a VM after",
-            worktree.display()
-        );
+        let session = Id::of_worktree(&name_of(&worktree)?).with_context(|| {
+            format!(
+                "{} has no letters or digits to name a VM after",
+                worktree.display()
+            )
+        })?;
         Ok(Self {
-            name: format!("abc-{slug}"),
-            state: state_root.join(&slug),
+            name: session.name(),
+            state: session.state(state_root),
             worktree,
             common,
             admin,
@@ -558,8 +597,8 @@ fn slug(name: &str) -> String {
 /// A worktree of the main clone, as `vm gc` sees it.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct Worktree {
-    /// The name of its session's VM.
-    pub(crate) session: String,
+    /// Its session.
+    pub(crate) session: Id,
     /// The branch checked out in it, without `refs/heads/`; none when its HEAD is detached.
     pub(crate) branch: Option<String>,
     /// The commit checked out in it.
@@ -586,9 +625,7 @@ pub(crate) fn worktrees(main: &Path) -> anyhow::Result<Vec<Worktree>> {
                 session = Path::new(path)
                     .file_name()
                     .and_then(OsStr::to_str)
-                    .map(slug)
-                    .filter(|slug| !slug.is_empty())
-                    .map(|slug| format!("abc-{slug}"));
+                    .and_then(Id::of_worktree);
             } else if let Some(name) = line.strip_prefix("branch refs/heads/") {
                 branch = Some(name.to_owned());
             } else if let Some(head) = line.strip_prefix("HEAD ") {
@@ -606,28 +643,72 @@ pub(crate) fn worktrees(main: &Path) -> anyhow::Result<Vec<Worktree>> {
     Ok(worktrees)
 }
 
-/// The commit of `branch` in the session repository under the session directory `state`; none
-/// when there is no such repository or branch. The VM can write that repository, so it is read
-/// only through [`sealed`] git.
-pub(crate) fn branch_commit(state: &Path, branch: &str) -> anyhow::Result<Option<String>> {
+/// The branches of the session repository under the session directory `state`, each with its
+/// commit; none when there is no repository. Read only through [`sealed`] git.
+pub(crate) fn branches(state: &Path) -> anyhow::Result<Vec<(String, String)>> {
     let repo = state.join("git");
     if !repo.is_dir() {
-        return Ok(None);
+        return Ok(Vec::new());
     }
-    let output = sealed(&repo)
-        .args(["rev-parse", "--verify", "--quiet", "--end-of-options"])
-        .arg(format!("refs/heads/{branch}^{{commit}}"))
-        .output()
-        .context("could not run git")?;
-    if !output.status.success() {
-        return Ok(None);
+    let mut list = sealed(&repo);
+    list.args([
+        "for-each-ref",
+        "--format=%(objectname) %(refname:lstrip=2)",
+        "refs/heads/",
+    ]);
+    run(list, "for-each-ref")?
+        .lines()
+        .map(|line| {
+            line.split_once(' ')
+                .map(|(commit, branch)| (branch.to_owned(), commit.to_owned()))
+                .with_context(|| format!("git for-each-ref printed {line:?}"))
+        })
+        .collect()
+}
+
+/// The commits of the session repository under `state` that only it holds: reachable from its
+/// branches, but neither from a branch of `origin` it knows nor from any of `elsewhere`, commits
+/// known to be kept (a merged pull request's head). Each is its commit's first twelve characters
+/// and its subject. Commits of `elsewhere` the repository lacks are skipped.
+pub(crate) fn unshared(state: &Path, elsewhere: &[String]) -> anyhow::Result<Vec<String>> {
+    let tips: Vec<String> = branches(state)?
+        .into_iter()
+        .map(|(_, commit)| commit)
+        .collect();
+    if tips.is_empty() {
+        return Ok(Vec::new());
     }
-    Ok(Some(
-        String::from_utf8(output.stdout)
-            .context("git printed text that is not UTF-8")?
-            .trim()
-            .to_owned(),
-    ))
+    let repo = state.join("git");
+    let mut known = Vec::new();
+    for commit in elsewhere {
+        let mut exists = sealed(&repo);
+        exists.args([
+            "cat-file",
+            "-e",
+            "--end-of-options",
+            &format!("{commit}^{{commit}}"),
+        ]);
+        if exists
+            .output()
+            .context("could not run git")?
+            .status
+            .success()
+        {
+            known.push(commit);
+        }
+    }
+    let mut list = sealed(&repo);
+    list.args(["rev-list", "--no-commit-header", "--format=%H %s"])
+        .args(&tips)
+        .args(["--not", "--remotes=origin"])
+        .args(known);
+    Ok(run(list, "rev-list")?
+        .lines()
+        .map(|line| {
+            let (commit, subject) = line.split_once(' ').unwrap_or((line, ""));
+            format!("{} {subject}", short(commit))
+        })
+        .collect())
 }
 
 /// The first twelve characters of a commit's name.
