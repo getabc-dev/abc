@@ -13,6 +13,7 @@ mod github;
 mod guard;
 mod hook;
 mod integrity;
+mod junit;
 mod mutants;
 mod postgres;
 mod pr;
@@ -554,10 +555,13 @@ fn check(
     check::run(
         root,
         check::REPOSITORY,
-        changed,
+        check::Options {
+            changed,
+            target_dir: None,
+            mode: annotation::Mode::from_env(&|name| std::env::var_os(name)),
+        },
         &tools,
         &postgres,
-        None,
         report,
     )
 }

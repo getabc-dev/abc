@@ -74,6 +74,8 @@ pub(crate) fn run(
             out,
             "xtask: running the tests of the {name} workspace under coverage"
         )?;
+        let junit = (mode == Mode::Actions)
+            .then(|| crate::junit::prepare(root, &workspace.manifest_args(), "llvm-cov-target"));
         let status = Command::new(llvm_cov)
             .args(["llvm-cov", "nextest"])
             .args(workspace.manifest_args())
@@ -85,6 +87,12 @@ pub(crate) fn run(
             .current_dir(root)
             .status()
             .context("could not run cargo-llvm-cov")?;
+        if !status.success()
+            && let Some(junit) = &junit
+        {
+            let failed = crate::junit::annotations_of(junit, workspace.dir(), "coverage's tests");
+            write!(out, "{}", annotation::commands(mode, &failed))?;
+        }
         ensure!(
             status.success(),
             "the tests of the {name} workspace failed under coverage; run `cargo xtask check` and \
@@ -605,6 +613,66 @@ mod tests {
                 .to_string()
                 .contains("the tests of the main workspace failed under coverage"),
             "{error}"
+        );
+    }
+
+    /// #33: a test that failed under coverage showed only "exit code 1" in the checks; inside
+    /// GitHub Actions it is now an annotation at its panic.
+    #[test]
+    fn annotates_the_tests_that_fail_under_coverage() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = repository_with_change(
+            &temp.path().join("repo"),
+            &[
+                (
+                    "Cargo.toml",
+                    "[package]\nname = \"xtask\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+                ),
+                ("src/main.rs", "fn main() {}\n"),
+            ],
+        );
+        let locked = std::process::Command::new(crate::check::cargo())
+            .arg("generate-lockfile")
+            .current_dir(&repo)
+            .status()
+            .unwrap();
+        assert!(locked.success());
+        let report = crate::junit::target_directory(&repo, &[])
+            .unwrap()
+            .join("llvm-cov-target")
+            .join(crate::junit::REPORT);
+        std::fs::create_dir_all(report.parent().unwrap()).unwrap();
+        std::fs::write(&report, "stale: an earlier run's report is never read").unwrap();
+        let recorded = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/nextest-junit-33.xml");
+        let failing = temp.path().join("failing");
+        script(
+            &failing,
+            &format!(
+                "[ -e {report} ] && exit 7\ncp {recorded} {report}\nexit 1\n",
+                report = report.display(),
+                recorded = recorded.display()
+            ),
+        );
+        let mut out = Vec::new();
+        let error = run(
+            &repo,
+            "base",
+            &tools(&failing, &temp.path().join("cargo-nextest")),
+            Mode::Actions,
+            &mut out,
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("failed under coverage"),
+            "{error}"
+        );
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains(
+                "::error file=src/broker.rs,line=6,title=Test failed%3A xtask%3A%3Abin/xtask \
+                 broker%3A%3Atests%3A%3Aa_client_has_its_patience_in_all_not_per_read::"
+            ),
+            "{text}"
         );
     }
 

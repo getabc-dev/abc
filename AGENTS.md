@@ -174,7 +174,8 @@ request's tree (`--root`), so a pull request cannot change the gates that judge 
 that adds a gate fails that gate, which says it is bootstrapping. Only the review job has
 `GEMINI_API_KEY`, and it runs nothing from the pull request's tree. Inside GitHub Actions
 (`GITHUB_ACTIONS=true`), `review`, `mutants`, `coverage` and `integrity` also print their findings
-as annotations, at most ten of each level per step as GitHub keeps them; elsewhere their output is
+as annotations, and `check`, `coverage` and `mutants` each failing test with its panic, read from
+nextest's JUnit report, at most ten of each level per step as GitHub keeps them; elsewhere their output is
 unchanged.
 
 A PR that deletes, skips or weakens a test explains each one in its description, in a

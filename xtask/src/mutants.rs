@@ -42,12 +42,17 @@ enum Outcome {
     TimedOut,
 }
 
+/// cargo-mutants' exit code when the tests fail in the unmutated tree.
+const BASELINE_FAILED: i32 = 4;
+
 fn outcome(code: Option<i32>) -> anyhow::Result<Outcome> {
     match code {
         Some(0) => Ok(Outcome::AllCaught),
         Some(2) => Ok(Outcome::Missed),
         Some(3) => Ok(Outcome::TimedOut),
-        Some(4) => bail!("the tests fail without any mutation; run `cargo xtask check` first"),
+        Some(BASELINE_FAILED) => {
+            bail!("the tests fail without any mutation; run `cargo xtask check` first")
+        }
         Some(other) => bail!("cargo-mutants failed with exit code {other}"),
         None => bail!("cargo-mutants was stopped by a signal"),
     }
@@ -248,7 +253,10 @@ impl Run<'_> {
             .arg("--jobs")
             .arg(self.options.jobs.to_string())
             // The tests run the pinned tools in .tools/, which .gitignore lists; copy them too.
-            .args(["--gitignore", "false"]);
+            .args(["--gitignore", "false"])
+            // The copies stay until this run removes the scratch directory below, so a failing
+            // baseline's test report can be read first.
+            .arg("--leak-dirs");
         let status = command
             .args(
                 self.options
@@ -274,6 +282,14 @@ impl Run<'_> {
             .current_dir(root)
             .status()
             .context("could not run cargo-mutants");
+        if self.options.mode == Mode::Actions
+            && status
+                .as_ref()
+                .is_ok_and(|status| status.code() == Some(BASELINE_FAILED))
+        {
+            let failed = baseline_failures(&scratch, self.workspace.dir())?;
+            write!(out, "{}", annotation::commands(Mode::Actions, &failed))?;
+        }
         // Whatever cargo-mutants left behind goes, so repeated runs never fill the disk.
         fs::remove_dir_all(&scratch)
             .with_context(|| format!("could not remove {}", scratch.display()))?;
@@ -341,6 +357,38 @@ fn test_env_config(temp: &Path, root: &Path) -> anyhow::Result<String> {
     let mut config = toml_edit::DocumentMut::new();
     config.insert("env", toml_edit::Item::Table(env));
     Ok(config.to_string())
+}
+
+/// The annotations for the tests that failed in cargo-mutants' unmutated copy, from the `JUnit`
+/// report nextest wrote in it (the copy builds into its own `target/`), among the copies in
+/// `scratch`, of the workspace at `dir`.
+fn baseline_failures(scratch: &Path, dir: &str) -> anyhow::Result<Vec<Annotation>> {
+    let mut copies: Vec<PathBuf> = fs::read_dir(scratch)
+        .with_context(|| format!("could not read {}", scratch.display()))?
+        .map(|entry| entry.map(|entry| entry.path()))
+        .collect::<Result<_, _>>()
+        .with_context(|| format!("could not read {}", scratch.display()))?;
+    copies.sort();
+    let what = "mutants' unmutated tests";
+    let reports: Vec<PathBuf> = copies
+        .into_iter()
+        .map(|copy| copy.join("target").join(crate::junit::REPORT))
+        .filter(|report| report.is_file())
+        .collect();
+    if reports.is_empty() {
+        return Ok(crate::junit::annotations_of(
+            &Err(anyhow::anyhow!(
+                "cargo-mutants left no test report in {}",
+                scratch.display()
+            )),
+            dir,
+            what,
+        ));
+    }
+    Ok(reports
+        .iter()
+        .flat_map(|report| crate::junit::annotations(report, dir, what))
+        .collect())
 }
 
 /// Where cargo-mutants copies and builds the tree: under the checkout's build output.
@@ -739,6 +787,68 @@ mod tests {
                 repo.display()
             )),
             "the copies' builds name the checkout: {config}"
+        );
+    }
+
+    /// #33: a test that failed in mutants' unmutated copy showed only an exit code in the
+    /// checks. Inside GitHub Actions, each one is an annotation, read from the copy's report.
+    #[test]
+    fn annotates_the_tests_that_fail_without_a_mutation() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = repository_with_change(
+            &temp.path().join("repo"),
+            &[("xtask/src/a.rs", "fn a() -> bool { true }\n")],
+        );
+        let recorded = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/nextest-junit-33.xml");
+        let mutants = temp.path().join("cargo-mutants");
+        script(
+            &mutants,
+            &format!(
+                "case \"$*\" in *--leak-dirs*) ;; *) exit 9 ;; esac\n\
+                 report=\"$TMPDIR/cargo-mutants-xtask-a.tmp/target/nextest/default\"\n\
+                 mkdir -p \"$report\" && cp {} \"$report/junit.xml\"\nexit 4\n",
+                recorded.display()
+            ),
+        );
+        let actions = Options {
+            mode: Mode::Actions,
+            ..TWO
+        };
+        let mut out = Vec::new();
+        let error = run(
+            &repo,
+            "base",
+            &actions,
+            &mutants,
+            &temp.path().join("cargo-nextest"),
+            &no_web(),
+            &mut out,
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("fail without any mutation"),
+            "{error}"
+        );
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains(
+                "::error file=xtask/src/broker.rs,line=6,title=Test failed%3A xtask%3A%3Abin/xtask \
+                 broker%3A%3Atests%3A%3Aa_client_has_its_patience_in_all_not_per_read::"
+            ),
+            "{text}"
+        );
+        assert!(
+            !repo.join("target/mutants-tmp").exists(),
+            "the copies go once read"
+        );
+        let empty = temp.path().join("empty");
+        fs::create_dir_all(empty.join("cargo-mutants-a.tmp")).unwrap();
+        let none = super::baseline_failures(&empty, "xtask").unwrap();
+        assert!(
+            none[0]
+                .message
+                .contains("cargo-mutants left no test report"),
+            "{none:?}"
         );
     }
 
