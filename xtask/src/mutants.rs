@@ -18,6 +18,11 @@ use crate::check::{self, PROPTEST_RNG_SEED, Workspace};
 use crate::git;
 use crate::tools;
 
+/// The variable that names the checkout to xtask's tests when they run in a copy of `xtask/`
+/// alone (`testing::checkout`, in test builds). Only test code reads it, at run time; the
+/// shipped binary never does.
+pub(crate) const TEST_REPOSITORY: &str = "XTASK_TEST_REPOSITORY";
+
 /// Where cargo-mutants writes its results, relative to the repository root.
 const OUTPUT: &str = "target/mutants";
 
@@ -103,8 +108,8 @@ pub(crate) struct Options {
 /// `options.jobs`, never in the checkout: there, any other `cargo xtask` command would compile the
 /// mutated code (on 6 Nov, the pull request watch's `cargo xtask gh` built a mutant). xtask's
 /// tests read the repository around their workspace (the main manifest, the hook launcher, the
-/// CI workflows), which a copy of `xtask/` alone does not have, so its builds name the checkout in
-/// `XTASK_REPOSITORY` ([`test_env_config`]).
+/// CI workflows), which a copy of `xtask/` alone does not have, so their runs name the checkout
+/// in [`TEST_REPOSITORY`].
 pub(crate) fn run(
     root: &Path,
     base: &str,
@@ -236,7 +241,7 @@ impl Run<'_> {
         // room.
         let scratch = Scratch::create(scratch(root))?;
         let test_env = output.join("test-env.toml");
-        fs::write(&test_env, test_env_config(&std::env::temp_dir(), root)?)
+        fs::write(&test_env, test_env_config(&std::env::temp_dir())?)
             .with_context(|| format!("could not write {}", test_env.display()))?;
         let mut cargo_config = OsString::from("--cargo-arg=--config=");
         cargo_config.push(&test_env);
@@ -288,6 +293,7 @@ impl Run<'_> {
             .arg(&output)
             .env("PATH", tools::path_with(self.nextest)?)
             .env("PROPTEST_RNG_SEED", PROPTEST_RNG_SEED)
+            .env(TEST_REPOSITORY, root)
             .env("TMPDIR", scratch.path())
             // Each copy builds into its own target/: a copy of xtask/ alone has no .cargo/, and
             // cargo, looking up from it, would read the checkout's and build every mutant into the
@@ -343,9 +349,8 @@ impl Run<'_> {
 /// Cargo configuration, forced over the environment, for everything cargo-mutants has cargo
 /// build and run: `TMPDIR` is `temp`, this process's own, not cargo-mutants' scratch directory,
 /// which is inside the checkout's git repository and Cargo workspace and can make paths too long
-/// for a Unix socket; and `XTASK_REPOSITORY` is the checkout at `root`, which xtask, built in a
-/// copy of `xtask/` alone, reads around itself when compiled ([`crate::repo_root`]).
-fn test_env_config(temp: &Path, root: &Path) -> anyhow::Result<String> {
+/// for a Unix socket.
+fn test_env_config(temp: &Path) -> anyhow::Result<String> {
     let text = |path: &Path, what: &str| {
         path.to_str().map(str::to_owned).with_context(|| {
             format!(
@@ -362,7 +367,6 @@ fn test_env_config(temp: &Path, root: &Path) -> anyhow::Result<String> {
     };
     let mut env = toml_edit::Table::new();
     env.insert("TMPDIR", forced(text(temp, "the temporary directory")?));
-    env.insert("XTASK_REPOSITORY", forced(text(root, "the checkout")?));
     let mut config = toml_edit::DocumentMut::new();
     config.insert("env", toml_edit::Item::Table(env));
     Ok(config.to_string())
@@ -595,11 +599,10 @@ mod tests {
 
     #[test]
     fn the_tests_get_the_callers_temporary_directory_back() {
-        let config: toml_edit::DocumentMut =
-            test_env_config(Path::new("/tmp/a \"b\""), Path::new("/work/abc"))
-                .unwrap()
-                .parse()
-                .unwrap();
+        let config: toml_edit::DocumentMut = test_env_config(Path::new("/tmp/a \"b\""))
+            .unwrap()
+            .parse()
+            .unwrap();
         let tmpdir = &config["env"]["TMPDIR"];
         assert_eq!(tmpdir["value"].as_str(), Some("/tmp/a \"b\""), "{config}");
         assert_eq!(
@@ -607,17 +610,17 @@ mod tests {
             Some(true),
             "it overrides cargo-mutants' TMPDIR: {config}"
         );
-        let repository = &config["env"]["XTASK_REPOSITORY"];
-        assert_eq!(repository["value"].as_str(), Some("/work/abc"), "{config}");
-        assert_eq!(repository["force"].as_bool(), Some(true), "{config}");
+        assert_eq!(
+            config["env"].as_table().map(toml_edit::Table::len),
+            Some(1),
+            "nothing else, and nothing xtask reads when it is built: {config}"
+        );
         #[cfg(unix)]
         {
             use std::os::unix::ffi::OsStrExt as _;
             let invalid = std::ffi::OsStr::from_bytes(b"/tmp/\xff");
-            let error = test_env_config(Path::new(invalid), Path::new("/w")).unwrap_err();
+            let error = test_env_config(Path::new(invalid)).unwrap_err();
             assert!(error.to_string().contains("not UTF-8"), "{error}");
-            let checkout = test_env_config(Path::new("/tmp"), Path::new(invalid)).unwrap_err();
-            assert!(checkout.to_string().contains("the checkout"), "{checkout}");
         }
     }
 
@@ -815,7 +818,8 @@ mod tests {
         script(
             &mutants,
             &format!(
-                "echo \"$*\" > {}\nwhile [ $# -gt 0 ]; do case \"$1\" in --output) out=$2 ;; --in-diff) diff=$2 ;; esac; shift; done\ngrep -q '^+++ b/src/a.rs' \"$diff\" || exit 8\n! grep -q README \"$diff\" || exit 9\nmkdir -p \"$out/mutants.out\"\necho 'src/a.rs:1:18: replace a -> bool with false' > \"$out/mutants.out/missed.txt\"\nexit 2\n",
+                "echo \"$XTASK_TEST_REPOSITORY\" > {}\necho \"$*\" > {}\nwhile [ $# -gt 0 ]; do case \"$1\" in --output) out=$2 ;; --in-diff) diff=$2 ;; esac; shift; done\ngrep -q '^+++ b/src/a.rs' \"$diff\" || exit 8\n! grep -q README \"$diff\" || exit 9\nmkdir -p \"$out/mutants.out\"\necho 'src/a.rs:1:18: replace a -> bool with false' > \"$out/mutants.out/missed.txt\"\nexit 2\n",
+                temp.path().join("checkout").display(),
                 args.display()
             ),
         );
@@ -865,13 +869,12 @@ mod tests {
             )),
             "{called}"
         );
-        let config = fs::read_to_string(repo.join("target/mutants/xtask/test-env.toml")).unwrap();
-        assert!(
-            config.contains(&format!(
-                "XTASK_REPOSITORY = {{ value = \"{}\"",
-                repo.display()
-            )),
-            "the copies' builds name the checkout: {config}"
+        assert_eq!(
+            fs::read_to_string(temp.path().join("checkout"))
+                .unwrap()
+                .trim(),
+            repo.to_str().unwrap(),
+            "the tests in the copies are told the checkout at run time"
         );
     }
 

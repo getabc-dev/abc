@@ -956,7 +956,7 @@ mod tests {
 
     #[test]
     fn metadata_reads_which_crates_use_sqlx_and_keep_a_query_cache() {
-        let root = crate::repo_root().unwrap();
+        let root = crate::testing::checkout();
         let packages = super::workspace_packages(&root, MAIN).unwrap();
         let find = |name: &str| {
             packages
@@ -1052,7 +1052,7 @@ mod tests {
 
     #[test]
     fn xtask_metadata_reads_from_its_own_workspace() {
-        let root = crate::repo_root().unwrap();
+        let root = crate::testing::checkout();
         let packages = super::workspace_packages(&root, XTASK).unwrap();
         let names: Vec<(&str, &Path)> = packages
             .iter()
@@ -1293,7 +1293,7 @@ mod tests {
         )
         .unwrap();
         fs::copy(
-            crate::repo_root().unwrap().join("rust-toolchain.toml"),
+            crate::testing::checkout().join("rust-toolchain.toml"),
             root.join("rust-toolchain.toml"),
         )
         .unwrap();
@@ -1630,7 +1630,7 @@ mod tests {
 
     #[test]
     fn the_repositorys_scripts_are_all_listed() {
-        let root = crate::repo_root().unwrap();
+        let root = crate::testing::checkout();
         let listed = git(
             &root,
             &[

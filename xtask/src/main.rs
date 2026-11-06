@@ -710,20 +710,15 @@ fn run_vm(
     vm::run(action, &host, &msb, env, report)
 }
 
-/// The repository root: the checkout xtask was built from, whose pinned tools it runs.
-///
-/// That is the directory around xtask's own, unless the build named another in
-/// `XTASK_REPOSITORY`: `cargo xtask mutants` builds xtask in a copy of `xtask/` alone, so that no
-/// other command in the checkout compiles a mutant, and sets it to the checkout, which its tests
-/// read around them. It is read when xtask is compiled, never at run time.
+/// The repository root: the checkout xtask was built from, the directory around xtask's own,
+/// whose pinned tools it runs. Nothing in the environment changes it, when xtask is built or
+/// when it runs; tests that run in a copy of `xtask/` alone read the checkout through
+/// `testing::checkout`, in test builds.
 fn repo_root() -> anyhow::Result<PathBuf> {
-    match option_env!("XTASK_REPOSITORY") {
-        Some(root) => Ok(PathBuf::from(root)),
-        None => Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .map(Path::to_path_buf)
-            .context("xtask is not inside the repository"),
-    }
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .map(Path::to_path_buf)
+        .context("xtask is not inside the repository")
 }
 
 #[cfg(test)]
@@ -739,8 +734,7 @@ mod tests {
     use std::process::ExitCode;
 
     use super::{
-        Cli, Invocation, RulesetAction, Task, TaskAction, repo_root, run, serve_tokens, user_home,
-        verdict,
+        Cli, Invocation, RulesetAction, Task, TaskAction, run, serve_tokens, user_home, verdict,
     };
     use crate::testing::{git, repository_with_change, script};
 
@@ -1087,8 +1081,8 @@ mod tests {
                 Task::Rulesets {
                     action: RulesetAction::Check
                 },
-                &repo_root().unwrap(),
-                &repo_root().unwrap(),
+                &crate::testing::checkout(),
+                &crate::testing::checkout(),
                 &no_env
             )
             .unwrap(),
@@ -1135,7 +1129,7 @@ mod tests {
             fs::write(path, "#!/bin/sh\n").unwrap();
         }
         fs::copy(
-            repo_root().unwrap().join("rust-toolchain.toml"),
+            crate::testing::checkout().join("rust-toolchain.toml"),
             root.join("rust-toolchain.toml"),
         )
         .unwrap();
@@ -1162,7 +1156,7 @@ mod tests {
         let here = Invocation::new(None).unwrap();
         assert_eq!(
             here.root,
-            repo_root().unwrap(),
+            crate::testing::checkout(),
             "the tree defaults to xtask's own"
         );
         assert_eq!(here.home, here.root, "and so do the tools");
@@ -1184,7 +1178,7 @@ mod tests {
         );
         assert_eq!(
             elsewhere.home,
-            repo_root().unwrap(),
+            crate::testing::checkout(),
             "the tools stay xtask's own"
         );
         assert!(
@@ -1284,7 +1278,7 @@ mod tests {
 
     #[test]
     fn no_symlink_is_tracked() {
-        let root = repo_root().unwrap();
+        let root = crate::testing::checkout();
         let listing = crate::git::git(&root, &["ls-files", "--stage", "-z"]).unwrap();
         let links: Vec<&str> = listing
             .split('\0')
@@ -1299,7 +1293,7 @@ mod tests {
 
     #[test]
     fn the_xtask_workspace_keeps_the_main_workspace_lints_and_rust_version() {
-        let root = repo_root().unwrap();
+        let root = crate::testing::checkout();
         let read = |path: &str| -> serde_json::Value {
             toml_edit::de::from_str(&fs::read_to_string(root.join(path)).unwrap()).unwrap()
         };
@@ -1339,7 +1333,7 @@ mod tests {
 
     #[test]
     fn workspace_rust_version_is_the_pinned_toolchain() {
-        let root = repo_root().unwrap();
+        let root = crate::testing::checkout();
         let toolchain: toml_edit::DocumentMut =
             fs::read_to_string(root.join("rust-toolchain.toml"))
                 .unwrap()
