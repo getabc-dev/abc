@@ -220,10 +220,12 @@ notices: every tool call and stop fails, naming the fix, until you run `cargo xt
 `cargo xtask vm start` for the worktree. To reclaim their space, stop the session and purge it
 (`vm stop --purge`, or `vm gc --yes` once its branch is merged).
 
-`vm stop` always stops the session's token broker: one that does not answer within a minute gets
-SIGTERM, which makes it revoke its tokens and remove its sockets and pid file in
-`~/.config/abc/agent-broker/`, and SIGKILL a minute later if it still runs; its tokens then expire
-within the hour.
+`vm stop` always stops the session's VM, and its token broker: one that does not answer within a
+minute gets SIGTERM, which makes it hang up on its clients, revoke its tokens and remove its
+sockets and pid file in `~/.config/abc/agent-broker/`, and SIGKILL a minute later if it is still
+the broker; its tokens then expire within the hour. When the broker may still run (it cannot be
+signalled, outlives SIGKILL, or listens without a pid file), `vm stop` leaves its files, stops the
+VM, and fails naming what to stop by hand.
 
 `start` refuses unless `claude auth status` in the VM reports the subscription token
 (`authMethod` `oauth_token`). The launcher strips `ANTHROPIC_API_KEY` and every other API route

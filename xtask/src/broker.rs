@@ -9,8 +9,10 @@
 //! [`ENV`] names the guest end, and `cargo xtask git-credential` and `cargo xtask gh` ask it for a
 //! token per use. The control socket stays on the host: `cargo xtask vm stop` asks the broker
 //! there to revoke every token it minted and to exit ([`shut_down`]). A broker that does not
-//! answer gets SIGTERM through the pid file it writes beside its sockets, and on SIGTERM it stops
-//! as if asked ([`stop_on_signals`]): it revokes its tokens and removes its sockets and pid file.
+//! answer gets SIGTERM through the pid file it writes beside its sockets. SIGTERM, SIGINT and
+//! SIGHUP stop it directly, as `stop` does, through no socket: it hangs up on the clients it is
+//! serving, revokes its tokens and removes its sockets and pid file. Each client has
+//! [`PATIENCE`] in all to send its request and take its answer, so no client holds up a stop.
 //! Each line the broker logs names its session, and it mints at most [`MAX_PER_HOUR`] tokens an
 //! hour.
 //!
@@ -19,7 +21,7 @@
 //! within the hour, or `error <reason>`, and closes the connection. The key never leaves the
 //! broker and no token is ever logged.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::ffi::OsString;
 use std::fs;
 use std::io::{BufRead as _, BufReader, Read, Write};
@@ -27,8 +29,8 @@ use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _, PermissionsExt 
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Mutex, MutexGuard, mpsc};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, anyhow, bail};
@@ -49,9 +51,19 @@ pub(crate) const STOP_PATIENCE: Duration = Duration::from_secs(60);
 /// of the vsock forward.
 pub(crate) const ENV: &str = "ABC_AGENT_BROKER";
 
-/// How long the broker waits for a client to send its one-line request or take its answer, and a
-/// client for the broker's answer.
+/// How long a client of the broker has, in all, to send its one-line request and take its answer,
+/// however slowly it sends; and how long a client waits for the broker's answer.
 const PATIENCE: Duration = Duration::from_secs(5);
+
+/// How often the broker's listeners look for a client and for a stop.
+const ACCEPT_POLL: Duration = Duration::from_millis(100);
+
+/// The signals that stop a broker as `stop` does.
+const STOP_SIGNALS: [i32; 3] = [
+    signal_hook::consts::SIGTERM,
+    signal_hook::consts::SIGINT,
+    signal_hook::consts::SIGHUP,
+];
 
 /// How many clients the broker serves at once; more are refused until one finishes, so clients
 /// that hang can hold up at most this many connections, each for at most [`PATIENCE`].
@@ -204,10 +216,72 @@ impl Ledger {
     }
 }
 
+/// What stops a broker.
+enum Stop {
+    /// A client of the control socket said `stop`; it is told what was revoked.
+    Asked(UnixStream),
+    /// The process got this signal.
+    Signal(i32),
+}
+
+/// What a broker's threads share.
+#[derive(Default)]
+struct Shared {
+    /// Set once the broker stops: from then on it accepts no client and mints nothing.
+    stopping: AtomicBool,
+    ledger: Mutex<Ledger>,
+    /// The clients being served, by number, to hang up on when the broker stops.
+    clients: Mutex<BTreeMap<u64, UnixStream>>,
+    next: AtomicU64,
+}
+
+impl Shared {
+    fn ledger(&self) -> anyhow::Result<MutexGuard<'_, Ledger>> {
+        self.ledger
+            .lock()
+            .map_err(|poisoned| anyhow!("the broker's ledger is poisoned: {poisoned}"))
+    }
+
+    /// Records `client` as being served, to hang up on if the broker stops meanwhile; returns its
+    /// number for [`Shared::leave`]. A client that comes as the broker stops is hung up on at once.
+    fn enter(&self, client: &UnixStream) -> Option<u64> {
+        let copy = client.try_clone().ok()?;
+        let number = self.next.fetch_add(1, Ordering::SeqCst);
+        if let Ok(mut clients) = self.clients.lock() {
+            clients.insert(number, copy);
+        }
+        // `stop` sets the flag before it hangs up, so a client it missed sees the flag here.
+        if self.stopping.load(Ordering::SeqCst) {
+            let _hung_up = client.shutdown(std::net::Shutdown::Both);
+        }
+        Some(number)
+    }
+
+    /// Forgets client `number`, which is done.
+    fn leave(&self, number: u64) {
+        if let Ok(mut clients) = self.clients.lock() {
+            clients.remove(&number);
+        }
+    }
+
+    /// Stops the broker: no more clients or tokens, and every client being served is hung up on,
+    /// which ends its reads and writes at once.
+    fn stop(&self) {
+        self.stopping.store(true, Ordering::SeqCst);
+        if let Ok(mut clients) = self.clients.lock() {
+            for (_, client) in std::mem::take(&mut *clients) {
+                // A client that already went is fine.
+                let _hung_up = client.shutdown(std::net::Shutdown::Both);
+            }
+        }
+    }
+}
+
 /// Serves session `session`'s tokens from `mint`, at most `limit` an hour, on the sockets of
-/// `files` until a client of the control socket says `stop`; then revokes every token it minted
-/// with `revoke`, tells that client how many, removes its files and returns. While it serves, its
-/// pid file names this process. Each request is noted in `log`.
+/// `files` until a client of the control socket says `stop` or the process gets one of
+/// [`STOP_SIGNALS`]; then hangs up on the clients it is serving, revokes every token it minted
+/// with `revoke`, removes its files, tells the client that asked how many it revoked, and
+/// returns. While it serves, its pid file names this process. Each request is noted in `log`.
 pub(crate) fn serve(
     session: &str,
     files: &Files,
@@ -216,6 +290,10 @@ pub(crate) fn serve(
     limit: usize,
     log: &mut (impl Write + Send),
 ) -> anyhow::Result<()> {
+    // Before anything else, so that a stop signal from here on stops the broker as `stop` does.
+    let mut signals = signal_hook::iterator::Signals::new(STOP_SIGNALS)
+        .context("could not handle the stop signals")?;
+    let signal_thread = signals.handle();
     let tokens = bind(&files.tokens)?;
     let control = bind(&files.control)?;
     write_pid(&files.pid)?;
@@ -225,56 +303,150 @@ pub(crate) fn serve(
         files.tokens.display()
     )?;
     let log = Mutex::new(log);
-    let ledger = Mutex::new(Ledger::default());
-    let stopping = AtomicBool::new(false);
+    let shared = Shared::default();
     let metered = |scope: Scope| -> anyhow::Result<String> {
-        ledger
-            .lock()
-            .map_err(|poisoned| anyhow!("the broker's ledger is poisoned: {poisoned}"))?
-            .admit(Instant::now(), limit)?;
+        anyhow::ensure!(
+            !shared.stopping.load(Ordering::SeqCst),
+            "the broker is stopping"
+        );
+        shared.ledger()?.admit(Instant::now(), limit)?;
+        // A token minted while the broker stops is still recorded, and so revoked: the broker
+        // revokes only once every client's thread has ended.
         let token = mint(scope)?;
-        ledger
-            .lock()
-            .map_err(|poisoned| anyhow!("the broker's ledger is poisoned: {poisoned}"))?
-            .minted
-            .push(token.clone());
+        shared.ledger()?.minted.push(token.clone());
         Ok(token)
     };
-    let mut asker = std::thread::scope(|scope| {
-        scope.spawn(|| {
-            let clients = tokens
-                .incoming()
-                .take_while(|_| !stopping.load(Ordering::SeqCst))
-                .map(|client| {
-                    let client = client?;
-                    client.set_read_timeout(Some(PATIENCE))?;
-                    client.set_write_timeout(Some(PATIENCE))?;
-                    Ok(client)
-                });
-            answer_all(session, clients, &metered, &log, MAX_CLIENTS);
+    let (sender, stops) = mpsc::channel();
+    let stop = std::thread::scope(|scope| {
+        let shared = &shared;
+        let (asked, log, metered) = (sender.clone(), &log, &metered);
+        scope.spawn(move || {
+            let clients = accepting(&tokens, &shared.stopping);
+            answer_all(session, clients, metered, log, MAX_CLIENTS, shared);
         });
-        let asker = await_stop(&control);
-        stopping.store(true, Ordering::SeqCst);
-        // Wakes the token loop, which then sees it is stopping.
-        let _woken = UnixStream::connect(&files.tokens);
-        asker
-    })?;
-    let minted = std::mem::take(
-        &mut ledger
-            .lock()
-            .map_err(|poisoned| anyhow!("the broker's ledger is poisoned: {poisoned}"))?
-            .minted,
-    );
+        scope.spawn(move || {
+            if let Some(client) = await_stop(accepting(&control, &shared.stopping)) {
+                let _sent = asked.send(Stop::Asked(client));
+            }
+        });
+        scope.spawn(move || {
+            // Ends once the handle is closed below.
+            for signal in signals.forever() {
+                if sender.send(Stop::Signal(signal)).is_err() {
+                    break;
+                }
+            }
+        });
+        // The signal thread holds a sender until the handle is closed, so a stop always comes.
+        let stop = stops.recv();
+        shared.stop();
+        signal_thread.close();
+        stop
+    })
+    .context("the broker's stop channel closed")?;
+    let minted = std::mem::take(&mut shared.ledger()?.minted);
     let revoked = minted.iter().filter(|token| revoke(token).is_ok()).count();
     let summary = format!("revoked {revoked} of {} tokens", minted.len());
-    note_line(&log, &format!("broker {session}: stopped; {summary}"));
+    let how = match &stop {
+        Stop::Asked(_) => String::new(),
+        Stop::Signal(signal) => format!(
+            " on {}",
+            signal_hook::low_level::signal_name(*signal).unwrap_or("a signal")
+        ),
+    };
+    note_line(&log, &format!("broker {session}: stopped{how}; {summary}"));
     for file in files.all() {
         let _removed = fs::remove_file(file);
     }
     // The client may be gone; the tokens are revoked either way. It is told last, so that once it
     // reads the answer the broker's files are gone.
-    let _told = writeln!(asker, "stopped {summary}");
+    if let Stop::Asked(mut asker) = stop {
+        let _told = asker
+            .set_write_timeout(Some(PATIENCE))
+            .and_then(|()| writeln!(asker, "stopped {summary}"));
+    }
     Ok(())
+}
+
+/// The clients `listener` accepts until `stopping` is set, which it looks at every
+/// [`ACCEPT_POLL`]: the listener does not block, so a stop never waits on a client that does not
+/// come.
+fn accepting<'a>(
+    listener: &'a UnixListener,
+    stopping: &'a AtomicBool,
+) -> impl Iterator<Item = std::io::Result<UnixStream>> + 'a {
+    std::iter::from_fn(move || {
+        loop {
+            if stopping.load(Ordering::SeqCst) {
+                return None;
+            }
+            match listener.accept() {
+                // On macOS an accepted socket inherits the listener's non-blocking mode.
+                Ok((client, _)) => return Some(client.set_nonblocking(false).map(|()| client)),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(ACCEPT_POLL);
+                }
+                Err(error) => {
+                    // An error that repeats, such as too many open files, must not spin.
+                    std::thread::sleep(ACCEPT_POLL);
+                    return Some(Err(error));
+                }
+            }
+        }
+    })
+}
+
+/// A client's stream, read and written within one deadline for the whole exchange: each read and
+/// write may take only what is left of it, so a client that sends a byte at a time gets no more.
+struct Timed<'a> {
+    stream: &'a UnixStream,
+    deadline: Instant,
+}
+
+impl<'a> Timed<'a> {
+    /// `stream`, with [`PATIENCE`] from now.
+    fn new(stream: &'a UnixStream) -> Self {
+        Self {
+            stream,
+            // An instant past what the clock can show cannot come; then the time is up at once.
+            deadline: Instant::now()
+                .checked_add(PATIENCE)
+                .unwrap_or_else(Instant::now),
+        }
+    }
+
+    /// What is left of the deadline; an error once it has passed.
+    fn left(&self) -> std::io::Result<Duration> {
+        self.deadline
+            .checked_duration_since(Instant::now())
+            .filter(|left| !left.is_zero())
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("the client took more than {} s", PATIENCE.as_secs()),
+                )
+            })
+    }
+}
+
+impl Read for Timed<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.stream.set_read_timeout(Some(self.left()?))?;
+        let mut stream = self.stream;
+        stream.read(buf)
+    }
+}
+
+impl Write for Timed<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.stream.set_write_timeout(Some(self.left()?))?;
+        let mut stream = self.stream;
+        stream.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 /// Writes this process's id to `path`, readable only by its owner.
@@ -289,38 +461,19 @@ fn write_pid(path: &Path) -> anyhow::Result<()> {
         .with_context(|| format!("could not write {}", path.display()))
 }
 
-/// Makes SIGTERM, SIGINT and SIGHUP stop this broker as `stop` on its control socket `control`
-/// would: it revokes its tokens and removes its files before it exits. A signal that comes before
-/// the broker listens is retried on the next.
-pub(crate) fn stop_on_signals(control: PathBuf) -> anyhow::Result<()> {
-    use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
-    let mut signals = signal_hook::iterator::Signals::new([SIGTERM, SIGINT, SIGHUP])
-        .context("could not handle the stop signals")?;
-    std::thread::spawn(move || {
-        for _ in signals.forever() {
-            if stop_at(&control, STOP_PATIENCE).is_ok() {
-                break;
-            }
-        }
-    });
-    Ok(())
-}
-
-/// Waits on `control` for a client that says `stop`, refusing anything else, and returns it.
-fn await_stop(control: &UnixListener) -> anyhow::Result<UnixStream> {
-    for client in control.incoming() {
+/// Waits among `clients` of the control socket for one that says `stop`, refusing anything else,
+/// and returns it; none once there are no more.
+fn await_stop(clients: impl Iterator<Item = std::io::Result<UnixStream>>) -> Option<UnixStream> {
+    for client in clients {
         let Ok(mut client) = client else { continue };
-        if client.set_read_timeout(Some(PATIENCE)).is_err() {
-            continue;
-        }
         let mut line = String::new();
-        let read = BufReader::new((&mut client).take(MAX_REQUEST)).read_line(&mut line);
+        let read = BufReader::new(Timed::new(&client).take(MAX_REQUEST)).read_line(&mut line);
         if read.is_ok() && line == "stop\n" {
-            return Ok(client);
+            return Some(client);
         }
         refuse(&mut client, "the control socket understands only `stop`");
     }
-    bail!("the broker's control socket closed")
+    None
 }
 
 /// Stops the broker whose control socket is `control`, which revokes its tokens, waiting
@@ -347,13 +500,17 @@ fn stop_at(control: &Path, patience: Duration) -> anyhow::Result<String> {
         .with_context(|| format!("the broker did not stop: {answer:?}"))
 }
 
-/// Stops session `session`'s broker, whose files are `files`, so that none is left running and
-/// no file of it is left behind: asked on its control socket first, which revokes its tokens;
-/// when it does not answer within `patience`, SIGTERM to the pid its pid file names, once `ps`
-/// shows that process is still that session's broker, which stops it the same way; when it is
-/// still running `patience` later, SIGKILL, and its tokens expire within the hour. Returns what
-/// happened, for the user.
-pub(crate) fn shut_down(files: &Files, session: &str, patience: Duration) -> String {
+/// Stops session `session`'s broker, whose files are `files`, so that none is left running: asked
+/// on its control socket first, which revokes its tokens; when it does not answer within
+/// `patience`, SIGTERM to the pid its pid file names, once `ps` shows that process is still that
+/// session's broker, which stops it the same way; when it is still that broker `patience` later,
+/// SIGKILL, and its tokens expire within the hour. Its files are removed only once it is gone.
+/// Returns what happened, for the user; fails, naming the pid, when the broker may still run.
+pub(crate) fn shut_down(
+    files: &Files,
+    session: &str,
+    patience: Duration,
+) -> anyhow::Result<String> {
     let mut said = Vec::new();
     // A broker that answers has removed its files by then.
     let answered = files.control.exists()
@@ -367,8 +524,28 @@ pub(crate) fn shut_down(files: &Files, session: &str, patience: Duration) -> Str
                 false
             }
         };
-    if !answered && let Some(pid) = read_pid(&files.pid) {
-        said.push(signal_broker(pid, session, patience));
+    if !answered {
+        match read_pid(&files.pid) {
+            Some(pid) => match signal_broker(pid, session, patience) {
+                Ok(done) => said.push(done),
+                Err(error) => {
+                    said.push(format!("{error:#}"));
+                    bail!(
+                        "{}; its files in {} are left as they are",
+                        said.join("; "),
+                        files.pid.parent().unwrap_or(&files.pid).display()
+                    );
+                }
+            },
+            None => anyhow::ensure!(
+                !listening(files),
+                "{}; a token broker listens on {} and left no pid file, so it may still be \
+                 running: find it with `pgrep -f 'broker --session {session}'`, stop it, and run \
+                 this again",
+                said.join("; "),
+                files.tokens.parent().unwrap_or(&files.tokens).display()
+            ),
+        }
     }
     let mut removed = Vec::new();
     for file in files.all() {
@@ -385,7 +562,14 @@ pub(crate) fn shut_down(files: &Files, session: &str, patience: Duration) -> Str
     if said.is_empty() {
         said.push(String::from("no token broker was running"));
     }
-    said.join("; ")
+    Ok(said.join("; "))
+}
+
+/// Whether a process accepts connections on either of the sockets of `files`.
+fn listening(files: &Files) -> bool {
+    [&files.tokens, &files.control]
+        .into_iter()
+        .any(|socket| UnixStream::connect(socket).is_ok())
 }
 
 /// The process id in the pid file at `path`, if there is one.
@@ -393,27 +577,39 @@ fn read_pid(path: &Path) -> Option<u32> {
     fs::read_to_string(path).ok()?.trim().parse().ok()
 }
 
-/// Sends SIGTERM to `pid`, then SIGKILL if it is still running `patience` later, once `ps` shows
-/// it is session `session`'s broker; says what it did.
-fn signal_broker(pid: u32, session: &str, patience: Duration) -> String {
+/// Sends SIGTERM to `pid` once `ps` shows it is session `session`'s broker, then SIGKILL if it is
+/// still that broker `patience` later, and waits `patience` again for it to go; says what it did.
+/// Fails, naming the pid, when it cannot be signalled or is still that broker after SIGKILL.
+fn signal_broker(pid: u32, session: &str, patience: Duration) -> anyhow::Result<String> {
     if !is_broker(pid, session) {
-        return format!("process {pid} is no longer the token broker of {session}; left alone");
+        return Ok(format!(
+            "process {pid} is no longer the token broker of {session}; left alone"
+        ));
     }
-    if !signal(pid, "TERM") {
-        return format!("could not signal the token broker (pid {pid})");
+    anyhow::ensure!(
+        signal(pid, "TERM"),
+        "could not send SIGTERM to the token broker (pid {pid}), which may still be running"
+    );
+    if within(patience, || !is_broker(pid, session)) {
+        return Ok(format!("stopped the token broker (pid {pid}) with SIGTERM"));
     }
-    if within(patience, || !alive(pid)) {
-        return format!("stopped the token broker (pid {pid}) with SIGTERM");
-    }
-    if signal(pid, "KILL") {
-        format!(
-            "killed the token broker (pid {pid}), which outlived SIGTERM by {} s; its tokens \
-             were not revoked and expire within the hour",
-            patience.as_secs()
-        )
-    } else {
-        format!("could not kill the token broker (pid {pid})")
-    }
+    // `within` looked last just now: the process is still the broker, not a program that took its
+    // pid or that it became.
+    anyhow::ensure!(
+        signal(pid, "KILL"),
+        "could not kill the token broker (pid {pid}), which outlived SIGTERM and may still be \
+         running"
+    );
+    anyhow::ensure!(
+        within(patience, || !is_broker(pid, session)),
+        "the token broker (pid {pid}) still runs {} s after SIGKILL",
+        patience.as_secs()
+    );
+    Ok(format!(
+        "killed the token broker (pid {pid}), which outlived SIGTERM by {} s; its tokens were not \
+         revoked and expire within the hour",
+        patience.as_secs()
+    ))
 }
 
 /// Whether `done` holds within `patience`, asked at once and then every [`POLL`].
@@ -431,46 +627,30 @@ fn within(patience: Duration, mut done: impl FnMut() -> bool) -> bool {
     done()
 }
 
-/// How often [`within`] asks.
-const POLL: Duration = Duration::from_millis(50);
+/// How often [`within`] asks: each ask runs one `ps`.
+const POLL: Duration = Duration::from_millis(200);
 
-/// Whether process `pid` runs `broker --session <session>`, by its command line as `ps` shows it.
+/// Whether process `pid` is running `broker --session <session>`, by one `ps` showing its state
+/// and command line: a process that is gone, a zombie (exited, not yet reaped) or one running
+/// anything else is not.
 fn is_broker(pid: u32, session: &str) -> bool {
     let Ok(output) = Command::new("ps")
-        .args(["-o", "command=", "-p", &pid.to_string()])
+        .args(["-o", "stat=", "-o", "command=", "-p", &pid.to_string()])
         .stdin(Stdio::null())
         .stderr(Stdio::null())
         .output()
     else {
         return false;
     };
-    let command = String::from_utf8_lossy(&output.stdout);
-    let words: Vec<&str> = command.split_whitespace().collect();
+    let shown = String::from_utf8_lossy(&output.stdout);
+    let mut words = shown.split_whitespace();
+    let running = words.next().is_some_and(|state| !state.starts_with('Z'));
+    let words: Vec<&str> = words.collect();
     output.status.success()
+        && running
         && words
             .windows(3)
             .any(|window| window == ["broker", "--session", session])
-}
-
-/// Whether process `pid` is still running: `kill -0` finds it, and `ps` does not show it as a
-/// zombie, which has exited but was not yet reaped.
-fn alive(pid: u32) -> bool {
-    let found = Command::new("kill")
-        .args(["-0", &pid.to_string()])
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success());
-    found
-        && !Command::new("ps")
-            .args(["-o", "stat=", "-p", &pid.to_string()])
-            .stdin(Stdio::null())
-            .output()
-            .is_ok_and(|output| {
-                String::from_utf8_lossy(&output.stdout)
-                    .trim()
-                    .starts_with('Z')
-            })
 }
 
 /// Sends `signal` to `pid` with `kill`; whether it was delivered.
@@ -484,14 +664,15 @@ fn signal(pid: u32, signal: &str) -> bool {
 }
 
 /// Answers each of `clients` with a token from `mint`, each on its own thread and at most `max` at
-/// once, noting each in `log`. A client that fails or comes while `max` are being served is noted
-/// and refused.
+/// once, noting each in `log`, and each recorded in `shared` while it is served, so a stop can
+/// hang up on it. A client that fails or comes while `max` are being served is noted and refused.
 fn answer_all(
     session: &str,
     clients: impl Iterator<Item = std::io::Result<UnixStream>>,
     mint: &(impl Fn(Scope) -> anyhow::Result<String> + Sync),
     log: &Mutex<&mut (impl Write + Send)>,
     max: usize,
+    shared: &Shared,
 ) {
     let serving = AtomicUsize::new(0);
     std::thread::scope(|scope| {
@@ -519,7 +700,11 @@ fn answer_all(
             }
             let serving = &serving;
             scope.spawn(move || {
+                let number = shared.enter(&client);
                 note(session, log, answer(client, mint));
+                if let Some(number) = number {
+                    shared.leave(number);
+                }
                 serving.fetch_sub(1, Ordering::SeqCst);
             });
         }
@@ -558,8 +743,8 @@ pub(crate) fn refuse_checkout(exe: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Listens on `socket`, in a directory only the user can enter, replacing a socket no broker
-/// listens on any longer.
+/// Listens on `socket` without blocking, in a directory only the user can enter, replacing a
+/// socket no broker listens on any longer.
 fn bind(socket: &Path) -> anyhow::Result<UnixListener> {
     let dir = socket
         .parent()
@@ -580,19 +765,24 @@ fn bind(socket: &Path) -> anyhow::Result<UnixListener> {
     }
     let listener = UnixListener::bind(socket)
         .with_context(|| format!("could not listen on {}", socket.display()))?;
+    // [`accepting`] looks for clients without blocking, so that it sees a stop.
+    listener
+        .set_nonblocking(true)
+        .with_context(|| format!("could not listen on {} without blocking", socket.display()))?;
     fs::set_permissions(socket, fs::Permissions::from_mode(0o600))
         .with_context(|| format!("could not restrict {} to its owner", socket.display()))?;
     Ok(listener)
 }
 
 /// Answers one client on `stream` with a token from `mint`, or with the reason there is none, and
-/// returns the scope it minted for.
+/// returns the scope it minted for. The client has [`PATIENCE`] in all to send its request, and
+/// again to take its answer, however long minting took.
 fn answer(
     mut stream: UnixStream,
     mint: impl Fn(Scope) -> anyhow::Result<String>,
 ) -> anyhow::Result<Scope> {
     let mut request = String::new();
-    let read = BufReader::new((&mut stream).take(MAX_REQUEST)).read_line(&mut request);
+    let read = BufReader::new(Timed::new(&stream).take(MAX_REQUEST)).read_line(&mut request);
     let minted = read
         .context("could not read the request")
         .and_then(|_| {
@@ -604,7 +794,7 @@ fn answer(
         .and_then(|scope| Ok((scope, mint(scope)?)));
     match minted {
         Ok((scope, token)) => {
-            writeln!(stream, "token {token}").context("could not send the token")?;
+            writeln!(Timed::new(&stream), "token {token}").context("could not send the token")?;
             Ok(scope)
         }
         Err(error) => {
@@ -729,6 +919,7 @@ mod tests {
             &|_| Ok("ghs_secret".to_owned()),
             &Mutex::new(&mut log),
             2,
+            &super::Shared::default(),
         );
         let mut reply = String::new();
         first.read_to_string(&mut reply).unwrap();
@@ -768,6 +959,7 @@ mod tests {
                 &|_| Ok("ghs_x".to_owned()),
                 &Mutex::new(&mut log),
                 1,
+                &super::Shared::default(),
             );
             sender.send(String::from_utf8(log).unwrap()).unwrap();
         });
@@ -1138,7 +1330,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (sockets, revoked, thread) = broker(dir.path(), 5);
         assert_eq!(request(&sockets.tokens, Scope::Git).unwrap(), "ghs_git0");
-        super::stop_on_signals(sockets.control.clone()).unwrap();
         // nextest runs each test in a process of its own, so this signals this test alone.
         let sent = std::process::Command::new("kill")
             .args(["-s", "TERM", &std::process::id().to_string()])
@@ -1147,13 +1338,164 @@ mod tests {
         assert!(sent.success());
         let log = thread.join().unwrap();
         assert!(
-            log.contains("broker abc-w: stopped; revoked 1 of 1 tokens"),
+            log.contains("broker abc-w: stopped on SIGTERM; revoked 1 of 1 tokens"),
             "{log}"
         );
         assert_eq!(*revoked.lock().unwrap(), ["ghs_git0"]);
         for file in [&sockets.tokens, &sockets.control, &sockets.pid] {
             assert!(!file.exists(), "{} is left behind", file.display());
         }
+    }
+
+    /// Waits up to `patience` for the broker thread `thread` to end, returning its log; fails the
+    /// test when it does not.
+    fn ended(thread: std::thread::JoinHandle<String>, patience: Duration) -> String {
+        let (sender, ended) = std::sync::mpsc::channel();
+        std::thread::spawn(move || sender.send(thread.join().unwrap()));
+        ended
+            .recv_timeout(patience)
+            .expect("the broker did not stop in time")
+    }
+
+    /// A client of `tokens` that sends one byte a second, each within the broker's patience for a
+    /// read, and never finishes its request; it stops when the broker hangs up.
+    fn trickle(tokens: &Path) -> std::thread::JoinHandle<()> {
+        let mut client = UnixStream::connect(tokens).unwrap();
+        std::thread::spawn(move || {
+            for _ in 0..60 {
+                if client.write_all(b"g").is_err() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_secs(1));
+            }
+        })
+    }
+
+    /// The broker's stop waited for every client being served, and a client that sends a byte
+    /// within each read's patience held it for as long as it liked: up to 64 bytes at almost 5 s
+    /// each. Stopping ends the clients in flight.
+    #[test]
+    fn a_trickling_client_cannot_hold_up_a_stop() {
+        let dir = tempfile::tempdir().unwrap();
+        let (sockets, revoked, thread) = broker(dir.path(), 5);
+        assert_eq!(request(&sockets.tokens, Scope::Git).unwrap(), "ghs_git0");
+        let trickler = trickle(&sockets.tokens);
+        std::thread::sleep(Duration::from_millis(200));
+        let started = std::time::Instant::now();
+        assert_eq!(
+            stop_at(&sockets.control, Duration::from_secs(3)).unwrap(),
+            "revoked 1 of 1 tokens"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+        ended(thread, Duration::from_secs(2));
+        assert_eq!(*revoked.lock().unwrap(), ["ghs_git0"]);
+        trickler.join().unwrap();
+    }
+
+    /// A client that sends a byte within each read's patience gets no more than its time in all.
+    #[test]
+    fn a_client_has_its_patience_in_all_not_per_read() {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let trickler = std::thread::spawn(move || {
+            while client.write_all(b"g").is_ok() {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        });
+        let started = std::time::Instant::now();
+        let timed = super::Timed {
+            stream: &server,
+            deadline: started + Duration::from_millis(400),
+        };
+        let mut line = String::new();
+        let read = std::io::BufReader::new(std::io::Read::take(timed, 1000)).read_line(&mut line);
+        assert_eq!(
+            read.map_err(|error| error.kind()),
+            Err(std::io::ErrorKind::TimedOut),
+            "{line:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "{:?}",
+            started.elapsed()
+        );
+        drop(server);
+        trickler.join().unwrap();
+    }
+
+    /// The broker stopped on SIGTERM by sending `stop` to its own control socket: a broker that
+    /// did not answer there was never revoked, and one whose control socket was gone never exited
+    /// on SIGTERM. It now stops directly.
+    #[test]
+    fn sigterm_stops_the_broker_without_its_control_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let (sockets, revoked, thread) = broker(dir.path(), 5);
+        assert_eq!(request(&sockets.tokens, Scope::Git).unwrap(), "ghs_git0");
+        std::fs::remove_file(&sockets.control).unwrap();
+        let trickler = trickle(&sockets.tokens);
+        std::thread::sleep(Duration::from_millis(200));
+        // nextest runs each test in a process of its own, so this signals this test alone.
+        let sent = std::process::Command::new("kill")
+            .args(["-s", "TERM", &std::process::id().to_string()])
+            .status()
+            .unwrap();
+        assert!(sent.success());
+        let log = ended(thread, Duration::from_secs(3));
+        assert!(
+            log.contains("broker abc-w: stopped on SIGTERM; revoked 1 of 1 tokens"),
+            "{log}"
+        );
+        assert_eq!(*revoked.lock().unwrap(), ["ghs_git0"]);
+        for file in [&sockets.tokens, &sockets.pid] {
+            assert!(!file.exists(), "{} is left behind", file.display());
+        }
+        trickler.join().unwrap();
+    }
+
+    /// A broker that listens but does not answer and left no pid file may still be running and
+    /// minting: its files were deleted and `vm stop` went on as if it were gone.
+    #[test]
+    fn a_broker_that_may_still_run_keeps_its_files_and_fails_loudly() {
+        let dir = tempfile::tempdir().unwrap();
+        let (files, _control) = hung(dir.path(), 1);
+        std::fs::remove_file(&files.pid).unwrap();
+        let said = format!(
+            "{:?}",
+            super::shut_down(&files, "abc-w", Duration::from_millis(300))
+        );
+        assert!(said.contains("may still be running"), "{said}");
+        assert!(files.control.exists() && files.tokens.exists(), "{said}");
+    }
+
+    /// A broker that, on SIGTERM, became another program at the same pid got SIGKILL: the
+    /// identity check ran only before SIGTERM.
+    #[test]
+    fn sigkill_goes_only_to_a_process_that_is_still_the_broker() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut child = std::process::Command::new("sh")
+            .args([
+                "-c",
+                "trap 'exec sleep 30' TERM; while :; do sleep 0.05; done",
+                "sh",
+                "broker",
+                "--session",
+                "abc-w",
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let (files, _control) = hung(dir.path(), child.id());
+        let said = format!(
+            "{:?}",
+            super::shut_down(&files, "abc-w", Duration::from_millis(500))
+        );
+        assert!(child.try_wait().unwrap().is_none(), "never killed: {said}");
+        child.kill().unwrap();
+        child.wait().unwrap();
     }
 
     /// A process that looks like session abc-w's broker to `ps`: it exits on SIGTERM unless
@@ -1194,7 +1536,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut child = fake_broker(false);
         let (files, _control) = hung(dir.path(), child.id());
-        let said = super::shut_down(&files, "abc-w", Duration::from_secs(1));
+        let said = super::shut_down(&files, "abc-w", Duration::from_secs(1)).unwrap();
         assert!(
             said.starts_with("the broker did not answer `stop` within 1 s: ")
                 && said.contains(&format!(
@@ -1215,7 +1557,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut child = fake_broker(true);
         let (files, _control) = hung(dir.path(), child.id());
-        let said = super::shut_down(&files, "abc-w", Duration::from_millis(500));
+        let said = super::shut_down(&files, "abc-w", Duration::from_millis(500)).unwrap();
         assert!(
             said.contains(&format!(
                 "killed the token broker (pid {}), which outlived SIGTERM",
@@ -1231,16 +1573,19 @@ mod tests {
     fn waits_as_long_as_its_patience_and_no_longer() {
         let started = std::time::Instant::now();
         let mut asked = 0;
-        assert!(!super::within(Duration::from_millis(300), || {
+        assert!(!super::within(Duration::from_millis(600), || {
             asked += 1;
             false
         }));
-        assert_eq!(asked, 7, "at once, then every 50 ms");
-        assert!(started.elapsed() >= Duration::from_millis(300));
+        assert_eq!(
+            asked, 4,
+            "at once, then every 200 ms: one ps a poll, not two every 50 ms"
+        );
+        assert!(started.elapsed() >= Duration::from_millis(600));
         let mut late = 0;
-        assert!(super::within(Duration::from_millis(300), || {
+        assert!(super::within(Duration::from_millis(600), || {
             late += 1;
-            late == 7
+            late == 4
         }));
         assert!(super::within(Duration::ZERO, || true), "asked once");
     }
@@ -1257,7 +1602,7 @@ mod tests {
             .unwrap();
         let (files, control) = hung(dir.path(), other.id());
         drop(control);
-        let said = super::shut_down(&files, "abc-w", Duration::from_secs(1));
+        let said = super::shut_down(&files, "abc-w", Duration::from_secs(1)).unwrap();
         assert!(
             said.starts_with("no broker listens on ")
                 && said.contains(&format!(
@@ -1271,7 +1616,7 @@ mod tests {
         other.kill().unwrap();
         other.wait().unwrap();
         assert_eq!(
-            super::shut_down(&files, "abc-w", Duration::from_secs(1)),
+            super::shut_down(&files, "abc-w", Duration::from_secs(1)).unwrap(),
             "no token broker was running"
         );
     }
@@ -1282,7 +1627,7 @@ mod tests {
         let (sockets, revoked, thread) = broker(dir.path(), 5);
         request(&sockets.tokens, Scope::Git).unwrap();
         assert_eq!(
-            super::shut_down(&sockets, "abc-w", STOP_PATIENCE),
+            super::shut_down(&sockets, "abc-w", STOP_PATIENCE).unwrap(),
             "stopped the token broker; revoked 1 of 1 tokens"
         );
         thread.join().unwrap();

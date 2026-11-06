@@ -696,8 +696,9 @@ fn push(session: &Session, backend: &dyn Backend) -> anyhow::Result<String> {
 }
 
 /// Stops session `name`'s token broker and VM, and deletes the VM; with `purge`, also its volumes
-/// and its directory `state`. A broker that does not answer is stopped by signal, so this always
-/// stops ([`crate::broker::shut_down`]). Returns what happened to the broker, for the user.
+/// and its directory `state`. A broker that does not answer is stopped by signal
+/// ([`crate::broker::shut_down`]); the VM stops in any case, and a broker that may still run then
+/// fails the stop, naming its pid. Returns what happened to the broker, for the user.
 fn stop(
     name: &str,
     state: &Path,
@@ -710,6 +711,8 @@ fn stop(
         name,
         host.broker_patience,
     );
+    // The VM stops whatever became of the broker; a broker that may still run fails the stop
+    // after it.
     backend.remove(name)?;
     if purge {
         backend.remove_volumes(&volume_names(name))?;
@@ -720,7 +723,7 @@ fn stop(
             _ => {}
         }
     }
-    Ok(broker)
+    broker
 }
 
 /// Why `vm gc` purges a session.

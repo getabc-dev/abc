@@ -675,7 +675,6 @@ fn serve_tokens(exe: &Path, home: &Path, session: &str) -> anyhow::Result<ExitCo
     broker::check_session(session)?;
     let app = app::App::load(&app::config_dir()?)?;
     let files = broker::files(home, session);
-    broker::stop_on_signals(files.control.clone())?;
     broker::serve(
         session,
         &files,
