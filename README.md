@@ -4,8 +4,22 @@ abc is an open-source, self-hosted software factory for developers. Agents take 
 to shipped pull request on your own machines, and every PR carries one HTML artifact that lets you
 trust it without reading the code.
 
-**Status: in development. Nothing is installable yet.** There are no releases, and the parts below
+**Status: in development. Nothing is usable yet.** There are no releases yet, and the parts below
 describe the design being built, not features you can use today.
+
+## Install
+
+From its first release, Homebrew installs abc on macOS 12 or newer and on Linux with glibc 2.28 or
+newer (RHEL 8, Debian 10, Ubuntu 20.04 and later), on arm64 or x86_64:
+
+```sh
+brew install getabc-dev/tap/abc
+```
+
+That installs the `abc` binary, Postgres 18, and abc's own private `tailscaled`, which stays in
+abc's directory and off your `PATH`, so your own `tailscale` command is never shadowed. Setting up
+a server from there, with one command that runs them for you, is the next step being built; until
+it lands, an install gives you the binary alone.
 
 ## How a change moves
 

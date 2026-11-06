@@ -1070,7 +1070,8 @@ pub(crate) fn feed(child: &mut Child, input: &mut dyn Read) -> std::io::Result<b
     }
 }
 
-fn download(url: &str) -> anyhow::Result<Vec<u8>> {
+/// Downloads `url`, up to [`MAX_ARCHIVE_BYTES`].
+pub(crate) fn download(url: &str) -> anyhow::Result<Vec<u8>> {
     let mut response = ureq::get(url)
         .call()
         .with_context(|| format!("could not download {url}"))?;
@@ -1107,7 +1108,8 @@ fn published_sha256(listing: &str, file_name: &str) -> Option<String> {
         .filter(|hash| is_sha256_hex(hash))
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
+/// The sha256 of `bytes`, in lowercase hex.
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     let mut hex = String::with_capacity(64);
     for byte in Sha256::digest(bytes) {
         for nibble in [byte.wrapping_shr(4), byte & 0x0f] {

@@ -136,6 +136,7 @@ watchdog compares the diff with that task and the rules above, and keeps it work
 | `cargo xtask git-credential <op>` | git's credential helper for github.com in agent VMs (`xtask/vm/gitconfig`): it answers with an agent App token from the broker. Never run it yourself. |
 | `cargo xtask broker --session <name>` | Started by `cargo xtask vm start`, one per session, from a build of main installed outside any checkout: serves that agent VM's App tokens, at most 120 an hour, and revokes them all when the session stops; the one process that reads the App's key. |
 | `cargo xtask vm start\|shell\|auth\|sync\|push\|stop <worktree>`, `vm run <worktree> --log <file> -- <cmd>`, `vm gc [--yes]`, `vm image`, `vm ls` | For the maintainer only, from the main clone: runs agent sessions in microsandbox microVMs, one per worktree (D37; CONTRIBUTING.md). `vm run` drives a session with no terminal, writing the output to the log line by line; `vm gc` lists the stopped sessions whose worktree is gone or whose branch GitHub merged, with their disk, and purges them with `--yes`. `stop` always stops the session's broker: one that does not answer gets SIGTERM, then SIGKILL. In a VM, every tool call and stop fails, naming the fix, while `target/` or `.tools/` is not the session's own disk (the image's `abc-own-disks`, built from `xtask/vm/own-disks`); never delete or move them while a VM runs. |
+| `cargo xtask release tailscale-source` / `go` / `package --target <triple>` / `check-tag <tag>` / `formula --dist <dir> --base-url <url> --out <file>` / `tap-plan --formula <file> [--current <json>] --out <file>` | The release workflow's steps (brief decision 52; CONTRIBUTING.md has the release process). `tailscale-source` fetches Tailscale's source at the tag and commit `packaging/tailscale.toml` pins into `target/tailscale`, refusing a tag that names another commit. `go` installs the Go that file pins into `target/go`, refusing one other than the version Tailscale's `go.mod` names and an archive whose sha256 is not the one go.dev publishes, which the pin records. `package` builds the web app, abc for the target with it embedded (macOS 12 and newer) and tailscaled from that source with that Go (static on Linux), and writes `abc-<version>-<target>.tar.gz` and `tailscaled-<version>-<target>.tar.gz`, each with its licences, into `target/dist`; a Linux abc whose ELF version-needed table names a glibc newer than 2.28, or a tailscaled that needs any, fails it. `check-tag` fails unless the tag is `v` and the workspace's version, a release number, and the tagged commit is on `origin`'s `main`. `formula` renders `packaging/homebrew/abc.rb` for every target's archives in `<dir>`, at `<url>/<archive>`. `tap-plan` writes how the tap job updates the tap to a rendered formula (`create`, `update <blob sha>` or `keep`) from the tap's current one, as GitHub's contents API gives it, and fails when the tap holds a newer version. |
 | `cargo xtask rulesets check` | Checks `.github/rulesets/main.json` against the CI workflows: every job that runs on pull requests and in the merge queue is a required check. |
 | `cargo xtask rulesets apply` | For the maintainer only, with their own gh login: puts `.github/rulesets/` on GitHub (`main`, the `agent/*` branch limit and the tag rule), replacing the rulesets they supersede. Agents never run it. |
 | `cargo xtask tool <name> [args]` | Runs a pinned tool from `.tools/`, such as `cargo xtask tool cargo-deny check`. Never run these tools from `PATH`. |
@@ -158,7 +159,11 @@ longer matches its queries, saying how to regenerate it.
 
 CI runs `check`, `e2e`, `integrity`, `coverage`, `mutants` (in eight shards, reported as one
 `Mutants` check), `review` and `fuzz` (for a minute; for an hour nightly on `main`) on every pull
-request, and
+request, the release dry run (`release-dry-run.yml`, when the pull request changes what a release
+builds from: `cargo xtask release package` for the four targets, then the formula installed,
+tested and linted with Homebrew on macOS arm64 and x86_64 and Linux x86_64 and arm64, each on a
+native runner; its verdict is the `Release dry run` check, which passes when the jobs were
+skipped or all passed), and
 `cargo xtask tool cargo-deny check`, `cargo xtask tool cargo-shear --deny-warnings --locked`, both
 again on the fuzz workspace (`cargo xtask tool cargo-deny --manifest-path fuzz/Cargo.toml --config
 fuzz/deny.toml --locked check`, `cargo xtask tool cargo-shear --deny-warnings --locked fuzz`) and
@@ -169,7 +174,13 @@ xtask/Cargo.lock --lockfile web/pnpm-lock.yaml` (which reads `web/osv-scanner.to
 lockfile: each ignored advisory there names its reason and an `ignoreUntil` date, after which the
 scan fails again unless someone renews it on purpose), `cargo xtask tool zizmor --pedantic .github`, `cargo xtask tool pinact run --check --verify-comment` and
 `cargo xtask tool gitleaks git --redact --no-banner --verbose .`. Every job is a required check on
-`main`. Integrity, Coverage, Mutants and Gemini review run the base commit's xtask on the pull
+`main`. The release itself (`release.yml`) runs only on a tag `v*` the maintainer pushes, one
+release at a time: the dry run's build, formula and install jobs without its caches, which an
+xtask test keeps equal, then it attests the archives, publishes the GitHub Release, resuming one
+an earlier attempt left unfinished (`.github/release/publish.sh`), and pushes the formula to
+`getabc-dev/homebrew-tap` with `HOMEBREW_TAP_TOKEN`, a secret no other job reads, never to an
+older version than the tap holds. No job that can write builds anything, which an xtask test
+checks. Integrity, Coverage, Mutants and Gemini review run the base commit's xtask on the pull
 request's tree (`--root`), so a pull request cannot change the gates that judge it; a pull request
 that adds a gate fails that gate, which says it is bootstrapping. Only the review job has
 `GEMINI_API_KEY`, and it runs nothing from the pull request's tree. Inside GitHub Actions
