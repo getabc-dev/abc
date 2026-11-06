@@ -318,9 +318,10 @@ mod tests {
             serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(record["gate"], "e2e");
         assert_eq!(record["pid"], std::process::id());
+        let since = record["since"].as_u64().unwrap();
         assert!(
-            record["since"].as_u64().unwrap() > 0,
-            "the real time: {record}"
+            super::now().abs_diff(since) < 60,
+            "the real time, in seconds since the epoch: {record}"
         );
     }
 

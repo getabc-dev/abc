@@ -331,17 +331,15 @@ fn stop_at(control: &Path, patience: Duration) -> anyhow::Result<String> {
     stream.set_read_timeout(Some(patience))?;
     stream.write_all(b"stop\n")?;
     let mut answer = String::new();
-    match BufReader::new(stream).read_line(&mut answer) {
-        Ok(_) => {}
-        // A read that times out says it would block (EAGAIN).
-        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-            bail!(
+    // A read that times out fails as one that would block (EAGAIN).
+    BufReader::new(stream)
+        .read_line(&mut answer)
+        .with_context(|| {
+            format!(
                 "the broker did not answer `stop` within {} s",
                 patience.as_secs()
             )
-        }
-        Err(error) => return Err(error).context("could not read the broker's answer to `stop`"),
-    }
+        })?;
     answer
         .trim_end()
         .strip_prefix("stopped ")
@@ -357,21 +355,19 @@ fn stop_at(control: &Path, patience: Duration) -> anyhow::Result<String> {
 /// happened, for the user.
 pub(crate) fn shut_down(files: &Files, session: &str, patience: Duration) -> String {
     let mut said = Vec::new();
-    if files.control.exists() {
-        match stop_at(&files.control, patience) {
+    // A broker that answers has removed its files by then.
+    let answered = files.control.exists()
+        && match stop_at(&files.control, patience) {
             Ok(summary) => {
                 said.push(format!("stopped the token broker; {summary}"));
+                true
             }
-            Err(error) => said.push(format!("{error:#}")),
-        }
-    }
-    if said
-        .first()
-        .is_some_and(|first| first.starts_with("stopped"))
-    {
-        // It removes its own files; wait for it to finish.
-        await_gone(files, patience);
-    } else if let Some(pid) = read_pid(&files.pid) {
+            Err(error) => {
+                said.push(format!("{error:#}"));
+                false
+            }
+        };
+    if !answered && let Some(pid) = read_pid(&files.pid) {
         said.push(signal_broker(pid, session, patience));
     }
     let mut removed = Vec::new();
@@ -392,14 +388,6 @@ pub(crate) fn shut_down(files: &Files, session: &str, patience: Duration) -> Str
     said.join("; ")
 }
 
-/// Waits up to `patience` for the files of a broker that is stopping to go.
-fn await_gone(files: &Files, patience: Duration) {
-    let started = Instant::now();
-    while files.all().iter().any(|file| file.exists()) && started.elapsed() < patience {
-        std::thread::sleep(Duration::from_millis(50));
-    }
-}
-
 /// The process id in the pid file at `path`, if there is one.
 fn read_pid(path: &Path) -> Option<u32> {
     fs::read_to_string(path).ok()?.trim().parse().ok()
@@ -414,12 +402,8 @@ fn signal_broker(pid: u32, session: &str, patience: Duration) -> String {
     if !signal(pid, "TERM") {
         return format!("could not signal the token broker (pid {pid})");
     }
-    let started = Instant::now();
-    while started.elapsed() < patience {
-        if !alive(pid) {
-            return format!("stopped the token broker (pid {pid}) with SIGTERM");
-        }
-        std::thread::sleep(Duration::from_millis(50));
+    if within(patience, || !alive(pid)) {
+        return format!("stopped the token broker (pid {pid}) with SIGTERM");
     }
     if signal(pid, "KILL") {
         format!(
@@ -431,6 +415,24 @@ fn signal_broker(pid: u32, session: &str, patience: Duration) -> String {
         format!("could not kill the token broker (pid {pid})")
     }
 }
+
+/// Whether `done` holds within `patience`, asked at once and then every [`POLL`].
+fn within(patience: Duration, mut done: impl FnMut() -> bool) -> bool {
+    let tries = patience
+        .as_millis()
+        .checked_div(POLL.as_millis())
+        .unwrap_or_default();
+    for _ in 0..tries {
+        if done() {
+            return true;
+        }
+        std::thread::sleep(POLL);
+    }
+    done()
+}
+
+/// How often [`within`] asks.
+const POLL: Duration = Duration::from_millis(50);
 
 /// Whether process `pid` runs `broker --session <session>`, by its command line as `ps` shows it.
 fn is_broker(pid: u32, session: &str) -> bool {
@@ -1167,6 +1169,8 @@ mod tests {
                 "--session",
                 "abc-w",
             ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
             .spawn()
             .unwrap()
     }
@@ -1192,7 +1196,7 @@ mod tests {
         let (files, _control) = hung(dir.path(), child.id());
         let said = super::shut_down(&files, "abc-w", Duration::from_secs(1));
         assert!(
-            said.starts_with("the broker did not answer `stop` within 1 s; ")
+            said.starts_with("the broker did not answer `stop` within 1 s: ")
                 && said.contains(&format!(
                     "stopped the token broker (pid {}) with SIGTERM",
                     child.id()
@@ -1224,10 +1228,31 @@ mod tests {
     }
 
     #[test]
+    fn waits_as_long_as_its_patience_and_no_longer() {
+        let started = std::time::Instant::now();
+        let mut asked = 0;
+        assert!(!super::within(Duration::from_millis(300), || {
+            asked += 1;
+            false
+        }));
+        assert_eq!(asked, 7, "at once, then every 50 ms");
+        assert!(started.elapsed() >= Duration::from_millis(300));
+        let mut late = 0;
+        assert!(super::within(Duration::from_millis(300), || {
+            late += 1;
+            late == 7
+        }));
+        assert!(super::within(Duration::ZERO, || true), "asked once");
+    }
+
+    #[test]
     fn a_pid_that_is_not_the_broker_is_left_alone() {
         let dir = tempfile::tempdir().unwrap();
-        let mut other = std::process::Command::new("sleep")
-            .arg("30")
+        // Another session's broker, by its command line.
+        let mut other = std::process::Command::new("sh")
+            .args(["-c", "sleep 30", "sh", "broker", "--session", "abc-other"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
             .spawn()
             .unwrap();
         let (files, control) = hung(dir.path(), other.id());

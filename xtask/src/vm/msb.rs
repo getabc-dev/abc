@@ -536,6 +536,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let msb = fake(dir.path(), "exit 0\n");
         assert!(msb.volumes().unwrap().is_empty(), "no volumes yet");
+        std::fs::create_dir_all(dir.path().join("home")).unwrap();
+        std::fs::write(dir.path().join("home/volumes"), "").unwrap();
+        assert!(
+            msb.volumes()
+                .is_err_and(|error| error.to_string().starts_with("could not read ")),
+            "a volume directory that cannot be read is an error, not no volumes"
+        );
+        std::fs::remove_file(dir.path().join("home/volumes")).unwrap();
         let volumes = dir.path().join("home/volumes");
         std::fs::create_dir_all(volumes.join("abc-w-target/nested")).unwrap();
         std::fs::write(
