@@ -6,3 +6,8 @@ Cargo.lock linguist-generated
 **/.sqlx/** linguist-generated
 web/src/generated/** linguist-generated
 web/pnpm-lock.yaml linguist-generated
+
+# Diff drivers. The review's diff shows each change with its whole function (git diff
+# --function-context), which needs a language's function boundaries; git's rust driver knows
+# Rust's, nested items included.
+*.rs diff=rust

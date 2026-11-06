@@ -76,14 +76,13 @@ pub(crate) fn diff(root: &Path, commit: &str, context: u32) -> anyhow::Result<St
 /// The pathspec attribute that marks a generated file in `.gitattributes`.
 pub(crate) const GENERATED: &str = "linguist-generated";
 
-/// The diff from `commit` to the working tree without generated files, and the generated files it
-/// left out. Which files are generated comes from `.gitattributes` as it was at `commit`, never
-/// from the working tree, so a change cannot hide its own code by marking it generated.
-pub(crate) fn reviewable_diff(
-    root: &Path,
-    commit: &str,
-    context: u32,
-) -> anyhow::Result<(String, Vec<String>)> {
+/// The diff the review reads, from `commit` to the working tree: each change with its whole
+/// function as context (`--function-context`, with the function boundaries of the diff drivers
+/// `.gitattributes` names, such as git's `rust`), without generated files, and the generated
+/// files it left out. Which files are generated, and their drivers, come from `.gitattributes` as
+/// it was at `commit`, never from the working tree, so a change cannot hide its own code by
+/// marking it generated.
+pub(crate) fn reviewable_diff(root: &Path, commit: &str) -> anyhow::Result<(String, Vec<String>)> {
     let attr_source = format!("--attr-source={commit}");
     let diff = git(
         root,
@@ -95,7 +94,7 @@ pub(crate) fn reviewable_diff(
             "--no-color",
             "--no-ext-diff",
             "-M",
-            &format!("-U{context}"),
+            "--function-context",
             commit,
             "--",
             ".",
@@ -118,6 +117,30 @@ pub(crate) fn reviewable_diff(
         ],
     )?;
     Ok((diff, generated.lines().map(str::to_owned).collect()))
+}
+
+/// The files the review reads in full beside the diff: those changed from `commit` to the
+/// working tree that existed at `commit` too (an added file is whole in the diff already), not
+/// generated (by `.gitattributes` at `commit`), with their paths in the working tree.
+pub(crate) fn modified_files(root: &Path, commit: &str) -> anyhow::Result<Vec<String>> {
+    let listing = git(
+        root,
+        &[
+            &format!("--attr-source={commit}"),
+            "-c",
+            "core.quotePath=false",
+            "diff",
+            "--no-ext-diff",
+            "-M",
+            "--diff-filter=MR",
+            "--name-only",
+            commit,
+            "--",
+            ".",
+            &format!(":(exclude,attr:{GENERATED})"),
+        ],
+    )?;
+    Ok(listing.lines().map(str::to_owned).collect())
 }
 
 /// The content of `path` at `revision`, or `None` when the file did not exist there.
@@ -306,7 +329,7 @@ mod tests {
         git(&repo, &["commit", "--quiet", "-m", "change"]);
 
         let base = merge_base(&repo, "base").unwrap();
-        let (text, generated) = reviewable_diff(&repo, &base, 3).unwrap();
+        let (text, generated) = reviewable_diff(&repo, &base).unwrap();
         assert_eq!(
             generated,
             ["gen/cache.json"],
@@ -323,6 +346,45 @@ mod tests {
         assert!(
             text.contains("+src.rs linguist-generated"),
             "and so is the change to .gitattributes"
+        );
+    }
+
+    #[test]
+    fn the_review_diff_shows_whole_functions_and_lists_modified_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = repository(&temp.path().join("repo"));
+        fs::write(repo.join(".gitattributes"), "*.rs diff=rust\n").unwrap();
+        let body = |value: &str| {
+            format!(
+                "mod tests {{\n    fn first() {{\n        let a = 1;\n        let b = 2;\n        \
+                 let c = 3;\n        let d = 4;\n        let value = {value};\n    }}\n\n    fn \
+                 second() {{\n        let unrelated = 0;\n    }}\n}}\n"
+            )
+        };
+        fs::write(repo.join("a.rs"), body("1")).unwrap();
+        fs::write(repo.join("gone.rs"), "fn gone() {}\n").unwrap();
+        git(&repo, &["add", "--all"]);
+        git(&repo, &["commit", "--quiet", "-m", "base"]);
+        git(&repo, &["branch", "base"]);
+        fs::write(repo.join("a.rs"), body("2")).unwrap();
+        fs::write(repo.join("new.rs"), "fn new() {}\n").unwrap();
+        fs::remove_file(repo.join("gone.rs")).unwrap();
+        git(&repo, &["add", "--all"]);
+        git(&repo, &["commit", "--quiet", "-m", "change"]);
+        let base = merge_base(&repo, "base").unwrap();
+        let (text, _) = reviewable_diff(&repo, &base).unwrap();
+        assert!(
+            text.contains(" fn first() {\n         let a = 1;"),
+            "the changed function is whole, past three lines of context: {text}"
+        );
+        assert!(
+            !text.contains("let unrelated"),
+            "git's rust driver ends it at the next function, not at the end of the module: {text}"
+        );
+        assert_eq!(
+            super::modified_files(&repo, &base).unwrap(),
+            ["a.rs"],
+            "an added file is whole in the diff and a deleted one is gone"
         );
     }
 

@@ -1,0 +1,109 @@
+//! `cargo xtask integrity`: changes that weaken the gates, which a person must approve.
+//!
+//! Comparing each changed file with its version at the merge base, it reports deleted tests and
+//! test files, newly added `#[ignore]` and `#[should_panic]`, tests that lost assertions, tests
+//! that a commit of the pull request added and a later one deleted, and
+//! changes to gate files: CI, lint, dependency and toolchain settings, hook settings, and the
+//! xtask code that runs the gates. In CI a finding fails the check unless a listed approver has
+//! labelled the pull request `integrity-approved` after its latest push.
+//!
+//! Tests are read per language, in [`inventory`]: Rust's, and the web app's TypeScript test files
+//! (`*.test.ts`, `*.test.tsx`), where `.skip` and its kin count as `#[ignore]` and `.fails` as
+//! `#[should_panic]`.
+
+mod approval;
+mod reasons;
+mod rust;
+mod typescript;
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
+use std::fs;
+use std::io::Write;
+use std::path::Path;
+
+use anyhow::Context;
+
+pub(crate) use approval::PullRequest;
+use reasons::Explained;
+pub(crate) use reasons::{Event, event};
+pub(crate) use rust::TestCode;
+
+use crate::annotation::{self, Annotation, Mode};
+use crate::git;
+
+/// The gate files: whatever decides what passes. CODEOWNERS patterns, the single list both the
+/// check and `.github/CODEOWNERS` follow: a trailing `/` covers a directory, anything else is one
+/// file, both from the repository root.
+pub(crate) const GATES: [&str; 29] = [
+    "/.cargo/",
+    "/.claude/settings.json",
+    "/.config/",
+    "/.gitattributes",
+    "/.github/",
+    "/.gitleaks.toml",
+    "/AGENTS.md",
+    "/CLAUDE.md",
+    "/Cargo.lock",
+    "/Cargo.toml",
+    "/clippy.toml",
+    "/deny.toml",
+    "/fuzz/Cargo.lock",
+    "/fuzz/Cargo.toml",
+    "/fuzz/deny.toml",
+    "/rust-toolchain.toml",
+    "/rustfmt.toml",
+    "/web/.oxlintrc.json",
+    "/web/biome.json",
+    "/web/knip.jsonc",
+    "/web/package.json",
+    "/web/playwright.config.ts",
+    "/web/pnpm-lock.yaml",
+    "/web/pnpm-workspace.yaml",
+    "/web/tsconfig.base.json",
+    "/web/tsconfig.json",
+    "/web/tsconfig.node.json",
+    "/web/vite.config.ts",
+    "/xtask/",
+];
+
+/// One test in a file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Test {
+    /// The test's path within its file, such as `tests::parses`.
+    pub(crate) name: String,
+    pub(crate) ignored: bool,
+    pub(crate) should_panic: bool,
+    /// How many assertion macros it calls.
+    pub(crate) assertions: usize,
+}
+
+/// Whether the file at `path` is in a language the check reads tests in.
+fn has_tests(path: &str) -> bool {
+    is_rust(path) || typescript::is_test_file(path)
+}
+
+fn is_rust(path: &str) -> bool {
+    Path::new(path)
+        .extension()
+        .is_some_and(|extension| extension == "rs")
+}
+
+/// The tests in a file, for the languages the check reads; `None` for any other file.
+fn inventory(path: &str, source: &str) -> Option<anyhow::Result<Vec<Test>>> {
+    if is_rust(path) {
+        Some(rust::tests(source))
+    } else if typescript::is_test_file(path) {
+        Some(typescript::tests(path, source))
+    } else {
+        None
+    }
+}
+
+/// The test-only code in a file, for the languages the check reads; `None` for any other file.
+pub(crate) fn test_code(path: &Path, source: &str) -> Option<anyhow::Result<TestCode>> {
+    path.extension()
+        .is_some_and(|extension| extension == "rs")
+        .then(|| rust::test_code(source))
+}
+

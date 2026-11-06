@@ -336,7 +336,7 @@ fn review_size(root: &Path, out: &mut impl Write) -> anyhow::Result<bool> {
         }
     };
     let merge_base = crate::git::merge_base(root, &branch)?;
-    let (diff, _) = crate::git::reviewable_diff(root, &merge_base, 3)?;
+    let (diff, _) = crate::git::reviewable_diff(root, &merge_base)?;
     if let Err(error) = crate::review::check_size("the diff", diff.len()) {
         writeln!(out, "xtask: since {branch}, {error}")?;
         return Ok(false);
