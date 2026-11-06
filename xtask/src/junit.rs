@@ -239,6 +239,17 @@ note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace</f
             "a timeout says so, and a panic outside the repository has no place"
         );
         assert!(failures("<testsuites>", "").is_err(), "not XML");
+        assert_eq!(
+            failures(xml, "").unwrap()[0].annotation().file,
+            None,
+            "an annotation without a place names no file"
+        );
+        let unnamed = r#"<testsuites><testcase name="t::lone"><failure message="m"/></testcase></testsuites>"#;
+        assert_eq!(
+            failures(unnamed, "").unwrap()[0].test,
+            "t::lone",
+            "a test case without its binary keeps its name"
+        );
         assert_eq!(panic("no panic here"), None);
         assert_eq!(
             panic("thread 'a' panicked at src/a.rs:x:1:\nm"),
@@ -281,5 +292,11 @@ note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace</f
         super::clear(&report).unwrap();
         assert!(!report.exists());
         super::clear(&report).unwrap();
+        let directory = temp.path().join("a directory");
+        fs::create_dir(&directory).unwrap();
+        assert!(
+            format!("{:#}", super::clear(&directory).unwrap_err()).contains("could not remove"),
+            "only a missing report is no error"
+        );
     }
 }

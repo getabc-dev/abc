@@ -587,6 +587,10 @@ mod tests {
             ),
             "in GitHub Actions the lines are annotated too: {text}"
         );
+        assert!(
+            !text.contains("tests failed"),
+            "tests that pass are not annotated: {text}"
+        );
         let full = run(
             &repo,
             "base",

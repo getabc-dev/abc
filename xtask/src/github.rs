@@ -137,7 +137,9 @@ pub(crate) fn push_of(
                 pusher: field("/actor/login")?,
                 at: field("/created_at")?,
             };
-            if earliest.as_ref().is_none_or(|first| push.at < first.at) {
+            // GitHub lists runs newest first, so of two in the same second the later listed is
+            // the older: a push and a label's run can share one.
+            if earliest.as_ref().is_none_or(|first| push.at <= first.at) {
                 earliest = Some(push);
             }
         }

@@ -435,3 +435,16 @@ fn warns_when_main_moved_on_the_branchs_files() {
         "{offline}"
     );
 }
+
+/// A label added in the same second as the push starts a run with the same `created_at`; GitHub
+/// lists it first, being newer, and the push is still the one that counts.
+#[test]
+fn a_run_in_the_same_second_as_the_push_does_not_hide_it() {
+    let run =
+        |login: &str| json!({"actor": {"login": login}, "created_at": "2026-11-05T10:00:00Z"});
+    let mut answers = vec![json!({"workflow_runs": [run("snehilvj"), run(APP_LOGIN)]})].into_iter();
+    let push = crate::github::push_of("abc", &mut |_| Ok(answers.next().unwrap()))
+        .unwrap()
+        .unwrap();
+    assert_eq!(push.pusher, APP_LOGIN);
+}

@@ -760,6 +760,10 @@ mod tests {
             "annotated in GitHub Actions, named from the repository root: {text}"
         );
         assert!(
+            !text.contains("unmutated tests failed"),
+            "a baseline that passed is not annotated: {text}"
+        );
+        assert!(
             text.contains("missed: xtask/src/a.rs:1:18: replace a -> bool with false"),
             "named from the repository root: {text}"
         );
