@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use super::{APPLY_PUSH, Push, Session, sealed, short, slug};
+use super::{APPLY_PUSH, Id, Push, Session, branches, sealed, short, slug};
 use crate::testing::{git, repository, script};
 
 /// A main clone with an `origin/main` and a linked worktree on branch `feature`; returns the main
@@ -550,4 +550,43 @@ fn what_cannot_be_inspected_is_an_error_not_a_missing_path() {
     let remove = format!("{:#}", super::remove_any(&beneath).unwrap_err());
     assert!(remove.starts_with("could not remove "), "{remove}");
     super::remove_any(&dir.path().join("missing")).unwrap();
+}
+
+/// A session's name and state come from its slug alone. Stripping every leading `abc-` from a
+/// name gave the session of worktree `abc-cli` the state of worktree `cli`'s, and the session of
+/// worktree `abc` the state root itself.
+#[test]
+fn a_sessions_name_and_state_come_from_its_slug() {
+    let root = Path::new("/state");
+    for (worktree, name, state) in [
+        ("abc", "abc-abc", "/state/abc"),
+        ("abc-cli", "abc-abc-cli", "/state/abc-cli"),
+        ("My Change!", "abc-my-change", "/state/my-change"),
+    ] {
+        let id = Id::of_worktree(worktree).unwrap();
+        assert_eq!(id.name(), name, "{worktree}");
+        assert_eq!(id.state(root), Path::new(state), "{worktree}");
+        assert_eq!(Id::of_name(name), Some(id.clone()), "{name}");
+        let slug = state.strip_prefix("/state/").unwrap();
+        assert_eq!(Id::of_slug(slug), Some(id), "{slug}");
+    }
+    assert_eq!(Id::of_worktree("--"), None);
+    for name in ["abc-", "cli", "abc-Cli", "abc--x", "abc-x-", "abc-a/b"] {
+        assert_eq!(Id::of_name(name), None, "{name}");
+    }
+    for slug in ["", ".", "..", "-x", "x-", "A", "a b"] {
+        assert_eq!(Id::of_slug(slug), None, "{slug:?}");
+    }
+}
+
+/// A session directory whose `git` is not a repository must not read the repository around it:
+/// git searched up from the directory it was given.
+#[test]
+fn sealed_git_reads_only_the_repository_it_is_given() {
+    let dir = tempfile::tempdir().unwrap();
+    let around = repository(&dir.path().join("around"));
+    let state = around.join("state/s");
+    fs::create_dir_all(state.join("git")).unwrap();
+    let error = format!("{:#}", branches(&state).unwrap_err());
+    assert!(error.contains("not a git repository"), "{error}");
 }

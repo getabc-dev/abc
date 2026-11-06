@@ -82,6 +82,10 @@ struct Main {
     blocked: u32,
     /// The BLOCKED declaration its next stop takes.
     declaration: Option<String>,
+    /// A stop the drift watchdog was to judge found another gate running, so its check did not
+    /// run and the watchdog was not asked: the next stop that runs `check` is watched in its
+    /// place, though the hook sent this one back.
+    unwatched: bool,
     round: MainRound,
 }
 
@@ -125,12 +129,22 @@ pub(crate) enum Event {
         agent: Agent,
         stop_hook_active: bool,
     },
-    /// The agent's `check` ran; one that could not run did not pass.
-    Checked { agent: Agent, passed: bool },
+    /// The agent's `check` ran, or found another gate running.
+    Checked { agent: Agent, result: CheckResult },
     /// The judge ruled on the main agent's declaration.
     Judged(Ruling),
     /// The drift watchdog judged the main agent's passing stop: why it drifted, if it did.
     Watched(Option<String>),
+}
+
+/// What the stop's `check` came to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CheckResult {
+    Passed,
+    /// It failed or could not run.
+    Failed,
+    /// Another gate held the gate lock (`crate::gate`), so it did not start.
+    GateBusy,
 }
 
 /// What the judge rules on a BLOCKED declaration.
@@ -176,6 +190,11 @@ pub(crate) enum Decision {
 pub(crate) enum Block {
     /// `check` failed or could not run.
     CheckFailed,
+    /// Another gate held the gate lock all the while the hook waited for it (`hook::GATE_WAIT`),
+    /// so `check` did not start: the agent waits for it. Counted like a failure, so a gate that
+    /// never ends cannot hold the agent forever; the wait keeps a long gate from using up the
+    /// count in seconds.
+    GateBusy,
     /// The judge sent the declaration back.
     SentBack { declaration: String, reason: String },
     /// The drift watchdog found the work off its task.
@@ -213,12 +232,12 @@ pub(crate) fn decide(mut state: State, event: Event) -> (Decision, State) {
         }
         Event::Checked {
             agent: Agent::Main,
-            passed,
-        } => state.main.checked(passed),
+            result,
+        } => state.main.checked(result),
         Event::Checked {
             agent: Agent::Sub(id),
-            passed,
-        } => sub_checked(&mut state.subagents, id, passed),
+            result,
+        } => sub_checked(&mut state.subagents, id, result),
         Event::Judged(ruling) => state.main.judged(ruling),
         Event::Watched(drift) => state.main.watched(drift),
     };
@@ -236,6 +255,8 @@ impl State {
         Self {
             main: Main {
                 round,
+                // The watchdog still owes the work a look.
+                unwatched: self.main.unwatched,
                 ..Main::default()
             },
             subagents: self
@@ -292,29 +313,37 @@ impl Main {
             }
             None => {
                 // Only the first stop since one was let through: a stop the hook sent back, or
-                // whose run of blocks continues, is never judged for drift again.
+                // whose run of blocks continues, is never judged for drift again; unless a busy
+                // gate kept the watchdog from judging the one that was to be.
                 self.round = MainRound::Checking {
-                    watched: !stop_hook_active && self.blocked == 0,
+                    watched: (!stop_hook_active && self.blocked == 0)
+                        || std::mem::take(&mut self.unwatched),
                 };
                 Decision::RunCheck
             }
         }
     }
 
-    fn checked(&mut self, passed: bool) -> Decision {
+    fn checked(&mut self, result: CheckResult) -> Decision {
         let MainRound::Checking { watched } = self.round else {
             return Decision::Ignored;
         };
         self.round = MainRound::Idle;
-        if passed {
-            self.blocked = 0;
-            if watched {
-                self.round = MainRound::Watching;
-                return Decision::Watch;
+        match result {
+            CheckResult::Passed => {
+                self.blocked = 0;
+                if watched {
+                    self.round = MainRound::Watching;
+                    return Decision::Watch;
+                }
+                Decision::Allow
             }
-            return Decision::Allow;
+            CheckResult::Failed => self.block(Block::CheckFailed, Agent::Main),
+            CheckResult::GateBusy => {
+                self.unwatched |= watched;
+                self.block(Block::GateBusy, Agent::Main)
+            }
         }
-        self.block(Block::CheckFailed, Agent::Main)
     }
 
     fn judged(&mut self, ruling: Ruling) -> Decision {
@@ -354,6 +383,8 @@ impl Main {
     fn block(&mut self, why: Block, agent: Agent) -> Decision {
         if self.blocked >= MAX_BLOCKED_STOPS {
             let count = std::mem::take(&mut self.blocked);
+            // The stop goes through, and the next one is a first stop, which is watched anyway.
+            self.unwatched = false;
             return Decision::Backstop { agent, count };
         }
         self.blocked = self.blocked.saturating_add(1);
@@ -361,15 +392,23 @@ impl Main {
     }
 }
 
-fn sub_checked(subagents: &mut BTreeMap<AgentId, Sub>, id: AgentId, passed: bool) -> Decision {
+fn sub_checked(
+    subagents: &mut BTreeMap<AgentId, Sub>,
+    id: AgentId,
+    result: CheckResult,
+) -> Decision {
     let Some(sub) = subagents.get_mut(&id).filter(|sub| sub.checking) else {
         return Decision::Ignored;
     };
     sub.checking = false;
-    if passed {
-        subagents.remove(&id);
-        return Decision::Allow;
-    }
+    let why = match result {
+        CheckResult::Passed => {
+            subagents.remove(&id);
+            return Decision::Allow;
+        }
+        CheckResult::Failed => Block::CheckFailed,
+        CheckResult::GateBusy => Block::GateBusy,
+    };
     if sub.blocked >= MAX_BLOCKED_STOPS {
         let count = sub.blocked;
         subagents.remove(&id);
@@ -379,7 +418,7 @@ fn sub_checked(subagents: &mut BTreeMap<AgentId, Sub>, id: AgentId, passed: bool
         };
     }
     sub.blocked = sub.blocked.saturating_add(1);
-    Decision::Block(Block::CheckFailed)
+    Decision::Block(why)
 }
 
 /// Decides `event` on the state of the worktree at `root` and saves the state it leads to, under
@@ -501,8 +540,8 @@ mod tests {
     use proptest::test_runner::{Config, RngAlgorithm, TestCaseError, TestRng, TestRunner};
 
     use super::{
-        Agent, AgentId, Block, Decision, Event, MAX_BLOCKED_STOPS, Main, MainRound, Ruling, State,
-        apply, decide,
+        Agent, AgentId, Block, CheckResult, Decision, Event, MAX_BLOCKED_STOPS, Main, MainRound,
+        Ruling, State, apply, decide,
     };
 
     fn sub(id: &str) -> Agent {
@@ -541,7 +580,7 @@ mod tests {
             stop(Agent::Main),
             Event::Checked {
                 agent: Agent::Main,
-                passed: true,
+                result: CheckResult::Passed,
             },
             Event::Watched(None),
         ]);
@@ -562,7 +601,7 @@ mod tests {
             },
             Event::Checked {
                 agent: Agent::Main,
-                passed: true,
+                result: CheckResult::Passed,
             },
         ]);
         assert_eq!(
@@ -578,13 +617,13 @@ mod tests {
             stop(Agent::Main),
             Event::Checked {
                 agent: Agent::Main,
-                passed: true,
+                result: CheckResult::Passed,
             },
             Event::Watched(Some("off task".to_owned())),
             stop(Agent::Main),
             Event::Checked {
                 agent: Agent::Main,
-                passed: true,
+                result: CheckResult::Passed,
             },
         ]);
         assert_eq!(
@@ -608,7 +647,7 @@ mod tests {
             events.push(stop(Agent::Main));
             events.push(Event::Checked {
                 agent: Agent::Main,
-                passed: false,
+                result: CheckResult::Failed,
             });
         }
         let (decisions, state) = run(events);
@@ -630,6 +669,62 @@ mod tests {
             "five held, the sixth through"
         );
         assert_eq!(state.main.blocked, 0, "the backstop resets the count");
+    }
+
+    /// PR 5a: the stop hook's `check` started while the agent's `coverage` ran. Now a stop that
+    /// finds another gate running is sent back to wait for it, and counts, so a gate that never
+    /// ends cannot keep the agent from stopping forever.
+    #[test]
+    fn a_stop_while_another_gate_runs_is_sent_back_and_counts() {
+        for agent in [Agent::Main, sub("a1")] {
+            let mut events = Vec::new();
+            for _ in 0..=MAX_BLOCKED_STOPS {
+                events.push(stop(agent.clone()));
+                events.push(Event::Checked {
+                    agent: agent.clone(),
+                    result: CheckResult::GateBusy,
+                });
+            }
+            let (decisions, state) = run(events);
+            let ends: Vec<&Decision> = decisions.iter().skip(1).step_by(2).collect();
+            let waiting = Decision::Block(Block::GateBusy);
+            assert_eq!(
+                ends,
+                [
+                    &waiting,
+                    &waiting,
+                    &waiting,
+                    &waiting,
+                    &waiting,
+                    &Decision::Backstop {
+                        agent: agent.clone(),
+                        count: MAX_BLOCKED_STOPS
+                    }
+                ],
+                "{agent:?}: sent back to wait five times, the sixth through"
+            );
+            assert_eq!(state, State::default(), "{agent:?}: nothing left over");
+        }
+        let (decisions, state) = run(vec![
+            stop(Agent::Main),
+            Event::Checked {
+                agent: Agent::Main,
+                result: CheckResult::GateBusy,
+            },
+            stop(Agent::Main),
+            Event::Checked {
+                agent: Agent::Main,
+                result: CheckResult::Passed,
+            },
+            Event::Watched(None),
+        ]);
+        assert_eq!(
+            decisions[decisions.len() - 2..],
+            [Decision::Watch, Decision::Allow],
+            "once the gate is done, a passing check goes to the drift watchdog the busy stop never \
+             reached, though the hook sent that one back, and then through: {decisions:?}"
+        );
+        assert_eq!(state.main.blocked, 0, "and the wait no longer counts");
     }
 
     #[test]
@@ -685,7 +780,7 @@ mod tests {
             events.push(stop(Agent::Main));
             events.push(Event::Checked {
                 agent: Agent::Main,
-                passed: false,
+                result: CheckResult::Failed,
             });
         }
         events.push(declare("stuck".to_owned()));
@@ -721,11 +816,11 @@ mod tests {
         for event in [
             Event::Checked {
                 agent: Agent::Main,
-                passed: false,
+                result: CheckResult::Failed,
             },
             Event::Checked {
                 agent: sub("a"),
-                passed: false,
+                result: CheckResult::Failed,
             },
             Event::Judged(Ruling::Outside),
             Event::Watched(Some("drift".to_owned())),
@@ -743,7 +838,7 @@ mod tests {
             events.push(stop(sub("a")));
             events.push(Event::Checked {
                 agent: sub("a"),
-                passed: false,
+                result: CheckResult::Failed,
             });
         }
         let (decisions, state) = run(events);
@@ -770,7 +865,7 @@ mod tests {
             stop(sub("a")),
             Event::Checked {
                 agent: sub("a"),
-                passed: false,
+                result: CheckResult::Failed,
             },
             Event::TaskSet,
         ]);
@@ -845,7 +940,7 @@ mod tests {
         TaskSet,
         Declare { agent: u8 },
         Stop { agent: u8, active: bool },
-        Checked { agent: u8, passed: bool },
+        Checked { agent: u8, result: CheckResult },
         Judged { outside: bool },
         Watched { drifted: bool },
     }
@@ -862,8 +957,12 @@ mod tests {
             1 => Just(Step::TaskSet),
             2 => (0..3_u8).prop_map(|agent| Step::Declare { agent }),
             6 => (0..3_u8, any::<bool>()).prop_map(|(agent, active)| Step::Stop { agent, active }),
-            8 => (0..3_u8, prop::bool::weighted(0.3))
-                .prop_map(|(agent, passed)| Step::Checked { agent, passed }),
+            8 => (0..3_u8, prop_oneof![
+                3 => Just(CheckResult::Passed),
+                5 => Just(CheckResult::Failed),
+                2 => Just(CheckResult::GateBusy),
+            ])
+                .prop_map(|(agent, result)| Step::Checked { agent, result }),
             3 => any::<bool>().prop_map(|outside| Step::Judged { outside }),
             2 => any::<bool>().prop_map(|drifted| Step::Watched { drifted }),
         ];
@@ -908,11 +1007,11 @@ mod tests {
             ),
             Step::Checked {
                 agent: index,
-                passed,
+                result,
             } => (
                 Event::Checked {
                     agent: agent(*index),
-                    passed: *passed,
+                    result: *result,
                 },
                 Some(*index),
             ),
@@ -940,6 +1039,8 @@ mod tests {
         held: BTreeMap<u8, u32>,
         /// The agent whose stop the latest decision ends.
         stopping: Option<u8>,
+        /// A main stop the watchdog was to judge found another gate running.
+        owed: bool,
     }
 
     /// Checks that a declaration is kept, or refused and changes nothing.
@@ -966,6 +1067,39 @@ mod tests {
                 );
                 prop_assert_eq!(after, before, "a refused declaration changed the state");
             }
+        }
+        Ok(())
+    }
+
+    /// Checks that a busy gate never turns the watchdog off: after a main stop that was to be
+    /// watched found another gate running, the next main stop that runs `check` is watched,
+    /// whatever `stop_hook_active` and the count say.
+    fn check_owed_watch(
+        watch: &mut Watch,
+        event: &Event,
+        decision: &Decision,
+        (before, after): (&State, &State),
+    ) -> Result<(), TestCaseError> {
+        let busy = Event::Checked {
+            agent: Agent::Main,
+            result: CheckResult::GateBusy,
+        };
+        if *event == busy && before.main.round == (MainRound::Checking { watched: true }) {
+            watch.owed = true;
+        }
+        let checks = matches!(
+            event,
+            Event::Stop {
+                agent: Agent::Main,
+                ..
+            }
+        ) && *decision == Decision::RunCheck;
+        if checks && std::mem::take(&mut watch.owed) {
+            prop_assert_eq!(
+                &after.main.round,
+                &MainRound::Checking { watched: true },
+                "a busy gate turned the watchdog off for the next stop"
+            );
         }
         Ok(())
     }
@@ -1011,15 +1145,20 @@ mod tests {
             watch.held.clear();
         }
         check_declaration(event, decision, (before, after))?;
-        if let Event::Checked { passed: false, .. } = event {
+        check_owed_watch(watch, event, decision, (before, after))?;
+        if let Event::Checked {
+            result: CheckResult::Failed | CheckResult::GateBusy,
+            ..
+        } = event
+        {
             prop_assert!(
                 *decision != Decision::Allow,
-                "a failed check let the stop through"
+                "a failed check, or one another gate kept from starting, let the stop through"
             );
         }
         if let Event::Checked {
             agent: Agent::Main,
-            passed: true,
+            result: CheckResult::Passed,
         } = event
             && *decision != Decision::Ignored
         {
@@ -1112,7 +1251,7 @@ mod tests {
             event,
             Event::Checked {
                 agent: Agent::Sub(_),
-                passed: false
+                result: CheckResult::Failed
             }
         );
         let before = state.clone();
@@ -1270,17 +1409,17 @@ mod tests {
             stop(sub("b")),
             Event::Checked {
                 agent: sub("b"),
-                passed: false,
+                result: CheckResult::Failed,
             },
             stop(Agent::Main),
             Event::TaskSet,
             Event::Checked {
                 agent: sub("a"),
-                passed: false,
+                result: CheckResult::Failed,
             },
             Event::Checked {
                 agent: Agent::Main,
-                passed: false,
+                result: CheckResult::Failed,
             },
         ]);
         assert_eq!(
@@ -1307,6 +1446,7 @@ mod tests {
             main: Main {
                 blocked: 2,
                 declaration: Some("stuck".to_owned()),
+                unwatched: true,
                 round: MainRound::Checking { watched: false },
             },
             subagents: BTreeMap::from([(
@@ -1324,6 +1464,7 @@ mod tests {
                 "main": {
                     "blocked": 2,
                     "declaration": "stuck",
+                    "unwatched": true,
                     "round": { "phase": "checking", "watched": false }
                 },
                 "subagents": { "a1": { "blocked": 1, "checking": true } }

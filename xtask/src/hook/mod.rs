@@ -35,14 +35,14 @@ use std::ffi::OsStr;
 use std::io::{Read, Write};
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, bail, ensure};
 use serde::{Deserialize, Serialize};
 
-use crate::stop::{self, Agent, AgentId, Block, Decision, Ruling};
-use crate::{guard, tools, watchdog};
+use crate::stop::{self, Agent, AgentId, Block, CheckResult, Decision, Ruling};
+use crate::{gate, guard, tools, watchdog};
 
 /// The launcher every hook in `.claude/settings.json` runs. A checkout without it predates these
 /// hooks, so its xtask cannot take a hook over.
@@ -72,6 +72,16 @@ pub(crate) const UNKEPT_STATUS: u8 = 3;
 /// silently, because Claude Code discards what a cancelled hook prints; this leaves the watchdog
 /// (`watchdog::TIMEOUT`, 240 s) and the build of xtask room before it.
 const CHECK_DEADLINE: Duration = Duration::from_secs(600);
+
+/// How long a stop's `check` waits for another gate to finish before the stop is sent back to
+/// wait for it, out of [`CHECK_DEADLINE`], which leaves the check itself the rest. Without the
+/// wait, a stop during a long gate came back at once and counted, so an agent could reach the
+/// backstop in seconds. [`GATE_WAIT_ENV`] shortens it, for tests.
+const GATE_WAIT: Duration = Duration::from_secs(300);
+
+/// The variable that sets [`GATE_WAIT`] in seconds instead; the hook's tests use it, so that a
+/// test of a busy gate does not wait five minutes.
+const GATE_WAIT_ENV: &str = "XTASK_HOOK_GATE_WAIT";
 
 /// Marks a hook handed over by another checkout, which must not be handed on again.
 const DELEGATED: &str = "XTASK_HOOK_DELEGATED";
@@ -460,18 +470,18 @@ fn stop_with(root: &Path, fields: &HookInput, steps: &mut impl Steps, log: &mut 
         Err(error) => error,
     };
     let mut said = Vec::new();
-    let passed = remembered.check(&mut said).unwrap_or(false);
+    let result = remembered.check(&mut said).unwrap_or(CheckResult::Failed);
     let said = String::from_utf8_lossy(&said);
     let kept = format!(
         "xtask stop hook: it could not keep its state in {}: {error:#}",
         root.display()
     );
-    if passed {
-        Answer::Notify(format!(
+    match result {
+        CheckResult::Passed => Answer::Notify(format!(
             "{said}check: PASS. {kept}; this stop is allowed, and the drift watchdog did not run."
-        ))
-    } else {
-        Answer::Held(format!("{said}check: FAIL. {kept}."))
+        )),
+        CheckResult::Failed => Answer::Held(format!("{said}check: FAIL. {kept}.")),
+        CheckResult::GateBusy => Answer::Held(format!("{said}check: NOT RUN. {kept}. {WAIT}")),
     }
 }
 
@@ -479,26 +489,26 @@ fn stop_with(root: &Path, fields: &HookInput, steps: &mut impl Steps, log: &mut 
 /// half way through never runs a long check twice.
 struct Remembered<'a, S> {
     steps: &'a mut S,
-    check: Option<(bool, Vec<u8>)>,
+    check: Option<(CheckResult, Vec<u8>)>,
 }
 
 impl<S: Steps> Steps for Remembered<'_, S> {
-    fn check(&mut self, out: &mut Vec<u8>) -> anyhow::Result<bool> {
-        if let Some((passed, said)) = &self.check {
+    fn check(&mut self, out: &mut Vec<u8>) -> anyhow::Result<CheckResult> {
+        if let Some((result, said)) = &self.check {
             out.extend_from_slice(said);
-            return Ok(*passed);
+            return Ok(*result);
         }
         let mut said = Vec::new();
-        let passed = match self.steps.check(&mut said) {
-            Ok(passed) => passed,
+        let result = match self.steps.check(&mut said) {
+            Ok(result) => result,
             Err(error) => {
                 writeln!(said, "xtask stop hook: the check could not run: {error:#}")?;
-                false
+                CheckResult::Failed
             }
         };
         out.extend_from_slice(&said);
-        self.check = Some((passed, said));
-        Ok(passed)
+        self.check = Some((result, said));
+        Ok(result)
     }
 
     fn judge(&mut self, declaration: &str, out: &mut Vec<u8>) -> anyhow::Result<Ruling> {
@@ -519,8 +529,9 @@ fn note(log: &mut Vec<u8>, text: &str) -> Answer {
 
 /// What the stop hook runs when a decision asks for it.
 trait Steps {
-    /// Whether `check` passes; what it prints goes to `out`.
-    fn check(&mut self, out: &mut Vec<u8>) -> anyhow::Result<bool>;
+    /// What `check` comes to: it never starts while another gate holds the gate lock. What it
+    /// prints goes to `out`.
+    fn check(&mut self, out: &mut Vec<u8>) -> anyhow::Result<CheckResult>;
     /// The judge's ruling on `declaration`.
     fn judge(&mut self, declaration: &str, out: &mut Vec<u8>) -> anyhow::Result<Ruling>;
     /// Why the drift watchdog keeps the agent working, if it does.
@@ -536,17 +547,21 @@ struct Real<'a> {
 }
 
 impl Steps for Real<'_> {
-    fn check(&mut self, out: &mut Vec<u8>) -> anyhow::Result<bool> {
+    fn check(&mut self, out: &mut Vec<u8>) -> anyhow::Result<CheckResult> {
         if let Some(failure) = &self.failure {
             bail!("{failure}");
         }
+        let wait = std::env::var(GATE_WAIT_ENV)
+            .ok()
+            .and_then(|seconds| seconds.parse().ok())
+            .unwrap_or(GATE_WAIT.as_secs());
         let mut command = Command::new(std::env::current_exe().context("could not find xtask")?);
         command
             .arg("--root")
             .arg(self.root)
-            .args(["check", "--changed"])
+            .args(["check", "--changed", "--wait-at-most", &wait.to_string()])
             .current_dir(self.root);
-        run_bounded(command, CHECK_DEADLINE, out)
+        Ok(check_result(run_bounded(command, CHECK_DEADLINE, out)?))
     }
 
     fn judge(&mut self, declaration: &str, out: &mut Vec<u8>) -> anyhow::Result<Ruling> {
@@ -560,15 +575,24 @@ impl Steps for Real<'_> {
     }
 }
 
+/// What `check --wait-at-most` came to, from how it exited: `None` when it was stopped at its deadline.
+fn check_result(status: Option<ExitStatus>) -> CheckResult {
+    match status.and_then(|status| status.code()) {
+        Some(0) => CheckResult::Passed,
+        Some(code) if code == i32::from(gate::BUSY_STATUS) => CheckResult::GateBusy,
+        Some(_) | None => CheckResult::Failed,
+    }
+}
+
 /// Runs `command`, which prints its findings on stdout and stderr, for at most `deadline`: the
-/// time it waits on other builds counts. What it printed goes to `out`. It passes when it exits 0.
-/// At the deadline its whole process group is killed and the run fails, with the reason in `out`,
-/// because Claude Code discards what a hook that times out printed.
+/// time it waits on other builds counts. What it printed goes to `out`. Returns how it exited, or
+/// `None` when it reached the deadline: then its whole process group is killed, with the reason in
+/// `out`, because Claude Code discards what a hook that times out printed.
 fn run_bounded(
     mut command: Command,
     deadline: Duration,
     out: &mut Vec<u8>,
-) -> anyhow::Result<bool> {
+) -> anyhow::Result<Option<ExitStatus>> {
     let (mut reader, writer) = std::io::pipe().context("could not make a pipe")?;
     command
         .stdin(Stdio::null())
@@ -611,16 +635,20 @@ fn run_bounded(
         .map_err(|_panic| anyhow::anyhow!("the check's reader panicked"))?
         .context("could not read what the check printed")?;
     out.extend_from_slice(&printed);
-    let Some(status) = status else {
+    if status.is_none() {
         writeln!(
             out,
             "xtask stop hook: check did not finish in {} s; it was stopped, and counts as failed",
             deadline.as_secs()
         )?;
-        return Ok(false);
-    };
-    Ok(status.success())
+    }
+    Ok(status)
 }
+
+/// What an agent whose stop found another gate running does.
+const WAIT: &str = "Another gate held the gate lock (gate.lock in the checkout's git directory) \
+                    all the while the hook waited, so check did not start: wait for that gate to \
+                    finish, starting no other gate, then stop again.";
 
 /// How to declare a task BLOCKED, for the main agent.
 const DECLARE: &str = "If what stops you is outside your control, declare it: cargo xtask task \
@@ -647,16 +675,16 @@ fn drive(
     loop {
         let event = match decision {
             Decision::RunCheck => {
-                let passed = match steps.check(&mut said) {
-                    Ok(passed) => passed,
+                let result = match steps.check(&mut said) {
+                    Ok(result) => result,
                     Err(error) => {
                         writeln!(said, "xtask stop hook: the check could not run: {error:#}")?;
-                        false
+                        CheckResult::Failed
                     }
                 };
                 stop::Event::Checked {
                     agent: agent.clone(),
-                    passed,
+                    result,
                 }
             }
             Decision::Judge(declaration) => {
@@ -707,6 +735,7 @@ fn conclude(
                 format!("{said}xtask stop hook: the check did not pass; keep working.")
             }
         }),
+        Decision::Block(Block::GateBusy) => Answer::Block(format!("{said}xtask stop hook: {WAIT}")),
         Decision::Block(Block::SentBack {
             declaration,
             reason,

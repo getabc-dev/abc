@@ -110,7 +110,13 @@ setup, not the product.
   `~/.config/abc/agent-broker/` (owner only): one forwarded into that VM over vsock, so the VM has
   no network path to the host, and a control socket the VM cannot reach. It logs each request
   with the session's name and never a token, mints at most 120 tokens an hour, and when
-  `cargo xtask vm stop` stops it, revokes every token it minted. git gets contents write alone; a
+  `cargo xtask vm stop` stops it, revokes every token it minted. Each client has five seconds in
+  all to send its request, and a stop hangs up on the clients in flight, so a VM that trickles a
+  request cannot hold the broker. A broker that does not answer `stop` gets SIGTERM through its
+  pid file, once `ps` shows that pid is still the session's broker; SIGTERM stops it directly,
+  without its sockets, revoking its tokens the same way. One still the broker a minute later gets
+  SIGKILL, which leaves its tokens to expire within the hour. Its files are removed only once it
+  is gone; when it may still run, `vm stop` fails naming its pid. git gets contents write alone; a
   change to a workflow is the maintainer's to push. `cargo xtask gh` gets contents and pull
   requests write and read access to CI results. The `branches` ruleset lets the App create,
   update and delete only `agent/*` branches (every other branch but `main`, which its own

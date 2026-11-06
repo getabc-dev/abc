@@ -7,6 +7,7 @@ mod check;
 mod coverage;
 mod e2e;
 mod fuzz;
+mod gate;
 mod git;
 mod github;
 mod guard;
@@ -85,6 +86,11 @@ enum Task {
         /// (upstream/HEAD, else origin/HEAD), including uncommitted and untracked files.
         #[arg(long)]
         changed: bool,
+        /// When another gate holds the gate lock, wait at most SECONDS for it, then exit with
+        /// status 75 (`EX_TEMPFAIL`), naming it; without, wait until it ends. The stop hook runs
+        /// check this way.
+        #[arg(long, value_name = "SECONDS")]
+        wait_at_most: Option<u64>,
     },
     /// Run the tests under coverage and require 90% of the changed, instrumented lines covered.
     Coverage {
@@ -302,7 +308,34 @@ fn verdict(passed: bool) -> ExitCode {
     }
 }
 
+/// Runs `task`; a heavy gate holds the gate lock while it runs, so gates run one at a time.
 fn run(
+    task: Task,
+    invocation: &Invocation<'_>,
+    report: &mut impl Write,
+) -> anyhow::Result<ExitCode> {
+    let Some((gate, wait)) = gate_of(&task) else {
+        return perform(task, invocation, report);
+    };
+    match gate::take(&invocation.root, gate, wait, report)? {
+        gate::Taken::Held(held) => {
+            let result = perform(task, invocation, report);
+            drop(held);
+            result
+        }
+        gate::Taken::Busy(holder) => {
+            writeln!(
+                report,
+                "{}: not started: {holder} holds the gate lock ({})",
+                gate.name(),
+                gate::path(&invocation.root)?.display()
+            )?;
+            Ok(ExitCode::from(gate::BUSY_STATUS))
+        }
+    }
+}
+
+fn perform(
     task: Task,
     invocation: &Invocation<'_>,
     report: &mut impl Write,
@@ -313,7 +346,7 @@ fn run(
     let env = |name: &str| (invocation.env)(name);
     let mode = annotation::Mode::from_env(&env);
     match task {
-        Task::Check { changed } => Ok(verdict(check(root, changed, tool, report)?)),
+        Task::Check { changed, .. } => Ok(verdict(check(root, changed, tool, report)?)),
         Task::Coverage { base } => Ok(verdict(coverage::run(
             root,
             &base,
@@ -404,6 +437,39 @@ fn run(
         Task::Pnpm { args } => run_web(WebTask::Pnpm(args), root, tool, report),
         Task::E2e => run_web(WebTask::E2e, root, tool, report),
         Task::Hook { event } => run_hook(event, home, report),
+    }
+}
+
+/// The gate lock `task` takes, if it is a heavy gate, and whether it waits for another gate.
+const fn gate_of(task: &Task) -> Option<(gate::Gate, gate::Wait)> {
+    match task {
+        Task::Check { wait_at_most, .. } => Some((
+            gate::Gate::Check,
+            match wait_at_most {
+                Some(seconds) => gate::Wait::AtMost(std::time::Duration::from_secs(*seconds)),
+                None => gate::Wait::Yes,
+            },
+        )),
+        Task::Coverage { .. } => Some((gate::Gate::Coverage, gate::Wait::Yes)),
+        Task::Mutants { .. } => Some((gate::Gate::Mutants, gate::Wait::Yes)),
+        Task::Fuzz { .. } => Some((gate::Gate::Fuzz, gate::Wait::Yes)),
+        Task::E2e => Some((gate::Gate::E2e, gate::Wait::Yes)),
+        Task::Integrity { .. }
+        | Task::GitCredential { .. }
+        | Task::Gh { .. }
+        | Task::Pr { .. }
+        | Task::Broker { .. }
+        | Task::Vm { .. }
+        | Task::Review { .. }
+        | Task::Work { .. }
+        | Task::Rulesets { .. }
+        | Task::Build
+        | Task::Pnpm { .. }
+        | Task::Setup { .. }
+        | Task::Doctor { .. }
+        | Task::Pin
+        | Task::Tool { .. }
+        | Task::Hook { .. } => None,
     }
 }
 
@@ -608,9 +674,10 @@ fn serve_tokens(exe: &Path, home: &Path, session: &str) -> anyhow::Result<ExitCo
     broker::refuse_checkout(exe)?;
     broker::check_session(session)?;
     let app = app::App::load(&app::config_dir()?)?;
+    let files = broker::files(home, session);
     broker::serve(
         session,
-        &broker::sockets(home, session),
+        &files,
         |scope| app.token(app::GITHUB_API, scope),
         |token| app::revoke(app::GITHUB_API, token),
         broker::MAX_PER_HOUR,
@@ -904,7 +971,13 @@ mod tests {
                     shard: None,
                 },
             ),
-            ("check", Task::Check { changed: false }),
+            (
+                "check",
+                Task::Check {
+                    changed: false,
+                    wait_at_most: None,
+                },
+            ),
         ] {
             assert_eq!(
                 dispatch(task, &home, &root, &no_env).unwrap(),
@@ -1054,10 +1127,18 @@ mod tests {
             root.join("rust-toolchain.toml"),
         )
         .unwrap();
+        // A checkout, whose repository holds the gate lock.
+        git(&root, &["init", "--quiet"]);
         assert_eq!(
-            dispatch(Task::Check { changed: false }, &home, &root, &|_: &str| {
-                None
-            })
+            dispatch(
+                Task::Check {
+                    changed: false,
+                    wait_at_most: None,
+                },
+                &home,
+                &root,
+                &|_: &str| { None }
+            )
             .unwrap(),
             ExitCode::SUCCESS,
             "check passes a clean tree with the pinned nextest and shellcheck it finds"

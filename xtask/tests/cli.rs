@@ -246,6 +246,7 @@ mod tests {
             .arg(project.join("xtask/hooks/hook.sh"))
             .arg(event)
             .env("CLAUDE_PROJECT_DIR", project)
+            .env("XTASK_HOOK_GATE_WAIT", "2")
             .env_remove("ABC_VM")
             .env_remove("CARGO_TARGET_DIR")
             .env_remove("RUSTUP_TOOLCHAIN")
@@ -346,6 +347,80 @@ mod tests {
         git(&["init", "--quiet"]);
         git(&["add", "--all"]);
         git(&["commit", "--quiet", "--no-verify", "-m", "copy"]);
+    }
+
+    /// PR 5a, twice: the stop hook's `check` started while the agent's `coverage`, then its
+    /// `mutants`, ran, and the VM's out-of-memory killer took the linker. With a gate holding the
+    /// gate lock, the real stop hook does not start `check`: it sends the stop back, naming the
+    /// gate to wait for. A gate run by hand waits for it instead, saying so once.
+    #[test]
+    fn the_stop_hook_never_starts_check_beside_another_gate() {
+        let (copy, _held) = copy_of_the_repository();
+        // The copy is a main clone of its own: its lock is in its own repository directory.
+        let lock_path = copy.join(".git/gate.lock");
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        lock.lock().unwrap();
+        std::fs::write(
+            &lock_path,
+            "{\"gate\":\"coverage\",\"pid\":4242,\"since\":0}\n",
+        )
+        .unwrap();
+
+        let stop = r#"{"hook_event_name":"Stop","stop_hook_active":false}"#;
+        // xtask is built before the clock starts, so the time measured is the hook's own.
+        launch(
+            &copy,
+            "pre-tool-use",
+            r#"{"tool_name":"Read","tool_input":{}}"#,
+        );
+        let started = std::time::Instant::now();
+        let (stopped, answer, log) = launch(&copy, "stop", stop);
+        assert_eq!(stopped, Some(0), "{log}");
+        assert!(
+            started.elapsed() >= std::time::Duration::from_secs(2),
+            "the hook waits for the gate (here 2 s, XTASK_HOOK_GATE_WAIT) before sending the stop \
+             back: a stop during a long gate came back at once and counted, {:?}",
+            started.elapsed()
+        );
+        let held: serde_json::Value = serde_json::from_str(&answer).unwrap();
+        assert_eq!(held["decision"], "block", "{answer}");
+        let reason = held["reason"].as_str().unwrap();
+        assert!(
+            reason.contains("`cargo xtask coverage` (pid 4242")
+                && reason.contains("wait for that gate to finish"),
+            "sent back to wait for coverage: {reason}"
+        );
+
+        let mut waiting = Command::new(env!("CARGO_BIN_EXE_xtask"))
+            .arg("--root")
+            .arg(&copy)
+            .args(["fuzz", "--seconds", "1"])
+            .env_remove("CARGO_TARGET_DIR")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut said = waiting.stderr.take().unwrap();
+        let mut first = String::new();
+        std::io::BufRead::read_line(&mut std::io::BufReader::new(&mut said), &mut first).unwrap();
+        assert!(
+            first.contains("waiting for `cargo xtask coverage` (pid 4242"),
+            "a gate run by hand waits, naming the one running: {first}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(
+            waiting.try_wait().unwrap().is_none(),
+            "and does not start while the lock is held"
+        );
+        waiting.kill().unwrap();
+        waiting.wait().unwrap();
+        drop(lock);
     }
 
     #[test]
