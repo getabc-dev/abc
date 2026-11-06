@@ -45,7 +45,8 @@ pub(crate) enum Action {
     /// `vm run <worktree> --log run.log -- claude -p "..."`.
     Run {
         worktree: PathBuf,
-        /// The file the output goes to, replaced if it exists.
+        /// The file the output goes to, replaced if it exists; never in the worktree, and never a
+        /// symbolic link.
         #[arg(long)]
         log: PathBuf,
         #[arg(last = true, required = true)]
@@ -654,12 +655,54 @@ fn run_logged(
     command: Vec<OsString>,
     log: &Path,
 ) -> anyhow::Result<ExitCode> {
-    let mut file = std::fs::File::create(log)
-        .with_context(|| format!("could not create {}", log.display()))?;
+    let mut file = open_log(log, &session.worktree)?;
     let mut full = vec![OsString::from("agent-exec")];
     full.extend(command);
     let status = backend.stream(&session.name, &full, &mut file)?;
     Ok(ExitCode::from(crate::tools::status_code(status)))
+}
+
+/// Creates the log `log` of a run in the session whose worktree is `worktree`, replacing a file
+/// there. The VM can write the worktree, so the log may not be in it, through a link or not; and
+/// a link at `log` is refused, never followed: the file is created anew (`O_EXCL`), which fails
+/// rather than follow one put there meanwhile.
+fn open_log(log: &Path, worktree: &Path) -> anyhow::Result<std::fs::File> {
+    let shown = log.display();
+    let name = log
+        .file_name()
+        .with_context(|| format!("could not create {shown}: it names no file"))?;
+    let parent = log
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let dir = std::fs::canonicalize(parent).with_context(|| {
+        format!(
+            "could not create {shown}: no directory {}",
+            parent.display()
+        )
+    })?;
+    ensure!(
+        !dir.starts_with(worktree),
+        "{shown} is inside the worktree {}, which the VM can write; put the log outside it",
+        worktree.display()
+    );
+    let path = dir.join(name);
+    match std::fs::symlink_metadata(&path) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            bail!("{shown} is a symbolic link, which `vm run` does not follow; remove it")
+        }
+        Ok(meta) if meta.is_file() => {
+            std::fs::remove_file(&path).with_context(|| format!("could not replace {shown}"))?;
+        }
+        Ok(_) => bail!("{shown} is not a file"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).with_context(|| format!("could not inspect {shown}")),
+    }
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .with_context(|| format!("could not create {shown}"))
 }
 
 /// Brings the worktree branch's new commits into the running VM of `session`: the VM's own git

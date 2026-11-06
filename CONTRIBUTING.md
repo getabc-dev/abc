@@ -213,7 +213,8 @@ Fetch them from the repository it names, delete that repository, and run `vm gc 
 `vm shell` is the interactive way in. To drive a session from a script or another agent, use
 `vm run`: it needs no pseudo-terminal, so no `script` wrapper, and writes stdout and stderr to the
 log as they come (microsandbox holds back the output of a command without a terminal unless asked
-to stream it, which `vm run` does).
+to stream it, which `vm run` does). The log must be outside the worktree, which the VM can write,
+and `vm run` refuses a symbolic link there rather than follow it.
 
 The session's `target/` and `.tools/` are disks of the VM's own, mounted over those directories of
 the worktree. **Never delete or move `target/` or `.tools/` in a worktree while its VM runs**:

@@ -680,6 +680,49 @@ fn runs_a_command_into_a_log_without_a_terminal() {
     );
 }
 
+/// `vm run --log` created its log with `File::create`, which follows a symlink: a VM that put a
+/// link where the log goes, in the worktree it can write, had the host write the session's output
+/// through it into any of the maintainer's files. The log may not be in the worktree, and a link
+/// is refused, never followed.
+#[test]
+fn a_run_log_is_never_in_the_worktree_or_through_a_link() {
+    let world = world("t");
+    let backend = subscribed();
+    start_ok(&world, &backend);
+    let run = |log: PathBuf| {
+        let (result, _) = act(
+            &world,
+            &backend,
+            Action::Run {
+                worktree: world.worktree.clone(),
+                log,
+                command: vec!["true".into()],
+            },
+        );
+        result.map_or_else(|error| format!("{error:#}"), |_| "ran".to_owned())
+    };
+    let inside = run(world.worktree.join("run.log"));
+    assert!(inside.contains("inside the worktree"), "{inside}");
+    assert!(!world.worktree.join("run.log").exists());
+    let precious = world.root.join("precious");
+    std::fs::write(&precious, "keep\n").unwrap();
+    let link = world.root.join("link.log");
+    std::os::unix::fs::symlink(&precious, &link).unwrap();
+    let linked = run(link);
+    assert!(linked.contains("is a symbolic link"), "{linked}");
+    assert_eq!(std::fs::read_to_string(&precious).unwrap(), "keep\n");
+    // A directory link into the worktree is the worktree too.
+    let into = world.root.join("into");
+    std::os::unix::fs::symlink(&world.worktree, &into).unwrap();
+    let through = run(into.join("run.log"));
+    assert!(through.contains("inside the worktree"), "{through}");
+    assert_eq!(run(world.root.join("ok.log")), "ran");
+    assert_eq!(
+        std::fs::read_to_string(world.root.join("ok.log")).unwrap(),
+        "one\ntwo\n"
+    );
+}
+
 /// The worktree's commit, as `vm gc` compares it with a merged pull request's.
 fn head(worktree: &Path) -> String {
     let output = std::process::Command::new("git")
