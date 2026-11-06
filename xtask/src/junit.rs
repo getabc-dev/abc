@@ -2,21 +2,21 @@
 //!
 //! On #33 a failing xtask test showed only "exit code 1" in the pull request's checks: the panic
 //! was in the job log, which agent VMs cannot reach. nextest writes a `JUnit` report of every run
-//! (`[profile.default.junit]` in `.config/nextest.toml`, at [`REPORT`] under the target
-//! directory), so `check`, `coverage` and `mutants` read it after a failing run and, inside GitHub
+//! (`[profile.default.junit]` in `.config/nextest.toml`, at [`REPORT`] in the workspace), so `check`, `coverage` and `mutants` read it after a failing run and, inside GitHub
 //! Actions, annotate each failing test with its name, the file and line its panic names, and the
 //! panic's message, which `cargo xtask pr checks` shows.
 
 use std::fs;
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::path::Path;
 
-use anyhow::{Context as _, ensure};
+use anyhow::Context as _;
 
 use crate::annotation::Annotation;
 
-/// nextest's `JUnit` report of its last run, under the target directory.
-pub(crate) const REPORT: &str = "nextest/default/junit.xml";
+/// nextest's `JUnit` report of its last run, from the workspace's root. nextest keeps its store
+/// at `target/nextest` there (its `store.dir`), whatever directory cargo builds into: for
+/// xtask's workspace that is `xtask/target/`, though its builds go to the root's `target/`.
+pub(crate) const REPORT: &str = "target/nextest/default/junit.xml";
 
 /// One failing test.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -120,65 +120,13 @@ fn in_repository(file: &str, dir: &str) -> Option<String> {
     })
 }
 
-/// The target directory cargo builds the workspace whose manifest `manifest_args` name into, from
-/// `root`.
-pub(crate) fn target_directory(root: &Path, manifest_args: &[String]) -> anyhow::Result<PathBuf> {
-    let output = Command::new(crate::check::cargo())
-        .args(["metadata", "--format-version", "1", "--no-deps", "--locked"])
-        .args(manifest_args)
-        .current_dir(root)
-        .output()
-        .context("could not run cargo metadata")?;
-    ensure!(
-        output.status.success(),
-        "cargo metadata failed: {}",
-        String::from_utf8_lossy(&output.stderr).trim()
-    );
-    let metadata: serde_json::Value =
-        serde_json::from_slice(&output.stdout).context("could not parse cargo metadata")?;
-    metadata
-        .get("target_directory")
-        .and_then(serde_json::Value::as_str)
-        .map(PathBuf::from)
-        .context("cargo metadata named no target directory")
-}
-
-/// Where nextest will write its report for a run of the workspace whose manifest `manifest_args`
-/// name, from `root`, building into `under` in the target directory (cargo-llvm-cov's
-/// `llvm-cov-target`; empty for the target directory itself). An earlier report there is removed,
-/// so a run that writes none (it did not build) is never read with an earlier run's.
-pub(crate) fn prepare(
-    root: &Path,
-    manifest_args: &[String],
-    under: &str,
-) -> anyhow::Result<PathBuf> {
-    let path = target_directory(root, manifest_args)?
-        .join(under)
-        .join(REPORT);
-    clear(&path)?;
-    Ok(path)
-}
-
-/// Removes the report at `path`, if there is one.
+/// Removes the report at `path`, if there is one, before a run, so a run that writes none (it
+/// did not build) is never read with an earlier run's.
 pub(crate) fn clear(path: &Path) -> anyhow::Result<()> {
     match fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error).with_context(|| format!("could not remove {}", path.display())),
-    }
-}
-
-/// The annotations for the failing tests in the report `prepared` found the place of, of a run
-/// in the workspace at `dir`; when that place is unknown, or there is no report, or none fails in
-/// it, one annotation saying so and where the log is, so the failure is never only an exit code.
-pub(crate) fn annotations_of(
-    prepared: &anyhow::Result<PathBuf>,
-    dir: &str,
-    what: &str,
-) -> Vec<Annotation> {
-    match prepared {
-        Ok(path) => annotations(path, dir, what),
-        Err(error) => unexplained(what, &format!("could not find the test report: {error:#}")),
     }
 }
 
@@ -195,7 +143,8 @@ fn unexplained(what: &str, why: &str) -> Vec<Annotation> {
 }
 
 /// The annotations for the failing tests in the report at `path`, of a run in the workspace at
-/// `dir`, as [`annotations_of`].
+/// `dir`; when there is no report, or none fails in it, one annotation saying so and where the
+/// log is, so the failure is never only an exit code.
 pub(crate) fn annotations(path: &Path, dir: &str, what: &str) -> Vec<Annotation> {
     let unexplained = |why: String| unexplained(what, &why);
     let xml = match fs::read_to_string(path) {
@@ -220,7 +169,7 @@ pub(crate) fn annotations(path: &Path, dir: &str, what: &str) -> Vec<Annotation>
 mod tests {
     use std::fs;
 
-    use super::{Failed, annotations, annotations_of, failures, panic};
+    use super::{Failed, annotations, failures, panic};
     use crate::annotation::{self, Mode};
 
     /// A real report of cargo-nextest 0.9.151 (the pinned version) on a crate shaped like
@@ -332,41 +281,5 @@ note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace</f
         super::clear(&report).unwrap();
         assert!(!report.exists());
         super::clear(&report).unwrap();
-        let unknown = annotations_of(&Err(anyhow::anyhow!("no manifest")), "", "tests");
-        assert!(
-            unknown[0]
-                .message
-                .contains("could not find the test report: no manifest"),
-            "{unknown:?}"
-        );
-    }
-
-    #[test]
-    fn finds_the_target_directory() {
-        let temp = tempfile::tempdir().unwrap();
-        fs::write(
-            temp.path().join("Cargo.toml"),
-            "[package]\nname = \"a\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
-        )
-        .unwrap();
-        fs::create_dir_all(temp.path().join("src")).unwrap();
-        fs::write(temp.path().join("src/lib.rs"), "").unwrap();
-        let locked = std::process::Command::new(crate::check::cargo())
-            .arg("generate-lockfile")
-            .current_dir(temp.path())
-            .status()
-            .unwrap();
-        assert!(locked.success());
-        let target = super::target_directory(temp.path(), &[]).unwrap();
-        assert_eq!(target, temp.path().canonicalize().unwrap().join("target"));
-        let missing = super::target_directory(
-            &temp.path().join("src"),
-            &["--manifest-path".to_owned(), "none/Cargo.toml".to_owned()],
-        )
-        .unwrap_err();
-        assert!(
-            format!("{missing:#}").contains("cargo metadata failed"),
-            "{missing:#}"
-        );
     }
 }

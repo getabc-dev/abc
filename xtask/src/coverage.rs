@@ -74,8 +74,8 @@ pub(crate) fn run(
             out,
             "xtask: running the tests of the {name} workspace under coverage"
         )?;
-        let junit = (mode == Mode::Actions)
-            .then(|| crate::junit::prepare(root, &workspace.manifest_args(), "llvm-cov-target"));
+        let junit = root.join(workspace.dir()).join(crate::junit::REPORT);
+        crate::junit::clear(&junit)?;
         let status = Command::new(llvm_cov)
             .args(["llvm-cov", "nextest"])
             .args(workspace.manifest_args())
@@ -87,10 +87,8 @@ pub(crate) fn run(
             .current_dir(root)
             .status()
             .context("could not run cargo-llvm-cov")?;
-        if !status.success()
-            && let Some(junit) = &junit
-        {
-            let failed = crate::junit::annotations_of(junit, workspace.dir(), "coverage's tests");
+        if !status.success() && mode == Mode::Actions {
+            let failed = crate::junit::annotations(&junit, workspace.dir(), "coverage's tests");
             write!(out, "{}", annotation::commands(mode, &failed))?;
         }
         ensure!(
@@ -631,16 +629,7 @@ mod tests {
                 ("src/main.rs", "fn main() {}\n"),
             ],
         );
-        let locked = std::process::Command::new(crate::check::cargo())
-            .arg("generate-lockfile")
-            .current_dir(&repo)
-            .status()
-            .unwrap();
-        assert!(locked.success());
-        let report = crate::junit::target_directory(&repo, &[])
-            .unwrap()
-            .join("llvm-cov-target")
-            .join(crate::junit::REPORT);
+        let report = repo.join(crate::junit::REPORT);
         std::fs::create_dir_all(report.parent().unwrap()).unwrap();
         std::fs::write(&report, "stale: an earlier run's report is never read").unwrap();
         let recorded = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/nextest-junit-33.xml");

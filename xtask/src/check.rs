@@ -509,7 +509,7 @@ impl<W: Write> Run<'_, W> {
         if database.needs_server() {
             (self.postgres.warm)(self.out)?;
         }
-        self.tests(workspace, scope, &manifest)?;
+        self.tests(workspace, scope)?;
         // A workspace of binaries alone, such as xtask's, has no doctests to run.
         let doc_test_args = if packages.iter().any(|package| package.library) {
             scope.doc_test_args()
@@ -580,31 +580,19 @@ impl<W: Write> Run<'_, W> {
         Ok(current)
     }
 
-    /// Runs the tests of `scope` of `workspace`, whose manifest `manifest` names; in
+    /// Runs the tests of `scope` of `workspace`; in
     /// [`Mode::Actions`], each failing test is also an annotation.
-    fn tests(
-        &mut self,
-        workspace: Workspace,
-        scope: &Scope,
-        manifest: &[String],
-    ) -> anyhow::Result<()> {
-        let report = match (self.mode, self.target_dir) {
-            (Mode::Plain, _) => None,
-            (Mode::Actions, Some(dir)) => {
-                let report = self.root.join(dir).join(crate::junit::REPORT);
-                crate::junit::clear(&report)?;
-                Some(Ok(report))
-            }
-            (Mode::Actions, None) => Some(crate::junit::prepare(self.root, manifest, "")),
-        };
+    fn tests(&mut self, workspace: Workspace, scope: &Scope) -> anyhow::Result<()> {
+        let report = self.root.join(workspace.dir()).join(crate::junit::REPORT);
+        crate::junit::clear(&report)?;
         if !self.step(&mut test_command(&self.tools.nextest, workspace, scope))? {
             self.failures.push(Failure::new(
                 "tests",
                 workspace,
                 "fix the cause of each failing test above; never skip or weaken a test",
             ));
-            if let Some(report) = report {
-                let failed = crate::junit::annotations_of(&report, workspace.dir(), "tests");
+            if self.mode == Mode::Actions {
+                let failed = crate::junit::annotations(&report, workspace.dir(), "tests");
                 write!(
                     self.out,
                     "{}",

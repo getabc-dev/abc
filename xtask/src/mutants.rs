@@ -360,7 +360,7 @@ fn test_env_config(temp: &Path, root: &Path) -> anyhow::Result<String> {
 }
 
 /// The annotations for the tests that failed in cargo-mutants' unmutated copy, from the `JUnit`
-/// report nextest wrote in it (the copy builds into its own `target/`), among the copies in
+/// report nextest wrote in it, among the copies in
 /// `scratch`, of the workspace at `dir`.
 fn baseline_failures(scratch: &Path, dir: &str) -> anyhow::Result<Vec<Annotation>> {
     let mut copies: Vec<PathBuf> = fs::read_dir(scratch)
@@ -372,15 +372,12 @@ fn baseline_failures(scratch: &Path, dir: &str) -> anyhow::Result<Vec<Annotation
     let what = "mutants' unmutated tests";
     let reports: Vec<PathBuf> = copies
         .into_iter()
-        .map(|copy| copy.join("target").join(crate::junit::REPORT))
+        .map(|copy| copy.join(crate::junit::REPORT))
         .filter(|report| report.is_file())
         .collect();
     if reports.is_empty() {
-        return Ok(crate::junit::annotations_of(
-            &Err(anyhow::anyhow!(
-                "cargo-mutants left no test report in {}",
-                scratch.display()
-            )),
+        return Ok(crate::junit::annotations(
+            &scratch.join("cargo-mutants left no test report here"),
             dir,
             what,
         ));

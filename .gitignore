@@ -1,4 +1,6 @@
 /target/
+# nextest keeps its store, and its JUnit report, in each workspace's own target/nextest.
+/xtask/target/
 /.tools/
 /.claude/worktrees/
 /.abc/
