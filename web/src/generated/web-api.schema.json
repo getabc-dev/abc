@@ -262,7 +262,9 @@
     },
     "DisplayName": {
       "description": "How a person or worker is shown: an actor's display name.",
-      "type": "string"
+      "type": "string",
+      "maxLength": 64,
+      "minLength": 1
     },
     "EnrolmentTokenId": {
       "description": "An enrolment token, and the stream of its lifecycle events.",
@@ -436,7 +438,9 @@
     },
     "MachineLabel": {
       "description": "A note the owner attaches to an enrolment token, such as \"work laptop\". It becomes the\nenrolled worker's display name.",
-      "type": "string"
+      "type": "string",
+      "maxLength": 64,
+      "minLength": 1
     },
     "Os": {
       "description": "The operating systems abc ships for.",
@@ -571,7 +575,7 @@
       "type": "string"
     },
     "TokenIssuedResponse": {
-      "description": "The only response that carries a secret: the token, shown once. The web app renders it as a\nready-to-paste `abc worker enrol <url> --token …` command and never stores it.",
+      "description": "The only response that carries a secret: the token, shown once. The web app shows it beside the\n`abc worker enrol <url>` command, which asks for it on standard input so it never reaches a\ncommand line or a shell's history, and never stores it.",
       "type": "object",
       "properties": {
         "expires_at": {
@@ -712,7 +716,9 @@
     },
     "WorkspaceName": {
       "description": "A workspace's name.",
-      "type": "string"
+      "type": "string",
+      "maxLength": 64,
+      "minLength": 1
     },
     "WorkspaceSummary": {
       "description": "One of a person's workspaces.",

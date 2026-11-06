@@ -21,6 +21,7 @@
 /web/.oxlintrc.json       @snehilvj
 /web/biome.json           @snehilvj
 /web/knip.jsonc           @snehilvj
+/web/osv-scanner.toml     @snehilvj
 /web/package.json         @snehilvj
 /web/playwright.config.ts @snehilvj
 /web/pnpm-lock.yaml       @snehilvj

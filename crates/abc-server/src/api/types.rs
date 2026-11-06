@@ -80,8 +80,9 @@ pub(crate) struct IssueTokenRequest {
     pub(crate) ttl: TokenTtl,
 }
 
-/// The only response that carries a secret: the token, shown once. The web app renders it as a
-/// ready-to-paste `abc worker enrol <url> --token …` command and never stores it.
+/// The only response that carries a secret: the token, shown once. The web app shows it beside the
+/// `abc worker enrol <url>` command, which asks for it on standard input so it never reaches a
+/// command line or a shell's history, and never stores it.
 #[derive(Debug, Serialize, TS, JsonSchema)]
 pub(crate) struct TokenIssuedResponse {
     /// The token's id, for listing and revoking.

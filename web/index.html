@@ -6,6 +6,12 @@
     <title>abc</title>
     <!-- An empty icon: without a link, the browser asks the server for /favicon.ico. -->
     <link rel="icon" href="data:," />
+    <!--
+      The theme, before the first paint (public/theme.js): a classic script blocks rendering until it
+      has run, so the page never flashes in the other theme. It is one of the app's own files, as the
+      CSP (script-src 'self') requires.
+    -->
+    <script src="/theme.js"></script>
   </head>
   <body>
     <div id="root"></div>
