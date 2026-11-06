@@ -716,6 +716,14 @@ fn a_run_log_is_never_in_the_worktree_or_through_a_link() {
     std::os::unix::fs::symlink(&world.worktree, &into).unwrap();
     let through = run(into.join("run.log"));
     assert!(through.contains("inside the worktree"), "{through}");
+    let directory = world.root.join("a-directory");
+    std::fs::create_dir(&directory).unwrap();
+    let not_a_file = run(directory.clone());
+    assert!(not_a_file.ends_with("is not a file"), "{not_a_file}");
+    assert!(directory.is_dir());
+    // A name too long for the file system: looking it up fails other than "not found".
+    let unreadable = run(world.root.join("x".repeat(300)));
+    assert!(unreadable.starts_with("could not inspect "), "{unreadable}");
     assert_eq!(run(world.root.join("ok.log")), "ran");
     assert_eq!(
         std::fs::read_to_string(world.root.join("ok.log")).unwrap(),

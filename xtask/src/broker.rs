@@ -368,11 +368,28 @@ pub(crate) fn serve(
     Ok(())
 }
 
-/// The clients `listener` accepts until `stopping` is set, which it looks at every
-/// [`ACCEPT_POLL`]: the listener does not block, so a stop never waits on a client that does not
-/// come.
+/// The clients `listener` accepts until `stopping` is set.
 fn accepting<'a>(
     listener: &'a UnixListener,
+    stopping: &'a AtomicBool,
+) -> impl Iterator<Item = std::io::Result<UnixStream>> + 'a {
+    accepted(
+        || {
+            listener.accept().and_then(|(client, _)| {
+                // On macOS an accepted socket inherits the listener's non-blocking mode.
+                client.set_nonblocking(false).map(|()| client)
+            })
+        },
+        stopping,
+    )
+}
+
+/// The clients `accept` gives until `stopping` is set, which it looks at every [`ACCEPT_POLL`]:
+/// the listener does not block, so a stop never waits on a client that does not come. "Would
+/// block" means no client yet; any other error is passed on, after the same pause, so one that
+/// repeats, such as too many open files, does not spin.
+fn accepted<'a>(
+    mut accept: impl FnMut() -> std::io::Result<UnixStream> + 'a,
     stopping: &'a AtomicBool,
 ) -> impl Iterator<Item = std::io::Result<UnixStream>> + 'a {
     std::iter::from_fn(move || {
@@ -380,16 +397,13 @@ fn accepting<'a>(
             if stopping.load(Ordering::SeqCst) {
                 return None;
             }
-            match listener.accept() {
-                // On macOS an accepted socket inherits the listener's non-blocking mode.
-                Ok((client, _)) => return Some(client.set_nonblocking(false).map(|()| client)),
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    std::thread::sleep(ACCEPT_POLL);
-                }
+            match accept() {
+                Ok(client) => return Some(Ok(client)),
                 Err(error) => {
-                    // An error that repeats, such as too many open files, must not spin.
                     std::thread::sleep(ACCEPT_POLL);
-                    return Some(Err(error));
+                    if error.kind() != std::io::ErrorKind::WouldBlock {
+                        return Some(Err(error));
+                    }
                 }
             }
         }
@@ -1394,6 +1408,32 @@ mod tests {
         ended(thread, Duration::from_secs(2));
         assert_eq!(*revoked.lock().unwrap(), ["ghs_git0"]);
         trickler.join().unwrap();
+    }
+
+    /// The listeners look again while no client comes, pass on any other error, and end once the
+    /// broker stops.
+    #[test]
+    fn listening_waits_out_would_block_and_passes_other_errors_on() {
+        let stopping = std::sync::atomic::AtomicBool::new(false);
+        let (client, _other) = UnixStream::pair().unwrap();
+        let mut answers = vec![
+            Ok(client),
+            Err(std::io::Error::other("too many open files")),
+            Err(std::io::Error::from(std::io::ErrorKind::WouldBlock)),
+        ];
+        let mut clients =
+            super::accepted(move || answers.pop().expect("asked too often"), &stopping);
+        let first = clients.next().unwrap();
+        assert_eq!(
+            first.map(|_| ()).map_err(|error| error.to_string()),
+            Err("too many open files".to_owned()),
+            "would block is no client yet, and is not passed on"
+        );
+        assert!(clients.next().unwrap().is_ok(), "then the client");
+        drop(clients);
+        stopping.store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut stopped = super::accepted(|| panic!("not asked once stopping"), &stopping);
+        assert!(stopped.next().is_none());
     }
 
     /// A client that sends a byte within each read's patience gets no more than its time in all.

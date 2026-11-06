@@ -297,11 +297,26 @@ impl Run<'_> {
         let workspace = self.workspace.dir();
         // The diff of an in-place workspace names its files relative to it.
         let mutated: BTreeSet<PathBuf> = git::added_lines(diff).keys().map(PathBuf::from).collect();
-        let done = before.put_back(&root.join(workspace), &mutated)?;
+        // One directory per run, so a later run never mixes with or replaces what this one kept.
+        let aside = self.output().join("left-behind").join(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .context("the clock is before 1970")?
+                .as_secs()
+                .to_string(),
+        );
+        let done = before.put_back(&root.join(workspace), &mutated, &aside)?;
         for change in done.restored {
             writeln!(
                 out,
                 "mutants: put back {workspace}/{change}, which the run in place left behind"
+            )?;
+        }
+        for path in done.moved {
+            writeln!(
+                out,
+                "mutants: moved {workspace}/{path}, which appeared during the run, to {}",
+                aside.join(&path).display()
             )?;
         }
         for (path, what) in done.left {
@@ -362,7 +377,11 @@ enum Entry {
 struct PutBack {
     /// What it put back or removed, by path relative to the workspace.
     restored: Vec<String>,
-    /// What changed during the run but not by it, left as it is: each path and what happened.
+    /// What appeared during the run where the run does not write, moved aside, by path relative
+    /// to the workspace.
+    moved: Vec<String>,
+    /// What changed or went during the run but not by it, left as it is: each path and what
+    /// happened.
     left: Vec<(String, &'static str)>,
 }
 
@@ -421,30 +440,48 @@ impl Tree {
         Ok(tree)
     }
 
-    /// Puts back under `dir` what the run changed, as `self` found it: of the paths it may
-    /// change ([`owned`], with the files it mutates, `mutated`), files and directories that
-    /// appeared go, and files and links that changed or went come back as they were, links as
-    /// links. Anything else that changed is left as it is and reported: someone else changed it.
-    fn put_back(&self, dir: &Path, mutated: &BTreeSet<PathBuf>) -> anyhow::Result<PutBack> {
+    /// Puts back under `dir` what the run changed, as `self` found it, and keeps everything else.
+    ///
+    /// - A file or link that appeared goes: removed when the run may write it ([`owned`], with
+    ///   the files it mutates, `mutated`), otherwise moved under `aside`, at the same relative
+    ///   path, since tests of a mutant can write anywhere in the tree (a mutated path becomes
+    ///   relative to xtask/) but it might be someone's; directories that appeared go with them.
+    /// - A file or link the run may write that changed or went comes back as it was, a link as a
+    ///   link.
+    /// - Any other change is someone else's, left as it is and reported.
+    fn put_back(
+        &self,
+        dir: &Path,
+        mutated: &BTreeSet<PathBuf>,
+        aside: &Path,
+    ) -> anyhow::Result<PutBack> {
         let now = Self::read(dir)?;
         let mut done = PutBack::default();
         let shown = |path: &Path| path.display().to_string();
-        for path in now
+        for (path, entry) in now
             .entries
-            .keys()
-            .filter(|path| !self.entries.contains_key(*path))
+            .iter()
+            .filter(|(path, _)| !self.entries.contains_key(*path))
         {
+            let full = dir.join(path);
             if owned(path, mutated) {
-                let full = dir.join(path);
-                // Removes a link itself, never what it points to.
-                fs::remove_file(&full)
-                    .with_context(|| format!("could not remove {}", full.display()))?;
                 done.restored.push(shown(path));
             } else {
-                done.left.push((shown(path), "appeared"));
+                let kept = aside.join(path);
+                if let Some(parent) = kept.parent() {
+                    fs::create_dir_all(parent)
+                        .with_context(|| format!("could not create {}", parent.display()))?;
+                }
+                // Written anew from what was read: in an agent VM `aside`, under target/, is
+                // another disk, which a rename cannot reach.
+                restore(&kept, entry)?;
+                done.moved.push(shown(path));
             }
+            // Removes a link itself, never what it points to.
+            fs::remove_file(&full)
+                .with_context(|| format!("could not remove {}", full.display()))?;
         }
-        // Deepest first, so a new directory is empty by the time it goes.
+        // Deepest first, so each is empty by the time it goes: what was in it went above.
         for path in now
             .dirs
             .iter()
@@ -452,21 +489,9 @@ impl Tree {
             .filter(|path| !self.dirs.contains(*path))
         {
             let full = dir.join(path);
-            let empty = fs::read_dir(&full)
-                .with_context(|| format!("could not read {}", full.display()))?
-                .next()
-                .is_none();
-            if owned(path, mutated) && empty {
-                fs::remove_dir(&full)
-                    .with_context(|| format!("could not remove {}", full.display()))?;
-                done.restored.push(format!("{}/", path.display()));
-            } else if !done
-                .left
-                .iter()
-                .any(|(left, _)| Path::new(left).starts_with(path))
-            {
-                done.left.push((format!("{}/", path.display()), "appeared"));
-            }
+            fs::remove_dir(&full)
+                .with_context(|| format!("could not remove {}", full.display()))?;
+            done.restored.push(format!("{}/", path.display()));
         }
         for (path, entry) in &self.entries {
             let found = now.entries.get(path);
@@ -1018,6 +1043,7 @@ mod tests {
                 "while [ $# -gt 0 ]; do case \"$1\" in --output) out=$2 ;; esac; shift; done\n\
                  echo 'edited meanwhile' >> xtask/notes.md\n\
                  echo 'new meanwhile' > xtask/new.md\n\
+                 mkdir xtask/made-meanwhile\n\
                  rm xtask/src/proptest-regressions/linked.txt\n\
                  echo 'cc 1' > xtask/src/proptest-regressions/linked.txt\n\
                  rm xtask/src/a.rs\n\
@@ -1056,22 +1082,46 @@ mod tests {
             "mine\nedited meanwhile\n",
             "someone else's edit is kept: {text}"
         );
-        assert!(repo.join("xtask/new.md").is_file(), "{text}");
+        assert!(!repo.join("xtask/new.md").exists(), "{text}");
+        let left_behind = repo.join("target/mutants/xtask/left-behind");
+        let runs: Vec<std::path::PathBuf> = fs::read_dir(&left_behind)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert_eq!(runs.len(), 1, "one directory for the run: {runs:?}");
+        assert_eq!(
+            fs::read_to_string(runs[0].join("new.md")).unwrap(),
+            "new meanwhile\n",
+            "what appeared outside the run's own paths is moved aside, not lost: {text}"
+        );
+        assert_eq!(
+            fs::read_dir(&runs[0]).unwrap().count(),
+            1,
+            "and nothing else, not proptest's regressions: {text}"
+        );
+        assert!(
+            !repo.join("xtask/made-meanwhile").exists(),
+            "an empty directory that appeared goes: {text}"
+        );
+        assert!(
+            text.contains(&format!(
+                "mutants: moved xtask/new.md, which appeared during the run, to {}\n",
+                runs[0].join("new.md").display()
+            )),
+            "{text}"
+        );
         for put_back in [
             "xtask/src/a.rs",
             "xtask/src/proptest-regressions/linked.txt",
+            "xtask/made-meanwhile/",
         ] {
             assert!(
                 text.contains(&format!("mutants: put back {put_back}, ")),
                 "{put_back}: {text}"
             );
         }
-        for left in [
-            "mutants: xtask/notes.md changed during the run, not by it; left as it is",
-            "mutants: xtask/new.md appeared during the run, not by it; left as it is",
-        ] {
-            assert!(text.contains(left), "{left}: {text}");
-        }
+        let left = "mutants: xtask/notes.md changed during the run, not by it; left as it is";
+        assert!(text.contains(left), "{left}: {text}");
     }
 
     #[test]
