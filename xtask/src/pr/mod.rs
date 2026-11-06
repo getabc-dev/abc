@@ -196,7 +196,7 @@ fn preflight(root: &Path, body: &str, out: &mut String) -> anyhow::Result<Checke
     if workflows {
         crate::rulesets::check(root).context(".github/ changed and `rulesets check` fails")?;
     }
-    let (diff, _) = git::reviewable_diff(root, &commit)?;
+    let (diff, _) = git::reviewable_diff(root, &commit, git::To::WorkingTree)?;
     Ok(Checked { branch, base, diff })
 }
 

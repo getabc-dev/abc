@@ -341,7 +341,7 @@ pub(crate) fn run(
 }
 
 /// Whether the changes since the merge base with the default branch fit the Gemini review's
-/// limit, measured on the same diff the review sends, so an oversized change is split before it
+/// limit, measured as the review measures the change, so an oversized change is split before it
 /// reaches CI rather than after. Where no default branch is known, as in a fresh clone or CI's
 /// checkout, it says so and passes: the review job enforces the limit there.
 fn review_size(root: &Path, out: &mut impl Write) -> anyhow::Result<bool> {
@@ -353,7 +353,7 @@ fn review_size(root: &Path, out: &mut impl Write) -> anyhow::Result<bool> {
         }
     };
     let merge_base = crate::git::merge_base(root, &branch)?;
-    let (diff, _) = crate::git::reviewable_diff(root, &merge_base)?;
+    let (diff, _) = crate::git::reviewable_diff(root, &merge_base, crate::git::To::WorkingTree)?;
     if let Err(error) = crate::review::check_size("the diff", diff.len()) {
         writeln!(out, "xtask: since {branch}, {error}")?;
         return Ok(false);

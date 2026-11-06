@@ -7,7 +7,8 @@ Cargo.lock linguist-generated
 web/src/generated/** linguist-generated
 web/pnpm-lock.yaml linguist-generated
 
-# Diff drivers. The review's diff shows each change with its whole function (git diff
+# Diff drivers. The review's diff shows each Rust change with its whole function (git diff
 # --function-context), which needs a language's function boundaries; git's rust driver knows
-# Rust's, nested items included.
+# Rust's, nested items included. git has no driver for TypeScript, YAML or TOML, so their changes
+# keep three lines of context (FUNCTION_DRIVERS in xtask/src/git.rs).
 *.rs diff=rust
