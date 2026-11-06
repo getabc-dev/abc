@@ -402,12 +402,35 @@ fn findings(root: &Path, commit: &str) -> anyhow::Result<Vec<Finding>> {
 /// Tests that exist in a file at some commit between `commit` and HEAD but neither at `commit`
 /// nor in the working tree: added, then deleted, within the pull request. Only the files with
 /// tests that those commits touched are read, once per version.
+///
+/// Each commit of the range lists the files it changed itself, so the walk covers every commit
+/// of the pull request whether HEAD is its head or GitHub's merge commit of it into the base.
+/// A path-limited `rev-list` would not: at a merge whose result equals its first parent for that
+/// path (the base, where a file the pull request created and deleted never existed), git's
+/// history simplification follows that parent alone and drops the pull request's side (#38).
 fn added_then_deleted(root: &Path, commit: &str) -> anyhow::Result<Vec<Finding>> {
-    let range = format!("{commit}..HEAD");
-    let touched = git::git(
+    let log = git::git(
         root,
-        &["log", "--format=", "--name-only", "--no-renames", &range],
+        &[
+            "-c",
+            "core.quotePath=false",
+            "log",
+            "--format=%x00%H",
+            "--name-only",
+            "--no-renames",
+            &format!("{commit}..HEAD"),
+        ],
     )?;
+    let mut versions: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for entry in log.split('\0').skip(1) {
+        let mut lines = entry.lines();
+        let Some(revision) = lines.next() else {
+            continue;
+        };
+        for path in lines.filter(|path| has_tests(path)) {
+            versions.entry(path).or_default().push(revision);
+        }
+    }
     let names = |path: &str, source: Option<String>| -> anyhow::Result<BTreeSet<String>> {
         Ok(match source {
             Some(source) => tests_in(path, &source)?
@@ -419,15 +442,14 @@ fn added_then_deleted(root: &Path, commit: &str) -> anyhow::Result<Vec<Finding>>
         })
     };
     let mut found = Vec::new();
-    let paths: BTreeSet<&str> = touched.lines().filter(|path| has_tests(path)).collect();
-    for &path in &paths {
+    for (path, revisions) in versions {
         let now = fs::read_to_string(root.join(path)).ok();
         let mut kept = names(path, git::show(root, commit, path)?)?;
         kept.extend(names(path, now)?);
         let mut gone = BTreeSet::new();
-        for version in git::git(root, &["rev-list", &range, "--", path])?.lines() {
+        for revision in revisions {
             gone.extend(
-                names(path, git::show(root, version, path)?)?
+                names(path, git::show(root, revision, path)?)?
                     .into_iter()
                     .filter(|test| !kept.contains(test)),
             );
@@ -1244,6 +1266,61 @@ mod tests {
             ],
             "a test at the base is a deleted test, once; one kept to the end is no finding"
         );
+    }
+
+    /// #38: `web/src/ui/ui.test.tsx` was created and deleted within the pull request. On the
+    /// head, integrity flagged its tests as added then deleted; on GitHub's merge commit, the
+    /// path-limited walk followed only the merge's first parent (main, where the file never
+    /// existed) and missed them, so the description's reasons became "stale" there. Both runs
+    /// must walk the pull request's own commits.
+    #[test]
+    fn the_head_and_the_merge_commit_find_the_same_added_then_deleted_tests() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = repository(&temp.path().join("repo"));
+        let commit = |files: &[(&str, Option<&str>)]| {
+            for (path, text) in files {
+                let target = repo.join(path);
+                match text {
+                    Some(text) => {
+                        fs::create_dir_all(target.parent().unwrap()).unwrap();
+                        fs::write(target, text).unwrap();
+                    }
+                    None => fs::remove_file(target).unwrap(),
+                }
+            }
+            git(&repo, &["add", "--all"]);
+            git(&repo, &["commit", "--quiet", "-m", "change"]);
+        };
+        let ui = "web/src/ui/ui.test.tsx";
+        commit(&[("README.md", Some("x\n"))]);
+        git(&repo, &["checkout", "--quiet", "-b", "pr"]);
+        commit(&[(
+            ui,
+            Some(
+                "test(\"copies\", () => { expect(1).toBe(1); });\ntest(\"wraps\", () => { expect(1).toBe(1); });\n",
+            ),
+        )]);
+        commit(&[(ui, None), ("web/src/app.ts", Some("export {};\n"))]);
+        git(&repo, &["checkout", "--quiet", "main"]);
+        commit(&[("CONTRIBUTING.md", Some("main moved on\n"))]);
+        let expected = [
+            Finding::AddedThenDeleted {
+                file: ui.into(),
+                test: "copies".into(),
+            },
+            Finding::AddedThenDeleted {
+                file: ui.into(),
+                test: "wraps".into(),
+            },
+        ];
+        git(&repo, &["checkout", "--quiet", "pr"]);
+        let head = findings(&repo, &crate::git::merge_base(&repo, "main").unwrap()).unwrap();
+        assert_eq!(head, expected, "on the head");
+        // GitHub's refs/pull/N/merge: main first, the pull request's head second.
+        git(&repo, &["checkout", "--quiet", "--detach", "main"]);
+        git(&repo, &["merge", "--quiet", "--no-ff", "--no-edit", "pr"]);
+        let merge = findings(&repo, &crate::git::merge_base(&repo, "main").unwrap()).unwrap();
+        assert_eq!(merge, expected, "on the merge commit, as on the head");
     }
 
     #[test]
