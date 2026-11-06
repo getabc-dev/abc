@@ -1,0 +1,16 @@
+# osv-scanner reads this file for web/pnpm-lock.yaml, the lockfile beside it, both in CI and in
+# `cargo xtask tool osv-scanner scan source --lockfile web/pnpm-lock.yaml`. It is a gate file.
+#
+# Each ignore names one advisory, says why it cannot reach the app, and expires: on its
+# `ignoreUntil` date the scan fails again unless someone renews it on purpose. The packages stay
+# in the lockfile and stay scanned; any other advisory, in them or elsewhere, still fails.
+
+[[IgnoredVulns]]
+id = "GHSA-gcqx-w48m-w2h4"
+ignoreUntil = 2027-01-05T00:00:00Z
+reason = "deepmerge 4.3.1 has no fixed release. It is reached only through the pinned shadcn CLI, a devDependency run by hand to add registry components; it is never bundled into web/dist or shipped."
+
+[[IgnoredVulns]]
+id = "GHSA-g3hv-75wg-m249"
+ignoreUntil = 2027-01-05T00:00:00Z
+reason = "minimatch 10.2.6 is fixed only in 11.x, which ts-morph ^10 rejects. It is reached only through the pinned shadcn CLI (via ts-morph), a devDependency run by hand to add registry components; it is never bundled into web/dist or shipped."

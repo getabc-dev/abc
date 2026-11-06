@@ -165,8 +165,9 @@ fuzz/deny.toml --locked check`, `cargo xtask tool cargo-shear --deny-warnings --
 on xtask's (`cargo xtask tool cargo-deny --manifest-path xtask/Cargo.toml --config xtask/deny.toml
 --locked check`, `cargo xtask tool cargo-shear --deny-warnings --locked xtask`), `cargo xtask tool
 osv-scanner scan source --lockfile Cargo.lock --lockfile fuzz/Cargo.lock --lockfile
-xtask/Cargo.lock --lockfile web/pnpm-lock.yaml`, `cargo
-xtask tool zizmor --pedantic .github`, `cargo xtask tool pinact run --check --verify-comment` and
+xtask/Cargo.lock --lockfile web/pnpm-lock.yaml` (which reads `web/osv-scanner.toml` for the web
+lockfile: each ignored advisory there names its reason and an `ignoreUntil` date, after which the
+scan fails again unless someone renews it on purpose), `cargo xtask tool zizmor --pedantic .github`, `cargo xtask tool pinact run --check --verify-comment` and
 `cargo xtask tool gitleaks git --redact --no-banner --verbose .`. Every job is a required check on
 `main`. Integrity, Coverage, Mutants and Gemini review run the base commit's xtask on the pull
 request's tree (`--root`), so a pull request cannot change the gates that judge it; a pull request
@@ -192,8 +193,8 @@ changes no tests.
 
 The gate files are the files that decide what passes: CI and rulesets (`.github/`), cargo, lint,
 toolchain and tool configuration, `Cargo.toml` and `Cargo.lock` (the fuzz workspace's too, with
-`fuzz/deny.toml`), the web app's manifest, lockfile, pnpm, TypeScript, Vite, Biome, Oxlint, knip and
-Playwright configuration, the agent settings, this file and `CLAUDE.md`, and all of `xtask/`, its
+`fuzz/deny.toml`), the web app's manifest, lockfile, pnpm, TypeScript, Vite, Biome, Oxlint, knip, Playwright and
+osv-scanner configuration, the agent settings, this file and `CLAUDE.md`, and all of `xtask/`, its
 workspace's manifest, lockfile and `deny.toml` included. `GATES` in
 `xtask/src/integrity/mod.rs` lists them, and a test keeps `.github/CODEOWNERS` identical. A change
 to one needs the integrity approval and a code owner's review.
