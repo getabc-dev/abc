@@ -360,3 +360,78 @@ fn a_label_re_run_does_not_hide_who_pushed() {
         format!("/repos/o/r/actions/runs?event=pull_request&head_sha={head}&per_page=100&page=2")
     );
 }
+
+/// #33 and #38 were built at once; #33 broke on its merge with main once #38 merged. `pr open`
+/// and `pr update` fetch main and warn when it moved on files the branch changes too.
+#[test]
+fn warns_when_main_moved_on_the_branchs_files() {
+    let temp = tempfile::tempdir().unwrap();
+    let work = checkout(temp.path());
+    let prepared = |action: Action| {
+        let mut out = String::new();
+        prepare(action, &work, &mut out).unwrap().unwrap();
+        out
+    };
+    assert_eq!(
+        prepared(open("feat: x", body(temp.path(), REASONED))),
+        "",
+        "main has not moved"
+    );
+    // Another branch merges into main: it changes src/t.rs, which agent/x deletes, and a file
+    // agent/x leaves alone. This checkout has not fetched it.
+    let other = temp.path().join("other");
+    git(
+        temp.path(),
+        &[
+            "clone",
+            "--quiet",
+            temp.path().join("origin.git").to_str().unwrap(),
+            other.to_str().unwrap(),
+        ],
+    );
+    fs::write(
+        other.join("src/t.rs"),
+        "#[test]\nfn kept() { assert!(true); }\n",
+    )
+    .unwrap();
+    fs::write(other.join("README.md"), "moved\n").unwrap();
+    git(&other, &["add", "--all"]);
+    git(
+        &other,
+        &[
+            "-c",
+            "user.name=other",
+            "-c",
+            "user.email=other@example.com",
+            "commit",
+            "--quiet",
+            "-m",
+            "#38",
+        ],
+    );
+    git(&other, &["push", "--quiet", "origin", "HEAD:main"]);
+    let warned = "pr: warning: origin/main moved on since this branch left it, changing 1 \
+                  file(s) this branch changes too:\n  src/t.rs\npr: merge it (`git merge \
+                  origin/main`), check again and push; never rebase a pushed branch\n";
+    assert_eq!(
+        prepared(open("feat: x", body(temp.path(), REASONED))),
+        warned
+    );
+    assert_eq!(
+        prepared(Action::Update {
+            number: 7,
+            body: body(temp.path(), REASONED),
+        }),
+        warned
+    );
+    git(&work, &["remote", "set-url", "origin", "/no/such/remote"]);
+    let offline = prepared(Action::Update {
+        number: 7,
+        body: body(temp.path(), REASONED),
+    });
+    assert!(
+        offline.starts_with("pr: could not fetch origin/main, so it is compared as last fetched")
+            && offline.ends_with(warned),
+        "{offline}"
+    );
+}
