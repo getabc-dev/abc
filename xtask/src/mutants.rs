@@ -5,7 +5,6 @@
 //! behaviour no test pins down; the gate fails on any and lists them, and in GitHub Actions
 //! annotates each on its line.
 
-use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fs;
 use std::io::Write;
@@ -95,12 +94,12 @@ pub(crate) struct Options {
 /// Runs cargo-mutants, with the cargo-mutants and cargo-nextest executables given, on the Rust
 /// lines changed since the merge base with `base`, in each workspace of the repository.
 ///
-/// The main workspace's mutants are built in copies of the tree, as many at once as
-/// xtask's are tested in place, one at a time: its tests read the repository
-/// around the workspace (the main manifest, the hook launcher, the CI workflows), which a copy of
-/// the workspace alone would not have. cargo-mutants puts each source file back after its mutants,
-/// but a mutant's tests can write into the tree, as a property test that fails does
-/// (`proptest-regressions/`), so the run puts xtask's tree back as it found it ([`Tree`]).
+/// Every workspace's mutants are built and tested in copies of it, as many at once as
+/// `options.jobs`, never in the checkout: there, any other `cargo xtask` command would compile the
+/// mutated code (on 6 Nov, the pull request watch's `cargo xtask gh` built a mutant). xtask's
+/// tests read the repository around their workspace (the main manifest, the hook launcher, the
+/// CI workflows), which a copy of `xtask/` alone does not have, so its builds name the checkout in
+/// `XTASK_REPOSITORY` ([`test_env_config`]).
 pub(crate) fn run(
     root: &Path,
     base: &str,
@@ -206,14 +205,13 @@ impl Run<'_> {
         }
         let diff_file = output.join("changes.diff");
         fs::write(&diff_file, diff).context("could not write the diff for cargo-mutants")?;
-        let in_place = !self.workspace.dir().is_empty();
         writeln!(
             out,
-            "xtask: mutating the changed Rust code{}",
-            if in_place {
-                format!(" of {}/, in place", self.workspace.dir())
-            } else {
+            "xtask: mutating the changed Rust code{}, in copies of it",
+            if self.workspace.dir().is_empty() {
                 String::new()
+            } else {
+                format!(" of {}/", self.workspace.dir())
             }
         )?;
         // cargo-mutants copies the tree, once per job, into the temporary directory and builds
@@ -222,12 +220,8 @@ impl Run<'_> {
         let scratch = scratch(root);
         fs::create_dir_all(&scratch)
             .with_context(|| format!("could not create {}", scratch.display()))?;
-        // The tests must not inherit that directory: inside the checkout it is inside its git
-        // repository and its Cargo workspace, and its paths can be too long for a Unix socket.
-        // Cargo's `[env]`, forced, gives every build and test cargo-mutants runs this process's
-        // own one back.
         let test_env = output.join("test-env.toml");
-        fs::write(&test_env, test_env_config(&std::env::temp_dir())?)
+        fs::write(&test_env, test_env_config(&std::env::temp_dir(), root)?)
             .with_context(|| format!("could not write {}", test_env.display()))?;
         let mut cargo_config = OsString::from("--cargo-arg=--config=");
         cargo_config.push(&test_env);
@@ -247,20 +241,14 @@ impl Run<'_> {
             .arg("--timeout-multiplier")
             .arg(timeout_multiplier(self.options.jobs).to_string())
             .args(["--minimum-test-timeout", MINIMUM_TEST_TIMEOUT]);
-        if in_place {
-            command.args(["--dir", self.workspace.dir(), "--in-place"]);
-        } else {
-            command
-                .arg("--jobs")
-                .arg(self.options.jobs.to_string())
-                // The tests run the pinned tools in .tools/, which .gitignore lists; copy them too.
-                .args(["--gitignore", "false"]);
+        if !self.workspace.dir().is_empty() {
+            command.args(["--dir", self.workspace.dir()]);
         }
-        let before = if in_place {
-            Some(Tree::read(&root.join(self.workspace.dir()))?)
-        } else {
-            None
-        };
+        command
+            .arg("--jobs")
+            .arg(self.options.jobs.to_string())
+            // The tests run the pinned tools in .tools/, which .gitignore lists; copy them too.
+            .args(["--gitignore", "false"]);
         let status = command
             .args(
                 self.options
@@ -284,48 +272,7 @@ impl Run<'_> {
         // Whatever cargo-mutants left behind goes, so repeated runs never fill the disk.
         fs::remove_dir_all(&scratch)
             .with_context(|| format!("could not remove {}", scratch.display()))?;
-        if let Some(before) = before {
-            self.put_back(&before, diff, out)?;
-        }
         self.report(&results, outcome(status?.code())?, out)
-    }
-
-    /// After an in-place run, puts back what it changed of the workspace as `before` found it,
-    /// the files it mutated being those `diff` changes, and reports that and what else changed.
-    fn put_back(&self, before: &Tree, diff: &str, out: &mut impl Write) -> anyhow::Result<()> {
-        let root = self.root;
-        let workspace = self.workspace.dir();
-        // The diff of an in-place workspace names its files relative to it.
-        let mutated: BTreeSet<PathBuf> = git::added_lines(diff).keys().map(PathBuf::from).collect();
-        // One directory per run, so a later run never mixes with or replaces what this one kept.
-        let aside = self.output().join("left-behind").join(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .context("the clock is before 1970")?
-                .as_secs()
-                .to_string(),
-        );
-        let done = before.put_back(&root.join(workspace), &mutated, &aside)?;
-        for change in done.restored {
-            writeln!(
-                out,
-                "mutants: put back {workspace}/{change}, which the run in place left behind"
-            )?;
-        }
-        for path in done.moved {
-            writeln!(
-                out,
-                "mutants: moved {workspace}/{path}, which appeared during the run, to {}",
-                aside.join(&path).display()
-            )?;
-        }
-        for (path, what) in done.left {
-            writeln!(
-                out,
-                "mutants: {workspace}/{path} {what} during the run, not by it; left as it is"
-            )?;
-        }
-        Ok(())
     }
 
     /// Reads the results cargo-mutants wrote in `results` and reports them, with its `result`;
@@ -363,195 +310,30 @@ impl Run<'_> {
     }
 }
 
-/// One entry of a [`Tree`] that is not a directory.
-#[derive(Debug, PartialEq, Eq)]
-enum Entry {
-    /// A file, with its contents.
-    File(Vec<u8>),
-    /// A symbolic link, with its target, never followed.
-    Link(PathBuf),
-}
-
-/// What [`Tree::put_back`] did and found.
-#[derive(Debug, Default, PartialEq, Eq)]
-struct PutBack {
-    /// What it put back or removed, by path relative to the workspace.
-    restored: Vec<String>,
-    /// What appeared during the run where the run does not write, moved aside, by path relative
-    /// to the workspace.
-    moved: Vec<String>,
-    /// What changed or went during the run but not by it, left as it is: each path and what
-    /// happened.
-    left: Vec<(String, &'static str)>,
-}
-
-/// A workspace's files as they were before an in-place run, to put back afterwards. The workspace
-/// holds sources only (its build output is under the root's `target/`), so it is read whole.
-#[derive(Debug, PartialEq, Eq)]
-struct Tree {
-    /// Each file and symbolic link, by its path relative to the workspace.
-    entries: BTreeMap<PathBuf, Entry>,
-    /// Each directory, by its path relative to the workspace.
-    dirs: BTreeSet<PathBuf>,
-}
-
-/// Whether the in-place run may change `path`, relative to the workspace: one of the files it
-/// mutates, `mutated`, or what proptest records in `proptest-regressions/` when a mutant fails a
-/// property test. Anyone else's change is left alone.
-fn owned(path: &Path, mutated: &BTreeSet<PathBuf>) -> bool {
-    mutated.contains(path)
-        || path
-            .components()
-            .any(|component| component.as_os_str() == "proptest-regressions")
-}
-
-impl Tree {
-    /// The tree under `dir`. A symbolic link is read as the link, never followed.
-    fn read(dir: &Path) -> anyhow::Result<Self> {
-        let mut tree = Self {
-            entries: BTreeMap::new(),
-            dirs: BTreeSet::new(),
-        };
-        let mut pending = vec![PathBuf::new()];
-        while let Some(relative) = pending.pop() {
-            let here = dir.join(&relative);
-            let entries = fs::read_dir(&here)
-                .with_context(|| format!("could not read {}", here.display()))?;
-            for entry in entries {
-                let entry = entry.with_context(|| format!("could not read {}", here.display()))?;
-                let path = relative.join(entry.file_name());
-                let kind = entry
-                    .file_type()
-                    .with_context(|| format!("could not read {}", entry.path().display()))?;
-                if kind.is_dir() {
-                    tree.dirs.insert(path.clone());
-                    pending.push(path);
-                } else if kind.is_symlink() {
-                    let target = fs::read_link(entry.path())
-                        .with_context(|| format!("could not read {}", entry.path().display()))?;
-                    tree.entries.insert(path, Entry::Link(target));
-                } else {
-                    let contents = fs::read(entry.path())
-                        .with_context(|| format!("could not read {}", entry.path().display()))?;
-                    tree.entries.insert(path, Entry::File(contents));
-                }
-            }
-        }
-        Ok(tree)
-    }
-
-    /// Puts back under `dir` what the run changed, as `self` found it, and keeps everything else.
-    ///
-    /// - A file or link that appeared goes: removed when the run may write it ([`owned`], with
-    ///   the files it mutates, `mutated`), otherwise moved under `aside`, at the same relative
-    ///   path, since tests of a mutant can write anywhere in the tree (a mutated path becomes
-    ///   relative to xtask/) but it might be someone's; directories that appeared go with them.
-    /// - A file or link the run may write that changed or went comes back as it was, a link as a
-    ///   link.
-    /// - Any other change is someone else's, left as it is and reported.
-    fn put_back(
-        &self,
-        dir: &Path,
-        mutated: &BTreeSet<PathBuf>,
-        aside: &Path,
-    ) -> anyhow::Result<PutBack> {
-        let now = Self::read(dir)?;
-        let mut done = PutBack::default();
-        let shown = |path: &Path| path.display().to_string();
-        for (path, entry) in now
-            .entries
-            .iter()
-            .filter(|(path, _)| !self.entries.contains_key(*path))
-        {
-            let full = dir.join(path);
-            if owned(path, mutated) {
-                done.restored.push(shown(path));
-            } else {
-                let kept = aside.join(path);
-                if let Some(parent) = kept.parent() {
-                    fs::create_dir_all(parent)
-                        .with_context(|| format!("could not create {}", parent.display()))?;
-                }
-                // Written anew from what was read: in an agent VM `aside`, under target/, is
-                // another disk, which a rename cannot reach.
-                restore(&kept, entry)?;
-                done.moved.push(shown(path));
-            }
-            // Removes a link itself, never what it points to.
-            fs::remove_file(&full)
-                .with_context(|| format!("could not remove {}", full.display()))?;
-        }
-        // Deepest first, so each is empty by the time it goes: what was in it went above.
-        for path in now
-            .dirs
-            .iter()
-            .rev()
-            .filter(|path| !self.dirs.contains(*path))
-        {
-            let full = dir.join(path);
-            fs::remove_dir(&full)
-                .with_context(|| format!("could not remove {}", full.display()))?;
-            done.restored.push(format!("{}/", path.display()));
-        }
-        for (path, entry) in &self.entries {
-            let found = now.entries.get(path);
-            if found == Some(entry) {
-                continue;
-            }
-            let what = if found.is_some() { "changed" } else { "went" };
-            // Only into a directory that is still one, so nothing is written through a link that
-            // took a directory's place.
-            let parent_is_dir = path
-                .parent()
-                .is_none_or(|parent| parent.as_os_str().is_empty() || now.dirs.contains(parent));
-            if owned(path, mutated) && parent_is_dir {
-                restore(&dir.join(path), entry)?;
-                done.restored.push(shown(path));
-            } else {
-                done.left.push((shown(path), what));
-            }
-        }
-        Ok(done)
-    }
-}
-
-/// Puts `entry` at `path`, replacing whatever is there without following it: the entry is made
-/// beside it under a fresh name, then renamed over it, which replaces a link itself.
-fn restore(path: &Path, entry: &Entry) -> anyhow::Result<()> {
-    let name = path
-        .file_name()
-        .with_context(|| format!("{} has no name", path.display()))?;
-    let mut fresh = OsString::from(".");
-    fresh.push(name);
-    fresh.push(format!(".xtask-restore-{}", std::process::id()));
-    let temporary = path.with_file_name(fresh);
-    match entry {
-        Entry::File(contents) => fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temporary)
-            .and_then(|mut file| file.write_all(contents)),
-        Entry::Link(target) => std::os::unix::fs::symlink(target, &temporary),
-    }
-    .with_context(|| format!("could not write {}", temporary.display()))?;
-    fs::rename(&temporary, path).with_context(|| format!("could not restore {}", path.display()))
-}
-
-/// Cargo configuration that sets `TMPDIR` to `temp` for everything cargo runs, overriding the
-/// environment.
-fn test_env_config(temp: &Path) -> anyhow::Result<String> {
-    let temp = temp.to_str().with_context(|| {
-        format!(
-            "the temporary directory {} is not UTF-8, so Cargo's configuration cannot name it",
-            temp.display()
-        )
-    })?;
-    let mut tmpdir = toml_edit::InlineTable::new();
-    tmpdir.insert("value", temp.into());
-    tmpdir.insert("force", true.into());
-    let mut config = toml_edit::DocumentMut::new();
+/// Cargo configuration, forced over the environment, for everything cargo-mutants has cargo
+/// build and run: `TMPDIR` is `temp`, this process's own, not cargo-mutants' scratch directory,
+/// which is inside the checkout's git repository and Cargo workspace and can make paths too long
+/// for a Unix socket; and `XTASK_REPOSITORY` is the checkout at `root`, which xtask, built in a
+/// copy of `xtask/` alone, reads around itself when compiled ([`crate::repo_root`]).
+fn test_env_config(temp: &Path, root: &Path) -> anyhow::Result<String> {
+    let text = |path: &Path, what: &str| {
+        path.to_str().map(str::to_owned).with_context(|| {
+            format!(
+                "{what} {} is not UTF-8, so Cargo's configuration cannot name it",
+                path.display()
+            )
+        })
+    };
+    let forced = |value: String| {
+        let mut table = toml_edit::InlineTable::new();
+        table.insert("value", value.into());
+        table.insert("force", true.into());
+        toml_edit::value(table)
+    };
     let mut env = toml_edit::Table::new();
-    env.insert("TMPDIR", toml_edit::value(tmpdir));
+    env.insert("TMPDIR", forced(text(temp, "the temporary directory")?));
+    env.insert("XTASK_REPOSITORY", forced(text(root, "the checkout")?));
+    let mut config = toml_edit::DocumentMut::new();
     config.insert("env", toml_edit::Item::Table(env));
     Ok(config.to_string())
 }
@@ -679,10 +461,11 @@ mod tests {
 
     #[test]
     fn the_tests_get_the_callers_temporary_directory_back() {
-        let config: toml_edit::DocumentMut = test_env_config(Path::new("/tmp/a \"b\""))
-            .unwrap()
-            .parse()
-            .unwrap();
+        let config: toml_edit::DocumentMut =
+            test_env_config(Path::new("/tmp/a \"b\""), Path::new("/work/abc"))
+                .unwrap()
+                .parse()
+                .unwrap();
         let tmpdir = &config["env"]["TMPDIR"];
         assert_eq!(tmpdir["value"].as_str(), Some("/tmp/a \"b\""), "{config}");
         assert_eq!(
@@ -690,12 +473,17 @@ mod tests {
             Some(true),
             "it overrides cargo-mutants' TMPDIR: {config}"
         );
+        let repository = &config["env"]["XTASK_REPOSITORY"];
+        assert_eq!(repository["value"].as_str(), Some("/work/abc"), "{config}");
+        assert_eq!(repository["force"].as_bool(), Some(true), "{config}");
         #[cfg(unix)]
         {
             use std::os::unix::ffi::OsStrExt as _;
             let invalid = std::ffi::OsStr::from_bytes(b"/tmp/\xff");
-            let error = test_env_config(Path::new(invalid)).unwrap_err();
+            let error = test_env_config(Path::new(invalid), Path::new("/w")).unwrap_err();
             assert!(error.to_string().contains("not UTF-8"), "{error}");
+            let checkout = test_env_config(Path::new("/tmp"), Path::new(invalid)).unwrap_err();
+            assert!(checkout.to_string().contains("the checkout"), "{checkout}");
         }
     }
 
@@ -878,7 +666,7 @@ mod tests {
     }
 
     #[test]
-    fn mutates_xtask_in_place_with_paths_relative_to_it() {
+    fn mutates_xtask_in_copies_with_paths_relative_to_it() {
         let temp = tempfile::tempdir().unwrap();
         let repo = repository_with_change(
             &temp.path().join("repo"),
@@ -925,17 +713,13 @@ mod tests {
             text.contains("missed: xtask/src/a.rs:1:18: replace a -> bool with false"),
             "named from the repository root: {text}"
         );
-        assert!(text.contains("of xtask/, in place"), "{text}");
+        assert!(text.contains("of xtask/, in copies of it"), "{text}");
         let called = fs::read_to_string(&args).unwrap();
-        assert!(called.contains("--dir xtask --in-place"), "{called}");
         assert!(
-            !called.contains("--jobs"),
-            "one at a time in place: {called}"
+            called.contains("--dir xtask --jobs 2 --gitignore false"),
+            "in copies, as many at once as the jobs: {called}"
         );
-        assert!(
-            !called.contains("--gitignore"),
-            "nothing is copied in place, and cargo-mutants refuses the option there: {called}"
-        );
+        assert!(!called.contains("--in-place"), "{called}");
         assert!(
             called.contains(&format!(
                 "--output {}",
@@ -943,40 +727,70 @@ mod tests {
             )),
             "{called}"
         );
+        let config = fs::read_to_string(repo.join("target/mutants/xtask/test-env.toml")).unwrap();
+        assert!(
+            config.contains(&format!(
+                "XTASK_REPOSITORY = {{ value = \"{}\"",
+                repo.display()
+            )),
+            "the copies' builds name the checkout: {config}"
+        );
     }
 
-    /// In-place xtask mutants left stray files behind: a mutant that fails a property test makes
-    /// proptest record the case in `proptest-regressions/` beside the source. The run now puts
-    /// xtask's tree back as it found it, and leaves nothing in `target/` but its results.
+    /// Every regular file under `dir` with its bytes, `target/` and `.git/` left out.
+    fn snapshot(dir: &Path) -> Vec<(std::path::PathBuf, String)> {
+        let mut files = Vec::new();
+        let mut pending = vec![dir.to_path_buf()];
+        while let Some(next) = pending.pop() {
+            for entry in fs::read_dir(&next).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    if path != dir.join("target") && path != dir.join(".git") {
+                        pending.push(path);
+                    }
+                } else {
+                    files.push((
+                        path.strip_prefix(dir).unwrap().to_owned(),
+                        String::from_utf8_lossy(&fs::read(&path).unwrap()).into_owned(),
+                    ));
+                }
+            }
+        }
+        files.sort();
+        files
+    }
+
+    /// #33's mutants ran xtask's in place: while a mutant was in xtask/src, any other `cargo
+    /// xtask` in the checkout compiled it (on 6 Nov, the pull request watch's `cargo xtask gh`
+    /// built `vm::Pull: Default`). The run now leaves the checkout byte-identical while
+    /// cargo-mutants works and after: this fake mutates and writes as cargo-mutants and its tests
+    /// do, in the copy it is given, and records the checkout as it finds it meanwhile.
     #[test]
-    fn an_in_place_run_leaves_nothing_behind() {
+    fn the_checkout_is_untouched_during_and_after_a_run() {
         let temp = tempfile::tempdir().unwrap();
         let repo = repository_with_change(
             &temp.path().join("repo"),
             &[
                 ("xtask/src/a.rs", "fn a() -> bool { true }\n"),
-                ("xtask/src/b.rs", "fn b() {}\n"),
+                ("src/b.rs", "fn b() -> bool { true }\n"),
             ],
         );
-        fs::create_dir_all(repo.join("xtask/src/proptest-regressions")).unwrap();
-        fs::write(
-            repo.join("xtask/src/proptest-regressions/kept.txt"),
-            "cc 1\n",
-        )
-        .unwrap();
+        let during = temp.path().join("during");
         let mutants = temp.path().join("cargo-mutants");
         script(
             &mutants,
-            "while [ $# -gt 0 ]; do case \"$1\" in --output) out=$2 ;; esac; shift; done\n\
-             mkdir -p xtask/src/proptest-regressions/new/deeper \"$TMPDIR/copy\"\n\
-             echo 'cc 2' > xtask/src/proptest-regressions/stop.txt\n\
-             echo 'cc 3' >> xtask/src/proptest-regressions/kept.txt\n\
-             echo 'x' > xtask/src/proptest-regressions/new/deeper/stray.txt\n\
-             echo 'fn a() -> bool { false }' > xtask/src/a.rs\n\
-             rm xtask/src/b.rs\n\
-             mkdir -p \"$out/mutants.out\"\n",
+            &format!(
+                "dir=.\nwhile [ $# -gt 0 ]; do case \"$1\" in --output) out=$2 ;; --dir) dir=$2 ;; --in-place) exit 9 ;; esac; shift; done\n\
+                 copy=\"$TMPDIR/copy-$$\"\nmkdir -p \"$copy\"\ncp -R \"$dir\"/. \"$copy\"\n\
+                 echo 'fn a() -> bool {{ false }}' > \"$copy/src/a.rs\"\n\
+                 mkdir -p \"$copy/src/proptest-regressions\" && echo 'cc 1' > \"$copy/src/proptest-regressions/a.txt\"\n\
+                 rm -rf {during} && cp -R {repo} {during}\n\
+                 mkdir -p \"$out/mutants.out\"\n",
+                repo = repo.display(),
+                during = during.display(),
+            ),
         );
-        let before = super::Tree::read(&repo.join("xtask")).unwrap();
+        let before = snapshot(&repo);
         let mut out = Vec::new();
         assert!(
             run(
@@ -986,142 +800,22 @@ mod tests {
                 &mutants,
                 &temp.path().join("cargo-nextest"),
                 &no_web(),
-                &mut out
+                &mut out,
             )
-            .unwrap()
+            .unwrap(),
+            "{}",
+            String::from_utf8_lossy(&out)
         );
-        let text = String::from_utf8(out).unwrap();
         assert_eq!(
-            super::Tree::read(&repo.join("xtask")).unwrap(),
+            snapshot(&during),
             before,
-            "xtask's tree is as the run found it: {text}"
-        );
-        for put_back in [
-            "xtask/src/proptest-regressions/stop.txt",
-            "xtask/src/proptest-regressions/kept.txt",
-            "xtask/src/proptest-regressions/new/",
-            "xtask/src/proptest-regressions/new/deeper/",
-            "xtask/src/proptest-regressions/new/deeper/stray.txt",
-            "xtask/src/a.rs",
-            "xtask/src/b.rs",
-        ] {
-            assert!(
-                text.contains(&format!("mutants: put back {put_back}, ")),
-                "{put_back}: {text}"
-            );
-        }
-        let left: Vec<String> = fs::read_dir(repo.join("target"))
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
-            .collect();
-        assert_eq!(left, ["mutants"], "only the results stay in target/");
-    }
-
-    /// The in-place run put xtask's whole tree back as it found it: an edit made meanwhile by
-    /// someone else was silently reverted, a symlink came back as a file holding its target's name,
-    /// and a file the run left as a symlink was written through. It now puts back only what the
-    /// run may change (the files it mutates and proptest's regressions), as they were, and
-    /// reports the rest.
-    #[test]
-    fn an_in_place_run_puts_back_only_what_it_changed() {
-        let temp = tempfile::tempdir().unwrap();
-        let repo = repository_with_change(
-            &temp.path().join("repo"),
-            &[("xtask/src/a.rs", "fn a() -> bool { true }\n")],
-        );
-        fs::write(repo.join("xtask/notes.md"), "mine\n").unwrap();
-        let regressions = repo.join("xtask/src/proptest-regressions");
-        fs::create_dir_all(&regressions).unwrap();
-        fs::write(repo.join("xtask/shared.txt"), "cc 0\n").unwrap();
-        std::os::unix::fs::symlink("../../shared.txt", regressions.join("linked.txt")).unwrap();
-        let outside = temp.path().join("outside.rs");
-        fs::write(&outside, "outside\n").unwrap();
-        let mutants = temp.path().join("cargo-mutants");
-        script(
-            &mutants,
-            &format!(
-                "while [ $# -gt 0 ]; do case \"$1\" in --output) out=$2 ;; esac; shift; done\n\
-                 echo 'edited meanwhile' >> xtask/notes.md\n\
-                 echo 'new meanwhile' > xtask/new.md\n\
-                 mkdir xtask/made-meanwhile\n\
-                 rm xtask/src/proptest-regressions/linked.txt\n\
-                 echo 'cc 1' > xtask/src/proptest-regressions/linked.txt\n\
-                 rm xtask/src/a.rs\n\
-                 ln -s {} xtask/src/a.rs\n\
-                 mkdir -p \"$out/mutants.out\"\n",
-                outside.display()
-            ),
-        );
-        let mut out = Vec::new();
-        run(
-            &repo,
-            "base",
-            &TWO,
-            &mutants,
-            &temp.path().join("cargo-nextest"),
-            &no_web(),
-            &mut out,
-        )
-        .unwrap();
-        let text = String::from_utf8(out).unwrap();
-        assert_eq!(
-            fs::read_to_string(&outside).unwrap(),
-            "outside\n",
-            "nothing is written through a symlink: {text}"
-        );
-        let a = repo.join("xtask/src/a.rs");
-        assert!(fs::symlink_metadata(&a).unwrap().is_file(), "{text}");
-        assert_eq!(fs::read_to_string(&a).unwrap(), "fn a() -> bool { true }\n");
-        assert_eq!(
-            fs::read_link(regressions.join("linked.txt")).unwrap(),
-            Path::new("../../shared.txt"),
-            "a symlink comes back as a symlink: {text}"
+            "the checkout is as it was while cargo-mutants ran"
         );
         assert_eq!(
-            fs::read_to_string(repo.join("xtask/notes.md")).unwrap(),
-            "mine\nedited meanwhile\n",
-            "someone else's edit is kept: {text}"
+            snapshot(&repo),
+            before,
+            "the checkout is as it was after the run"
         );
-        assert!(!repo.join("xtask/new.md").exists(), "{text}");
-        let left_behind = repo.join("target/mutants/xtask/left-behind");
-        let runs: Vec<std::path::PathBuf> = fs::read_dir(&left_behind)
-            .unwrap()
-            .map(|entry| entry.unwrap().path())
-            .collect();
-        assert_eq!(runs.len(), 1, "one directory for the run: {runs:?}");
-        assert_eq!(
-            fs::read_to_string(runs[0].join("new.md")).unwrap(),
-            "new meanwhile\n",
-            "what appeared outside the run's own paths is moved aside, not lost: {text}"
-        );
-        assert_eq!(
-            fs::read_dir(&runs[0]).unwrap().count(),
-            1,
-            "and nothing else, not proptest's regressions: {text}"
-        );
-        assert!(
-            !repo.join("xtask/made-meanwhile").exists(),
-            "an empty directory that appeared goes: {text}"
-        );
-        assert!(
-            text.contains(&format!(
-                "mutants: moved xtask/new.md, which appeared during the run, to {}\n",
-                runs[0].join("new.md").display()
-            )),
-            "{text}"
-        );
-        for put_back in [
-            "xtask/src/a.rs",
-            "xtask/src/proptest-regressions/linked.txt",
-            "xtask/made-meanwhile/",
-        ] {
-            assert!(
-                text.contains(&format!("mutants: put back {put_back}, ")),
-                "{put_back}: {text}"
-            );
-        }
-        let left = "mutants: xtask/notes.md changed during the run, not by it; left as it is";
-        assert!(text.contains(left), "{left}: {text}");
     }
 
     #[test]

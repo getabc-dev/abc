@@ -1000,8 +1000,10 @@ case \"$*\" in 'api repos/getabc-dev/abc/rulesets') echo '[]' ;; *) \
 
     #[test]
     fn the_branch_exclusions_free_the_merge_queue_and_agents_and_nothing_else() {
-        let ruleset: serde_json::Value =
-            serde_json::from_str(include_str!("../../.github/rulesets/branches.json")).unwrap();
+        let ruleset: serde_json::Value = serde_json::from_str(&crate::testing::read_in_repository(
+            ".github/rulesets/branches.json",
+        ))
+        .unwrap();
         let excluded: Vec<String> = ruleset["conditions"]["ref_name"]["exclude"]
             .as_array()
             .unwrap()

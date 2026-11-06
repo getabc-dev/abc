@@ -275,7 +275,12 @@ mod tests {
     /// by every test process on this machine, as when a main agent's and a subagent's stop hooks
     /// check at once, so it comes with an exclusive lock that the caller holds until it is done.
     fn copy_of_the_repository() -> (std::path::PathBuf, std::fs::File) {
-        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        // As xtask's own repo_root: `cargo xtask mutants` builds xtask in a copy of xtask/ and
+        // names the checkout in XTASK_REPOSITORY.
+        let repo = option_env!("XTASK_REPOSITORY").map_or_else(
+            || Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap(),
+            Path::new,
+        );
         let tmp = Path::new(env!("CARGO_TARGET_TMPDIR"));
         let copy = tmp.join("broken-workspace");
         std::fs::create_dir_all(&copy).unwrap();

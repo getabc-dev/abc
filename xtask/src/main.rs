@@ -706,12 +706,20 @@ fn run_vm(
     vm::run(action, &host, &msb, env, report)
 }
 
-/// The repository root: the workspace that contains xtask.
+/// The repository root: the checkout xtask was built from, whose pinned tools it runs.
+///
+/// That is the directory around xtask's own, unless the build named another in
+/// `XTASK_REPOSITORY`: `cargo xtask mutants` builds xtask in a copy of `xtask/` alone, so that no
+/// other command in the checkout compiles a mutant, and sets it to the checkout, which its tests
+/// read around them. It is read when xtask is compiled, never at run time.
 fn repo_root() -> anyhow::Result<PathBuf> {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .map(Path::to_path_buf)
-        .context("xtask is not inside the repository")
+    match option_env!("XTASK_REPOSITORY") {
+        Some(root) => Ok(PathBuf::from(root)),
+        None => Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .map(Path::to_path_buf)
+            .context("xtask is not inside the repository"),
+    }
 }
 
 #[cfg(test)]

@@ -672,9 +672,10 @@ mod tests {
     /// it on purpose.
     #[test]
     fn every_osv_ignore_names_its_reason_and_expires() {
-        let config: toml_edit::DocumentMut = include_str!("../../../web/osv-scanner.toml")
-            .parse()
-            .unwrap();
+        let config: toml_edit::DocumentMut =
+            crate::testing::read_in_repository("web/osv-scanner.toml")
+                .parse()
+                .unwrap();
         let ignores = config["IgnoredVulns"].as_array_of_tables().unwrap();
         assert!(!ignores.is_empty(), "the config ignores something");
         for ignore in ignores {
@@ -697,7 +698,8 @@ mod tests {
 
     #[test]
     fn codeowners_follow_the_gate_list() {
-        let owned: BTreeSet<&str> = include_str!("../../../.github/CODEOWNERS")
+        let codeowners = crate::testing::read_in_repository(".github/CODEOWNERS");
+        let owned: BTreeSet<&str> = codeowners
             .lines()
             .map(str::trim)
             .filter(|line| !line.is_empty() && !line.starts_with('#'))
