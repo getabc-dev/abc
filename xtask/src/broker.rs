@@ -410,14 +410,37 @@ fn accepted<'a>(
     })
 }
 
-/// A client's stream, read and written within one deadline for the whole exchange: each read and
-/// write may take only what is left of it, so a client that sends a byte at a time gets no more.
-struct Timed<'a> {
-    stream: &'a UnixStream,
-    deadline: Instant,
+/// A stream whose every read and write waits at most a given time; a wait that runs out is the
+/// operating system's "would block".
+trait Patient {
+    fn read_within(&mut self, buf: &mut [u8], patience: Duration) -> std::io::Result<usize>;
+    fn write_within(&mut self, buf: &[u8], patience: Duration) -> std::io::Result<usize>;
 }
 
-impl<'a> Timed<'a> {
+impl Patient for &UnixStream {
+    fn read_within(&mut self, buf: &mut [u8], patience: Duration) -> std::io::Result<usize> {
+        self.set_read_timeout(Some(patience))?;
+        self.read(buf)
+    }
+
+    fn write_within(&mut self, buf: &[u8], patience: Duration) -> std::io::Result<usize> {
+        self.set_write_timeout(Some(patience))?;
+        self.write(buf)
+    }
+}
+
+/// A client's stream, read and written within one deadline for the whole exchange: each read and
+/// write may take only what is left of it, so a client that sends a byte at a time gets no more.
+/// Once the deadline has come, whether between reads or during one, every read and write is
+/// [`timed_out`], never an end of input.
+struct Timed<S, C = fn() -> Instant> {
+    stream: S,
+    deadline: Instant,
+    /// The clock the deadline is read on.
+    now: C,
+}
+
+impl<'a> Timed<&'a UnixStream> {
     /// `stream`, with [`PATIENCE`] from now.
     fn new(stream: &'a UnixStream) -> Self {
         Self {
@@ -426,36 +449,52 @@ impl<'a> Timed<'a> {
             deadline: Instant::now()
                 .checked_add(PATIENCE)
                 .unwrap_or_else(Instant::now),
+            now: Instant::now,
         }
     }
+}
 
+impl<S, C: Fn() -> Instant> Timed<S, C> {
     /// What is left of the deadline; an error once it has passed.
     fn left(&self) -> std::io::Result<Duration> {
         self.deadline
-            .checked_duration_since(Instant::now())
+            .checked_duration_since((self.now)())
             .filter(|left| !left.is_zero())
-            .ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    format!("the client took more than {} s", PATIENCE.as_secs()),
-                )
-            })
+            .ok_or_else(timed_out)
     }
 }
 
-impl Read for Timed<'_> {
+/// The error of a client whose time is up.
+fn timed_out() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        format!("the client took more than {} s", PATIENCE.as_secs()),
+    )
+}
+
+/// `result` of one read or write given what was left of the deadline: the stream's own timeout,
+/// which Linux and macOS report as "would block", means the deadline has come.
+fn within_deadline(result: std::io::Result<usize>) -> std::io::Result<usize> {
+    result.map_err(|error| {
+        if error.kind() == std::io::ErrorKind::WouldBlock {
+            timed_out()
+        } else {
+            error
+        }
+    })
+}
+
+impl<S: Patient, C: Fn() -> Instant> Read for Timed<S, C> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        self.stream.set_read_timeout(Some(self.left()?))?;
-        let mut stream = self.stream;
-        stream.read(buf)
+        let left = self.left()?;
+        within_deadline(self.stream.read_within(buf, left))
     }
 }
 
-impl Write for Timed<'_> {
+impl<S: Patient, C: Fn() -> Instant> Write for Timed<S, C> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.stream.set_write_timeout(Some(self.left()?))?;
-        let mut stream = self.stream;
-        stream.write(buf)
+        let left = self.left()?;
+        within_deadline(self.stream.write_within(buf, left))
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
@@ -1436,34 +1475,91 @@ mod tests {
         assert!(stopped.next().is_none());
     }
 
-    /// A client that sends a byte within each read's patience gets no more than its time in all.
+    /// A client that sends nothing until the deadline gets the deadline's error, not the
+    /// operating system's "would block" from a read whose timeout ran out (CI on #33 saw it).
+    #[test]
+    fn a_silent_client_times_out_with_the_deadlines_error() {
+        let (_client, server) = UnixStream::pair().unwrap();
+        let mut timed = super::Timed {
+            stream: &server,
+            deadline: std::time::Instant::now() + Duration::from_millis(100),
+            now: std::time::Instant::now,
+        };
+        let read = std::io::Read::read(&mut timed, &mut [0; 8]);
+        assert_eq!(
+            read.map_err(|error| (error.kind(), error.to_string())),
+            Err((
+                std::io::ErrorKind::TimedOut,
+                format!("the client took more than {} s", super::PATIENCE.as_secs())
+            ))
+        );
+    }
+
+    /// A client sending a byte every 50 ms, on a clock the test drives: each read waits only what
+    /// is left of the deadline, and once it has come the read is `TimedOut`, whether it came
+    /// between two reads (400 ms) or during one (420 ms). CI's runner once saw the stream's own
+    /// timeout, "would block", come out instead.
     #[test]
     fn a_client_has_its_patience_in_all_not_per_read() {
-        let (mut client, server) = UnixStream::pair().unwrap();
-        let trickler = std::thread::spawn(move || {
-            while client.write_all(b"g").is_ok() {
-                std::thread::sleep(Duration::from_millis(50));
+        /// A client that sends one byte 50 ms after each read starts, on `clock`.
+        struct Trickler<'a> {
+            clock: &'a std::cell::Cell<std::time::Instant>,
+            waits: Vec<Duration>,
+        }
+        impl super::Patient for &mut Trickler<'_> {
+            fn read_within(
+                &mut self,
+                buf: &mut [u8],
+                patience: Duration,
+            ) -> std::io::Result<usize> {
+                self.waits.push(patience);
+                let gap = Duration::from_millis(50);
+                if patience < gap {
+                    self.clock.set(self.clock.get() + patience);
+                    return Err(std::io::ErrorKind::WouldBlock.into());
+                }
+                self.clock.set(self.clock.get() + gap);
+                buf[0] = b'g';
+                Ok(1)
             }
-        });
-        let started = std::time::Instant::now();
-        let timed = super::Timed {
-            stream: &server,
-            deadline: started + Duration::from_millis(400),
-        };
-        let mut line = String::new();
-        let read = std::io::BufReader::new(std::io::Read::take(timed, 1000)).read_line(&mut line);
-        assert_eq!(
-            read.map_err(|error| error.kind()),
-            Err(std::io::ErrorKind::TimedOut),
-            "{line:?}"
-        );
-        assert!(
-            started.elapsed() < Duration::from_secs(1),
-            "{:?}",
-            started.elapsed()
-        );
-        drop(server);
-        trickler.join().unwrap();
+
+            fn write_within(&mut self, _: &[u8], _: Duration) -> std::io::Result<usize> {
+                Err(std::io::Error::other("the test only reads"))
+            }
+        }
+
+        for (millis, bytes, last_wait) in [(400, 8, None), (420, 8, Some(20))] {
+            let started = std::time::Instant::now();
+            let clock = std::cell::Cell::new(started);
+            let mut trickler = Trickler {
+                clock: &clock,
+                waits: Vec::new(),
+            };
+            let timed = super::Timed {
+                stream: &mut trickler,
+                deadline: started + Duration::from_millis(millis),
+                now: || clock.get(),
+            };
+            let mut line = String::new();
+            let read =
+                std::io::BufReader::new(std::io::Read::take(timed, 1000)).read_line(&mut line);
+            assert_eq!(
+                read.map_err(|error| error.kind()),
+                Err(std::io::ErrorKind::TimedOut),
+                "deadline {millis} ms"
+            );
+            assert_eq!(line, "g".repeat(bytes), "deadline {millis} ms");
+            let mut waits: Vec<Duration> = (0..bytes)
+                .map(|byte| Duration::from_millis(millis - 50 * u64::try_from(byte).unwrap()))
+                .collect();
+            waits.extend(last_wait.map(Duration::from_millis));
+            assert_eq!(trickler.waits, waits, "deadline {millis} ms");
+            assert_eq!(
+                clock.get() - started,
+                Duration::from_millis(millis),
+                "deadline {millis} ms"
+            );
+        }
     }
 
     /// The broker stopped on SIGTERM by sending `stop` to its own control socket: a broker that
