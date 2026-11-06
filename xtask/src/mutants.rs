@@ -104,6 +104,7 @@ pub(crate) fn run(
     options: &Options,
     mutants: &Path,
     nextest: &Path,
+    web: &crate::web::Toolchain,
     out: &mut impl Write,
 ) -> anyhow::Result<bool> {
     let commit = git::merge_base(root, base)?;
@@ -115,6 +116,12 @@ pub(crate) fn run(
             continue;
         }
         mutated = true;
+        // The main workspace's abc crate embeds the built web app, which the copies of the tree
+        // take along.
+        if workspace == check::MAIN && !crate::web::build_here(root, web, out)? {
+            passed = false;
+            continue;
+        }
         let run = Run {
             root,
             workspace,
@@ -414,6 +421,11 @@ mod tests {
     use crate::annotation::Mode;
     use crate::testing::{repository_with_change, script};
 
+    /// node and pnpm for a fixture, which holds no web app, so they are never run.
+    fn no_web() -> crate::web::Toolchain {
+        crate::web::Toolchain::pinned(&|name| Ok(Path::new("unused").join(name))).unwrap()
+    }
+
     #[test]
     fn reads_cargo_mutants_exit_codes() {
         assert_eq!(outcome(Some(0)).unwrap(), Outcome::AllCaught, "success");
@@ -506,6 +518,7 @@ mod tests {
     #[test]
     fn gates_a_repository_end_to_end() {
         let temp = tempfile::tempdir().unwrap();
+        let web = no_web();
         let repo = repository_with_change(
             &temp.path().join("repo"),
             &[("src/a.rs", "fn a() -> bool { true }\n")],
@@ -517,7 +530,7 @@ mod tests {
             "[ \"$1\" = mutants ] || exit 7\nwhile [ $# -gt 0 ]; do case \"$1\" in --output) out=$2 ;; --in-diff) diff=$2 ;; --timeout-multiplier) multiplier=$2 ;; esac; shift; done\ngrep -q 'src/a.rs' \"$diff\" || exit 8\n[ \"$multiplier\" = 6 ] || exit 9\nmkdir -p \"$out/mutants.out\"\necho 'src/a.rs:1:18: replace a -> bool with false' > \"$out/mutants.out/missed.txt\"\nexit 2\n",
         );
         let mut out = Vec::new();
-        let passed = run(&repo, "base", &TWO, &missing, &nextest, &mut out).unwrap();
+        let passed = run(&repo, "base", &TWO, &missing, &nextest, &web, &mut out).unwrap();
         let text = String::from_utf8(out).unwrap();
         assert!(!passed, "a missed mutant fails: {text}");
         assert!(
@@ -536,7 +549,7 @@ mod tests {
         );
         let mut both = Vec::new();
         assert!(
-            !run(&repo, "base", &TWO, &mixed, &nextest, &mut both).unwrap(),
+            !run(&repo, "base", &TWO, &mixed, &nextest, &web, &mut both).unwrap(),
             "a missed mutant fails even when another timed out"
         );
         assert!(
@@ -559,7 +572,16 @@ mod tests {
             mode: Mode::Plain,
         };
         assert!(
-            run(&repo, "base", &sharded, &caught, &nextest, &mut Vec::new()).unwrap(),
+            run(
+                &repo,
+                "base",
+                &sharded,
+                &caught,
+                &nextest,
+                &web,
+                &mut Vec::new()
+            )
+            .unwrap(),
             "all caught, in the shard asked for"
         );
         let tmpdir = fs::read_to_string(temp.path().join("tmpdir")).unwrap();
@@ -587,7 +609,7 @@ mod tests {
         script(&never, "exit 99\n");
         let mut skipped = Vec::new();
         assert!(
-            run(&docs, "base", &TWO, &never, &nextest, &mut skipped).unwrap(),
+            run(&docs, "base", &TWO, &never, &nextest, &web, &mut skipped).unwrap(),
             "nothing to mutate"
         );
         assert!(
@@ -595,6 +617,40 @@ mod tests {
                 .unwrap()
                 .contains("no Rust lines changed"),
             "said so"
+        );
+    }
+
+    #[test]
+    fn the_main_workspace_needs_the_web_app_built_first() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = repository_with_change(
+            &temp.path().join("repo"),
+            &[
+                ("web/package.json", "{}\n"),
+                ("src/a.rs", "fn a() -> bool { true }\n"),
+            ],
+        );
+        let never = temp.path().join("cargo-mutants");
+        script(&never, "exit 7\n");
+        let web = temp.path().join("web-tools");
+        let mut out = Vec::new();
+        let passed = run(
+            &repo,
+            "base",
+            &TWO,
+            &never,
+            &temp.path().join("cargo-nextest"),
+            &crate::testing::fake_web(&web, "build"),
+            &mut out,
+        )
+        .unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(!passed, "{text}");
+        assert!(text.contains("web build failed"), "{text}");
+        assert_eq!(
+            crate::testing::pnpm_calls(&web),
+            "install --frozen-lockfile\nrun --silent build\n",
+            "cargo-mutants never ran"
         );
     }
 
@@ -623,7 +679,16 @@ mod tests {
             mode: Mode::Actions,
             ..TWO
         };
-        let passed = run(&repo, "base", &actions, &mutants, &nextest, &mut out).unwrap();
+        let passed = run(
+            &repo,
+            "base",
+            &actions,
+            &mutants,
+            &nextest,
+            &no_web(),
+            &mut out,
+        )
+        .unwrap();
         let text = String::from_utf8(out).unwrap();
         assert!(!passed, "{text}");
         assert!(

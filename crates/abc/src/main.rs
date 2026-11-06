@@ -15,11 +15,14 @@ use abc_core::credential::EnrolmentToken;
 use abc_core::secret::Secret;
 use abc_platform::telemetry::chain;
 use abc_protocol::url::PublicUrl;
-use abc_server::{Limits, LinkTimings, ServerConfig};
+use abc_server::{Limits, LinkTimings, ServerConfig, WebApp};
 use abc_store::{DatabaseUrl, ExecuteError, Store, StoreOptions};
 use abc_worker::{Env, IfEnrolled, WorkerHome};
 use clap::{Parser, Subcommand};
 use zeroize::Zeroizing;
+
+// The web app, embedded by build.rs from web/dist.
+include!(concat!(env!("OUT_DIR"), "/web.rs"));
 
 /// abc: a self-hosted software factory.
 #[derive(Debug, Parser)]
@@ -200,6 +203,8 @@ async fn serve(server: ServerCommand) -> Result<(), Failure> {
     })?;
     abc_platform::telemetry::init(server.serve.log.as_deref())
         .map_err(|error| config(Box::new(error)))?;
+    // build.rs embedded what `cargo xtask build` built; a test checks it is a servable app.
+    let web = WebApp::new(WEB_FILES).map_err(|error| Failure::Run(Box::new(error)))?;
     let settings = ServerConfig {
         database_url: database_url()?,
         database_wait: Duration::from_secs(server.database.database_wait),
@@ -208,6 +213,7 @@ async fn serve(server: ServerCommand) -> Result<(), Failure> {
         public_url,
         link: LinkTimings::default(),
         limits: Limits::default(),
+        web,
     };
     abc_server::run(settings, shutdown_signal()?)
         .await
@@ -374,9 +380,21 @@ fn shutdown_signal() -> Result<impl Future<Output = ()>, Failure> {
 
 #[cfg(test)]
 mod tests {
+    use abc_server::WebApp;
     use abc_worker::{HomeError, RunError, Terminal};
 
-    use super::{Failure, worker_failure};
+    use super::{Failure, WEB_FILES, worker_failure};
+
+    #[test]
+    fn the_embedded_web_app_is_one_the_server_serves() {
+        WebApp::new(WEB_FILES).expect("web/dist as `cargo xtask build` leaves it");
+        assert!(
+            WEB_FILES.iter().any(|(path, _)| path.starts_with("assets/")
+                && std::path::Path::new(path).extension() == Some("js".as_ref())),
+            "the app's script is embedded: {:?}",
+            WEB_FILES.iter().map(|(path, _)| path).collect::<Vec<_>>()
+        );
+    }
 
     #[test]
     fn a_stopped_worker_exits_with_its_own_code() {

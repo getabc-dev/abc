@@ -1,7 +1,8 @@
 //! `cargo xtask coverage`: how many changed, instrumented lines the tests run.
 //!
-//! cargo-llvm-cov runs the test suite with coverage instrumentation and writes lcov. The gate
-//! reads that and the diff from the merge base, and fails when fewer than [`THRESHOLD_PERCENT`]
+//! cargo-llvm-cov runs the test suite with coverage instrumentation and writes lcov, and Vitest
+//! does the same for the web app's tests (`web/`), with coverage-v8. The gate reads both and the
+//! diff from the merge base, and fails when fewer than [`THRESHOLD_PERCENT`]
 //! of the changed lines that compile to code are covered, listing the ones that are not; in GitHub
 //! Actions, also as annotations, one per range of lines.
 
@@ -19,6 +20,7 @@ use crate::check::{self, PROPTEST_RNG_SEED};
 use crate::git;
 use crate::integrity::{self, TestCode};
 use crate::tools;
+use crate::web;
 
 /// The share of changed, instrumented lines the tests must run.
 pub(crate) const THRESHOLD_PERCENT: u64 = 90;
@@ -30,14 +32,22 @@ const LCOV_DIR: &str = "target/coverage";
 /// Hit counts by line, by file relative to the repository root.
 type Hits = BTreeMap<String, BTreeMap<u32, u64>>;
 
-/// Runs the tests of every workspace under coverage, with the cargo-llvm-cov and cargo-nextest
-/// executables given, and checks the lines changed since the merge base with `base`, annotating
-/// the lines no test runs in `mode`.
+/// The pinned tools coverage runs.
+#[derive(Debug)]
+pub(crate) struct Tools {
+    pub(crate) llvm_cov: PathBuf,
+    pub(crate) nextest: PathBuf,
+    /// node and pnpm, for the web app's tests.
+    pub(crate) web: web::Toolchain,
+}
+
+/// Runs the tests of every workspace and of the web app under coverage, with the tools given,
+/// and checks the lines changed since the merge base with `base`, annotating the lines no test
+/// runs in `mode`.
 pub(crate) fn run(
     root: &Path,
     base: &str,
-    llvm_cov: &Path,
-    nextest: &Path,
+    tools: &Tools,
     mode: Mode,
     out: &mut impl Write,
 ) -> anyhow::Result<bool> {
@@ -46,6 +56,12 @@ pub(crate) fn run(
     if crate::postgres::needed(root) {
         crate::postgres::warm(out)?;
     }
+    // The abc crate embeds the built web app.
+    ensure!(
+        web::build_here(root, &tools.web, out)?,
+        "the web app did not build; run `cargo xtask check` and fix it first"
+    );
+    let (llvm_cov, nextest) = (&tools.llvm_cov, &tools.nextest);
     let mut report = String::new();
     for &workspace in check::REPOSITORY.workspaces {
         let name = if workspace.dir().is_empty() {
@@ -79,6 +95,9 @@ pub(crate) fn run(
                 .with_context(|| format!("could not read {}", lcov.display()))?,
         );
     }
+    if web::present(root) {
+        report.push_str(&web_report(root, &tools.web, out)?);
+    }
     let commit = git::merge_base(root, base)?;
     let changed = without_tests(root, git::added_lines(&git::diff(root, &commit, 0)?))?;
     let measured = measure(&changed, &parse_lcov(&report, root));
@@ -89,6 +108,44 @@ pub(crate) fn run(
         annotation::commands(mode, &measured.annotations())
     )?;
     Ok(measured.passes())
+}
+
+/// Runs the web app's tests under coverage and returns their lcov, with paths made absolute as
+/// cargo-llvm-cov's are.
+fn web_report(
+    root: &Path,
+    toolchain: &web::Toolchain,
+    out: &mut impl Write,
+) -> anyhow::Result<String> {
+    writeln!(
+        out,
+        "xtask: running the tests of the web app under coverage"
+    )?;
+    let status = toolchain
+        .step(root, &web::COVERAGE)?
+        .status()
+        .context("could not run pnpm")?;
+    ensure!(
+        status.success(),
+        "the tests of the web app failed under coverage; run `cargo xtask check` and fix them first"
+    );
+    let dir = root.join(web::DIR);
+    let lcov = dir.join(web::LCOV);
+    let text =
+        fs::read_to_string(&lcov).with_context(|| format!("could not read {}", lcov.display()))?;
+    Ok(absolute_sources(&text, &dir))
+}
+
+/// `report` with each relative source path, as Vitest writes them, made absolute under `dir`; an
+/// absolute one stays as it is.
+fn absolute_sources(report: &str, dir: &Path) -> String {
+    report
+        .lines()
+        .map(|line| match line.strip_prefix("SF:") {
+            Some(path) => format!("SF:{}\n", dir.join(path).display()),
+            None => format!("{line}\n"),
+        })
+        .collect()
 }
 
 /// `changed` without test-only code: test items, test modules in files of their own, and files
@@ -306,7 +363,9 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
     use std::path::Path;
 
-    use super::{Measured, measure, parse_lcov, ranges, run, without_tests};
+    use super::{
+        Measured, Tools, absolute_sources, measure, parse_lcov, ranges, run, without_tests,
+    };
     use crate::annotation::Mode;
     use crate::testing::{repository_with_change, script};
 
@@ -314,6 +373,33 @@ mod tests {
 
     fn lines(numbers: &[u32]) -> BTreeSet<u32> {
         numbers.iter().copied().collect()
+    }
+
+    /// The tools for a fixture with fakes for cargo-llvm-cov and cargo-nextest; fixtures hold no
+    /// web app, so node and pnpm are never run.
+    fn tools(llvm_cov: &Path, nextest: &Path) -> Tools {
+        Tools {
+            llvm_cov: llvm_cov.to_path_buf(),
+            nextest: nextest.to_path_buf(),
+            web: crate::web::Toolchain::pinned(&|name| Ok(Path::new("unused").join(name))).unwrap(),
+        }
+    }
+
+    #[test]
+    fn makes_the_web_apps_sources_absolute() {
+        let vitest =
+            "TN:\nSF:src/app.tsx\nDA:1,1\nend_of_record\nSF:/elsewhere/a.ts\nend_of_record\n";
+        let absolute = absolute_sources(vitest, Path::new("/repo/web"));
+        assert_eq!(
+            absolute,
+            "TN:\nSF:/repo/web/src/app.tsx\nDA:1,1\nend_of_record\nSF:/elsewhere/a.ts\nend_of_record\n",
+            "relative paths are made absolute, absolute ones kept"
+        );
+        assert_eq!(
+            parse_lcov(&absolute, Path::new("/repo")).get("web/src/app.tsx"),
+            Some(&BTreeMap::from([(1, 1)])),
+            "counted under web/ with the Rust sources"
+        );
     }
 
     #[test]
@@ -480,8 +566,7 @@ mod tests {
         let half = run(
             &repo,
             "base",
-            &fake_llvm_cov(temp.path(), false),
-            &nextest,
+            &tools(&fake_llvm_cov(temp.path(), false), &nextest),
             Mode::Actions,
             &mut out,
         )
@@ -499,8 +584,7 @@ mod tests {
         let full = run(
             &repo,
             "base",
-            &fake_llvm_cov(temp.path(), true),
-            &nextest,
+            &tools(&fake_llvm_cov(temp.path(), true), &nextest),
             Mode::Plain,
             &mut Vec::new(),
         )
@@ -511,8 +595,7 @@ mod tests {
         let error = run(
             &repo,
             "base",
-            &failing,
-            &nextest,
+            &tools(&failing, &nextest),
             Mode::Plain,
             &mut Vec::new(),
         )
@@ -522,6 +605,61 @@ mod tests {
                 .to_string()
                 .contains("the tests of the main workspace failed under coverage"),
             "{error}"
+        );
+    }
+
+    #[test]
+    fn counts_the_web_apps_changed_lines_with_the_rust_ones() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = repository_with_change(
+            &temp.path().join("repo"),
+            &[("web/package.json", "{}\n"), ("web/src/a.ts", "a;\nb;\n")],
+        );
+        let empty = temp.path().join("cargo-llvm-cov");
+        script(
+            &empty,
+            "while [ $# -gt 0 ]; do [ \"$1\" = --output-path ] && out=$2; shift; done\n: > \"$out\"\n",
+        );
+        let nextest = temp.path().join("cargo-nextest");
+        let web = temp.path().join("web-tools");
+        let tools = Tools {
+            llvm_cov: empty.clone(),
+            nextest: nextest.clone(),
+            web: crate::testing::fake_web(&web, ""),
+        };
+        let mut out = Vec::new();
+        let passed = run(&repo, "base", &tools, Mode::Plain, &mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(!passed, "half the web lines covered fails: {text}");
+        assert!(text.contains("not covered: web/src/a.ts:2"), "{text}");
+        assert!(
+            crate::testing::pnpm_calls(&web).ends_with("run --silent coverage\n"),
+            "built first, then Vitest under coverage"
+        );
+
+        let failing = Tools {
+            llvm_cov: empty,
+            nextest,
+            web: crate::testing::fake_web(&temp.path().join("failing"), "coverage"),
+        };
+        let error = run(&repo, "base", &failing, Mode::Plain, &mut Vec::new())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("the tests of the web app failed under coverage"),
+            "{error}"
+        );
+        let unbuilt = Tools {
+            llvm_cov: temp.path().join("unused"),
+            nextest: temp.path().join("unused"),
+            web: crate::testing::fake_web(&temp.path().join("unbuilt"), "build"),
+        };
+        let unbuilt_error = run(&repo, "base", &unbuilt, Mode::Plain, &mut Vec::new())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            unbuilt_error.contains("the web app did not build"),
+            "{unbuilt_error}"
         );
     }
 
@@ -539,7 +677,14 @@ mod tests {
             "manifest=main\nwhile [ $# -gt 0 ]; do case \"$1\" in --output-path) out=$2 ;; --manifest-path) manifest=$2 ;; esac; shift; done\nif [ \"$manifest\" = xtask/Cargo.toml ]; then printf 'SF:%s/xtask/src/b.rs\\nDA:1,1\\nDA:2,0\\nend_of_record\\n' \"$PWD\" > \"$out\"; else printf 'SF:%s/src/a.rs\\nDA:1,1\\nend_of_record\\n' \"$PWD\" > \"$out\"; fi\n",
         );
         let mut out = Vec::new();
-        let passed = run(&repo, "base", &llvm_cov, &nextest, Mode::Plain, &mut out).unwrap();
+        let passed = run(
+            &repo,
+            "base",
+            &tools(&llvm_cov, &nextest),
+            Mode::Plain,
+            &mut out,
+        )
+        .unwrap();
         let text = String::from_utf8(out).unwrap();
         assert!(!passed, "xtask's uncovered line counts: {text}");
         assert!(

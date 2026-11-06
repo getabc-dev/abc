@@ -32,6 +32,7 @@
         "do_not_enforce_on_create": false,
         "required_status_checks": [
           { "context": "Format, clippy and tests", "integration_id": 15368 },
+          { "context": "End-to-end", "integration_id": 15368 },
           { "context": "Dependencies", "integration_id": 15368 },
           { "context": "Secrets and workflows", "integration_id": 15368 },
           { "context": "Coverage", "integration_id": 15368 },

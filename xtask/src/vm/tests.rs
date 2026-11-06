@@ -830,3 +830,34 @@ fn git_in_the_vm_asks_the_broker_and_never_a_stored_credential() {
         "the empty helper drops others: {filled}"
     );
 }
+
+#[test]
+fn the_image_installs_the_chromium_of_the_playwright_the_web_app_pins() {
+    let root = crate::repo_root().unwrap();
+    let containerfile = std::fs::read_to_string(root.join("xtask/vm/Containerfile")).unwrap();
+    let package: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(root.join("web/package.json")).unwrap())
+            .unwrap();
+    let pinned = package["devDependencies"]["@playwright/test"]
+        .as_str()
+        .unwrap();
+    let image: Vec<&str> = containerfile
+        .lines()
+        .filter_map(|line| line.strip_prefix("ARG PLAYWRIGHT_VERSION="))
+        .collect();
+    assert_eq!(
+        image,
+        [pinned],
+        "the Containerfile's PLAYWRIGHT_VERSION is web/package.json's @playwright/test"
+    );
+    for line in [
+        "ENV PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright",
+        "--package=\"@playwright/test@${PLAYWRIGHT_VERSION}\"",
+        "playwright install chromium",
+    ] {
+        assert!(
+            containerfile.contains(line),
+            "the image installs Chromium into its fixed path: {line}"
+        );
+    }
+}

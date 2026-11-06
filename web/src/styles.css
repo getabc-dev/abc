@@ -1,0 +1,11 @@
+@import "tailwindcss";
+
+/* The design tokens, as CSS variables Tailwind turns into utilities (bg-surface, text-ink, ...). */
+@theme {
+  --font-sans: ui-sans-serif, system-ui, sans-serif;
+  --color-surface: oklch(0.99 0 0);
+  --color-ink: oklch(0.21 0 0);
+  --color-muted: oklch(0.45 0 0);
+  --color-accent: oklch(0.55 0.17 255);
+  --color-danger: oklch(0.55 0.2 25);
+}

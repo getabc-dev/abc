@@ -7,12 +7,14 @@
 //! xtask code that runs the gates. In CI a finding fails the check unless a listed approver has
 //! labelled the pull request `integrity-approved` after its latest push.
 //!
-//! Tests are read per language; Rust is the only one so far, and [`inventory`] is where another
-//! joins.
+//! Tests are read per language, in [`inventory`]: Rust's, and the web app's TypeScript test files
+//! (`*.test.ts`, `*.test.tsx`), where `.skip` and its kin count as `#[ignore]` and `.fails` as
+//! `#[should_panic]`.
 
 mod approval;
 mod reasons;
 mod rust;
+mod typescript;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -33,7 +35,7 @@ use crate::git;
 /// The gate files: whatever decides what passes. CODEOWNERS patterns, the single list both the
 /// check and `.github/CODEOWNERS` follow: a trailing `/` covers a directory, anything else is one
 /// file, both from the repository root.
-pub(crate) const GATES: [&str; 18] = [
+pub(crate) const GATES: [&str; 29] = [
     "/.cargo/",
     "/.claude/settings.json",
     "/.config/",
@@ -51,6 +53,17 @@ pub(crate) const GATES: [&str; 18] = [
     "/fuzz/deny.toml",
     "/rust-toolchain.toml",
     "/rustfmt.toml",
+    "/web/.oxlintrc.json",
+    "/web/biome.json",
+    "/web/knip.jsonc",
+    "/web/package.json",
+    "/web/playwright.config.ts",
+    "/web/pnpm-lock.yaml",
+    "/web/pnpm-workspace.yaml",
+    "/web/tsconfig.base.json",
+    "/web/tsconfig.json",
+    "/web/tsconfig.node.json",
+    "/web/vite.config.ts",
     "/xtask/",
 ];
 
@@ -67,6 +80,10 @@ pub(crate) struct Test {
 
 /// Whether the file at `path` is in a language the check reads tests in.
 fn has_tests(path: &str) -> bool {
+    is_rust(path) || typescript::is_test_file(path)
+}
+
+fn is_rust(path: &str) -> bool {
     Path::new(path)
         .extension()
         .is_some_and(|extension| extension == "rs")
@@ -74,7 +91,13 @@ fn has_tests(path: &str) -> bool {
 
 /// The tests in a file, for the languages the check reads; `None` for any other file.
 fn inventory(path: &str, source: &str) -> Option<anyhow::Result<Vec<Test>>> {
-    has_tests(path).then(|| rust::tests(source))
+    if is_rust(path) {
+        Some(rust::tests(source))
+    } else if typescript::is_test_file(path) {
+        Some(typescript::tests(path, source))
+    } else {
+        None
+    }
 }
 
 /// The test-only code in a file, for the languages the check reads; `None` for any other file.
@@ -511,6 +534,22 @@ mod tests {
             should_panic,
             assertions,
         }
+    }
+
+    #[test]
+    fn reads_tests_in_rust_and_in_the_web_apps_test_files() {
+        let rust = super::inventory("src/a.rs", "#[test]\nfn a() { assert!(true); }\n")
+            .unwrap()
+            .unwrap();
+        assert_eq!(rust.len(), 1, "a Rust test");
+        let web = super::inventory("web/src/a.test.ts", "test(\"a\", () => { expect(1); });\n")
+            .unwrap()
+            .unwrap();
+        assert_eq!(web.len(), 1, "a Vitest test");
+        assert!(
+            super::inventory("web/src/a.ts", "test(\"a\", () => {});\n").is_none(),
+            "not a test file"
+        );
     }
 
     #[test]

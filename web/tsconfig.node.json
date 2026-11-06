@@ -1,0 +1,10 @@
+{
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "lib": ["es2024", "dom"],
+    "types": ["node"],
+    // node runs e2e/sidecar.ts as it is, and node resolves imports by their full file names.
+    "allowImportingTsExtensions": true
+  },
+  "include": ["e2e", "vite.config.ts", "playwright.config.ts"]
+}

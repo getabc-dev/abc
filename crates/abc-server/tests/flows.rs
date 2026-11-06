@@ -21,7 +21,9 @@ mod tests {
     use semver::Version;
     use serde_json::json;
 
-    use crate::common::{Call, HOST, Server, claim_body, config, enrol_body, socket_dir};
+    use crate::common::{
+        Call, HOST, INDEX, SCRIPT, Server, claim_body, config, enrol_body, socket_dir,
+    };
 
     const BAD: StatusCode = StatusCode::BAD_REQUEST;
     const FORBIDDEN: StatusCode = StatusCode::FORBIDDEN;
@@ -267,6 +269,87 @@ mod tests {
                 "wrong method",
             )
             .await;
+        server.stop().await.unwrap();
+    }
+
+    /// The status, the named headers and the body of `call`.
+    async fn fetch(
+        server: &Server,
+        call: Call,
+        names: &[&str],
+    ) -> (StatusCode, Vec<Option<String>>, Vec<u8>) {
+        use http_body_util::BodyExt as _;
+        let response = server.raw(call).await;
+        let status = response.status();
+        let headers = names
+            .iter()
+            .map(|name| {
+                response
+                    .headers()
+                    .get(*name)
+                    .map(|value| value.to_str().unwrap().to_owned())
+            })
+            .collect();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        (status, headers, body.to_vec())
+    }
+
+    #[tokio::test]
+    async fn the_web_app_is_served_beside_the_api_and_never_over_it() {
+        let database = TestDatabase::migrated().await;
+        let server = Server::start(database.pool().clone()).await;
+        let names = ["content-type", "cache-control", "x-request-id"];
+        for path in ["/", "/machines", "/workspaces/x/settings"] {
+            let (status, headers, body) = fetch(&server, Call::get(path), &names).await;
+            assert_eq!(status, OK, "{path}");
+            assert_eq!(body, INDEX, "{path} is the router's page");
+            assert_eq!(
+                headers[..2],
+                [
+                    Some("text/html; charset=utf-8".to_owned()),
+                    Some("no-cache".to_owned())
+                ],
+                "{path}"
+            );
+            assert!(headers[2].is_some(), "{path} is logged like any request");
+        }
+        let script = fetch(&server, Call::get("/assets/index-0123abcd.js"), &names).await;
+        assert_eq!(script.0, OK);
+        assert_eq!(script.2, SCRIPT);
+        assert_eq!(
+            script.1[1].as_deref(),
+            Some("public, max-age=31536000, immutable")
+        );
+        let head = fetch(&server, Call::new("HEAD", "/"), &names).await;
+        assert_eq!((head.0, head.2.len()), (OK, 0), "HEAD sends no body");
+        server
+            .refused(
+                Call::get("/assets/index-89abcdef.js"),
+                StatusCode::NOT_FOUND,
+                "not_found",
+                "a missing asset is not the page",
+            )
+            .await;
+        server
+            .refused(
+                Call::get("/api/machines"),
+                StatusCode::NOT_FOUND,
+                "not_found",
+                "an unknown API path is never the page",
+            )
+            .await;
+        server
+            .refused(
+                Call::post("/machines").alice(),
+                StatusCode::METHOD_NOT_ALLOWED,
+                "method_not_allowed",
+                "the page takes GET and HEAD only",
+            )
+            .await;
+        let session = server
+            .expect(Call::get("/api/session").alice(), OK, "the API answers")
+            .await;
+        assert_eq!(session["state"], "unclaimed", "{session}");
         server.stop().await.unwrap();
     }
 

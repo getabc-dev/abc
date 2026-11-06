@@ -15,6 +15,8 @@
 //! | `GET /api/workspaces/{ws}/live` (SSE) | tailnet | `query(ListMachines)`, then `MachinesSince` |
 //! | `POST /api/enrol` | anonymous (the token is the authority) | `execute(EnrolWorker)` |
 //! | `GET /api/worker/connect` (WebSocket) | worker key | `query(WorkerSelf)`, `execute(Start/EndSession)` |
+//!
+//! Any other path outside `/api/` is the web app's ([`crate::web`]).
 
 pub(crate) mod error;
 pub(crate) mod types;
@@ -28,7 +30,7 @@ use axum::extract::{
 };
 use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE, HeaderName};
 use axum::http::request::Parts;
-use axum::http::{HeaderValue, StatusCode};
+use axum::http::{HeaderValue, Method, StatusCode, Uri};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse as _, Json, Response};
 use axum::routing::{delete, get, post};
@@ -54,6 +56,7 @@ use crate::limits::{Limits, RateLimiter};
 use crate::listen::SidecarApp;
 use crate::sessions::Sessions;
 use crate::sidecar::{MaybeTailnetCaller, TailnetCaller};
+use crate::web::{Answer, WebApp};
 use crate::worker_link::LinkTimings;
 use error::ApiError;
 use types::{ClaimRequest, ClaimResponse, IssueTokenRequest, TokenIssuedResponse};
@@ -80,6 +83,8 @@ pub(crate) struct SidecarState {
     pub(crate) enrolments: RateLimiter<String>,
     /// Session starts per worker.
     pub(crate) session_starts: RateLimiter<WorkerId>,
+    /// The web app, which answers what no API route matches outside `/api/`.
+    pub(crate) web: WebApp,
 }
 
 /// The server-wide signal that it is shutting down: live streams end when it fires.
@@ -129,7 +134,7 @@ pub(crate) fn sidecar_app(state: SidecarState) -> SidecarApp {
         .route(CONNECT_PATH, get(crate::worker_link::upgrade));
     let router = requests
         .merge(streams)
-        .fallback(not_found)
+        .fallback(web_app)
         .method_not_allowed_fallback(method_not_allowed)
         .layer(DefaultBodyLimit::max(BODY_LIMIT))
         .layer(middleware::from_fn_with_state(state.clone(), observe))
@@ -137,8 +142,14 @@ pub(crate) fn sidecar_app(state: SidecarState) -> SidecarApp {
     SidecarApp::new(router)
 }
 
-async fn not_found() -> ApiError {
-    ApiError::new(ApiCode::NotFound, "no such route")
+/// The web app's answer to a request no API route matched; the API's errors for what it does not
+/// serve.
+async fn web_app(State(app): State<SidecarState>, method: Method, uri: Uri) -> Response {
+    match app.web.answer(&method, uri.path()) {
+        Answer::File(response) => response,
+        Answer::NotFound => ApiError::new(ApiCode::NotFound, "no such route").into_response(),
+        Answer::MethodNotAllowed => method_not_allowed().await.into_response(),
+    }
 }
 
 async fn method_not_allowed() -> ApiError {

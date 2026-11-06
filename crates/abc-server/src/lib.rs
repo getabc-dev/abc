@@ -2,7 +2,7 @@
 //!
 //! | Listener | Transport | Routes | Identity |
 //! | --- | --- | --- | --- |
-//! | sidecar | Unix socket shared only with the Tailscale sidecar | the whole API, the worker WebSocket, SSE | `Tailscale-User-Login`, trusted |
+//! | sidecar | Unix socket shared only with the Tailscale sidecar | the whole API, the worker WebSocket, SSE, the web app | `Tailscale-User-Login`, trusted |
 //! | ops | TCP, loopback by default | `/healthz`, `/readyz` | none, and no data |
 //!
 //! The public webhook listener (later) will be a third, with its own router and no identity.
@@ -23,6 +23,7 @@ mod live;
 mod ops;
 mod sessions;
 mod sidecar;
+mod web;
 mod worker_link;
 
 use std::future::Future;
@@ -41,6 +42,7 @@ use thiserror::Error;
 use tokio::sync::oneshot;
 
 pub use limits::Limits;
+pub use web::{WebApp, WebAppError};
 pub use worker_link::LinkTimings;
 
 /// Everything the server needs, parsed by the binary from flags and `ABC_*` environment variables.
@@ -63,6 +65,8 @@ pub struct ServerConfig {
     pub link: LinkTimings,
     /// Load limits.
     pub limits: Limits,
+    /// The web app, served on the sidecar listener beside the API.
+    pub web: WebApp,
 }
 
 /// How long a draining server waits for live worker sessions to record their end.
@@ -133,6 +137,7 @@ async fn serve(
         limits: config.limits,
         enrolments: limits::RateLimiter::new(config.limits.enrolments_per_minute),
         session_starts: limits::RateLimiter::new(config.limits.session_starts_per_minute),
+        web: config.web,
     });
     readiness.set(ops::Phase::Ready);
     tracing::info!(socket = %config.sidecar_socket.display(), "serving the tailnet API");
