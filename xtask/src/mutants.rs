@@ -266,6 +266,11 @@ impl Run<'_> {
             .env("PATH", tools::path_with(self.nextest)?)
             .env("PROPTEST_RNG_SEED", PROPTEST_RNG_SEED)
             .env("TMPDIR", &scratch)
+            // Each copy builds into its own target/: a copy of xtask/ alone has no .cargo/, and
+            // cargo, looking up from it, would read the checkout's and build every mutant into the
+            // checkout's target/, the jobs overwriting each other's binaries. cargo-mutants runs
+            // cargo in the copy, so a relative directory is the copy's.
+            .env("CARGO_TARGET_DIR", "target")
             .current_dir(root)
             .status()
             .context("could not run cargo-mutants");
@@ -762,8 +767,10 @@ mod tests {
 
     /// #33's mutants ran xtask's in place: while a mutant was in xtask/src, any other `cargo
     /// xtask` in the checkout compiled it (on 6 Nov, the pull request watch's `cargo xtask gh`
-    /// built `vm::Pull: Default`). The run now leaves the checkout byte-identical while
-    /// cargo-mutants works and after: this fake mutates and writes as cargo-mutants and its tests
+    /// built `vm::Pull: Default`), and a copy of xtask/ alone would still build into the
+    /// checkout's target/ through its .cargo/config.toml. The run now leaves the checkout
+    /// byte-identical while cargo-mutants works and after, each copy building into its own
+    /// target/: this fake mutates and writes as cargo-mutants and its tests
     /// do, in the copy it is given, and records the checkout as it finds it meanwhile.
     #[test]
     fn the_checkout_is_untouched_during_and_after_a_run() {
@@ -780,7 +787,8 @@ mod tests {
         script(
             &mutants,
             &format!(
-                "dir=.\nwhile [ $# -gt 0 ]; do case \"$1\" in --output) out=$2 ;; --dir) dir=$2 ;; --in-place) exit 9 ;; esac; shift; done\n\
+                "[ \"$CARGO_TARGET_DIR\" = target ] || exit 10\n\
+                 dir=.\nwhile [ $# -gt 0 ]; do case \"$1\" in --output) out=$2 ;; --dir) dir=$2 ;; --in-place) exit 9 ;; esac; shift; done\n\
                  copy=\"$TMPDIR/copy-$$\"\nmkdir -p \"$copy\"\ncp -R \"$dir\"/. \"$copy\"\n\
                  echo 'fn a() -> bool {{ false }}' > \"$copy/src/a.rs\"\n\
                  mkdir -p \"$copy/src/proptest-regressions\" && echo 'cc 1' > \"$copy/src/proptest-regressions/a.txt\"\n\

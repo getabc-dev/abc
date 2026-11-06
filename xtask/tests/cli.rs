@@ -249,6 +249,9 @@ mod tests {
             .env("XTASK_HOOK_GATE_WAIT", "2")
             .env_remove("ABC_VM")
             .env_remove("CARGO_TARGET_DIR")
+            // `cargo xtask mutants` names its checkout here for the tests' own build; the
+            // launcher builds the xtask of `project`, which must find its own.
+            .env_remove("XTASK_REPOSITORY")
             .env_remove("RUSTUP_TOOLCHAIN")
             .env_remove("CARGO")
             .stdin(Stdio::piped())
