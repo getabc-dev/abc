@@ -18,8 +18,9 @@ Claude included.
   your control? A failing check or flaky tests never is. If it says no, the stop is sent back with
   its reason, and every declaration is judged the same way; otherwise the stop is allowed and the
   handoff is shown to the user. A `check` that cannot run counts as a failed one; a stop while
-  another gate holds the gate lock (`target/gate.lock`) does not start `check` and is sent back to
-  wait for that gate, as a blocked stop; a refused declaration counts as a blocked stop, and after
+  another gate holds the gate lock (`gate.lock` in the checkout's git directory) waits for it up to
+  300 s, then does not start `check` and is sent back to wait for that gate, as a blocked stop that
+  does not turn the watchdog off for the next one; a refused declaration counts as a blocked stop, and after
   5 blocked stops in a row the hook lets the next stop through (a declaration with its handoff,
   unjudged; otherwise noted in `.abc/stop-backstop.md`). One pure state machine decides every stop (`xtask/src/stop.rs`), on one
   record per agent in `.abc/stop-state.json`: the main agent's count and declaration, and each

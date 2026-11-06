@@ -646,9 +646,9 @@ fn run_bounded(
 }
 
 /// What an agent whose stop found another gate running does.
-const WAIT: &str = "Another gate held the gate lock (target/gate.lock) all the while the hook \
-                    waited, so check did not start: wait for that gate to finish, starting no \
-                    other gate, then stop again.";
+const WAIT: &str = "Another gate held the gate lock (gate.lock in the checkout's git directory) \
+                    all the while the hook waited, so check did not start: wait for that gate to \
+                    finish, starting no other gate, then stop again.";
 
 /// How to declare a task BLOCKED, for the main agent.
 const DECLARE: &str = "If what stops you is outside your control, declare it: cargo xtask task \

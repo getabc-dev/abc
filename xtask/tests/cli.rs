@@ -356,8 +356,8 @@ mod tests {
     #[test]
     fn the_stop_hook_never_starts_check_beside_another_gate() {
         let (copy, _held) = copy_of_the_repository();
-        let lock_path = copy.join("target/gate.lock");
-        std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+        // The copy is a main clone of its own: its lock is in its own repository directory.
+        let lock_path = copy.join(".git/gate.lock");
         let lock = std::fs::OpenOptions::new()
             .create(true)
             .truncate(false)

@@ -5,24 +5,47 @@
 //! agent's `coverage`, and later its `mutants`, ran, and the out-of-memory killer took the linker
 //! both times. In-place xtask mutants also edit xtask's sources while they run, which a `check`
 //! beside them would build. So each of these gates takes one exclusive lock, [`LOCK`] under the
-//! checkout's `target/`, for the whole run. A second gate waits for it and says once who holds it;
+//! checkout's own git directory (`.git`, or `.git/worktrees/<name>` for a linked worktree), for
+//! the whole run. A second gate waits for it and says once who holds it;
 //! the stop hook waits only so long (`check --wait-at-most`, `hook::GATE_WAIT`), and then sends
 //! the stop back naming the gate to wait for.
 //!
 //! The lock is the operating system's (`flock` on Unix), so it dies with the process that holds
-//! it: a gate that was killed never blocks the next. The file records the holder, its gate, pid
+//! it: a gate that was killed never blocks the next. It is held on an open file, so the file
+//! must outlive the gate: in `target/`, `cargo clean` or a hand deleted it, the holder kept the
+//! unlinked file and the next gate locked a new one. Nothing deletes a checkout's git
+//! directory while it is in use, and no build writes there. The file records the holder, its gate, pid
 //! and start, only to say who holds the lock; the record never decides anything.
 
 use std::fs::{self, File, TryLockError};
 use std::io::{Read as _, Seek as _, SeekFrom, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
 
-/// The lock's file, relative to the checkout.
-pub(crate) const LOCK: &str = "target/gate.lock";
+/// The lock's file, in the checkout's git directory ([`path`]).
+pub(crate) const LOCK: &str = "gate.lock";
+
+/// The gate lock's file of the checkout at `root`: [`LOCK`] in its own git directory.
+pub(crate) fn path(root: &Path) -> anyhow::Result<PathBuf> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["rev-parse", "--absolute-git-dir"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .context("could not run git")?;
+    anyhow::ensure!(
+        output.status.success(),
+        "the gate lock lives in the checkout's git directory, but {} has none: {}",
+        root.display(),
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    let dir = String::from_utf8(output.stdout).context("git printed a path that is not UTF-8")?;
+    Ok(Path::new(dir.trim_end()).join(LOCK))
+}
 
 /// The exit status of `check --wait-at-most` when another gate still holds the lock at the end of
 /// the wait (`EX_TEMPFAIL`).
@@ -98,7 +121,7 @@ pub(crate) fn take(
     wait: Wait,
     out: &mut impl Write,
 ) -> anyhow::Result<Taken> {
-    take_at(&root.join(LOCK), gate, wait, now(), out)
+    take_at(&path(root)?, gate, wait, now(), out)
 }
 
 fn take_at(
@@ -119,8 +142,9 @@ fn take_at(
                     writeln!(
                         out,
                         "xtask: waiting at most {} s for {holder} to finish: one gate runs at a \
-                         time ({LOCK})",
-                        limit.as_secs()
+                         time ({})",
+                        limit.as_secs(),
+                        path.display()
                     )?;
                     out.flush()?;
                     if !retry(&file, path, limit)? {
@@ -130,7 +154,8 @@ fn take_at(
                 Wait::Yes => {
                     writeln!(
                         out,
-                        "xtask: waiting for {holder} to finish: one gate runs at a time ({LOCK})"
+                        "xtask: waiting for {holder} to finish: one gate runs at a time ({})",
+                        path.display()
                     )?;
                     out.flush()?;
                     file.lock()
@@ -175,11 +200,8 @@ fn retry(file: &File, path: &Path, limit: Duration) -> anyhow::Result<bool> {
     }
 }
 
-/// Opens the lock's file, creating it and its directory.
+/// Opens the lock's file, creating it in its existing directory.
 fn open(path: &Path) -> anyhow::Result<File> {
-    if let Some(dir) = path.parent() {
-        fs::create_dir_all(dir).with_context(|| format!("could not create {}", dir.display()))?;
-    }
     fs::OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -236,6 +258,13 @@ mod tests {
 
     use super::{Gate, LOCK, Taken, Wait, describe, minutes, open, take, take_at};
 
+    /// A checkout in a fresh directory, whose own repository the lock lives in.
+    fn checkout() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = crate::testing::repository(&dir.path().join("checkout"));
+        (dir, root)
+    }
+
     fn busy(taken: Taken) -> String {
         match taken {
             Taken::Busy(holder) => holder,
@@ -247,13 +276,13 @@ mod tests {
     /// ends within the wait lets the check start.
     #[test]
     fn a_wait_with_a_limit_takes_the_lock_if_it_comes_in_time() {
-        let root = tempfile::tempdir().unwrap();
-        let held = take(root.path(), Gate::Coverage, Wait::Yes, &mut Vec::new()).unwrap();
+        let (_dir, root) = checkout();
+        let held = take(&root, Gate::Coverage, Wait::Yes, &mut Vec::new()).unwrap();
         let started = std::time::Instant::now();
         let mut said = Vec::new();
         let holder = busy(
             take(
-                root.path(),
+                &root,
                 Gate::Check,
                 Wait::AtMost(Duration::from_millis(700)),
                 &mut said,
@@ -272,7 +301,7 @@ mod tests {
             drop(held);
         });
         let taken = take(
-            root.path(),
+            &root,
             Gate::Check,
             Wait::AtMost(Duration::from_secs(10)),
             &mut Vec::new(),
@@ -284,9 +313,9 @@ mod tests {
 
     #[test]
     fn a_second_gate_is_told_which_gate_holds_the_lock() {
-        let root = tempfile::tempdir().unwrap();
+        let (_dir, root) = checkout();
         let held = take(
-            root.path(),
+            &root,
             Gate::Coverage,
             Wait::AtMost(Duration::ZERO),
             &mut Vec::new(),
@@ -294,15 +323,8 @@ mod tests {
         .unwrap();
         assert!(matches!(held, Taken::Held(_)));
         let mut said = Vec::new();
-        let holder = busy(
-            take(
-                root.path(),
-                Gate::Check,
-                Wait::AtMost(Duration::ZERO),
-                &mut said,
-            )
-            .unwrap(),
-        );
+        let holder =
+            busy(take(&root, Gate::Check, Wait::AtMost(Duration::ZERO), &mut said).unwrap());
         assert_eq!(
             holder,
             format!(
@@ -318,7 +340,7 @@ mod tests {
         assert!(
             matches!(
                 take(
-                    root.path(),
+                    &root,
                     Gate::Check,
                     Wait::AtMost(Duration::ZERO),
                     &mut Vec::new()
@@ -328,17 +350,25 @@ mod tests {
             ),
             "released when dropped, and free for the next gate"
         );
-        assert!(root.path().join(LOCK).is_file(), "under target/");
+        assert!(
+            super::path(&root).unwrap().is_file(),
+            "in the checkout's own repository"
+        );
+        assert_eq!(
+            super::path(&root).unwrap(),
+            root.join(".git").join(LOCK),
+            "a main clone's own"
+        );
     }
 
     /// PR 5a: the stop hook's `check` started while the agent's `coverage` ran, and the VM's
     /// out-of-memory killer took the linker. Now `check` waits, saying once what for.
     #[test]
     fn a_gate_waits_for_the_one_running_and_says_so_once() {
-        let root = tempfile::tempdir().unwrap();
-        let held = take(root.path(), Gate::Coverage, Wait::Yes, &mut Vec::new()).unwrap();
+        let (_dir, root) = checkout();
+        let held = take(&root, Gate::Coverage, Wait::Yes, &mut Vec::new()).unwrap();
         let (done, finished) = mpsc::channel();
-        let dir = root.path().to_path_buf();
+        let dir = root.clone();
         let waiter = std::thread::spawn(move || {
             let mut said = Vec::new();
             let taken = take(&dir, Gate::Check, Wait::Yes, &mut said).unwrap();
@@ -360,7 +390,7 @@ mod tests {
         assert!(
             matches!(
                 take(
-                    root.path(),
+                    &root,
                     Gate::Fuzz,
                     Wait::AtMost(Duration::ZERO),
                     &mut Vec::new()
@@ -372,10 +402,32 @@ mod tests {
         );
     }
 
+    /// The lock lived in `target/`, which `cargo clean` or a hand deletes: the holder kept the
+    /// unlinked file, the next gate locked a fresh one, and two heavy gates ran at once.
+    #[test]
+    fn deleting_the_build_output_does_not_free_the_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = crate::testing::repository(&dir.path().join("checkout"));
+        fs::create_dir_all(root.join("target/debug")).unwrap();
+        let held = take(&root, Gate::Coverage, Wait::Yes, &mut Vec::new()).unwrap();
+        fs::remove_dir_all(root.join("target")).unwrap();
+        let holder = busy(
+            take(
+                &root,
+                Gate::Check,
+                Wait::AtMost(Duration::ZERO),
+                &mut Vec::new(),
+            )
+            .unwrap(),
+        );
+        assert!(holder.contains("`cargo xtask coverage`"), "{holder}");
+        drop(held);
+    }
+
     #[test]
     fn a_lock_whose_holder_was_killed_does_not_block() {
-        let root = tempfile::tempdir().unwrap();
-        let path = root.path().join(LOCK);
+        let (_dir, root) = checkout();
+        let path = super::path(&root).unwrap();
         let file = open(&path).unwrap();
         file.lock().unwrap();
         fs::write(&path, "{\"gate\":\"mutants\",\"pid\":1,\"since\":0}\n").unwrap();
@@ -387,7 +439,7 @@ mod tests {
             .unwrap();
         let holder = busy(
             take(
-                root.path(),
+                &root,
                 Gate::Check,
                 Wait::AtMost(Duration::ZERO),
                 &mut Vec::new(),
@@ -403,7 +455,7 @@ mod tests {
         assert!(
             matches!(
                 take(
-                    root.path(),
+                    &root,
                     Gate::Check,
                     Wait::AtMost(Duration::ZERO),
                     &mut Vec::new()
@@ -417,8 +469,8 @@ mod tests {
 
     #[test]
     fn a_record_that_cannot_be_read_is_another_gate() {
-        let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("lock");
+        let (_dir, root) = checkout();
+        let path = root.join("lock");
         fs::write(&path, "half a rec").unwrap();
         assert_eq!(describe(&mut open(&path).unwrap(), 0), "another gate");
         fs::write(&path, "{\"gate\":\"fuzz\",\"pid\":7,\"since\":100}\n").unwrap();
@@ -430,8 +482,8 @@ mod tests {
 
     #[test]
     fn the_holder_is_recorded_for_the_next_gate() {
-        let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("nested/lock");
+        let (_dir, root) = checkout();
+        let path = root.join("lock");
         let _held = take_at(
             &path,
             Gate::E2e,

@@ -328,7 +328,7 @@ fn run(
                 report,
                 "{}: not started: {holder} holds the gate lock ({})",
                 gate.name(),
-                gate::LOCK
+                gate::path(&invocation.root)?.display()
             )?;
             Ok(ExitCode::from(gate::BUSY_STATUS))
         }
@@ -1127,6 +1127,8 @@ mod tests {
             root.join("rust-toolchain.toml"),
         )
         .unwrap();
+        // A checkout, whose repository holds the gate lock.
+        git(&root, &["init", "--quiet"]);
         assert_eq!(
             dispatch(
                 Task::Check {

@@ -99,8 +99,10 @@ cargo xtask pnpm exec biome check --write   # format the web app and apply Biome
 ```
 
 Run gates one at a time, in the foreground. `check`, `coverage`, `mutants`, `fuzz` and `e2e`
-share one lock, `target/gate.lock`: a second gate waits for the first and says once which gate it
-waits for, and the Stop hook sends the agent back to wait rather than start `check` beside
+share one lock, `gate.lock` in the checkout's git directory (`.git/worktrees/<name>/` for a
+worktree), where neither `cargo clean` nor deleting `target/` can remove it from under a running
+gate: a second gate waits for the first and says once which gate it waits for, and the Stop hook
+waits up to five minutes, then sends the agent back to wait rather than start `check` beside
 another gate. The lock is the operating system's, so a gate that was killed leaves nothing that
 blocks the next. Two gates at once do not fit in an agent VM's memory: in S0 PR 5a the
 out-of-memory killer took the linker, twice.
