@@ -21,6 +21,8 @@ abc-server = { path = "../abc-server" }
 abc-store = { path = "../abc-store" }
 abc-worker = { path = "../abc-worker" }
 clap = { workspace = true, features = ["env"] }
+# Echo off while the enrolment token is pasted into a terminal.
+rustix = { workspace = true, features = ["termios"] }
 semver.workspace = true
 tokio.workspace = true
 tracing.workspace = true
@@ -33,6 +35,7 @@ hyper = { workspace = true, features = ["client", "http1"] }
 hyper-util.workspace = true
 rustls.workspace = true
 rustls-platform-verifier.workspace = true
+rustix = { workspace = true, features = ["pty"] }
 serde_json.workspace = true
 sqlx.workspace = true
 tempfile.workspace = true
