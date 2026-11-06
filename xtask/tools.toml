@@ -36,7 +36,7 @@
 [[tool]]
 name = "cargo-nextest"
 for-tests = true
-version = "0.9.150"
+version = "0.9.151"
 url = "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-{version}/cargo-nextest-{version}-{platform}.tar.gz"
 binary = "cargo-nextest"
 checksums = "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-{version}/cargo-nextest-{version}-{platform}.sha256"
