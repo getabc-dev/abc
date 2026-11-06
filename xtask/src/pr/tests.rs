@@ -182,13 +182,13 @@ fn opens_through_the_rest_api() {
     );
 }
 
-/// GitHub's recorded replies to `pr update`: the pull request at `head`, the latest CI run for
-/// it, pushed by `pusher` (no run when empty), and the edited pull request.
+/// GitHub's recorded replies to `pr update`: the pull request at `head`, the CI run of its push
+/// by `pusher` (no run when empty), and the edited pull request.
 fn replies(head: &str, pusher: &str) -> std::vec::IntoIter<Value> {
     let runs = if pusher.is_empty() {
         json!({"total_count": 0, "workflow_runs": []})
     } else {
-        json!({"workflow_runs": [{"actor": {"login": pusher}, "triggering_actor": {"login": "someone"}}]})
+        json!({"workflow_runs": [{"actor": {"login": pusher}, "triggering_actor": {"login": "someone"}, "created_at": "2026-11-05T10:00:00Z"}]})
     };
     vec![
         json!({"title": "feat: drop t", "head": {"ref": "agent/x", "sha": head}}),
@@ -240,7 +240,7 @@ fn updates_the_description_when_the_app_pushed_last() {
     assert_eq!(sent[0].path, "/repos/o/r/pulls/7");
     assert_eq!(
         sent[1].path,
-        format!("/repos/o/r/actions/runs?head_sha={head}&event=pull_request&per_page=1")
+        format!("/repos/o/r/actions/runs?event=pull_request&head_sha={head}&per_page=100&page=1")
     );
     assert_eq!(
         sent[2],
@@ -324,5 +324,39 @@ fn an_update_refuses_what_it_cannot_judge() {
         format!("{:#}", oversized.unwrap_err())
             .starts_with("the diff with the title and description is "),
         "the pull request's title counts"
+    );
+}
+
+/// #32: the maintainer's `integrity-approved` label started a new run for the same head, newest
+/// first in GitHub's list, so `pr update` read its actor and named the maintainer as the pusher
+/// of the App's push. The push is the earliest run, across pages.
+#[test]
+fn a_label_re_run_does_not_hide_who_pushed() {
+    let temp = tempfile::tempdir().unwrap();
+    let work = checkout(temp.path());
+    let head = git(&work, &["rev-parse", "HEAD"]).trim().to_owned();
+    let run = |login: &str, at: &str| json!({"actor": {"login": login}, "created_at": at});
+    // A full first page of later runs, newest first, then the push on the second page.
+    let mut newest: Vec<Value> = (0..100)
+        .map(|minute| {
+            run(
+                "snehilvj",
+                &format!("2026-11-05T12:{:02}:00Z", 59 - minute % 60),
+            )
+        })
+        .collect();
+    newest[0] = run("snehilvj", "2026-11-05T13:00:00Z");
+    let answers = vec![
+        json!({"title": "feat: drop t", "head": {"ref": "agent/x", "sha": head}}),
+        json!({"workflow_runs": newest}),
+        json!({"workflow_runs": [run(APP_LOGIN, "2026-11-05T10:00:00Z")]}),
+        json!({"number": 7}),
+    ];
+    let (result, out, sent) = update(&work, REASONED, answers.into_iter());
+    assert!(result.unwrap(), "the App pushed the head: {out}");
+    assert!(out.contains("is the agent App's"), "{out}");
+    assert_eq!(
+        sent[2].path,
+        format!("/repos/o/r/actions/runs?event=pull_request&head_sha={head}&per_page=100&page=2")
     );
 }

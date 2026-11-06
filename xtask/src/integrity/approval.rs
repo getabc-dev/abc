@@ -80,16 +80,6 @@ struct Named {
     name: String,
 }
 
-#[derive(Deserialize)]
-struct Runs {
-    workflow_runs: Vec<Run>,
-}
-
-#[derive(Deserialize)]
-struct Run {
-    created_at: String,
-}
-
 /// One pull request timeline event; only label events matter here.
 #[derive(Debug, Deserialize)]
 struct TimelineItem {
@@ -115,11 +105,10 @@ pub(super) fn approved(
     let pull: Pull =
         serde_json::from_slice(&fetch(&format!("{base}/pulls/{}", pull_request.number))?)
             .context("could not read the pull request")?;
-    let runs: Runs = serde_json::from_slice(&fetch(&format!(
-        "{base}/actions/runs?event=pull_request&per_page=100&head_sha={}",
-        pull.head.sha
-    ))?)
-    .context("could not read the head commit's workflow runs")?;
+    let push = crate::github::push_of(&pull.head.sha, &mut |path| {
+        serde_json::from_slice(&fetch(&format!("{base}/{path}"))?)
+            .with_context(|| format!("could not read {path}"))
+    })?;
     let mut events = Vec::new();
     for page in 1_u32.. {
         let batch: Vec<TimelineItem> = serde_json::from_slice(&fetch(&format!(
@@ -132,11 +121,7 @@ pub(super) fn approved(
         }
         events.extend(batch);
     }
-    let pushed = runs
-        .workflow_runs
-        .iter()
-        .map(|run| run.created_at.as_str())
-        .min();
+    let pushed = push.as_ref().map(|push| push.at.as_str());
     let labels: Vec<&str> = pull
         .labels
         .iter()
@@ -319,8 +304,8 @@ mod tests {
                 "https://api.example/repos/o/r/pulls/7" => {
                     br#"{"head": {"sha": "abc"}, "labels": [{"name": "integrity-approved"}]}"#.to_vec()
                 }
-                "https://api.example/repos/o/r/actions/runs?event=pull_request&per_page=100&head_sha=abc" => {
-                    br#"{"workflow_runs": [{"created_at": "2026-11-01T09:30:00Z"}, {"created_at": "2026-11-01T09:00:00Z"}]}"#.to_vec()
+                "https://api.example/repos/o/r/actions/runs?event=pull_request&head_sha=abc&per_page=100&page=1" => {
+                    br#"{"workflow_runs": [{"created_at": "2026-11-01T09:30:00Z", "actor": {"login": "snehilvj"}}, {"created_at": "2026-11-01T09:00:00Z", "actor": {"login": "getabc-dev-agent[bot]"}}]}"#.to_vec()
                 }
                 "https://api.example/repos/o/r/issues/7/timeline?per_page=100&page=1" => TIMELINE.as_bytes().to_vec(),
                 _ => b"[]".to_vec(),

@@ -278,22 +278,14 @@ fn update(
             .saturating_add(body.len()),
     )?;
     let head = text(&pull, "/head/sha").to_owned();
-    let runs = github::get(
-        send,
-        repo.path(&format!(
-            "actions/runs?head_sha={head}&event=pull_request&per_page=1"
-        )),
-    )?;
-    let pusher = runs
-        .pointer("/workflow_runs/0/actor/login")
-        .and_then(Value::as_str)
+    let pusher = github::push_of(&head, &mut |path| github::get(send, repo.path(path)))?
         .with_context(|| {
             format!(
                 "no CI run for #{number}'s head {head} yet, so who pushed it is unknown; run this \
                  again once CI has started"
             )
         })?
-        .to_owned();
+        .pusher;
     let handover = if pusher == APP_LOGIN {
         format!("pr: the latest push to #{number} is the agent App's; the hand-over is done")
     } else {

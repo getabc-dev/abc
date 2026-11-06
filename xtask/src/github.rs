@@ -96,6 +96,58 @@ pub(crate) fn graphql(
         .context("GitHub's GraphQL API answered without data")
 }
 
+/// The push that made a commit a pull request's head: who pushed it and when.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Push {
+    pub(crate) pusher: String,
+    /// GitHub's UTC ISO 8601 time, which sorts as text.
+    pub(crate) at: String,
+}
+
+/// Runs a page of the runs API holds.
+const RUNS_PER_PAGE: usize = 100;
+
+/// The push of `head`, read from its earliest `pull_request` workflow run, whose actor is who
+/// pushed it. Later runs for the same head come from labels, description edits and re-runs, and
+/// name whoever made them: #32's `integrity-approved` re-run was the newest run, so reading the
+/// newest named the maintainer as the pusher. `page` answers a path under the repository with
+/// its JSON; every page is read. Nothing when no run has started yet.
+pub(crate) fn push_of(
+    head: &str,
+    page: &mut impl FnMut(&str) -> anyhow::Result<Value>,
+) -> anyhow::Result<Option<Push>> {
+    let mut earliest: Option<Push> = None;
+    for number in 1_u32.. {
+        let path = format!(
+            "actions/runs?event=pull_request&head_sha={head}&per_page={RUNS_PER_PAGE}&page={number}"
+        );
+        let answer = page(&path)?;
+        let runs = answer
+            .get("workflow_runs")
+            .and_then(Value::as_array)
+            .with_context(|| format!("GitHub answered {path} without workflow_runs"))?;
+        for run in runs {
+            let field = |pointer: &str| {
+                run.pointer(pointer)
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                    .with_context(|| format!("a workflow run for {head} has no {pointer}"))
+            };
+            let push = Push {
+                pusher: field("/actor/login")?,
+                at: field("/created_at")?,
+            };
+            if earliest.as_ref().is_none_or(|first| push.at < first.at) {
+                earliest = Some(push);
+            }
+        }
+        if runs.len() < RUNS_PER_PAGE {
+            break;
+        }
+    }
+    Ok(earliest)
+}
+
 /// Runs `work` with a token from `mint`, then revokes the token with `revoke`, whatever `work`
 /// did. A revocation that fails is reported, not fatal: the token expires within the hour.
 pub(crate) fn with_token<T>(

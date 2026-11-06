@@ -843,7 +843,7 @@ mod tests {
             Ok(if url.ends_with("/pulls/7") {
                 br#"{"head": {"sha": "abc"}, "labels": [{"name": "integrity-approved"}]}"#.to_vec()
             } else if url.contains("/actions/runs") {
-                br#"{"workflow_runs": [{"created_at": "2026-11-01T09:00:00Z"}]}"#.to_vec()
+                br#"{"workflow_runs": [{"created_at": "2026-11-01T09:00:00Z", "actor": {"login": "getabc-dev-agent[bot]"}}]}"#.to_vec()
             } else if url.ends_with("page=1") {
                 format!(r#"[{{"event": "labeled", "created_at": "2026-11-01T10:00:00Z", "actor": {{"login": "{login}"}}, "label": {{"name": "integrity-approved"}}}}]"#).into_bytes()
             } else {
