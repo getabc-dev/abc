@@ -55,10 +55,11 @@ pub(crate) const XTASK: Workspace = Workspace {
 };
 
 /// The shell scripts of the repository, which shellcheck lints.
-pub(crate) const SCRIPTS: [&str; 3] = [
+pub(crate) const SCRIPTS: [&str; 4] = [
     "xtask/hooks/hook.sh",
     "xtask/vm/entrypoint.sh",
     "xtask/vm/agent-exec",
+    "xtask/vm/own-disks",
 ];
 
 /// What the check covers.

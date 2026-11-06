@@ -8,7 +8,7 @@ use super::{
     Answer, Context, Event, HookInput, LAUNCHER, Location, Steps, XTASK_HOOK, git_in,
     guard_unavailable, locate, run,
 };
-use crate::stop::{self, Ruling};
+use crate::stop::{self, CheckResult, Ruling};
 use crate::testing::{git, repository, script};
 
 /// A repository with a worktree nested inside it, where Claude Code puts its worktrees.
@@ -440,7 +440,7 @@ fn a_handed_over_hook_names_its_event_as_the_command_line_does() {
 
 /// Steps that answer as told and count how often the judge and the watchdog ran.
 struct Fake {
-    check: Result<bool, String>,
+    check: Result<CheckResult, String>,
     sent_back: Option<String>,
     drift: Option<String>,
     checked: u32,
@@ -449,7 +449,7 @@ struct Fake {
 }
 
 impl Fake {
-    const fn new(check: Result<bool, String>) -> Self {
+    const fn new(check: Result<CheckResult, String>) -> Self {
         Self {
             check,
             sent_back: None,
@@ -462,7 +462,7 @@ impl Fake {
 }
 
 impl Steps for Fake {
-    fn check(&mut self, out: &mut Vec<u8>) -> anyhow::Result<bool> {
+    fn check(&mut self, out: &mut Vec<u8>) -> anyhow::Result<CheckResult> {
         self.checked = self.checked.saturating_add(1);
         out.extend_from_slice(b"the check ran\n");
         self.check.clone().map_err(|error| anyhow::anyhow!(error))
@@ -498,7 +498,7 @@ fn drive(root: &Path, input: &str, steps: &mut Fake) -> Answer {
 #[test]
 fn a_passing_first_stop_goes_to_the_watchdog() {
     let dir = tempfile::tempdir().unwrap();
-    let mut steps = Fake::new(Ok(true));
+    let mut steps = Fake::new(Ok(CheckResult::Passed));
     assert_eq!(drive(dir.path(), MAIN, &mut steps), Answer::Allow);
     assert_eq!(steps.watched, 1, "the watchdog judged it");
     steps.drift = Some("off the task".to_owned());
@@ -519,7 +519,7 @@ fn a_passing_first_stop_goes_to_the_watchdog() {
 #[test]
 fn a_failing_check_holds_the_stop_and_tells_the_agent_how_to_declare() {
     let dir = tempfile::tempdir().unwrap();
-    let held = drive(dir.path(), MAIN, &mut Fake::new(Ok(false)));
+    let held = drive(dir.path(), MAIN, &mut Fake::new(Ok(CheckResult::Failed)));
     assert!(
         matches!(&held, Answer::Block(reason) if reason.starts_with("the check ran\n") && reason.contains("cargo xtask task blocked")),
         "{held:?}"
@@ -533,10 +533,42 @@ fn a_failing_check_holds_the_stop_and_tells_the_agent_how_to_declare() {
         matches!(&cannot, Answer::Block(reason) if reason.contains("the check could not run: no nextest")),
         "a check that cannot run fails: {cannot:?}"
     );
-    let sub = drive(dir.path(), SUBAGENT, &mut Fake::new(Ok(false)));
+    let sub = drive(
+        dir.path(),
+        SUBAGENT,
+        &mut Fake::new(Ok(CheckResult::Failed)),
+    );
     assert!(
         matches!(&sub, Answer::Block(reason) if !reason.contains("task blocked")),
         "a subagent has no declaration to make: {sub:?}"
+    );
+}
+
+/// PR 5a: the stop hook's `check` started beside the agent's `coverage`, and the out-of-memory
+/// killer took the linker. A stop that finds another gate running is sent back to wait for it.
+#[test]
+fn a_stop_while_another_gate_runs_is_sent_back_to_wait_for_it() {
+    let dir = tempfile::tempdir().unwrap();
+    for input in [MAIN, SUBAGENT] {
+        let mut busy = Fake::new(Ok(CheckResult::GateBusy));
+        let held = drive(dir.path(), input, &mut busy);
+        assert!(
+            matches!(&held, Answer::Block(reason) if reason.contains("wait for that gate to finish") && !reason.contains("task blocked")),
+            "{input}: {held:?}"
+        );
+        assert_eq!(busy.watched, 0, "{input}: nothing was checked to watch");
+    }
+    let broken = tempfile::tempdir().unwrap();
+    break_state(broken.path(), "no .abc");
+    let kept = super::stop_with(
+        broken.path(),
+        &serde_json::from_str::<HookInput>(MAIN).unwrap(),
+        &mut Fake::new(Ok(CheckResult::GateBusy)),
+        &mut Vec::new(),
+    );
+    assert!(
+        matches!(&kept, Answer::Held(reason) if reason.contains("check: NOT RUN") && reason.contains("wait for that gate")),
+        "with no state to count it in, the launcher holds it: {kept:?}"
     );
 }
 
@@ -545,11 +577,19 @@ fn the_backstop_lets_the_sixth_blocked_stop_through_and_records_it() {
     let dir = tempfile::tempdir().unwrap();
     for _ in 0..stop::MAX_BLOCKED_STOPS {
         assert!(matches!(
-            drive(dir.path(), MAIN_AGAIN, &mut Fake::new(Ok(false))),
+            drive(
+                dir.path(),
+                MAIN_AGAIN,
+                &mut Fake::new(Ok(CheckResult::Failed))
+            ),
             Answer::Block(_)
         ));
     }
-    let through = drive(dir.path(), MAIN_AGAIN, &mut Fake::new(Ok(false)));
+    let through = drive(
+        dir.path(),
+        MAIN_AGAIN,
+        &mut Fake::new(Ok(CheckResult::Failed)),
+    );
     assert!(
         matches!(&through, Answer::Notify(message) if message.contains("5 stops in a row")),
         "{through:?}"
@@ -557,9 +597,17 @@ fn the_backstop_lets_the_sixth_blocked_stop_through_and_records_it() {
     let record = fs::read_to_string(dir.path().join(stop::BACKSTOP)).unwrap();
     assert!(record.contains("after 5 blocked stops"), "{record}");
     for _ in 0..stop::MAX_BLOCKED_STOPS {
-        drive(dir.path(), SUBAGENT, &mut Fake::new(Ok(false)));
+        drive(
+            dir.path(),
+            SUBAGENT,
+            &mut Fake::new(Ok(CheckResult::Failed)),
+        );
     }
-    let sub = drive(dir.path(), SUBAGENT, &mut Fake::new(Ok(false)));
+    let sub = drive(
+        dir.path(),
+        SUBAGENT,
+        &mut Fake::new(Ok(CheckResult::Failed)),
+    );
     assert!(
         matches!(&sub, Answer::Notify(message) if message.starts_with("A subagent's check failed")),
         "{sub:?}"
@@ -570,7 +618,7 @@ fn the_backstop_lets_the_sixth_blocked_stop_through_and_records_it() {
 fn a_genuine_declaration_ends_the_stop_with_a_handoff_and_is_logged() {
     let dir = tempfile::tempdir().unwrap();
     crate::task::block(dir.path(), "no network; tried twice", &mut std::io::sink()).unwrap();
-    let mut steps = Fake::new(Ok(false));
+    let mut steps = Fake::new(Ok(CheckResult::Failed));
     assert_eq!(
         drive(dir.path(), MAIN, &mut steps),
         Answer::Notify("BLOCKED, stop allowed. Handoff: no network; tried twice".to_owned())
@@ -587,10 +635,14 @@ fn a_genuine_declaration_ends_the_stop_with_a_handoff_and_is_logged() {
 fn a_declaration_at_the_cap_goes_through_unjudged_and_is_logged() {
     let dir = tempfile::tempdir().unwrap();
     for _ in 0..stop::MAX_BLOCKED_STOPS {
-        drive(dir.path(), MAIN_AGAIN, &mut Fake::new(Ok(false)));
+        drive(
+            dir.path(),
+            MAIN_AGAIN,
+            &mut Fake::new(Ok(CheckResult::Failed)),
+        );
     }
     crate::task::block(dir.path(), "stuck", &mut std::io::sink()).unwrap();
-    let mut steps = Fake::new(Ok(false));
+    let mut steps = Fake::new(Ok(CheckResult::Failed));
     assert_eq!(
         drive(dir.path(), MAIN_AGAIN, &mut steps),
         Answer::Notify("BLOCKED, stop allowed. Handoff: stuck".to_owned())
@@ -607,7 +659,7 @@ fn a_declaration_at_the_cap_goes_through_unjudged_and_is_logged() {
 fn a_refused_declaration_is_logged_and_counts() {
     let dir = tempfile::tempdir().unwrap();
     crate::task::block(dir.path(), "the check fails", &mut std::io::sink()).unwrap();
-    let mut steps = Fake::new(Ok(false));
+    let mut steps = Fake::new(Ok(CheckResult::Failed));
     steps.sent_back = Some("a failing check is the work".to_owned());
     let sent = drive(dir.path(), MAIN, &mut steps);
     assert!(
@@ -630,7 +682,7 @@ fn a_refused_declaration_is_logged_and_counts() {
 fn a_subagents_stops_never_spend_the_main_agents_declaration() {
     let dir = tempfile::tempdir().unwrap();
     crate::task::block(dir.path(), "no network", &mut std::io::sink()).unwrap();
-    let mut steps = Fake::new(Ok(false));
+    let mut steps = Fake::new(Ok(CheckResult::Failed));
     for _ in 0..=stop::MAX_BLOCKED_STOPS {
         drive(dir.path(), SUBAGENT, &mut steps);
     }
@@ -670,10 +722,16 @@ fn a_state_that_cannot_be_kept_still_runs_the_check_once_and_says_pass_or_fail()
         break_state(&root, case);
         let fields = serde_json::from_str::<HookInput>(MAIN).unwrap();
         assert!(
-            super::drive(&root, &fields, &mut Fake::new(Ok(true)), &mut Vec::new()).is_err(),
+            super::drive(
+                &root,
+                &fields,
+                &mut Fake::new(Ok(CheckResult::Passed)),
+                &mut Vec::new()
+            )
+            .is_err(),
             "{case}: no state to count in"
         );
-        let mut passing = Fake::new(Ok(true));
+        let mut passing = Fake::new(Ok(CheckResult::Passed));
         let passed = super::stop_with(&root, &fields, &mut passing, &mut Vec::new());
         assert!(
             matches!(&passed, Answer::Notify(message) if message.contains("check: PASS") && message.contains("could not keep its state")),
@@ -681,7 +739,7 @@ fn a_state_that_cannot_be_kept_still_runs_the_check_once_and_says_pass_or_fail()
         );
         assert_eq!(passing.checked, 1, "{case}: the check ran once");
         assert_eq!(passing.watched, 0, "{case}");
-        let mut failing = Fake::new(Ok(false));
+        let mut failing = Fake::new(Ok(CheckResult::Failed));
         let failed = super::stop_with(&root, &fields, &mut failing, &mut Vec::new());
         assert!(
             matches!(&failed, Answer::Held(message) if message.contains("the check ran") && message.contains("check: FAIL") && message.contains("could not keep its state")),
@@ -705,7 +763,7 @@ fn a_stop_with_a_working_state_passes_the_watchdog_through() {
     let temp = tempfile::tempdir().unwrap();
     let root = repository(&temp.path().join("abc"));
     let fields = serde_json::from_str::<HookInput>(MAIN).unwrap();
-    let mut drifting = Fake::new(Ok(true));
+    let mut drifting = Fake::new(Ok(CheckResult::Passed));
     drifting.drift = Some("off task".to_owned());
     let answer = super::stop_with(&root, &fields, &mut drifting, &mut Vec::new());
     assert!(
@@ -719,7 +777,7 @@ fn a_stop_with_a_working_state_is_never_held_for_the_launcher() {
     let temp = tempfile::tempdir().unwrap();
     let root = repository(&temp.path().join("abc"));
     let fields = serde_json::from_str::<HookInput>(MAIN).unwrap();
-    let mut failing = Fake::new(Ok(false));
+    let mut failing = Fake::new(Ok(CheckResult::Failed));
     let blocked = super::stop_with(&root, &fields, &mut failing, &mut Vec::new());
     assert!(matches!(blocked, Answer::Block(_)), "{blocked:?}");
     assert_eq!(failing.checked, 1);
@@ -781,9 +839,10 @@ fn a_check_that_outlives_its_deadline_is_stopped_and_fails_with_a_reason() {
     slow.args(["-c", "echo started; sleep 60 & sleep 60"]);
     let started = std::time::Instant::now();
     let mut out = Vec::new();
-    let passed = super::run_bounded(slow, std::time::Duration::from_millis(400), &mut out).unwrap();
+    let status = super::run_bounded(slow, std::time::Duration::from_millis(400), &mut out).unwrap();
     let said = String::from_utf8(out).unwrap();
-    assert!(!passed, "{said}");
+    assert_eq!(status, None, "{said}");
+    assert_eq!(super::check_result(status), CheckResult::Failed);
     assert!(said.contains("started"), "what it printed is kept: {said}");
     assert!(
         said.contains("check did not finish in 0 s"),
@@ -798,18 +857,22 @@ fn a_check_that_outlives_its_deadline_is_stopped_and_fails_with_a_reason() {
 #[test]
 fn a_check_inside_its_deadline_passes_or_fails_by_its_exit_status() {
     for (script, expected) in [
-        ("sleep 0.3; echo fine", true),
-        ("echo broken >&2; exit 1", false),
+        ("sleep 0.3; echo fine", CheckResult::Passed),
+        ("echo broken >&2; exit 1", CheckResult::Failed),
+        (
+            "echo 'check: not started' >&2; exit 75",
+            CheckResult::GateBusy,
+        ),
     ] {
         let mut command = Command::new("sh");
         command.args(["-c", script]);
         let mut out = Vec::new();
-        let passed =
+        let status =
             super::run_bounded(command, std::time::Duration::from_secs(60), &mut out).unwrap();
-        assert_eq!(passed, expected, "{script}");
+        assert_eq!(super::check_result(status), expected, "{script}");
         let said = String::from_utf8(out).unwrap();
         assert!(
-            said.contains("fine") || said.contains("broken"),
+            said.contains("fine") || said.contains("broken") || said.contains("not started"),
             "stdout and stderr: {said}"
         );
         assert!(!said.contains("did not finish"), "{said}");
@@ -845,7 +908,8 @@ impl Launched {
 }
 
 /// Runs the launcher for `event` under `shell` on `input`, in the project directory `project`,
-/// with `bin` first on `PATH` and `ABC_VM` set when `vm`.
+/// with `bin` first on `PATH`, and when `vm` as in an agent VM: `ABC_VM` set and `project` the
+/// session's worktree.
 fn launch(shell: &str, event: &str, project: &Path, bin: &Path, input: &str, vm: bool) -> Launched {
     let launcher = crate::repo_root().unwrap().join(LAUNCHER);
     let mut command = Command::new(shell);
@@ -863,7 +927,7 @@ fn launch(shell: &str, event: &str, project: &Path, bin: &Path, input: &str, vm:
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     if vm {
-        command.env("ABC_VM", "1");
+        command.env("ABC_VM", "1").env("ABC_WORKTREE", project);
     }
     let mut child = command
         .spawn()
@@ -1152,10 +1216,19 @@ fn a_stop_the_launcher_cannot_count_goes_through() {
     assert!(matches!(through, Answer::Notify(_)), "{through:?}");
 }
 
+/// Gives the worktree `project` a target/ and a .tools/ on a filesystem of their own, as an agent
+/// VM's disks are: links to /dev, which is never on the same filesystem as a temporary directory.
+fn own_disks(project: &Path) {
+    for dir in ["target", ".tools"] {
+        std::os::unix::fs::symlink("/dev", project.join(dir)).unwrap();
+    }
+}
+
 #[test]
 fn in_an_agent_vm_the_launcher_checks_the_billing_first() {
     let temp = tempfile::tempdir().unwrap();
     fake_cargo(temp.path(), "", 0);
+    own_disks(temp.path());
     let checked = temp.path().join("checked");
     script(
         &temp.path().join("abc-xtask"),
@@ -1193,6 +1266,93 @@ fn in_an_agent_vm_the_launcher_checks_the_billing_first() {
         clean.answer(Event::PreToolUse),
         Answer::Allow,
         "a clean VM goes on to xtask"
+    );
+}
+
+/// S0 PR 5a: the host's target/ was deleted while the VM ran, which unmounted the VM's build disk,
+/// and builds went to the worktree mount shared with the host unnoticed. In a VM, the launcher
+/// denies every tool call and holds every stop while target/ or .tools/ is not the session's own
+/// disk, naming the fix, before it builds xtask.
+#[test]
+fn in_an_agent_vm_every_tool_call_and_stop_fails_while_a_disk_is_not_its_own() {
+    for shell in SHELLS {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path();
+        fake_cargo(project, "", 0);
+        script(&project.join("abc-xtask"), "exit 0\n");
+        // What the VM saw in PR 5a: target/ a plain directory of the shared worktree mount.
+        fs::create_dir(project.join("target")).unwrap();
+        std::os::unix::fs::symlink("/dev", project.join(".tools")).unwrap();
+        let input = r#"{"tool_name":"Bash","tool_input":{"command":"ls"}}"#;
+        let denied =
+            launch(shell, "pre-tool-use", project, project, input, true).answer(Event::PreToolUse);
+        assert!(
+            matches!(&denied, Answer::Block(reason) if reason.contains("broken: target/ in ")
+                && reason.contains("cargo xtask vm stop")
+                && reason.contains("then cargo xtask vm start")),
+            "{shell}: {denied:?}"
+        );
+        assert!(
+            !project.join("args").exists(),
+            "{shell}: xtask was never built, so nothing landed on the wrong disk"
+        );
+        for held in 1..=5 {
+            let stop = launch(shell, "stop", project, project, "{}", true).answer(Event::Stop);
+            assert!(
+                matches!(&stop, Answer::Block(reason) if reason.contains("cargo xtask vm stop")),
+                "{shell}: hold {held}: {stop:?}"
+            );
+        }
+        let through = launch(shell, "stop", project, project, "{}", true).answer(Event::Stop);
+        assert!(
+            matches!(&through, Answer::Notify(message) if message.contains("Agent VM storage is broken")
+                && message.contains("5 stops in a row were held")),
+            "{shell}: the sixth stop goes through, as when xtask cannot start: {through:?}"
+        );
+        let record = fs::read_to_string(project.join(stop::BACKSTOP)).unwrap();
+        assert!(
+            record.contains("Agent VM storage is broken"),
+            "{shell}: {record}"
+        );
+
+        fs::remove_dir(project.join("target")).unwrap();
+        fs::remove_file(project.join(".tools")).unwrap();
+        let both =
+            launch(shell, "pre-tool-use", project, project, input, true).answer(Event::PreToolUse);
+        assert!(
+            matches!(&both, Answer::Block(reason) if reason.contains("broken: target/ .tools/ in")),
+            "{shell}: a missing disk is not its own either: {both:?}"
+        );
+        assert_eq!(
+            launch(shell, "pre-tool-use", project, project, input, false).answer(Event::PreToolUse),
+            Answer::Allow,
+            "{shell}: outside a VM there are no disks to check"
+        );
+        own_disks(project);
+        assert_eq!(
+            launch(shell, "pre-tool-use", project, project, input, true).answer(Event::PreToolUse),
+            Answer::Allow,
+            "{shell}: with its own disks the VM goes on to xtask"
+        );
+        assert_eq!(
+            launch(shell, "stop", project, project, "{}", true).answer(Event::Stop),
+            Answer::Allow,
+            "{shell}"
+        );
+    }
+}
+
+#[test]
+fn the_own_disks_check_names_a_worktree_that_is_not_there() {
+    let output = Command::new("sh")
+        .arg(crate::repo_root().unwrap().join("xtask/vm/own-disks"))
+        .arg("/no/such/worktree")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        "own-disks: /no/such/worktree does not exist\n"
     );
 }
 

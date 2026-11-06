@@ -7,6 +7,7 @@ mod check;
 mod coverage;
 mod e2e;
 mod fuzz;
+mod gate;
 mod git;
 mod github;
 mod guard;
@@ -85,6 +86,10 @@ enum Task {
         /// (upstream/HEAD, else origin/HEAD), including uncommitted and untracked files.
         #[arg(long)]
         changed: bool,
+        /// When another gate holds the gate lock, exit at once with status 75 (`EX_TEMPFAIL`),
+        /// naming it, instead of waiting for it; the stop hook runs check this way.
+        #[arg(long)]
+        no_wait: bool,
     },
     /// Run the tests under coverage and require 90% of the changed, instrumented lines covered.
     Coverage {
@@ -302,7 +307,34 @@ fn verdict(passed: bool) -> ExitCode {
     }
 }
 
+/// Runs `task`; a heavy gate holds the gate lock while it runs, so gates run one at a time.
 fn run(
+    task: Task,
+    invocation: &Invocation<'_>,
+    report: &mut impl Write,
+) -> anyhow::Result<ExitCode> {
+    let Some((gate, wait)) = gate_of(&task) else {
+        return perform(task, invocation, report);
+    };
+    match gate::take(&invocation.root, gate, wait, report)? {
+        gate::Taken::Held(held) => {
+            let result = perform(task, invocation, report);
+            drop(held);
+            result
+        }
+        gate::Taken::Busy(holder) => {
+            writeln!(
+                report,
+                "{}: not started: {holder} holds the gate lock ({})",
+                gate.name(),
+                gate::LOCK
+            )?;
+            Ok(ExitCode::from(gate::BUSY_STATUS))
+        }
+    }
+}
+
+fn perform(
     task: Task,
     invocation: &Invocation<'_>,
     report: &mut impl Write,
@@ -313,7 +345,7 @@ fn run(
     let env = |name: &str| (invocation.env)(name);
     let mode = annotation::Mode::from_env(&env);
     match task {
-        Task::Check { changed } => Ok(verdict(check(root, changed, tool, report)?)),
+        Task::Check { changed, .. } => Ok(verdict(check(root, changed, tool, report)?)),
         Task::Coverage { base } => Ok(verdict(coverage::run(
             root,
             &base,
@@ -404,6 +436,40 @@ fn run(
         Task::Pnpm { args } => run_web(WebTask::Pnpm(args), root, tool, report),
         Task::E2e => run_web(WebTask::E2e, root, tool, report),
         Task::Hook { event } => run_hook(event, home, report),
+    }
+}
+
+/// The gate lock `task` takes, if it is a heavy gate, and whether it waits for another gate.
+const fn gate_of(task: &Task) -> Option<(gate::Gate, gate::Wait)> {
+    match task {
+        Task::Check { no_wait, .. } => Some((
+            gate::Gate::Check,
+            if *no_wait {
+                gate::Wait::No
+            } else {
+                gate::Wait::Yes
+            },
+        )),
+        Task::Coverage { .. } => Some((gate::Gate::Coverage, gate::Wait::Yes)),
+        Task::Mutants { .. } => Some((gate::Gate::Mutants, gate::Wait::Yes)),
+        Task::Fuzz { .. } => Some((gate::Gate::Fuzz, gate::Wait::Yes)),
+        Task::E2e => Some((gate::Gate::E2e, gate::Wait::Yes)),
+        Task::Integrity { .. }
+        | Task::GitCredential { .. }
+        | Task::Gh { .. }
+        | Task::Pr { .. }
+        | Task::Broker { .. }
+        | Task::Vm { .. }
+        | Task::Review { .. }
+        | Task::Work { .. }
+        | Task::Rulesets { .. }
+        | Task::Build
+        | Task::Pnpm { .. }
+        | Task::Setup { .. }
+        | Task::Doctor { .. }
+        | Task::Pin
+        | Task::Tool { .. }
+        | Task::Hook { .. } => None,
     }
 }
 
@@ -904,7 +970,13 @@ mod tests {
                     shard: None,
                 },
             ),
-            ("check", Task::Check { changed: false }),
+            (
+                "check",
+                Task::Check {
+                    changed: false,
+                    no_wait: false,
+                },
+            ),
         ] {
             assert_eq!(
                 dispatch(task, &home, &root, &no_env).unwrap(),
@@ -1055,9 +1127,15 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            dispatch(Task::Check { changed: false }, &home, &root, &|_: &str| {
-                None
-            })
+            dispatch(
+                Task::Check {
+                    changed: false,
+                    no_wait: false,
+                },
+                &home,
+                &root,
+                &|_: &str| { None }
+            )
             .unwrap(),
             ExitCode::SUCCESS,
             "check passes a clean tree with the pinned nextest and shellcheck it finds"

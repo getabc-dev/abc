@@ -17,9 +17,14 @@
 # the main agent and .abc/hook-holds.<agent_id> for each subagent, and cleared only by a stop that
 # xtask let through. Exit status 3 is xtask's one other word: it ran the check, which failed, but
 # could not keep its state to count the hold, so its output is the reason and this script counts
-# the hold. That is all the logic it has. In an agent VM, pre-tool-use first runs
-# the image's `abc-xtask vm billing`, code the agent cannot change, and denies every tool call
-# while it finds a credential other than the subscription token (D37).
+# the hold. That is all the logic it has.
+#
+# In an agent VM, before xtask is built, the launcher checks what nothing may run without (D37).
+# pre-tool-use runs the image's `abc-xtask vm billing`, code the agent cannot change, and denies
+# every tool call while it finds a credential other than the subscription token. Both events run
+# xtask/vm/own-disks: while target/ or .tools/ is not the session's own disk, every tool call is
+# denied and every stop held as when xtask cannot start, with the fix as the reason, so no build
+# lands on the worktree mount the VM shares with the host.
 
 event=$1
 input=$(cat)
@@ -40,12 +45,6 @@ deny() {
   answer "{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"permissionDecision\":\"deny\",\"permissionDecisionReason\":\"$(json_text "$1")\"}}"
 }
 
-if [ "$event" = pre-tool-use ] && [ "${ABC_VM:-}" = 1 ]; then
-  if ! refused=$(abc-xtask vm billing 2>&1); then
-    deny "$refused"
-  fi
-fi
-
 # The agent that stops: the input's agent_id, none for the main agent. A key is the only place an
 # unescaped "agent_id" followed by a colon can be, so the match cannot be a value's text.
 agent=$(printf '%s' "$input" | tr '\n\r' '  ' |
@@ -56,6 +55,41 @@ who="the main agent"
 if [ -n "$agent" ]; then
   holds=$holds.$agent
   who="subagent $agent"
+fi
+
+# Holds the stop with the reason $2 at most 5 times in a row, counted in $holds; the sixth goes
+# through with $1, the cause, recorded in .abc/stop-backstop.md.
+hold() {
+  count=$(cat "$holds" 2>/dev/null)
+  case $count in
+    '' | *[!0-9]*) count=0 ;;
+  esac
+  # A hold that cannot be counted is never made, so the cap always holds.
+  if [ "$count" -lt 5 ] && mkdir -p "$CLAUDE_PROJECT_DIR/.abc" 2>/dev/null &&
+    printf '%s\n' $((count + 1)) >"$holds.$$" 2>/dev/null && mv "$holds.$$" "$holds"; then
+    answer "{\"decision\":\"block\",\"reason\":\"$(json_text "$2")\"}"
+  fi
+  rm -f "$holds" "$holds.$$"
+  if [ "$count" -ge 5 ]; then
+    {
+      printf '\n## Unix time %s: launcher backstop\n\n' "$(date +%s)"
+      printf 'The stop hook let a stop of %s through after %s blocked stops in a row: %s\n' \
+        "$who" "$count" "$1"
+    } >>"$CLAUDE_PROJECT_DIR/.abc/stop-backstop.md" 2>/dev/null
+  fi
+  answer "{\"systemMessage\":\"$(json_text "$1"); $count stops in a row were held, so this stop is allowed with no check.\"}"
+}
+
+if [ "${ABC_VM:-}" = 1 ]; then
+  if [ "$event" = pre-tool-use ] && ! refused=$(abc-xtask vm billing 2>&1); then
+    deny "$refused"
+  fi
+  if ! broken=$(sh "$(dirname "$0")/../vm/own-disks" "${ABC_WORKTREE:-$CLAUDE_PROJECT_DIR}" 2>&1); then
+    case $event in
+      pre-tool-use) deny "$broken" ;;
+      stop) hold "$broken" "$broken After 5 stops held like this one, the next is let through." ;;
+    esac
+  fi
 fi
 if cd "$CLAUDE_PROJECT_DIR" 2>/dev/null; then
   output=$(printf '%s' "$input" |
@@ -119,27 +153,10 @@ case $event in
     answer "{\"systemMessage\":\"warning: the git guard could not run: $(json_text "$why"); allowing a command that does not mention git or gh\"}"
     ;;
   stop)
-    count=$(cat "$holds" 2>/dev/null)
-    case $count in
-      '' | *[!0-9]*) count=0 ;;
-    esac
-    # A hold that cannot be counted is never made, so the cap always holds.
-    if [ "$count" -lt 5 ] && mkdir -p "$CLAUDE_PROJECT_DIR/.abc" 2>/dev/null &&
-      printf '%s\n' $((count + 1)) >"$holds.$$" 2>/dev/null && mv "$holds.$$" "$holds"; then
-      if [ "$status" -eq 3 ]; then
-        answer "{\"decision\":\"block\",\"reason\":\"$(json_text "$why") Fix what the check reports. After 5 stops held like this one, the next is let through.\"}"
-      fi
-      answer "{\"decision\":\"block\",\"reason\":\"$(json_text "$why"), so the check cannot pass. Make xtask build again (cargo build --manifest-path xtask/Cargo.toml). A BLOCKED declaration is judged once it does; after 5 stops held like this one, the next is let through.\"}"
+    if [ "$status" -eq 3 ]; then
+      hold "$why" "$why Fix what the check reports. After 5 stops held like this one, the next is let through."
     fi
-    rm -f "$holds" "$holds.$$"
-    if [ "$count" -ge 5 ]; then
-      {
-        printf '\n## Unix time %s: launcher backstop\n\n' "$(date +%s)"
-        printf 'The stop hook let a stop of %s through after %s blocked stops in a row: %s\n' \
-          "$who" "$count" "$why"
-      } >>"$CLAUDE_PROJECT_DIR/.abc/stop-backstop.md" 2>/dev/null
-    fi
-    answer "{\"systemMessage\":\"$(json_text "$why"); $count stops in a row were held, so this stop is allowed with no check.\"}"
+    hold "$why" "$why, so the check cannot pass. Make xtask build again (cargo build --manifest-path xtask/Cargo.toml). A BLOCKED declaration is judged once it does; after 5 stops held like this one, the next is let through."
     ;;
 esac
 echo "xtask hook: unknown event '$event'; use pre-tool-use or stop" >&2

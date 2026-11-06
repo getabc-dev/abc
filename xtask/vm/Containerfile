@@ -100,6 +100,7 @@ RUN mv /opt/abc-src/.tools /opt/abc-tools \
  && install -m 755 /opt/abc-src/abc-xtask /usr/local/bin/abc-xtask \
  && install -m 755 /opt/abc-src/xtask/vm/entrypoint.sh /usr/local/bin/abc-entrypoint \
  && install -m 755 /opt/abc-src/xtask/vm/agent-exec /usr/local/bin/agent-exec \
+ && install -m 755 /opt/abc-src/xtask/vm/own-disks /usr/local/bin/abc-own-disks \
  && install -m 644 /opt/abc-src/xtask/vm/gitconfig /etc/gitconfig \
  && find / -xdev -perm /6000 -type f -exec chmod ug-s {} +
 ENTRYPOINT ["/usr/local/bin/abc-entrypoint"]

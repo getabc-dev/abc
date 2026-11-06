@@ -1,0 +1,37 @@
+#!/bin/sh
+# Fails, naming the fix, unless target/ and .tools/ in the agent VM's worktree $1 are each on a
+# filesystem other than the worktree's: the session's own disks (xtask/src/vm/mod.rs, D37). The
+# worktree is the host's directory, shared into the VM; builds and tools that land there fill the
+# host's disk through a mount the VM sees as nearly full. In S0 PR 5a the host's target/ was
+# deleted while the VM ran, which unmounted the VM's 60 GB build disk, and builds went to the
+# shared mount unnoticed until its free space kept falling. The hook launcher (xtask/hooks/hook.sh)
+# runs this before every tool call and every stop, and agent-exec before every command a session
+# runs, so nothing runs on the wrong disk.
+set -u
+worktree=${1:?usage: own-disks WORKTREE}
+
+# The device of the filesystem $1 resolves to: GNU stat in the VM, BSD stat on a Mac running the
+# tests.
+device() {
+  stat -L -c %d "$1" 2>/dev/null || stat -L -f %d "$1" 2>/dev/null
+}
+
+if ! shared=$(device "$worktree"); then
+  echo "own-disks: $worktree does not exist" >&2
+  exit 1
+fi
+wrong=
+for dir in target .tools; do
+  own=$(device "$worktree/$dir") || own=
+  if [ -z "$own" ] || [ "$own" = "$shared" ]; then
+    wrong="$wrong $dir/"
+  fi
+done
+if [ -n "$wrong" ]; then
+  echo "Agent VM storage is broken:$wrong in $worktree is not the session's own disk, so builds and \
+tools would fill the worktree mount the VM shares with the host. Nothing inside the VM can fix \
+this, and every command fails until it is fixed. On the host, from the main clone, run: cargo \
+xtask vm stop $worktree, then cargo xtask vm start $worktree. Never delete or move target/ or \
+.tools/ while a VM runs." >&2
+  exit 1
+fi
