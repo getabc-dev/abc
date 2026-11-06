@@ -196,6 +196,12 @@ look.
   - **TextField**: Field, FieldLabel, Input, FieldDescription and FieldError, with the label,
     description and error tied to the input by id; shadcn's Field leaves that to its user.
   - **TitledCard**: Card in a `section` named by its heading, with a Status beside the title.
+  - **CopyableText**: a command or secret a person pastes elsewhere, in a mono well with a Copy
+    Button. shadcn's only copy control is `code-block`, which brings the shiki highlighter for
+    plain text. The whole value always shows, wrapping inside its box at any width; Copy puts
+    exactly the value on the clipboard, says "Copied" for two seconds through a live region, and
+    selects the value instead where the clipboard is refused. The end-to-end checks fail on any
+    code box that clips its text.
   - **Status**: Badge with a dot and a word for a state (`success`, `warning`, `danger`,
     `neutral`). The word is always there: colour is never the only signal.
   - **Logo**: abc's name in mono on an ink tile. shadcn has no logo, and Avatar is a person's.

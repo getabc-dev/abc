@@ -3,6 +3,7 @@
 // - at phone width, every control is at least 44 by 44 px;
 // - no navigation label overflows its entry or the rail;
 // - on the desktop, no form field is wider than a reading width;
+// - no code box clips its text: a command or token shows whole, wrapping inside its box;
 // - the theme changes colours only: every element sits where it sat in the other theme.
 
 import type { Page } from "@playwright/test";
@@ -53,6 +54,13 @@ function problems(page: Page): Promise<string[]> {
           ) {
             found.push(`the label ${named(label)} overflows its entry or the rail`);
           }
+        }
+      }
+      for (const code of document.querySelectorAll("pre, code")) {
+        if (shown(code) && code.scrollWidth > code.clientWidth) {
+          found.push(
+            `the code ${named(code)} is clipped: ${code.scrollWidth} px of text in ${code.clientWidth} px`,
+          );
         }
       }
       for (const control of document.querySelectorAll(controls)) {

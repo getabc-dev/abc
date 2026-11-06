@@ -5,6 +5,7 @@
 import { LaptopIcon, ServerIcon } from "lucide-react";
 import type { ReactNode } from "react";
 
+import { CopyableText } from "@/components/CopyableText";
 import { Status, type Tone } from "@/components/Status";
 import { TextField } from "@/components/TextField";
 import { TitledCard } from "@/components/TitledCard";
@@ -85,15 +86,6 @@ function Machine({ machine }: { readonly machine: MachineCard }) {
   );
 }
 
-/** A command to run, set in mono in a well. */
-function CommandLine({ children }: { readonly children: string }) {
-  return (
-    <pre className="mt-1.5 overflow-x-auto rounded-lg border bg-sunken px-3 py-2 font-mono text-foreground text-xs">
-      <code>{children}</code>
-    </pre>
-  );
-}
-
 function EnrolPanel({
   first,
   origin,
@@ -114,15 +106,16 @@ function EnrolPanel({
         <ol className="flex list-decimal flex-col gap-4 pl-5 text-foreground">
           <li>
             On the machine, with abc installed, run:
-            <CommandLine>{`abc worker enrol ${origin}`}</CommandLine>
+            <CopyableText value={`abc worker enrol ${origin}`} label="the enrol command" />
           </li>
           <li>
             When it asks, paste this token. It works once, until{" "}
-            {formatInstant(step.token.expires_at)}:<CommandLine>{step.token.token}</CommandLine>
+            {formatInstant(step.token.expires_at)}:
+            <CopyableText value={step.token.token} label="the token" />
           </li>
           <li>
             Then start the worker, which keeps the machine online:
-            <CommandLine>abc worker</CommandLine>
+            <CopyableText value="abc worker" label="the worker command" />
           </li>
         </ol>
         <p className="mt-4 text-muted-foreground text-xs">

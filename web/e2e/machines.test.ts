@@ -45,6 +45,17 @@ test("a machine enrols, comes online, goes offline, and the page resumes after a
   await expect(page.getByText(`abc worker enrol ${ORIGIN}`)).toBeVisible();
   const token = (await page.locator("code", { hasText: /^abc_enr_/ }).textContent()) ?? "";
   expect(token).toMatch(/^abc_enr_/);
+  // Copy puts exactly what is shown on the clipboard: no prompt, no newline.
+  await page.context().grantPermissions(["clipboard-read", "clipboard-write"], { origin: ORIGIN });
+  const clipboard = () => page.evaluate(() => navigator.clipboard.readText());
+  await page.getByRole("button", { name: "Copy the enrol command" }).click();
+  await expect(
+    page.getByRole("status").filter({ hasText: "Copied the enrol command" }),
+  ).toBeAttached();
+  expect(await clipboard()).toBe(`abc worker enrol ${ORIGIN}`);
+  await page.getByRole("button", { name: "Copy the token" }).click();
+  await expect(page.getByRole("status").filter({ hasText: "Copied the token" })).toBeAttached();
+  expect(await clipboard()).toBe(token);
   await shoot(page, "machines-enrol-token");
   // Marks this page load: a reload would lose it.
   await page.evaluate(() => {

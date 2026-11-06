@@ -19,6 +19,7 @@ import { Button } from "@/components/ui/button";
 import { stubMatchMedia } from "@/testing";
 
 import { AppShell, initials, type MachinePill } from "./AppShell";
+import { CopyableText } from "./CopyableText";
 import { Status } from "./Status";
 import { TextField } from "./TextField";
 import { ThemeMenu } from "./ThemeMenu";
@@ -273,5 +274,68 @@ describe("AppShell", () => {
     expect(initials("  Ada  King Lovelace ")).toBe("AK");
     expect(initials("élise ñ")).toBe("ÉÑ");
     expect(initials("")).toBe("");
+  });
+});
+
+describe("CopyableText", () => {
+  test("shows the whole value and copies exactly it, saying Copied to screen readers", async () => {
+    const user = userEvent.setup();
+    const value = "abc_enr_7hQ2xL9vKp3mN8rT4wY6zB1cD5fG0jH2kL4nP6qR8sT0vX2yZ4";
+    render(<CopyableText value={value} label="the token" />);
+    expect(screen.getByText(value).tagName).toBe("CODE");
+    const button = screen.getByRole("button", { name: "Copy the token" });
+    expect(button.textContent).toBe("Copy");
+    await user.click(button);
+    await waitFor(() => {
+      expect(button.textContent).toBe("Copied");
+    });
+    expect(await navigator.clipboard.readText()).toBe(value);
+    expect(screen.getByRole("status").textContent).toBe("Copied the token");
+  });
+
+  test("says Copied only for a moment", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime.bind(vi) });
+      render(<CopyableText value="abc worker" label="the worker command" />);
+      const button = screen.getByRole("button", { name: "Copy the worker command" });
+      await user.click(button);
+      await waitFor(() => {
+        expect(button.textContent).toBe("Copied");
+      });
+      vi.advanceTimersByTime(1999);
+      expect(button.textContent).toBe("Copied");
+      vi.advanceTimersByTime(1);
+      await waitFor(() => {
+        expect(button.textContent).toBe("Copy");
+      });
+      expect(screen.getByRole("status").textContent).toBe("");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("selects the value when the clipboard is refused", async () => {
+    const user = userEvent.setup();
+    const refused = vi
+      .spyOn(navigator.clipboard, "writeText")
+      .mockRejectedValue(new DOMException("refused", "NotAllowedError"));
+    try {
+      render(
+        <CopyableText value="abc worker enrol https://abc.example.ts.net" label="the command" />,
+      );
+      await user.click(screen.getByRole("button", { name: "Copy the command" }));
+      await waitFor(() => {
+        expect(window.getSelection()?.toString()).toBe(
+          "abc worker enrol https://abc.example.ts.net",
+        );
+      });
+      expect(screen.getByRole("status").textContent).toBe(
+        "Selected the command; copy it with your keyboard",
+      );
+      expect(screen.getByRole("button", { name: "Copy the command" }).textContent).toBe("Copy");
+    } finally {
+      refused.mockRestore();
+    }
   });
 });
