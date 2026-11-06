@@ -16,6 +16,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "rustix",
  "rustls",
  "rustls-platform-verifier",
  "semver",

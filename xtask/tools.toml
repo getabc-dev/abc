@@ -42,13 +42,13 @@
 [[tool]]
 name = "cargo-nextest"
 for-tests = true
-version = "0.9.150"
+version = "0.9.151"
 url = "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-{version}/cargo-nextest-{version}-{platform}.tar.gz"
 binary = "cargo-nextest"
 checksums = "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-{version}/cargo-nextest-{version}-{platform}.sha256"
-targets.aarch64-apple-darwin = { platform = "universal-apple-darwin", sha256 = "82a759b4d218d38359424196ab244c470e8f7c7d149c814fbbeef4d67c3c301a", binary-sha256 = "aad9d409cd2f0a81fcaed49d7672a133254179458436c1e957505e4a11655329" }
-targets.x86_64-unknown-linux-gnu = { platform = "x86_64-unknown-linux-gnu", sha256 = "b0959bc64232974224cf9fb22c915845398c0e8668fa7831eb5b43fb1eef781f", binary-sha256 = "62dcc4348e189f5fbd5881f6b753c59d62f2e664b28c6357898644288d703c02" }
-targets.aarch64-unknown-linux-gnu = { platform = "aarch64-unknown-linux-gnu", sha256 = "9164568e9840c6509177086828ac7d3178c2d8feb0658b4d2bff62fa620e98c8", binary-sha256 = "5f9b5ea1599590cbbe1e3487746af3d707ab0c52a5aba784c0b139d39a7aa51b" }
+targets.aarch64-apple-darwin = { platform = "universal-apple-darwin", sha256 = "d1d7d025d4bfc9fb154cd76aea3949bd78534829a0589abefa6e5dd4edb135dd", binary-sha256 = "3237e5aac4329859cf9ff8bd4e07a53cffa6b30815f57059b3fa7411f9f2cf02" }
+targets.x86_64-unknown-linux-gnu = { platform = "x86_64-unknown-linux-gnu", sha256 = "1d4ce302b820c41f4b89c5fb9bce45f0f0c94882c1cf08fc360caf08be6e7df4", binary-sha256 = "f746a548e01a5ec9f50d209ff3188fbf934a4969bddb1cd84a17af087912219b" }
+targets.aarch64-unknown-linux-gnu = { platform = "aarch64-unknown-linux-gnu", sha256 = "3e35e8f6913af92558ba09d7155f74e35dd1f0024ef3cd891637433ae4eacbdd", binary-sha256 = "ea6cf5e032f927d9400b06ce45fb1bab454525771c7a8157f90ac6d12afe5b14" }
 
 [[tool]]
 name = "cargo-deny"
@@ -72,13 +72,13 @@ targets.aarch64-unknown-linux-gnu = { platform = "aarch64-unknown-linux-gnu", sh
 
 [[tool]]
 name = "zizmor"
-version = "1.31.1"
+version = "1.32.0"
 url = "https://github.com/zizmorcore/zizmor/releases/download/v{version}/zizmor-{platform}.tar.gz"
 attestations = "zizmorcore/zizmor"
 binary = "zizmor"
-targets.aarch64-apple-darwin = { platform = "aarch64-apple-darwin", sha256 = "ad5aa633cd56215b11e6c51d51f90c7e6b22904a75047d1215abbd422f61d698", binary-sha256 = "200733b2102e1bf5d53acfed2ab303fadf136532578a1ba9ec076c5bc543e70a" }
-targets.x86_64-unknown-linux-gnu = { platform = "x86_64-unknown-linux-gnu", sha256 = "d185f726bdaf92df78273217dfdd24ebcd6b0ef48cf3ce776ff5762b6e138c99", binary-sha256 = "dc3bb05237ddd11c62ac19cf5ac1c633acd228e386b7e18f9adb3498873d271f" }
-targets.aarch64-unknown-linux-gnu = { platform = "aarch64-unknown-linux-gnu", sha256 = "37eebbd5762a44f262d94875431b14a6d2402991e90a685113ea97b8b41be833", binary-sha256 = "e2cf0a73958aed6646f7937dcf647dd86b52d49eb2b4190a81b17fa63123f8b0" }
+targets.aarch64-apple-darwin = { platform = "aarch64-apple-darwin", sha256 = "6efed18c4539a663fd3c851a2be9533fd8456c4e646d9416206da059154a0d3c", binary-sha256 = "fd1e0503f98714dac56fb6859ccb8ddbac2dc1eb00562dc9d174c6858994c0f1" }
+targets.x86_64-unknown-linux-gnu = { platform = "x86_64-unknown-linux-gnu", sha256 = "bb110cc765eca9cd7efb2e284a956be5974c60027b0970f16397d86208a9957b", binary-sha256 = "04d55fb88e582a8e9a9ce6b4753df723fc44c35e0d1a8e8771db9e017066c6df" }
+targets.aarch64-unknown-linux-gnu = { platform = "aarch64-unknown-linux-gnu", sha256 = "cb152b207f815116d7fa1c1ee4614f61578803351395052908095e79adfd9fd0", binary-sha256 = "5056aebea3b0ec5238921c5fd11dae104fdb65589e3ed0a8bb2e06ef85d6e809" }
 
 [[tool]]
 name = "pinact"
@@ -193,11 +193,11 @@ targets.aarch64-unknown-linux-gnu = { platform = "linux-arm64", sha256 = "439e9c
 [[tool]]
 name = "pnpm"
 for-tests = true
-version = "12.16.1"
+version = "12.17.0"
 url = "https://github.com/pnpm/pnpm/releases/download/v{version}/pnpm-{platform}.tar.gz"
 attestations = "pnpm/pnpm"
 binary = "pnpm"
 tree = true
-targets.aarch64-apple-darwin = { platform = "darwin-arm64", sha256 = "6661212a6ec725634b0d3268e5bc9408e3152506dab5997891e38fa1ef22bf9c", binary-sha256 = "dbeac289e38258dbbe9c2aa3e51e33be2c5118682b05dd20d7f2e0fd11f38b95", tree-sha256 = "f64bdd362d65a8cc6acc397e0194a0bcf0e54c007f3c2dd0123e37e013f810e4" }
-targets.x86_64-unknown-linux-gnu = { platform = "linux-x64", sha256 = "565ff81174a14f6f7bd5d84c1b17e51031a80230d370a1fe24be5d16bd02a825", binary-sha256 = "41fe8049fc73f4239b99487c35def4eacdb3cb18659a6003573500e3cc313628", tree-sha256 = "e620393fb758fa6453ec4cd912f5d50390f90d6d0291a77c2bc41f467f77d2e6" }
-targets.aarch64-unknown-linux-gnu = { platform = "linux-arm64", sha256 = "f5847699e5d528f8f8e9bcfb385e58cb9fba7482af1b1aa7b70737be42277f81", binary-sha256 = "428d76b78652ad48553d9a663e031b20109effb5df6ae701c233c795a65bcff7", tree-sha256 = "227053eae305f03952e8ac77deaea12d23b018aaeafa70e3cd198028382c4237" }
+targets.aarch64-apple-darwin = { platform = "darwin-arm64", sha256 = "446c334d493bdfc6cc2db693764d1812fca06456f6a4be7996a13d7008780239", binary-sha256 = "be145d57690a2cabc1f770a62446c7b39a52af72ff2348fb9eaa69f1809bf250", tree-sha256 = "2f2889a8bc310ceee09fcf4058088da83c6e7d6a8e2fa8d211f2d8be7fbc21fb" }
+targets.x86_64-unknown-linux-gnu = { platform = "linux-x64", sha256 = "2c58959fd5df5cb9f4e72784c08a60ffc7ee558fed9b04b22254e29112203a51", binary-sha256 = "46e1d356cdef24c2f8a202de1b00e111fb95f2ded50f80f026ca5bcc0b8d6693", tree-sha256 = "58eb36f07771f4a0e2a48c67c442e424562c24f6ab2de5aef9deaf6b77e645c1" }
+targets.aarch64-unknown-linux-gnu = { platform = "linux-arm64", sha256 = "ce5a5b95a9974a0bbd713a5ef74416dbcd0e3fdf11f69ea92c5995b9c18ccb47", binary-sha256 = "cd5359326a79f3d24de2f6e1080581221737234fc201d8b5f660dc930966c264", tree-sha256 = "3da4057f5234394562bbb3787a6dada0a1fd6452d2017158bdede1b9ca66f648" }

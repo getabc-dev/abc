@@ -35,7 +35,7 @@ use crate::git;
 /// The gate files: whatever decides what passes. CODEOWNERS patterns, the single list both the
 /// check and `.github/CODEOWNERS` follow: a trailing `/` covers a directory, anything else is one
 /// file, both from the repository root.
-pub(crate) const GATES: [&str; 29] = [
+pub(crate) const GATES: [&str; 30] = [
     "/.cargo/",
     "/.claude/settings.json",
     "/.config/",
@@ -56,6 +56,7 @@ pub(crate) const GATES: [&str; 29] = [
     "/web/.oxlintrc.json",
     "/web/biome.json",
     "/web/knip.jsonc",
+    "/web/osv-scanner.toml",
     "/web/package.json",
     "/web/playwright.config.ts",
     "/web/pnpm-lock.yaml",
@@ -628,6 +629,7 @@ mod tests {
             "xtask/src/tools.rs",
             "xtask/Cargo.toml",
             ".claude/settings.json",
+            "web/osv-scanner.toml",
         ] {
             assert!(is_gate_file(path), "{path} is a gate file");
         }
@@ -640,6 +642,34 @@ mod tests {
             "xtask",
         ] {
             assert!(!is_gate_file(path), "{path} is not a gate file");
+        }
+    }
+
+    /// osv-scanner's ignores are scoped and temporary: each names one advisory, says why it
+    /// cannot reach what abc ships, and expires, so the scan fails again unless someone renews
+    /// it on purpose.
+    #[test]
+    fn every_osv_ignore_names_its_reason_and_expires() {
+        let config: toml_edit::DocumentMut = include_str!("../../../web/osv-scanner.toml")
+            .parse()
+            .unwrap();
+        let ignores = config["IgnoredVulns"].as_array_of_tables().unwrap();
+        assert!(!ignores.is_empty(), "the config ignores something");
+        for ignore in ignores {
+            let id = ignore["id"].as_str().unwrap();
+            assert!(id.starts_with("GHSA-"), "{id} is one advisory");
+            assert!(
+                ignore["ignoreUntil"].as_datetime().is_some(),
+                "{id} has an ignoreUntil date"
+            );
+            assert!(
+                ignore["reason"]
+                    .as_str()
+                    .is_some_and(|reason| reason.len() > 40),
+                "{id} says why"
+            );
+            let keys: Vec<&str> = ignore.iter().map(|(key, _)| key).collect();
+            assert_eq!(keys, ["id", "ignoreUntil", "reason"], "{id}'s fields");
         }
     }
 

@@ -5,8 +5,9 @@
 //! a person has to act, so a service manager should not restart it.
 
 use std::error::Error as StdError;
-use std::io::{BufRead as _, IsTerminal as _, Write as _};
+use std::io::{IsTerminal as _, Write as _};
 use std::net::SocketAddr;
+use std::os::fd::AsFd as _;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
@@ -20,6 +21,8 @@ use abc_store::{DatabaseUrl, ExecuteError, Store, StoreOptions};
 use abc_worker::{Env, IfEnrolled, WorkerHome};
 use clap::{Parser, Subcommand};
 use zeroize::Zeroizing;
+
+mod secret_input;
 
 // The web app, embedded by build.rs from web/dist.
 include!(concat!(env!("OUT_DIR"), "/web.rs"));
@@ -345,12 +348,12 @@ fn enrolment_token() -> Result<Secret<EnrolmentToken>, Box<dyn StdError>> {
         Ok(text) => Zeroizing::new(text),
         Err(_unset) => {
             let stdin = std::io::stdin();
-            if stdin.is_terminal() {
+            let terminal = stdin.is_terminal();
+            if terminal {
                 write!(std::io::stderr().lock(), "Paste the enrolment token: ")?;
             }
-            let mut line = Zeroizing::new(String::new());
-            stdin.lock().read_line(&mut line)?;
-            line
+            // On a terminal the token is not echoed, so it stays out of the scrollback.
+            secret_input::read_line(&mut stdin.lock(), terminal.then(|| stdin.as_fd()))?
         }
     };
     EnrolmentToken::parse(text.trim()).map_err(|error| {

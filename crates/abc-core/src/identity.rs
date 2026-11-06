@@ -87,6 +87,9 @@ macro_rules! bounded_text {
         #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, TS, JsonSchema)]
         #[serde(try_from = "String")]
         #[ts(type = "string")]
+        // The JSON Schema carries the bounds, in characters (code points) after trimming, and the
+        // web app's one validator reads them (`web/src/names.ts`).
+        #[schemars(extend("minLength" = 1, "maxLength" = NAME_MAX))]
         pub struct $name(String);
 
         impl $name {

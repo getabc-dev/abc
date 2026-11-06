@@ -2,7 +2,11 @@
   "extends": "./tsconfig.base.json",
   "compilerOptions": {
     "lib": ["es2024", "dom", "dom.iterable"],
-    "types": ["vite/client"]
+    "types": ["vite/client"],
+    "paths": { "@/*": ["./src/*"] },
+    // public/theme.js is the one script the browser runs as it is; it is checked as JavaScript.
+    "allowJs": true,
+    "checkJs": true
   },
-  "include": ["src"]
+  "include": ["src", "public/theme.js"]
 }

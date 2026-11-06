@@ -28,6 +28,9 @@
     // A closure passed as a prop is idiomatic React; memoizing every handler costs clarity and
     // buys nothing at this size.
     "react-perf/jsx-no-new-function-as-prop": "off",
+    // Base UI composes through a `render` prop that takes an element (`render={<Link />}`), which
+    // is how shadcn/ui's components are meant to be used.
+    "react-perf/jsx-no-jsx-as-prop": "off",
     // Stylesheets are imported for their effect.
     "import/no-unassigned-import": ["error", { "allow": ["**/*.css"] }],
     "typescript/no-floating-promises": "error",
@@ -52,6 +55,10 @@
     "test-results",
     "playwright-report",
     "src/generated",
-    "src/routeTree.gen.ts"
+    "src/routeTree.gen.ts",
+    // shadcn/ui's registry files, kept as `shadcn add` writes them (DESIGN.md): tsc, knip and the
+    // tests check them; lint rules written for abc's own code would make each refresh a fork.
+    "src/components/ui",
+    "src/hooks/use-mobile.ts"
   ]
 }
