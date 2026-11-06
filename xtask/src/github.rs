@@ -104,22 +104,72 @@ pub(crate) struct Push {
     pub(crate) at: String,
 }
 
-/// Runs a page of the runs API holds.
-const RUNS_PER_PAGE: usize = 100;
+/// A pull request's head, whose push [`push_of`] reads.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Head<'a> {
+    pub(crate) sha: &'a str,
+    /// The repository the head branch is in, `owner/name`: a fork's for a fork's pull request.
+    pub(crate) repository: &'a str,
+    pub(crate) branch: &'a str,
+}
 
-/// The push of `head`, read from its earliest `pull_request` workflow run, whose actor is who
-/// pushed it. Later runs for the same head come from labels, description edits and re-runs, and
-/// name whoever made them: #32's `integrity-approved` re-run was the newest run, so reading the
-/// newest named the maintainer as the pusher. `page` answers a path under the repository with
-/// its JSON; every page is read. Nothing when no run has started yet.
+/// How many items GitHub lists per page at most, as these reads ask for.
+const PER_PAGE: usize = 100;
+
+/// The workflow whose runs are the pull request's pushes: it runs on `pull_request` with
+/// GitHub's default activity types alone (opened, synchronize, reopened), so a label, a
+/// description edit or a review never starts one. A test keeps `.github/workflows/ci.yml` so.
+pub(crate) const PUSH_WORKFLOW: &str = "ci.yml";
+
+/// Every item of the pull request `number`'s timeline, oldest first, read through `page` (a path
+/// under the repository answered with its JSON).
+pub(crate) fn timeline(
+    number: u64,
+    page: &mut impl FnMut(&str) -> anyhow::Result<Value>,
+) -> anyhow::Result<Vec<Value>> {
+    let mut items = Vec::new();
+    for index in 1_u32.. {
+        let path = format!("issues/{number}/timeline?per_page={PER_PAGE}&page={index}");
+        let answer = page(&path)?;
+        let batch = answer
+            .as_array()
+            .with_context(|| format!("GitHub answered {path} with no list"))?;
+        items.extend(batch.iter().cloned());
+        if batch.len() < PER_PAGE {
+            break;
+        }
+    }
+    Ok(items)
+}
+
+/// The latest push that made `head` the pull request's head, from the pull request's own
+/// records: the [`PUSH_WORKFLOW`] runs for `head` on its head branch, its `head_ref_force_pushed`
+/// events and its `reopened` events in `timeline`, whichever came last; `page` answers a path
+/// under the repository with its JSON, and every page is read. Nothing when none of them records
+/// `head` itself, as when no run has started yet: the push is then unknown.
+///
+/// The timeline cannot give it alone: its `committed` items carry only the commit's own dates,
+/// which its author sets, and no pusher. Any run cannot either: #32's `integrity-approved` label
+/// started runs that named the maintainer, and the earliest run for a head can belong to another
+/// pull request with the same head, or be older than a force push that brought the head back
+/// after an approval.
 pub(crate) fn push_of(
-    head: &str,
+    head: Head<'_>,
+    timeline: &[Value],
     page: &mut impl FnMut(&str) -> anyhow::Result<Value>,
 ) -> anyhow::Result<Option<Push>> {
-    let mut earliest: Option<Push> = None;
+    let mut latest: Option<Push> = None;
+    let mut keep = |push: Push| {
+        // Of two in the same second, the first read stays: GitHub lists runs newest first.
+        if latest.as_ref().is_none_or(|last| push.at > last.at) {
+            latest = Some(push);
+        }
+    };
+    let mut recorded = false;
     for number in 1_u32.. {
         let path = format!(
-            "actions/runs?event=pull_request&head_sha={head}&per_page={RUNS_PER_PAGE}&page={number}"
+            "actions/workflows/{PUSH_WORKFLOW}/runs?event=pull_request&head_sha={}&per_page={PER_PAGE}&page={number}",
+            head.sha
         );
         let answer = page(&path)?;
         let runs = answer
@@ -127,27 +177,46 @@ pub(crate) fn push_of(
             .and_then(Value::as_array)
             .with_context(|| format!("GitHub answered {path} without workflow_runs"))?;
         for run in runs {
-            let field = |pointer: &str| {
-                run.pointer(pointer)
-                    .and_then(Value::as_str)
-                    .map(str::to_owned)
-                    .with_context(|| format!("a workflow run for {head} has no {pointer}"))
-            };
-            let push = Push {
-                pusher: field("/actor/login")?,
-                at: field("/created_at")?,
-            };
-            // GitHub lists runs newest first, so of two in the same second the later listed is
-            // the older: a push and a label's run can share one.
-            if earliest.as_ref().is_none_or(|first| push.at <= first.at) {
-                earliest = Some(push);
+            let text = |pointer: &str| run.pointer(pointer).and_then(Value::as_str);
+            // The same commit can head another pull request, from a fork or another branch.
+            if text("/head_repository/full_name") != Some(head.repository)
+                || text("/head_branch") != Some(head.branch)
+                || text("/head_sha") != Some(head.sha)
+            {
+                continue;
             }
+            recorded = true;
+            keep(push(run, "a workflow run")?);
         }
-        if runs.len() < RUNS_PER_PAGE {
+        if runs.len() < PER_PAGE {
             break;
         }
     }
-    Ok(earliest)
+    for item in timeline {
+        match item.get("event").and_then(Value::as_str) {
+            Some("head_ref_force_pushed") => {
+                recorded |= item.get("commit_id").and_then(Value::as_str) == Some(head.sha);
+                keep(push(item, "a head_ref_force_pushed event")?);
+            }
+            Some("reopened") => keep(push(item, "a reopened event")?),
+            _ => {}
+        }
+    }
+    Ok(latest.filter(|_| recorded))
+}
+
+/// The push `item` (a run or a timeline event, `what`) records: its actor and creation time.
+fn push(item: &Value, what: &str) -> anyhow::Result<Push> {
+    let field = |pointer: &str| {
+        item.pointer(pointer)
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .with_context(|| format!("{what} has no {pointer}"))
+    };
+    Ok(Push {
+        pusher: field("/actor/login")?,
+        at: field("/created_at")?,
+    })
 }
 
 /// Runs `work` with a token from `mint`, then revokes the token with `revoke`, whatever `work`
@@ -219,6 +288,29 @@ pub(crate) fn http<'a>(
 #[cfg(test)]
 mod tests {
     use serde_json::json;
+
+    /// [`push_of`] reads pushes from [`PUSH_WORKFLOW`]'s runs, so nothing but a push or a
+    /// reopen may start one: GitHub's default `pull_request` activity types.
+    #[test]
+    fn the_push_workflow_runs_on_pushes_alone() {
+        let text = crate::testing::read_in_repository(&format!(
+            ".github/workflows/{}",
+            super::PUSH_WORKFLOW
+        ));
+        let workflow = &yaml_rust2::YamlLoader::load_from_str(&text).unwrap()[0];
+        let trigger = &workflow["on"]["pull_request"];
+        assert!(
+            !trigger.is_badvalue(),
+            "{} runs on pull_request",
+            super::PUSH_WORKFLOW
+        );
+        assert!(
+            trigger["types"].is_badvalue(),
+            "{} keeps the default types (opened, synchronize, reopened); a label or edit that \
+             started it would read as a push: {trigger:?}",
+            super::PUSH_WORKFLOW
+        );
+    }
 
     use super::{Repo, Request, get, graphql, http, with_token};
     use crate::testing::serve;

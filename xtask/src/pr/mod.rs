@@ -279,14 +279,24 @@ fn update(
             .saturating_add(body.len()),
     )?;
     let head = text(&pull, "/head/sha").to_owned();
-    let pusher = github::push_of(&head, &mut |path| github::get(send, repo.path(path)))?
-        .with_context(|| {
-            format!(
-                "no CI run for #{number}'s head {head} yet, so who pushed it is unknown; run this \
-                 again once CI has started"
-            )
-        })?
-        .pusher;
+    let mut page = |path: &str| github::get(send, repo.path(path));
+    let timeline = github::timeline(number, &mut page)?;
+    let pusher = github::push_of(
+        github::Head {
+            sha: &head,
+            repository: text(&pull, "/head/repo/full_name"),
+            branch: head_ref,
+        },
+        &timeline,
+        &mut page,
+    )?
+    .with_context(|| {
+        format!(
+            "no CI run for #{number}'s head {head} yet, so who pushed it is unknown; run this \
+             again once CI has started"
+        )
+    })?
+    .pusher;
     let handover = if pusher == APP_LOGIN {
         format!("pr: the latest push to #{number} is the agent App's; the hand-over is done")
     } else {

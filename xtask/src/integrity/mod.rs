@@ -843,9 +843,9 @@ mod tests {
         move |url: &str, token: &str| {
             assert_eq!(token, "token", "the token CI gives");
             Ok(if url.ends_with("/pulls/7") {
-                br#"{"head": {"sha": "abc"}, "labels": [{"name": "integrity-approved"}]}"#.to_vec()
-            } else if url.contains("/actions/runs") {
-                br#"{"workflow_runs": [{"created_at": "2026-11-01T09:00:00Z", "actor": {"login": "getabc-dev-agent[bot]"}}]}"#.to_vec()
+                br#"{"head": {"sha": "abc", "ref": "agent/x", "repo": {"full_name": "o/r"}}, "labels": [{"name": "integrity-approved"}]}"#.to_vec()
+            } else if url.contains("/actions/workflows/ci.yml/runs") {
+                br#"{"workflow_runs": [{"head_sha": "abc", "head_branch": "agent/x", "head_repository": {"full_name": "o/r"}, "created_at": "2026-11-01T09:00:00Z", "actor": {"login": "getabc-dev-agent[bot]"}}]}"#.to_vec()
             } else if url.ends_with("page=1") {
                 format!(r#"[{{"event": "labeled", "created_at": "2026-11-01T10:00:00Z", "actor": {{"login": "{login}"}}, "label": {{"name": "integrity-approved"}}}}]"#).into_bytes()
             } else {

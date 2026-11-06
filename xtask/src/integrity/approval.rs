@@ -2,8 +2,9 @@
 //!
 //! An approver listed in `.github/integrity-approvers` at the merge base (so a pull request cannot
 //! name its own approvers) accepts them by adding the label `integrity-approved` after the pull
-//! request's latest push and latest description edit. The push time is when the head commit first
-//! ran a pull request workflow; the label events come from the pull request's timeline. A label
+//! request's latest push and latest description edit. The push time is the latest push that made
+//! the head commit the pull request's head ([`crate::github::push_of`]); the label events come
+//! from the pull request's timeline. A label
 //! that predates the push, was removed, or was added by anyone else does not count, and a run for
 //! a description edit treats any label as stale. A separate CI job also removes the label on every
 //! push and description edit.
@@ -73,6 +74,15 @@ struct Pull {
 #[derive(Deserialize)]
 struct Head {
     sha: String,
+    #[serde(rename = "ref")]
+    branch: String,
+    /// `None` when the fork it came from was deleted.
+    repo: Option<Repository>,
+}
+
+#[derive(Deserialize)]
+struct Repository {
+    full_name: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -105,22 +115,29 @@ pub(super) fn approved(
     let pull: Pull =
         serde_json::from_slice(&fetch(&format!("{base}/pulls/{}", pull_request.number))?)
             .context("could not read the pull request")?;
-    let push = crate::github::push_of(&pull.head.sha, &mut |path| {
+    let mut page = |path: &str| -> anyhow::Result<serde_json::Value> {
         serde_json::from_slice(&fetch(&format!("{base}/{path}"))?)
             .with_context(|| format!("could not read {path}"))
-    })?;
-    let mut events = Vec::new();
-    for page in 1_u32.. {
-        let batch: Vec<TimelineItem> = serde_json::from_slice(&fetch(&format!(
-            "{base}/issues/{}/timeline?per_page=100&page={page}",
-            pull_request.number
-        ))?)
+    };
+    let timeline = crate::github::timeline(pull_request.number, &mut page)?;
+    let push = crate::github::push_of(
+        crate::github::Head {
+            sha: &pull.head.sha,
+            repository: pull
+                .head
+                .repo
+                .as_ref()
+                .map_or("", |repo| repo.full_name.as_str()),
+            branch: &pull.head.branch,
+        },
+        &timeline,
+        &mut page,
+    )?;
+    let events: Vec<TimelineItem> = timeline
+        .into_iter()
+        .map(serde_json::from_value)
+        .collect::<Result<_, _>>()
         .context("could not read the pull request's timeline")?;
-        if batch.is_empty() {
-            break;
-        }
-        events.extend(batch);
-    }
     let pushed = push.as_ref().map(|push| push.at.as_str());
     let labels: Vec<&str> = pull
         .labels
@@ -289,33 +306,115 @@ mod tests {
         }
     }
 
-    #[test]
-    fn reads_the_verdict_from_github() {
-        let pull_request = PullRequest {
+    /// GitHub's recorded replies for #7, whose head `head` is `someone/abc`'s branch `x` and
+    /// carries the label, by URL: `runs` as the head's `ci.yml` runs (and, for the first
+    /// version's query, all its runs) and `timeline`.
+    fn github(
+        head: &'static str,
+        runs: &'static str,
+        timeline: &'static str,
+    ) -> impl FnMut(&str) -> anyhow::Result<Vec<u8>> {
+        move |url: &str| {
+            Ok(if url == "https://api.example/repos/o/r/pulls/7" {
+                format!(
+                    r#"{{"head": {{"sha": "{head}", "ref": "x", "repo": {{"full_name": "someone/abc"}}}}, "labels": [{{"name": "integrity-approved"}}]}}"#
+                )
+                .into_bytes()
+            } else if url.starts_with("https://api.example/repos/o/r/actions/")
+                && url.ends_with("page=1")
+            {
+                runs.as_bytes().to_vec()
+            } else if url.starts_with("https://api.example/repos/o/r/actions/") {
+                br#"{"workflow_runs": []}"#.to_vec()
+            } else if url == "https://api.example/repos/o/r/issues/7/timeline?per_page=100&page=1" {
+                timeline.as_bytes().to_vec()
+            } else {
+                b"[]".to_vec()
+            })
+        }
+    }
+
+    fn pull_request() -> PullRequest {
+        PullRequest {
             api: "https://api.example".to_owned(),
             repository: "o/r".to_owned(),
             number: 7,
             token: "t".to_owned(),
-        };
+        }
+    }
+
+    #[test]
+    fn reads_the_verdict_from_github() {
         let mut asked = Vec::new();
-        let mut fetch = |url: &str| -> anyhow::Result<Vec<u8>> {
+        let mut answer = github(
+            "abc",
+            r#"{"workflow_runs": [{"head_sha": "abc", "head_branch": "x", "head_repository": {"full_name": "someone/abc"}, "created_at": "2026-11-01T09:00:00Z", "actor": {"login": "someone"}}]}"#,
+            TIMELINE,
+        );
+        let mut fetch = |url: &str| {
             asked.push(url.to_owned());
-            Ok(match url {
-                "https://api.example/repos/o/r/pulls/7" => {
-                    br#"{"head": {"sha": "abc"}, "labels": [{"name": "integrity-approved"}]}"#.to_vec()
-                }
-                "https://api.example/repos/o/r/actions/runs?event=pull_request&head_sha=abc&per_page=100&page=1" => {
-                    br#"{"workflow_runs": [{"created_at": "2026-11-01T09:30:00Z", "actor": {"login": "snehilvj"}}, {"created_at": "2026-11-01T09:00:00Z", "actor": {"login": "getabc-dev-agent[bot]"}}]}"#.to_vec()
-                }
-                "https://api.example/repos/o/r/issues/7/timeline?per_page=100&page=1" => TIMELINE.as_bytes().to_vec(),
-                _ => b"[]".to_vec(),
-            })
+            answer(url)
         };
-        let verdict = approved(&pull_request, &logins(), false, &mut fetch).unwrap();
+        let verdict = approved(&pull_request(), &logins(), false, &mut fetch).unwrap();
         assert!(verdict.approved, "{verdict:?}");
         assert!(
-            asked.last().is_some_and(|url| url.ends_with("page=2")),
-            "the timeline is read until an empty page: {asked:?}"
+            asked.iter().any(|url| url
+                == "https://api.example/repos/o/r/actions/workflows/ci.yml/runs?event=pull_request&head_sha=abc&per_page=100&page=1"),
+            "the push is read from ci.yml's runs: {asked:?}"
+        );
+    }
+
+    /// In a fork, where the label job cannot remove the label, force-pushing an earlier commit
+    /// back after an approval kept the approval: the commit's first run predated the label.
+    #[test]
+    fn a_force_push_back_after_the_label_is_not_approved() {
+        let mut fetch = github(
+            "aaa",
+            r#"{"workflow_runs": [{"head_sha": "aaa", "head_branch": "x", "head_repository": {"full_name": "someone/abc"}, "created_at": "2026-11-01T09:00:00Z", "actor": {"login": "someone"}}]}"#,
+            r#"[
+                {"event": "committed", "sha": "aaa"},
+                {"event": "committed", "sha": "bbb"},
+                {"event": "labeled", "created_at": "2026-11-01T10:00:00Z", "actor": {"login": "snehilvj"}, "label": {"name": "integrity-approved"}},
+                {"event": "head_ref_force_pushed", "commit_id": "aaa", "created_at": "2026-11-01T10:30:00Z", "actor": {"login": "someone"}}
+            ]"#,
+        );
+        let verdict = approved(&pull_request(), &logins(), false, &mut fetch).unwrap();
+        assert!(!verdict.approved, "{verdict:?}");
+        assert!(
+            verdict.reason.contains("added before the latest push"),
+            "{verdict:?}"
+        );
+    }
+
+    /// A run for the same commit from another pull request is not this one's push: the same
+    /// commit pushed later elsewhere, after the label, does not make the label stale here, and
+    /// one pushed earlier elsewhere does not make it current.
+    #[test]
+    fn only_this_pull_requests_runs_are_its_push() {
+        let mut fetch = github(
+            "abc",
+            r#"{"workflow_runs": [
+                {"head_sha": "abc", "head_branch": "x", "head_repository": {"full_name": "someone/abc"}, "created_at": "2026-11-01T10:30:00Z", "actor": {"login": "someone"}},
+                {"head_sha": "abc", "head_branch": "y", "head_repository": {"full_name": "o/r"}, "created_at": "2026-11-01T08:00:00Z", "actor": {"login": "other"}}
+            ]}"#,
+            TIMELINE,
+        );
+        let verdict = approved(&pull_request(), &logins(), false, &mut fetch).unwrap();
+        assert!(
+            !verdict.approved,
+            "this branch's push came after the label: {verdict:?}"
+        );
+        let mut unknown = github(
+            "abc",
+            r#"{"workflow_runs": [{"head_sha": "abc", "head_branch": "y", "head_repository": {"full_name": "o/r"}, "created_at": "2026-11-01T08:00:00Z", "actor": {"login": "other"}}]}"#,
+            TIMELINE,
+        );
+        let unknown_push = approved(&pull_request(), &logins(), false, &mut unknown).unwrap();
+        assert!(
+            unknown_push
+                .reason
+                .contains("cannot tell when the head commit was pushed"),
+            "another branch's run is no push of this one: {unknown_push:?}"
         );
     }
 
