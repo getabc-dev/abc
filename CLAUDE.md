@@ -34,7 +34,8 @@ Claude included.
   and pull requests opened or edited with gh rather than `cargo xtask pr`;
   GitHub's ruleset and the agent App's permissions are the enforcement. In an agent VM it first
   runs the image's `abc-xtask vm billing`, the one check made with code the agent cannot change.
-  In an agent VM, both hooks also run `xtask/vm/own-disks` first: while `target/` or `.tools/` is
+  In an agent VM, both hooks also run the image's `abc-own-disks` (built from `xtask/vm/own-disks`)
+  first: while `target/` or `.tools/` is
   not the session's own disk, every tool call is denied and every stop held, naming the fix
   (`vm stop` then `vm start` on the host). Never delete or move `target/` or `.tools/`. Outside this repository, or in a checkout without these hooks, the hooks check nothing.
 - **Watchdog.** Run `cargo xtask task set "<the task>"` when you start a task. When you stop, the

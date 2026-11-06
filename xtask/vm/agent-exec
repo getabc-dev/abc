@@ -6,7 +6,8 @@
 # shells and other commands entered this way never see it. The commands Claude Code itself runs
 # inherit it: Claude Code strips it from them only under its bubblewrap isolation, which on Linux
 # leaves empty placeholder files (package.json, .npmrc, .env and more) in the worktree. It also
-# refuses while target/ or .tools/ is not the session's own disk (xtask/vm/own-disks).
+# refuses while target/ or .tools/ is not the session's own disk (abc-own-disks, the image's build
+# of xtask/vm/own-disks).
 set -eu
 abc-xtask vm billing
 abc-own-disks "${ABC_WORKTREE:?}"

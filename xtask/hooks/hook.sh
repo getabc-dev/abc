@@ -19,12 +19,15 @@
 # could not keep its state to count the hold, so its output is the reason and this script counts
 # the hold. That is all the logic it has.
 #
-# In an agent VM, before xtask is built, the launcher checks what nothing may run without (D37).
-# pre-tool-use runs the image's `abc-xtask vm billing`, code the agent cannot change, and denies
-# every tool call while it finds a credential other than the subscription token. Both events run
-# xtask/vm/own-disks: while target/ or .tools/ is not the session's own disk, every tool call is
-# denied and every stop held as when xtask cannot start, with the fix as the reason, so no build
-# lands on the worktree mount the VM shares with the host.
+# In an agent VM, before xtask is built, the launcher checks what nothing may run without (D37),
+# with the image's programs, code the agent cannot change; never the worktree's copies of them,
+# which a branch can edit or break. pre-tool-use runs `abc-xtask vm billing`, and denies every
+# tool call while it finds a credential other than the subscription token. Both events run
+# `abc-own-disks` (built from xtask/vm/own-disks): while target/ or .tools/ is not the session's
+# own disk, every tool call is denied and every stop held as when xtask cannot start, with the fix
+# as the reason, so no build lands on the worktree mount the VM shares with the host. An image
+# without `abc-own-disks` is treated the same way, naming its rebuild. On the host neither check
+# applies.
 
 event=$1
 input=$(cat)
@@ -84,7 +87,17 @@ if [ "${ABC_VM:-}" = 1 ]; then
   if [ "$event" = pre-tool-use ] && ! refused=$(abc-xtask vm billing 2>&1); then
     deny "$refused"
   fi
-  if ! broken=$(sh "$(dirname "$0")/../vm/own-disks" "${ABC_WORKTREE:-$CLAUDE_PROJECT_DIR}" 2>&1); then
+  if ! command -v abc-own-disks >/dev/null 2>&1; then
+    broken="This agent VM's image has no abc-own-disks, so the hook cannot check that target/ and \
+.tools/ are the session's own disks, and every command fails until it can. On the host, from the \
+main clone, run: cargo xtask vm image, then cargo xtask vm stop and cargo xtask vm start for this \
+worktree."
+    case $event in
+      pre-tool-use) deny "$broken" ;;
+      stop) hold "$broken" "$broken After 5 stops held like this one, the next is let through." ;;
+    esac
+  fi
+  if ! broken=$(abc-own-disks "${ABC_WORKTREE:-$CLAUDE_PROJECT_DIR}" 2>&1); then
     case $event in
       pre-tool-use) deny "$broken" ;;
       stop) hold "$broken" "$broken After 5 stops held like this one, the next is let through." ;;

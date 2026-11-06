@@ -4,9 +4,10 @@
 # worktree is the host's directory, shared into the VM; builds and tools that land there fill the
 # host's disk through a mount the VM sees as nearly full. In S0 PR 5a the host's target/ was
 # deleted while the VM ran, which unmounted the VM's 60 GB build disk, and builds went to the
-# shared mount unnoticed until its free space kept falling. The hook launcher (xtask/hooks/hook.sh)
-# runs this before every tool call and every stop, and agent-exec before every command a session
-# runs, so nothing runs on the wrong disk.
+# shared mount unnoticed until its free space kept falling. The image installs this as
+# abc-own-disks (xtask/vm/Containerfile), and the hook launcher (xtask/hooks/hook.sh) runs that
+# before every tool call and every stop, and agent-exec before every command a session runs, so
+# nothing runs on the wrong disk. Neither runs this copy, which a branch can change.
 set -u
 worktree=${1:?usage: own-disks WORKTREE}
 

@@ -928,6 +928,16 @@ fn launch(shell: &str, event: &str, project: &Path, bin: &Path, input: &str, vm:
         .stderr(Stdio::piped());
     if vm {
         command.env("ABC_VM", "1").env("ABC_WORKTREE", project);
+        // The image's disk check, as xtask/vm/Containerfile installs it, unless the test put
+        // another in its place.
+        let image = bin.join("abc-own-disks");
+        if !image.exists() {
+            fs::copy(
+                crate::repo_root().unwrap().join("xtask/vm/own-disks"),
+                &image,
+            )
+            .unwrap();
+        }
     }
     let mut child = command
         .spawn()
@@ -1340,6 +1350,78 @@ fn in_an_agent_vm_every_tool_call_and_stop_fails_while_a_disk_is_not_its_own() {
             "{shell}"
         );
     }
+}
+
+/// The launcher ran the worktree's xtask/vm/own-disks, which a branch can edit or break. In a VM
+/// it runs the image's `abc-own-disks`, as it runs the image's `abc-xtask vm billing`.
+#[test]
+fn in_an_agent_vm_the_disk_check_is_the_images() {
+    let temp = tempfile::tempdir().unwrap();
+    let project = temp.path();
+    fake_cargo(project, "", 0);
+    script(&project.join("abc-xtask"), "exit 0\n");
+    // Disks the worktree's own copy of the check would pass.
+    own_disks(project);
+    let asked = project.join("asked");
+    script(
+        &project.join("abc-own-disks"),
+        &format!(
+            "echo \"$*\" > {}\necho 'the image says: broken' >&2\nexit 1\n",
+            asked.display()
+        ),
+    );
+    let input = r#"{"tool_name":"Bash","tool_input":{"command":"ls"}}"#;
+    assert_eq!(
+        launch("sh", "pre-tool-use", project, project, input, true).answer(Event::PreToolUse),
+        Answer::Block("the image says: broken".to_owned())
+    );
+    assert_eq!(
+        fs::read_to_string(&asked).unwrap(),
+        format!("{}\n", project.display()),
+        "the session's worktree"
+    );
+}
+
+/// An image built before `abc-own-disks` existed cannot check the disks: every tool call is
+/// denied, naming the rebuild, rather than fall back to a copy the branch can change.
+#[test]
+fn in_an_agent_vm_an_image_without_the_disk_check_names_its_rebuild() {
+    let temp = tempfile::tempdir().unwrap();
+    let project = temp.path();
+    fake_cargo(project, "", 0);
+    script(&project.join("abc-xtask"), "exit 0\n");
+    own_disks(project);
+    let launcher = crate::repo_root().unwrap().join(LAUNCHER);
+    let mut child = Command::new("/bin/sh")
+        .arg(&launcher)
+        .arg("pre-tool-use")
+        // No directory that holds an image's abc-own-disks.
+        .env("PATH", format!("{}:/usr/bin:/bin", project.display()))
+        .env("CLAUDE_PROJECT_DIR", project)
+        .env("ABC_VM", "1")
+        .env("ABC_WORKTREE", project)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    crate::tools::feed(
+        &mut child,
+        &mut &br#"{"tool_name":"Bash","tool_input":{"command":"ls"}}"#[..],
+    )
+    .unwrap();
+    let output = child.wait_with_output().unwrap();
+    let denied = Launched {
+        code: output.status.code(),
+        stdout: String::from_utf8(output.stdout).unwrap(),
+        stderr: String::from_utf8(output.stderr).unwrap(),
+    }
+    .answer(Event::PreToolUse);
+    assert!(
+        matches!(&denied, Answer::Block(reason) if reason.contains("image has no abc-own-disks")
+            && reason.contains("cargo xtask vm image")),
+        "{denied:?}"
+    );
 }
 
 #[test]
