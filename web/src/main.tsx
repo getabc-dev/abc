@@ -10,6 +10,7 @@ const queryClient = new QueryClient();
 const router = createAppRouter({
   api: apiClient((input, init) => fetch(input, init)),
   queryClient,
+  origin: window.location.origin,
 });
 
 const root = document.getElementById("root");

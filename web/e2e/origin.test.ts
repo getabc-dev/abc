@@ -2,7 +2,7 @@
 // origin, so a state-changing request the app makes carries the server's own `Origin`, which the
 // stand-in passes on unchanged, as Serve does. `POST /api/owner/claim` is the state-changing route.
 
-import { expect, test } from "@playwright/test";
+import { expect, test } from "./abc.ts";
 
 /** A well-formed claim. No setup code was issued, so the claim itself refuses it. */
 const claim = {

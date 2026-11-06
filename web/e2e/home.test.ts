@@ -1,7 +1,8 @@
-// The home page, loaded from the real abc binary over a fresh database.
+// The app on an unclaimed server, loaded from the real abc binary over a fresh database.
 
-import { expect, type Page, test } from "@playwright/test";
+import type { Page } from "@playwright/test";
 
+import { expect, test } from "./abc.ts";
 import { LOGIN } from "./identity.ts";
 
 /** Collects the page's console errors and uncaught exceptions, such as a refused script. */
@@ -18,24 +19,26 @@ function errors(page: Page): string[] {
   return seen;
 }
 
-test("the home page shows who the server says the visitor is", async ({ page }) => {
+test("an unclaimed server shows the claim, naming who would own it", async ({ page }) => {
   const seen = errors(page);
   const response = await page.goto("/");
   expect(response?.status()).toBe(200);
   expect(response?.headers()["cache-control"]).toBe("no-cache");
   expect(response?.headers()["content-security-policy"]).toContain("default-src 'self'");
-  await expect(page.getByRole("heading", { level: 1 })).toHaveText("This server is unclaimed");
-  await expect(page.getByText(`You are signed in as ${LOGIN}.`)).toBeVisible();
+  await expect(page.getByRole("heading", { level: 1 })).toHaveText("Claim this server");
+  await expect(page.getByText(LOGIN)).toBeVisible();
+  // The self-hosted fonts load under the CSP.
+  expect(
+    await page.evaluate(async () => (await document.fonts.ready).check("13px 'Inter Variable'")),
+  ).toBe(true);
   expect(seen).toEqual([]);
 });
 
-test("a path of the router loads the app, which says there is no page there", async ({ page }) => {
+test("every path of an unclaimed server leads to the claim", async ({ page }) => {
   const seen = errors(page);
   const response = await page.goto("/nowhere");
   expect(response?.status()).toBe(200);
-  await expect(page.getByRole("heading", { level: 1 })).toHaveText("No page here");
-  await page.getByRole("link", { name: "Go home" }).click();
-  await expect(page.getByRole("heading", { level: 1 })).toHaveText("This server is unclaimed");
+  await expect(page.getByRole("heading", { level: 1 })).toHaveText("Claim this server");
   expect(seen).toEqual([]);
 });
 

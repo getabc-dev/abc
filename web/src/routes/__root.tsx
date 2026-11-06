@@ -1,40 +1,48 @@
 import type { QueryClient } from "@tanstack/react-query";
-import { createRootRouteWithContext, Link, Outlet } from "@tanstack/react-router";
-import { Heading } from "react-aria-components";
+import { createRootRouteWithContext, Outlet, useRouter } from "@tanstack/react-router";
+import { RouterProvider } from "react-aria-components";
 
 import type { ApiClient } from "../api/client";
+import { SessionGate } from "../session/SessionGate";
+import { Card } from "../ui/Card";
+import { Link } from "../ui/Link";
 
-/** What every route can reach: the API client and the query cache. */
+/** What every route can reach. */
 type RouterContext = {
   readonly api: ApiClient;
   readonly queryClient: QueryClient;
+  /** The origin the app was loaded from: the server's public URL. */
+  readonly origin: string;
 };
 
-function RootLayout() {
+function Root() {
+  const router = useRouter();
+  const { api, origin } = Route.useRouteContext();
   return (
-    <main className="mx-auto max-w-2xl p-6 font-sans text-ink">
-      <Outlet />
-    </main>
+    // React Aria's links navigate through the router, without a page load.
+    <RouterProvider
+      navigate={(href) => {
+        router.history.push(href);
+      }}
+    >
+      <SessionGate api={api} origin={origin}>
+        <Outlet />
+      </SessionGate>
+    </RouterProvider>
   );
 }
 
 function NotFound() {
   return (
-    <section aria-labelledby="not-found-title" className="space-y-2">
-      <Heading id="not-found-title" level={1} className="text-xl font-semibold">
-        No page here
-      </Heading>
-      <p className="text-muted">
-        abc has no page at this address.{" "}
-        <Link to="/" className="text-accent underline">
-          Go home
-        </Link>
+    <Card title="No page here" level={1}>
+      <p className="text-ink-muted">
+        abc has no page at this address. <Link href="/">Go home</Link>
       </p>
-    </section>
+    </Card>
   );
 }
 
 export const Route = createRootRouteWithContext<RouterContext>()({
-  component: RootLayout,
+  component: Root,
   notFoundComponent: NotFound,
 });

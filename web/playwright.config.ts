@@ -24,11 +24,27 @@ export default defineConfig({
     ignoreHTTPSErrors: true,
     trace: "retain-on-failure",
   },
-  projects: [{ name: "chromium", use: { ...devices["Desktop Chrome"] } }],
+  // The tests share the run's one server and database, so what one does the next sees, as on a
+  // real server: the unclaimed server first, then the claim, then the claimed server's machines.
+  projects: [
+    { name: "unclaimed", testMatch: /(home|origin)\.test\.ts/, use: devices["Desktop Chrome"] },
+    {
+      name: "claim",
+      testMatch: /claim\.test\.ts/,
+      dependencies: ["unclaimed"],
+      use: devices["Desktop Chrome"],
+    },
+    {
+      name: "machines",
+      testMatch: /machines\.test\.ts/,
+      dependencies: ["claim"],
+      use: devices["Desktop Chrome"],
+    },
+  ],
   webServer: {
     command: "node e2e/sidecar.ts",
-    ...(origin === undefined ? {} : { url: origin }),
-    ignoreHTTPSErrors: true,
+    // The stand-in is up once its port accepts connections; abc behind it starts with the tests.
+    ...(origin === undefined ? {} : { port: Number(new URL(origin).port) }),
     reuseExistingServer: false,
     stdout: "pipe",
   },

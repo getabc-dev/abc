@@ -6,6 +6,11 @@
     <title>abc</title>
     <!-- An empty icon: without a link, the browser asks the server for /favicon.ico. -->
     <link rel="icon" href="data:," />
+    <!--
+      React Aria adds a <style> for pressable elements unless an element with this id exists; the
+      CSP (style-src 'self') would block it, so the rule is in src/styles.css and this marks it.
+    -->
+    <meta id="react-aria-pressable-style" name="abc-pressable-style" content="src/styles.css" />
   </head>
   <body>
     <div id="root"></div>

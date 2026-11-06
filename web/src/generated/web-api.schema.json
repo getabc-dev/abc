@@ -571,7 +571,7 @@
       "type": "string"
     },
     "TokenIssuedResponse": {
-      "description": "The only response that carries a secret: the token, shown once. The web app renders it as a\nready-to-paste `abc worker enrol <url> --token …` command and never stores it.",
+      "description": "The only response that carries a secret: the token, shown once. The web app shows it beside the\n`abc worker enrol <url>` command, which asks for it on standard input so it never reaches a\ncommand line or a shell's history, and never stores it.",
       "type": "object",
       "properties": {
         "expires_at": {

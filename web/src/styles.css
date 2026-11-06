@@ -1,11 +1,75 @@
+/* The fonts, self-hosted: the app's CSP is `default-src 'self'`. */
+@import "@fontsource-variable/inter";
+@import "@fontsource-variable/jetbrains-mono";
 @import "tailwindcss";
 
-/* The design tokens, as CSS variables Tailwind turns into utilities (bg-surface, text-ink, ...). */
+/*
+ * The design tokens of DESIGN.md, which is their source: design.test.ts fails when the two differ.
+ * Tailwind's own colours, fonts, text sizes, radii and shadows are reset, so only these exist.
+ */
 @theme {
-  --font-sans: ui-sans-serif, system-ui, sans-serif;
-  --color-surface: oklch(0.99 0 0);
-  --color-ink: oklch(0.21 0 0);
-  --color-muted: oklch(0.45 0 0);
-  --color-accent: oklch(0.55 0.17 255);
-  --color-danger: oklch(0.55 0.2 25);
+  --color-*: initial;
+  --font-*: initial;
+  --text-*: initial;
+  --radius-*: initial;
+  --shadow-*: initial;
+
+  --color-ground: #f7f7f5;
+  --color-surface: #ffffff;
+  --color-sunken: #fbfbfa;
+  --color-ink: #1c1c1a;
+  --color-ink-muted: #5f5e59;
+  --color-ink-subtle: #6e6d68;
+  --color-rule: #e6e5e1;
+  --color-rule-strong: #d4d2cc;
+  --color-control: #878680;
+  --color-accent: #3451d1;
+  --color-accent-strong: #2639a3;
+  --color-accent-tint: #ebeefa;
+  --color-success: #1f7a3a;
+  --color-success-tint: #e9f2eb;
+  --color-warning: #b35400;
+  --color-warning-ink: #934500;
+  --color-warning-tint: #f7eee6;
+  --color-danger: #b3261e;
+  --color-danger-tint: #f7e9e8;
+  --color-neutral-tint: #eeede9;
+
+  --font-sans: "Inter Variable", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono Variable", ui-monospace, monospace;
+  --text-label: 11px;
+  --text-label--line-height: 16px;
+  --text-sm: 12px;
+  --text-sm--line-height: 16px;
+  --text-base: 13px;
+  --text-base--line-height: 20px;
+  --text-md: 15px;
+  --text-md--line-height: 22px;
+  --text-xl: 22px;
+  --text-xl--line-height: 28px;
+  --tracking-label: 0.06em;
+
+  --spacing: 0.25rem;
+  --radius-chip: 3px;
+  --radius-control: 6px;
+  --radius-nav: 8px;
+  --radius-card: 12px;
+  --shadow-halo: 0 0 0 3px var(--color-accent-tint);
+  --breakpoint-md: 48rem;
+}
+
+@layer base {
+  /* React Aria's rule for pressable elements, which it would add as a <style> the CSP blocks
+     (index.html marks it present): touch keeps panning and zooming, without double-tap delay. */
+  [data-react-aria-pressable] {
+    touch-action: pan-x pan-y pinch-zoom;
+  }
+
+  html {
+    background-color: var(--color-ground);
+    color: var(--color-ink);
+    font-family: var(--font-sans);
+    font-size: var(--text-base);
+    line-height: var(--text-base--line-height);
+  }
 }

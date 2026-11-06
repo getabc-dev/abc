@@ -1,11 +1,13 @@
 //! `cargo xtask e2e`: the web app in a real browser, served by the real binary.
 //!
 //! It builds `abc` as `cargo xtask build` does, creates a fresh database on the test Postgres
-//! server (`ABC_TEST_DATABASE_URL`, else the warm container), starts `abc server` on it with its
-//! sidecar socket in a private directory, and runs Playwright (`web/e2e/`) in Chromium. The
-//! browser reaches the server through `web/e2e/sidecar.ts`, a stand-in for the Tailscale sidecar
-//! that sets the headers Serve sets, as the server's own integration tests do; the server has no
-//! test-only way in. Afterwards the server is stopped and the database dropped.
+//! server (`ABC_TEST_DATABASE_URL`, else the warm container), makes a private directory for the
+//! server's sidecar socket and a certificate for the run, and runs Playwright (`web/e2e/`) in
+//! Chromium with them. The tests start the processes themselves (`web/e2e/abc.ts`): `abc server`,
+//! `abc server setup-code` and real `abc worker`s, since a test restarts the server and stops a
+//! worker. The browser and the workers reach the server through `web/e2e/sidecar.ts`, a stand-in
+//! for the Tailscale sidecar that sets the headers Serve sets, as the server's own integration
+//! tests do; the server has no test-only way in. Afterwards the database is dropped.
 //!
 //! The topology is production's: the browser loads the app from the origin the stand-in answers
 //! on over HTTPS, with a certificate made for the run, and that origin is the server's public URL.
@@ -13,12 +15,10 @@
 //! of forwarded hosts and origins run as they do in production.
 
 use std::fs;
-use std::io::{Read as _, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::io::Write;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
-use std::time::Duration;
+use std::process::Command;
 
 use anyhow::{Context as _, ensure};
 
@@ -30,10 +30,6 @@ const ORIGIN: &str = "https://localhost:4173";
 
 /// The host name the stand-in's certificate names.
 const HOST_NAME: &str = "localhost";
-
-/// How often to ask whether the server is ready, a tenth of a second apart: a minute for it to
-/// migrate its database and start.
-const READY_ATTEMPTS: u32 = 600;
 
 /// Runs the end-to-end tests from `root`, with cargo-sqlx at `sqlx` making and dropping the
 /// database, and reports whether they passed.
@@ -86,7 +82,7 @@ pub(crate) fn run(
         database("create")?,
         "could not create the end-to-end test's database"
     );
-    let passed = serve_and_test(root, toolchain, &url, &run, out);
+    let passed = test_with(root, toolchain, &url, &run, out);
     let dropped = database("drop");
     let passed = passed?;
     ensure!(
@@ -104,13 +100,14 @@ fn run_id() -> String {
     format!("{}_{earlier}", std::process::id())
 }
 
-/// Starts the server on the database at `url`, runs Playwright against it and stops it.
-fn serve_and_test(
+/// Runs Playwright with the binary, the database at `url`, a private socket path and a fresh
+/// certificate, and says where the logs and screenshots are.
+fn test_with(
     root: &Path,
     toolchain: &Toolchain,
     url: &str,
     run: &str,
-    out: &mut impl Write,
+    report: &mut impl Write,
 ) -> anyhow::Result<bool> {
     // A short path of its own: a Unix socket's path is limited to about a hundred bytes.
     let dir = std::env::temp_dir().join(format!("abc-e2e-{run}"));
@@ -127,42 +124,41 @@ fn serve_and_test(
     fs::write(&certificate_file, certificate)
         .with_context(|| format!("could not write {}", certificate_file.display()))?;
     fs::write(&key_file, key).with_context(|| format!("could not write {}", key_file.display()))?;
-    let log = root.join("target/e2e/server.log");
-    let ops = free_port()?;
-    let mut server = start(root, url, &socket, ops, &log)?;
-    let result = wait_ready(&mut server, ops, &log).and_then(|()| {
-        writeln!(out, "xtask e2e: abc server is ready; running Playwright")?;
-        let mut playwright = toolchain.pnpm(root)?;
-        playwright
-            .args(["exec", "playwright", "test"])
-            .env("ABC_E2E_SOCKET", &socket)
-            .env("ABC_E2E_ORIGIN", ORIGIN)
-            .env("ABC_E2E_TLS_CERT", &certificate_file)
-            .env("ABC_E2E_TLS_KEY", &key_file);
-        Ok(playwright
-            .status()
-            .context("could not run playwright")?
-            .success())
-    });
-    let stopped = server.kill().and_then(|()| server.wait());
+    let out = root.join("target/e2e");
+    let screens = root.join("target/e2e-screens");
+    for made in [&out, &screens] {
+        fs::create_dir_all(made).with_context(|| format!("could not create {}", made.display()))?;
+    }
+    let binary: PathBuf = web::target_dir(root).join(web::BINARY);
+    let mut playwright = toolchain.pnpm(root)?;
+    playwright
+        .args(["exec", "playwright", "test"])
+        .env("ABC_E2E_BINARY", &binary)
+        .env("ABC_E2E_DATABASE_URL", url)
+        .env("ABC_E2E_SOCKET", &socket)
+        .env("ABC_E2E_ORIGIN", ORIGIN)
+        .env("ABC_E2E_TLS_CERT", &certificate_file)
+        .env("ABC_E2E_TLS_KEY", &key_file)
+        .env("ABC_E2E_OUT", &out)
+        .env("ABC_E2E_SCREENS", &screens);
+    let passed = playwright.status().context("could not run playwright");
     let removed = fs::remove_dir_all(&dir);
-    let passed = result?;
-    stopped.context("could not stop abc server")?;
+    let passed = passed?.success();
     removed.with_context(|| format!("could not remove {}", dir.display()))?;
-    if !passed {
+    if passed {
         writeln!(
-            out,
-            "xtask e2e: Playwright failed: see its report above and the server's log in {}",
-            log.display()
+            report,
+            "xtask e2e: passed; screenshots are in {}",
+            screens.display()
+        )?;
+    } else {
+        writeln!(
+            report,
+            "xtask e2e: Playwright failed: see its report above and the logs of abc in {}",
+            out.display()
         )?;
     }
     Ok(passed)
-}
-
-/// A loopback address nothing listens on yet.
-fn free_port() -> anyhow::Result<SocketAddr> {
-    let listener = TcpListener::bind("127.0.0.1:0").context("could not find a free port")?;
-    listener.local_addr().context("could not read the port")
 }
 
 /// A self-signed certificate for the stand-in, made for this run alone, and its key, both as PEM.
@@ -198,73 +194,11 @@ fn pem(label: &str, der: &[u8]) -> String {
     pem
 }
 
-/// Starts the built `abc server`, logging to `log`.
-fn start(
-    root: &Path,
-    url: &str,
-    socket: &Path,
-    ops: SocketAddr,
-    log: &Path,
-) -> anyhow::Result<Child> {
-    let binary: PathBuf = web::target_dir(root).join(web::BINARY);
-    if let Some(parent) = log.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("could not create {}", parent.display()))?;
-    }
-    let file =
-        fs::File::create(log).with_context(|| format!("could not create {}", log.display()))?;
-    Command::new(&binary)
-        .arg("server")
-        .env("ABC_DATABASE_URL", url)
-        .env("ABC_SIDECAR_SOCKET", socket)
-        .env("ABC_OPS_ADDR", ops.to_string())
-        .env("ABC_PUBLIC_URL", ORIGIN)
-        .stdin(Stdio::null())
-        .stdout(file.try_clone().context("could not share the log")?)
-        .stderr(file)
-        .spawn()
-        .with_context(|| format!("could not start {}", binary.display()))
-}
-
-/// Waits until the server's ops listener says it is ready.
-fn wait_ready(server: &mut Child, ops: SocketAddr, log: &Path) -> anyhow::Result<()> {
-    for _ in 0..READY_ATTEMPTS {
-        if let Some(status) = server.try_wait().context("could not check on abc server")? {
-            anyhow::bail!(
-                "abc server exited with {status} before it was ready; its log is in {}",
-                log.display()
-            );
-        }
-        if ready(ops) {
-            return Ok(());
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    anyhow::bail!(
-        "abc server was not ready within a minute; its log is in {}",
-        log.display()
-    )
-}
-
-/// Whether `GET /readyz` on the ops listener at `ops` answers 200.
-fn ready(ops: SocketAddr) -> bool {
-    let Ok(mut stream) = TcpStream::connect_timeout(&ops, Duration::from_secs(1)) else {
-        return false;
-    };
-    let request = "GET /readyz HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n";
-    let mut answer = String::new();
-    stream.write_all(request.as_bytes()).is_ok()
-        && stream.read_to_string(&mut answer).is_ok()
-        && answer.starts_with("HTTP/1.1 200")
-}
-
 #[cfg(test)]
 mod tests {
-    use std::io::{Read as _, Write as _};
-    use std::net::TcpListener;
     use std::path::Path;
 
-    use super::{certificate, free_port, pem, ready, run, run_id};
+    use super::{certificate, pem, run, run_id};
     use crate::testing::{abc_tree, fake_web, pnpm_calls, script};
 
     /// A fake cargo-sqlx in `dir` that logs what it does to the database.
@@ -277,7 +211,7 @@ mod tests {
         sqlx
     }
 
-    /// Runs the end-to-end tests on a tree whose `abc` answers readiness, with pnpm failing the
+    /// Runs the end-to-end tests on a tree with a buildable `abc`, with pnpm failing the
     /// call that names `fail`; returns whether they passed, what was said, pnpm's calls and the
     /// database's.
     fn e2e(fail: &str) -> (bool, String, String, String) {
@@ -302,7 +236,8 @@ mod tests {
         let (passed, said, calls, database) = e2e("");
         assert!(passed, "{said}");
         assert!(
-            said.contains("abc server is ready; running Playwright"),
+            said.contains("xtask e2e: passed; screenshots are in ")
+                && said.contains("target/e2e-screens"),
             "{said}"
         );
         assert_eq!(
@@ -333,7 +268,8 @@ mod tests {
         let (passed, said, _, database) = e2e("playwright test");
         assert!(!passed);
         assert!(said.contains("Playwright failed"), "{said}");
-        assert!(said.contains("target/e2e/server.log"), "{said}");
+        assert!(said.contains("the logs of abc in "), "{said}");
+        assert!(said.contains("target/e2e"), "{said}");
         assert_eq!(
             database.lines().count(),
             2,
@@ -388,54 +324,5 @@ mod tests {
         assert!(said.contains("--with-deps chromium"), "{said}");
         assert!(said.contains("cargo xtask vm image"), "{said}");
         assert_eq!(database, "", "no database was made");
-    }
-
-    #[test]
-    fn a_server_that_exits_before_it_is_ready_is_reported() {
-        let temp = tempfile::tempdir().unwrap();
-        let tools = temp.path().join("tools");
-        let root = temp.path().join("tree");
-        abc_tree(&root);
-        std::fs::write(root.join("src/main.rs"), "fn main() {}\n").unwrap();
-        let error = run(
-            &root,
-            &fake_web(&tools, ""),
-            &fake_sqlx(&tools),
-            &mut Vec::new(),
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(
-            error.contains("exited with exit status: 0 before it was ready"),
-            "{error}"
-        );
-        assert!(
-            std::fs::read_to_string(tools.join("sqlx.log"))
-                .unwrap()
-                .contains("drop "),
-            "the database is dropped anyway"
-        );
-    }
-
-    #[test]
-    fn readiness_is_a_200_from_the_ops_listener() {
-        assert!(!ready(free_port().unwrap()), "nothing listens");
-        for (answer, expected) in [
-            ("HTTP/1.1 200 OK\r\n\r\nready", true),
-            ("HTTP/1.1 503 Service Unavailable\r\n\r\n", false),
-        ] {
-            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-            let address = listener.local_addr().unwrap();
-            let serving = std::thread::spawn(move || {
-                let (mut stream, _) = listener.accept().unwrap();
-                let mut request = [0_u8; 512];
-                let read = stream.read(&mut request).unwrap();
-                stream.write_all(answer.as_bytes()).unwrap();
-                String::from_utf8_lossy(&request[..read]).into_owned()
-            });
-            assert_eq!(ready(address), expected, "{answer}");
-            let request = serving.join().unwrap();
-            assert!(request.starts_with("GET /readyz HTTP/1.1\r\n"), "{request}");
-        }
     }
 }

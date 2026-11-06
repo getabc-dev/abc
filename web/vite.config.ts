@@ -11,6 +11,9 @@ export default defineConfig({
     // server caches for a year.
     outDir: "dist",
     assetsDir: "assets",
+    // Never inline a file as a `data:` URL: the CSP (`default-src 'self'`) allows the app's own
+    // files only, so the font subsets must be files.
+    assetsInlineLimit: 0,
     emptyOutDir: true,
     // Hex hashes, so the server can tell a hashed name (`<name>-<hash>.<extension>`) apart.
     rolldownOptions: { output: { hashCharacters: "hex" } },
