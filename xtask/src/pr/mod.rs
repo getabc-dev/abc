@@ -349,7 +349,7 @@ fn handover(root: &Path, head: &str, pusher: &str, number: u64) -> anyhow::Resul
 fn behind(root: &Path, base: &str, out: &mut String) -> anyhow::Result<()> {
     let short = base.strip_prefix("refs/remotes/").unwrap_or(base);
     if let Some((remote, branch)) = short.split_once('/')
-        && let Err(error) = git::git(root, &["fetch", "--quiet", remote, branch])
+        && let Err(error) = git::fetch(root, remote, branch, git::FETCH_TIMEOUT)
     {
         say(
             out,

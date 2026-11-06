@@ -569,6 +569,51 @@ fn warns_when_main_moved_on_the_branchs_files() {
     );
 }
 
+/// `pr open` and `pr update` fetch the default branch. On an HTTPS remote with no credential
+/// helper, git asked for a username on the terminal and waited; it now fails at once, and the
+/// branch is compared as last fetched.
+#[test]
+fn a_remote_that_asks_for_credentials_never_waits() {
+    let temp = tempfile::tempdir().unwrap();
+    let work = checkout(temp.path());
+    let asked = temp.path().join("asked");
+    crate::testing::script(
+        &temp.path().join("askpass"),
+        &format!("touch {}\necho secret\n", asked.display()),
+    );
+    git(
+        &work,
+        &[
+            "config",
+            "core.askPass",
+            temp.path().join("askpass").to_str().unwrap(),
+        ],
+    );
+    let (url, server) = crate::testing::serve(vec![("401 Unauthorized", "")]);
+    git(
+        &work,
+        &["remote", "set-url", "origin", &format!("{url}/abc.git")],
+    );
+    let mut out = String::new();
+    prepare(
+        Action::Update {
+            number: 7,
+            body: body(temp.path(), REASONED),
+        },
+        &work,
+        &mut out,
+    )
+    .unwrap()
+    .unwrap();
+    assert!(
+        out.starts_with("pr: could not fetch origin/main, so it is compared as last fetched")
+            && out.contains("terminal prompts disabled"),
+        "{out}"
+    );
+    assert!(!asked.exists(), "nothing asked for credentials");
+    server.join().unwrap();
+}
+
 /// Two of the head's own runs in the same second: GitHub lists the newer first, and the first
 /// read stays.
 #[test]

@@ -2,8 +2,10 @@
 //! were at a revision.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::Read as _;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail, ensure};
 
@@ -45,6 +47,67 @@ pub(crate) fn default_branch(root: &Path) -> anyhow::Result<String> {
         "cannot tell this repository's default branch: neither upstream/HEAD nor origin/HEAD is \
          set; run `git remote set-head origin --auto`"
     )
+}
+
+/// How long a fetch the gates make for themselves may take: a minute, ample for one branch of a
+/// repository this size, so a stalled network fails the fetch rather than hanging the command.
+pub(crate) const FETCH_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Fetches `branch` from `remote` in `root`, never waiting on a person: git gets no stdin, no
+/// terminal prompt (`GIT_TERMINAL_PROMPT=0`) and no askpass program, which git would still run
+/// with terminal prompts off, so a remote that wants credentials the configured helpers do not
+/// have fails at once; and git is stopped after `timeout`.
+pub(crate) fn fetch(
+    root: &Path,
+    remote: &str,
+    branch: &str,
+    timeout: Duration,
+) -> anyhow::Result<()> {
+    let mut child = Command::new("git")
+        .args(["-c", "core.askPass=", "fetch", "--quiet", remote, branch])
+        .current_dir(root)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_ASKPASS", "")
+        .env_remove("SSH_ASKPASS")
+        .env("SSH_ASKPASS_REQUIRE", "never")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("could not run git")?;
+    // Read what git says beside it, so a full pipe never stalls git; a remote helper git leaves
+    // running past the timeout keeps only this thread waiting.
+    let mut stderr = child.stderr.take().context("git has no stderr")?;
+    let (said, heard) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut text = String::new();
+        let _unread = stderr.read_to_string(&mut text);
+        let _unheard = said.send(text);
+    });
+    let started = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().context("could not wait for git fetch")? {
+            break status;
+        }
+        if started.elapsed() >= timeout {
+            child.kill().context("could not stop git fetch")?;
+            child.wait().context("could not reap git fetch")?;
+            bail!(
+                "git fetch {remote} {branch} took longer than {} seconds and was stopped",
+                timeout.as_secs()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let message = heard
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap_or_default();
+    ensure!(
+        status.success(),
+        "git fetch {remote} {branch} failed: {}",
+        message.trim()
+    );
+    Ok(())
 }
 
 /// The commit where `HEAD` left `base`.
@@ -380,6 +443,8 @@ mod tests {
     use std::fmt::Write as _;
     use std::fs;
 
+    use std::time::Duration;
+
     use super::{
         Blob, Change, To, added_lines, blobs, changes, context_diff, diff, merge_base,
         parse_name_status, reviewable_diff, show,
@@ -610,6 +675,58 @@ mod tests {
             ],
             "a symlink is never followed, a submodule never entered, a missing path left out"
         );
+    }
+
+    /// `pr open` and `pr update` fetch the default branch. git asked for credentials on the
+    /// terminal, or through an askpass program, and waited for an answer that never came.
+    #[test]
+    fn a_fetch_never_asks_for_credentials() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = repository(&temp.path().join("repo"));
+        let asked = temp.path().join("asked");
+        crate::testing::script(
+            &temp.path().join("askpass"),
+            &format!("touch {}\necho secret\n", asked.display()),
+        );
+        git(
+            &repo,
+            &[
+                "config",
+                "core.askPass",
+                temp.path().join("askpass").to_str().unwrap(),
+            ],
+        );
+        let (url, server) = crate::testing::serve(vec![("401 Unauthorized", "")]);
+        let error = super::fetch(
+            &repo,
+            &format!("{url}/abc.git"),
+            "main",
+            Duration::from_secs(30),
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("terminal prompts disabled"),
+            "it fails at once, saying why: {error}"
+        );
+        assert!(!asked.exists(), "no askpass program is run");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn a_stalled_fetch_is_stopped() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = repository(&temp.path().join("repo"));
+        // Accepts connections and never answers.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/abc.git", listener.local_addr().unwrap());
+        let started = std::time::Instant::now();
+        let error = super::fetch(&repo, &url, "main", Duration::from_secs(1)).unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(10), "{error}");
+        assert_eq!(
+            error.to_string(),
+            format!("git fetch {url} main took longer than 1 seconds and was stopped")
+        );
+        drop(listener);
     }
 
     #[test]
