@@ -1103,6 +1103,70 @@ mod tests {
         );
     }
 
+    /// A one-line change in a function longer than the prompt's limit sends the plain diff, not
+    /// the whole function.
+    #[test]
+    fn a_function_too_long_for_the_prompt_is_sent_as_the_plain_diff() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = repository(&temp.path().join("repo"));
+        let source = |changed: &str| {
+            let mut text = String::from("fn long() {\n");
+            for line in 0..20_000 {
+                let value = if line == 10_000 { changed } else { "0" };
+                writeln!(
+                    text,
+                    "    let value_{line} = {value}; // keeps the function long"
+                )
+                .unwrap();
+            }
+            text.push_str("}\n");
+            text
+        };
+        fs::write(repo.join(".gitattributes"), "*.rs diff=rust\n").unwrap();
+        fs::write(repo.join("AGENTS.md"), "- **S1 · Correctness.**\n").unwrap();
+        fs::write(repo.join("long.rs"), source("0")).unwrap();
+        git(&repo, &["add", "--all"]);
+        git(&repo, &["commit", "--quiet", "-m", "base"]);
+        git(&repo, &["branch", "base"]);
+        fs::write(repo.join("long.rs"), source("1")).unwrap();
+        git(&repo, &["commit", "--quiet", "--all", "-m", "one line"]);
+        let mut sent = String::new();
+        let mut post = |_: &str, body: &str, _: &str| {
+            sent = body.to_owned();
+            Ok((200, recorded(PASS)))
+        };
+        let mut out = Vec::new();
+        run(
+            &repo,
+            "base",
+            &event("local", serde_json::Value::Null),
+            Some("key"),
+            &Destination {
+                summary: None,
+                mode: Mode::Plain,
+            },
+            &mut out,
+            &mut post,
+        )
+        .unwrap();
+        let printed = String::from_utf8(out).unwrap();
+        assert!(
+            printed.contains(&format!(
+                "over the prompt's limit of {MAX_PROMPT_BYTES}; sending the plain diff"
+            )),
+            "{printed}"
+        );
+        assert!(
+            sent.contains("+    let value_10000 = 1;"),
+            "the change is sent"
+        );
+        assert!(
+            sent.len() < 10_000,
+            "without its function: {} bytes",
+            sent.len()
+        );
+    }
+
     /// A caller the review was not shown can break when a changed function's contract changes.
     /// That risk, named at the changed line and unquoted, is reported and blocks: nothing after
     /// the model filters findings about unshown code.
