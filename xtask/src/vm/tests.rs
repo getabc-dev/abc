@@ -1108,7 +1108,7 @@ fn git_in_the_vm_asks_the_broker_and_never_a_stored_credential() {
         &bin.join("abc-xtask"),
         "[ \"$*\" = 'git-credential get' ] || exit 9\necho username=x-access-token\necho password=app-token\n",
     );
-    let system = crate::repo_root().unwrap().join("xtask/vm/gitconfig");
+    let system = crate::testing::checkout().join("xtask/vm/gitconfig");
     let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
     let mut child = std::process::Command::new("git")
         .args(["credential", "fill"])
@@ -1139,7 +1139,7 @@ fn git_in_the_vm_asks_the_broker_and_never_a_stored_credential() {
 
 #[test]
 fn the_image_installs_the_chromium_of_the_playwright_the_web_app_pins() {
-    let root = crate::repo_root().unwrap();
+    let root = crate::testing::checkout();
     let containerfile = std::fs::read_to_string(root.join("xtask/vm/Containerfile")).unwrap();
     let package: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(root.join("web/package.json")).unwrap())

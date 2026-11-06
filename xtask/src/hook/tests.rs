@@ -911,7 +911,7 @@ impl Launched {
 /// with `bin` first on `PATH`, and when `vm` as in an agent VM: `ABC_VM` set and `project` the
 /// session's worktree.
 fn launch(shell: &str, event: &str, project: &Path, bin: &Path, input: &str, vm: bool) -> Launched {
-    let launcher = crate::repo_root().unwrap().join(LAUNCHER);
+    let launcher = crate::testing::checkout().join(LAUNCHER);
     let mut command = Command::new(shell);
     command
         .arg(&launcher)
@@ -933,7 +933,7 @@ fn launch(shell: &str, event: &str, project: &Path, bin: &Path, input: &str, vm:
         let image = bin.join("abc-own-disks");
         if !image.exists() {
             fs::copy(
-                crate::repo_root().unwrap().join("xtask/vm/own-disks"),
+                crate::testing::checkout().join("xtask/vm/own-disks"),
                 &image,
             )
             .unwrap();
@@ -1391,7 +1391,7 @@ fn in_an_agent_vm_an_image_without_the_disk_check_names_its_rebuild() {
     fake_cargo(project, "", 0);
     script(&project.join("abc-xtask"), "exit 0\n");
     own_disks(project);
-    let launcher = crate::repo_root().unwrap().join(LAUNCHER);
+    let launcher = crate::testing::checkout().join(LAUNCHER);
     let mut child = Command::new("/bin/sh")
         .arg(&launcher)
         .arg("pre-tool-use")
@@ -1427,7 +1427,7 @@ fn in_an_agent_vm_an_image_without_the_disk_check_names_its_rebuild() {
 #[test]
 fn the_own_disks_check_names_a_worktree_that_is_not_there() {
     let output = Command::new("sh")
-        .arg(crate::repo_root().unwrap().join("xtask/vm/own-disks"))
+        .arg(crate::testing::checkout().join("xtask/vm/own-disks"))
         .arg("/no/such/worktree")
         .output()
         .unwrap();
@@ -1451,7 +1451,7 @@ fn the_launcher_refuses_an_unknown_event() {
 /// Every hook command in `.claude/settings.json`, with its event.
 fn hook_commands() -> Vec<(String, String)> {
     let settings: serde_json::Value = serde_json::from_str(
-        &fs::read_to_string(crate::repo_root().unwrap().join(".claude/settings.json")).unwrap(),
+        &fs::read_to_string(crate::testing::checkout().join(".claude/settings.json")).unwrap(),
     )
     .unwrap();
     settings["hooks"]
@@ -1473,7 +1473,7 @@ fn hook_commands() -> Vec<(String, String)> {
 #[test]
 fn settings_wire_every_hook_to_the_launcher() {
     let settings: serde_json::Value = serde_json::from_str(
-        &fs::read_to_string(crate::repo_root().unwrap().join(".claude/settings.json")).unwrap(),
+        &fs::read_to_string(crate::testing::checkout().join(".claude/settings.json")).unwrap(),
     )
     .unwrap();
     let hooks = &settings["hooks"];
