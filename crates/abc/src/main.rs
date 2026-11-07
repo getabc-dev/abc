@@ -74,7 +74,8 @@ struct EnrolArgs {
     /// the server, offline, until its owner revokes it.
     #[arg(long)]
     replace: bool,
-    /// The name this machine introduces itself with [default: its hostname].
+    /// The name this machine introduces itself with [default: on macOS its computer name, else
+    /// its hostname].
     #[arg(long)]
     hostname: Option<String>,
 }

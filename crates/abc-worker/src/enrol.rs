@@ -22,6 +22,7 @@ use abc_platform::entropy::{ChaChaMint, Entropy as _, EntropyUnavailable, System
 use abc_protocol::api::ApiCode;
 use abc_protocol::enrol::EnrolRequest;
 use abc_protocol::url::PublicUrl;
+use std::path::Path;
 use thiserror::Error;
 
 use crate::dial::{self, DialError};
@@ -122,24 +123,69 @@ async fn send(
     })
 }
 
-/// This machine as it introduces itself at enrolment: its hostname, or `hostname` when given, and
-/// the operating system and architecture this build is for.
+/// This machine as it introduces itself at enrolment: its own name ([`own_name`]), or `hostname`
+/// when given, and the operating system and architecture this build is for.
 ///
 /// # Errors
 ///
 /// [`EnrolError::Hostname`] when the name is not a valid display name (1 to 64 characters, no
 /// control characters).
 pub fn machine(hostname: Option<&str>) -> Result<MachineInfo, EnrolError> {
-    let system = rustix::system::uname();
     let name = match hostname {
         Some(name) => name.to_owned(),
-        None => system.nodename().to_string_lossy().into_owned(),
+        None => own_name(),
     };
     Ok(MachineInfo {
         hostname: DisplayName::parse(&name).map_err(|_invalid| EnrolError::Hostname)?,
         os: crate::OS,
         arch: crate::ARCH,
     })
+}
+
+/// Where macOS keeps its names for the machine.
+const SCUTIL: &str = "/usr/sbin/scutil";
+
+/// This machine's own name. On macOS, the name its owner gave it in System Settings
+/// (`scutil --get ComputerName`), else its local network name (`LocalHostName`): there the kernel's
+/// hostname often names the network instead, such as the IP address a DHCP server handed out, which
+/// a machine card showed. Elsewhere, and when neither is set, the kernel's hostname.
+fn own_name() -> String {
+    let nodename = rustix::system::uname()
+        .nodename()
+        .to_string_lossy()
+        .into_owned();
+    let asked = if cfg!(target_os = "macos") {
+        ["ComputerName", "LocalHostName"]
+            .into_iter()
+            .map(|key| ask(Path::new(SCUTIL), key))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    first_name(asked, nodename)
+}
+
+/// The first of `names` that can name a worker, else `fallback`.
+fn first_name(names: Vec<Option<String>>, fallback: String) -> String {
+    names
+        .into_iter()
+        .flatten()
+        .find(|name| DisplayName::parse(name).is_ok())
+        .unwrap_or(fallback)
+}
+
+/// What `program --get key` prints, as `scutil` answers for a name it holds; none when it fails or
+/// prints nothing.
+fn ask(program: &Path, key: &str) -> Option<String> {
+    let output = std::process::Command::new(program)
+        .args(["--get", key])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    let name = String::from_utf8(output.stdout).ok()?;
+    let name = name.trim();
+    (output.status.success() && !name.is_empty()).then(|| name.to_owned())
 }
 
 /// Why enrolment failed. `Display` is the sentence the user reads; the server's own refusals are
@@ -236,9 +282,16 @@ mod tests {
         let own = machine(None).unwrap();
         assert_eq!(
             own.hostname.as_str(),
-            rustix::system::uname().nodename().to_str().unwrap().trim(),
-            "else the hostname"
+            own_name().trim(),
+            "else its own name"
         );
+        if !cfg!(target_os = "macos") {
+            assert_eq!(
+                own_name(),
+                rustix::system::uname().nodename().to_str().unwrap(),
+                "the kernel's hostname"
+            );
+        }
         assert!(
             matches!(machine(Some(&"x".repeat(65))), Err(EnrolError::Hostname)),
             "a name too long to show"
@@ -248,5 +301,52 @@ mod tests {
             "this machine is already enrolled as mbp; pass --replace to enrol it as a new worker",
             "the name it is enrolled as"
         );
+    }
+
+    /// On macOS the machine card showed `192.168.1.3`: the kernel's hostname named the network.
+    /// The name the owner gave the Mac comes first, then its local network name, then the
+    /// hostname.
+    #[test]
+    fn the_first_name_that_can_name_a_worker_wins() {
+        let some = |name: &str| Some(name.to_owned());
+        let ip = "192.168.1.3".to_owned();
+        assert_eq!(
+            first_name(
+                vec![some("Ada's MacBook Pro"), some("Adas-MacBook-Pro")],
+                ip.clone()
+            ),
+            "Ada's MacBook Pro"
+        );
+        assert_eq!(
+            first_name(vec![None, some("Adas-MacBook-Pro")], ip.clone()),
+            "Adas-MacBook-Pro"
+        );
+        assert_eq!(
+            first_name(vec![some(&"x".repeat(65)), None], ip.clone()),
+            "192.168.1.3",
+            "a name too long to show is passed over"
+        );
+        assert_eq!(first_name(Vec::new(), ip.clone()), ip, "elsewhere");
+    }
+
+    /// `scutil --get` prints the name, or fails when the name is not set.
+    #[test]
+    fn asks_scutil_for_a_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = dir.path().join("scutil");
+        std::fs::write(
+            &fake,
+            "#!/bin/sh\ncase \"$1 $2\" in\n\
+             '--get ComputerName') echo \"Ada's Mac \" ;;\n\
+             '--get LocalHostName') echo '' ;;\n\
+             *) echo 'ComputerName: not set' >&2; exit 1 ;;\nesac\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        assert_eq!(ask(&fake, "ComputerName").as_deref(), Some("Ada's Mac"));
+        assert_eq!(ask(&fake, "LocalHostName"), None, "printed nothing");
+        assert_eq!(ask(&fake, "HostName"), None, "not set");
+        assert_eq!(ask(&dir.path().join("missing"), "ComputerName"), None);
     }
 }
