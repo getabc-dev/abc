@@ -1246,7 +1246,7 @@ mod tests {
         fs::create_dir_all(root.join("packaging/homebrew")).unwrap();
         fs::write(root.join(TAILSCALE_PIN), pin_text(commit, &"0".repeat(64))).unwrap();
         fs::copy(
-            crate::repo_root().unwrap().join(FORMULA_TEMPLATE),
+            crate::testing::checkout().join(FORMULA_TEMPLATE),
             root.join(FORMULA_TEMPLATE),
         )
         .unwrap();
@@ -1714,7 +1714,7 @@ mod tests {
     #[test]
     fn renders_the_template_for_every_target() {
         let template =
-            fs::read_to_string(crate::repo_root().unwrap().join(FORMULA_TEMPLATE)).unwrap();
+            fs::read_to_string(crate::testing::checkout().join(FORMULA_TEMPLATE)).unwrap();
         let digest = |archive: &str| Ok(format!("sha256-of-{archive}"));
         let rendered = render(
             &template,
@@ -1876,7 +1876,7 @@ mod tests {
 
     #[test]
     fn the_checked_in_pin_and_template_render() {
-        let root = crate::repo_root().unwrap();
+        let root = crate::testing::checkout();
         let versions = Versions::read(&root).unwrap();
         let template = fs::read_to_string(root.join(FORMULA_TEMPLATE)).unwrap();
         render(
@@ -2737,11 +2737,7 @@ mod tests {
         );
         let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
         let output = Command::new("sh")
-            .arg(
-                crate::repo_root()
-                    .unwrap()
-                    .join(".github/release/publish.sh"),
-            )
+            .arg(crate::testing::checkout().join(".github/release/publish.sh"))
             .args(["v1.2.3"])
             .arg(&dist)
             .env("PATH", path)
@@ -2890,7 +2886,7 @@ mod tests {
 
     /// The jobs of the workflow at `file`, relative to the repository root.
     fn workflow_jobs(file: &str) -> yaml_rust2::Yaml {
-        let text = fs::read_to_string(crate::repo_root().unwrap().join(file)).unwrap();
+        let text = fs::read_to_string(crate::testing::checkout().join(file)).unwrap();
         yaml_rust2::YamlLoader::load_from_str(&text).unwrap()[0].clone()
     }
 

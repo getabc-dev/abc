@@ -337,7 +337,7 @@ mod tests {
     #[test]
     fn every_script_a_step_runs_is_in_package_json() {
         let manifest: serde_json::Value = serde_json::from_str(
-            &std::fs::read_to_string(crate::repo_root().unwrap().join("web/package.json")).unwrap(),
+            &std::fs::read_to_string(crate::testing::checkout().join("web/package.json")).unwrap(),
         )
         .unwrap();
         for step in GATES.iter().chain([&BUILD, &COVERAGE]) {

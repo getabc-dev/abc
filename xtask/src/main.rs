@@ -13,6 +13,7 @@ mod github;
 mod guard;
 mod hook;
 mod integrity;
+mod junit;
 mod mutants;
 mod postgres;
 mod pr;
@@ -682,10 +683,13 @@ fn check(
     check::run(
         root,
         check::REPOSITORY,
-        changed,
+        check::Options {
+            changed,
+            target_dir: None,
+            mode: annotation::Mode::from_env(&|name| std::env::var_os(name)),
+        },
         &tools,
         &postgres,
-        None,
         report,
     )
 }
@@ -834,7 +838,10 @@ fn run_vm(
     vm::run(action, &host, &msb, env, report)
 }
 
-/// The repository root: the workspace that contains xtask.
+/// The repository root: the checkout xtask was built from, the directory around xtask's own,
+/// whose pinned tools it runs. Nothing in the environment changes it, when xtask is built or
+/// when it runs; tests that run in a copy of `xtask/` alone read the checkout through
+/// `testing::checkout`, in test builds.
 fn repo_root() -> anyhow::Result<PathBuf> {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -855,7 +862,7 @@ mod tests {
     use std::process::ExitCode;
 
     use super::{
-        Cli, Invocation, ReleaseAction, RulesetAction, Task, TaskAction, release, repo_root, run,
+        Cli, Invocation, ReleaseAction, RulesetAction, Task, TaskAction, release, run,
         serve_tokens, user_home, verdict,
     };
     use crate::testing::{git, repository_with_change, script};
@@ -1002,7 +1009,7 @@ mod tests {
         );
         fs::create_dir_all(root.join("packaging")).unwrap();
         fs::copy(
-            repo_root().unwrap().join(release::TAILSCALE_PIN),
+            crate::testing::checkout().join(release::TAILSCALE_PIN),
             root.join(release::TAILSCALE_PIN),
         )
         .unwrap();
@@ -1026,7 +1033,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let (home, root) = release_tree(temp.path());
         let no_env = |_: &str| None;
-        let real = repo_root().unwrap();
+        let real = crate::testing::checkout();
         fs::create_dir_all(root.join("packaging/homebrew")).unwrap();
         for file in [release::TAILSCALE_PIN, release::FORMULA_TEMPLATE] {
             fs::copy(real.join(file), root.join(file)).unwrap();
@@ -1414,8 +1421,8 @@ mod tests {
                 Task::Rulesets {
                     action: RulesetAction::Check
                 },
-                &repo_root().unwrap(),
-                &repo_root().unwrap(),
+                &crate::testing::checkout(),
+                &crate::testing::checkout(),
                 &no_env
             )
             .unwrap(),
@@ -1462,7 +1469,7 @@ mod tests {
             fs::write(path, "#!/bin/sh\n").unwrap();
         }
         fs::copy(
-            repo_root().unwrap().join("rust-toolchain.toml"),
+            crate::testing::checkout().join("rust-toolchain.toml"),
             root.join("rust-toolchain.toml"),
         )
         .unwrap();
@@ -1489,7 +1496,7 @@ mod tests {
         let here = Invocation::new(None).unwrap();
         assert_eq!(
             here.root,
-            repo_root().unwrap(),
+            crate::testing::checkout(),
             "the tree defaults to xtask's own"
         );
         assert_eq!(here.home, here.root, "and so do the tools");
@@ -1511,7 +1518,7 @@ mod tests {
         );
         assert_eq!(
             elsewhere.home,
-            repo_root().unwrap(),
+            crate::testing::checkout(),
             "the tools stay xtask's own"
         );
         assert!(
@@ -1610,18 +1617,23 @@ mod tests {
     }
 
     #[test]
-    fn the_xtask_workspace_shares_the_nextest_configuration() {
-        let root = repo_root().unwrap();
-        assert_eq!(
-            fs::read_link(root.join("xtask/.config")).unwrap(),
-            Path::new("../.config"),
-            "nextest reads .config/ from the workspace root; xtask's is the repository's"
+    fn no_symlink_is_tracked() {
+        let root = crate::testing::checkout();
+        let listing = crate::git::git(&root, &["ls-files", "--stage", "-z"]).unwrap();
+        let links: Vec<&str> = listing
+            .split('\0')
+            .filter(|entry| entry.starts_with("120000 "))
+            .collect();
+        assert!(
+            links.is_empty(),
+            "a symlink dangles in a copy of part of the tree (xtask/.config did in mutants' \
+             copies of xtask/), and the review job's checkout follows it: {links:?}"
         );
     }
 
     #[test]
     fn the_xtask_workspace_keeps_the_main_workspace_lints_and_rust_version() {
-        let root = repo_root().unwrap();
+        let root = crate::testing::checkout();
         let read = |path: &str| -> serde_json::Value {
             toml_edit::de::from_str(&fs::read_to_string(root.join(path)).unwrap()).unwrap()
         };
@@ -1661,7 +1673,7 @@ mod tests {
 
     #[test]
     fn workspace_rust_version_is_the_pinned_toolchain() {
-        let root = repo_root().unwrap();
+        let root = crate::testing::checkout();
         let toolchain: toml_edit::DocumentMut =
             fs::read_to_string(root.join("rust-toolchain.toml"))
                 .unwrap()
