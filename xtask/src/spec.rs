@@ -5,7 +5,7 @@
 //! each model, checking its invariant and its temporal property, and requires TLC to find each
 //! seeded bug: a model with a fault built in must fail the property that guards against it, so a
 //! property that stops catching its bug fails the gate. `docs/spec/runner.md` explains the
-//! runner's spec, and `.abc/decisions.md` why TLC (brief decision 67).
+//! runner's spec; the product brief records why TLC checks it.
 //!
 //! Nothing runs from `PATH` or downloads at run time. Quint runs with an empty environment but
 //! for `PATH`, holding only the pinned JRE's `bin/`, for the TLC it starts, and `QUINT_HOME`,
@@ -17,14 +17,14 @@
 //! open to the machine's network while the gate runs; see `docs/spec/runner.md`.
 
 use std::fs::{self, Permissions};
-use std::io::{Read as _, Write};
+use std::io::Write;
 use std::net::{Ipv4Addr, TcpListener, TcpStream};
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context as _, bail};
+use anyhow::Context as _;
 
 /// The specs' directory, relative to the repository root.
 pub(crate) const DIR: &str = "spec";
@@ -122,7 +122,7 @@ pub(crate) const RUNNER: Checks<'static> = Checks {
 };
 
 /// The pinned tools the gate runs.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct Tools {
     quint: PathBuf,
     java: PathBuf,
@@ -147,9 +147,12 @@ impl Tools {
     }
 }
 
-/// Whether a change to `path` can change what the gate finds: a spec, or a pinned tool.
+/// Whether a change to `path` can change what the gate finds: a spec, a pinned tool, or the gate
+/// itself.
 pub(crate) fn affected_by(path: &Path) -> bool {
-    path.starts_with(DIR) || path == Path::new("xtask/tools.toml")
+    path.starts_with(DIR)
+        || path == Path::new("xtask/tools.toml")
+        || path == Path::new("xtask/src/spec.rs")
 }
 
 /// Whether the tree at `root` holds specs at all.
@@ -225,6 +228,18 @@ fn remove_tree(dir: &Path) -> anyhow::Result<()> {
     }
 }
 
+/// Why the Apalache server did not start.
+#[derive(Debug)]
+enum Start {
+    /// It exited, as when another process holds its port.
+    Exited(anyhow::Error),
+    /// Anything else.
+    Failed(anyhow::Error),
+}
+
+/// How many ports the server is tried on before it counts as unable to start.
+const SERVER_PORTS: u32 = 3;
+
 /// The Apalache server Quint compiles specs to TLA+ through, stopped when dropped.
 struct Server {
     child: Child,
@@ -233,12 +248,30 @@ struct Server {
 
 impl Server {
     /// Starts the pinned Apalache's server on a free port, its log in the workspace, and waits
-    /// until it listens, looking `checks` times, 200 ms apart.
+    /// until it listens, looking `checks` times, 200 ms apart. A port another process takes
+    /// first makes the server exit; it is tried again on another, [`SERVER_PORTS`] times.
     fn start(tools: &Tools, workspace: &Workspace, checks: u32) -> anyhow::Result<Self> {
-        let port = free_port()?;
+        let mut tries: u32 = 1;
+        loop {
+            match Self::start_on(tools, workspace, free_port()?, checks) {
+                Err(Start::Exited(_)) if tries < SERVER_PORTS => tries = tries.saturating_add(1),
+                Err(Start::Exited(error) | Start::Failed(error)) => return Err(error),
+                Ok(server) => return Ok(server),
+            }
+        }
+    }
+
+    /// Starts the server on `port`, and waits until it says it listens there, and does.
+    fn start_on(
+        tools: &Tools,
+        workspace: &Workspace,
+        port: u16,
+        checks: u32,
+    ) -> Result<Self, Start> {
         let log_path = workspace.server.join("server.log");
         let log = fs::File::create(&log_path)
-            .with_context(|| format!("could not create {}", log_path.display()))?;
+            .with_context(|| format!("could not create {}", log_path.display()))
+            .map_err(Start::Failed)?;
         let child = Command::new(&tools.java)
             .args(server_args(&tools.apalache, port))
             .current_dir(&workspace.server)
@@ -247,33 +280,41 @@ impl Server {
             .stdin(Stdio::null())
             .stdout(
                 log.try_clone()
-                    .context("could not share the server's log")?,
+                    .context("could not share the server's log")
+                    .map_err(Start::Failed)?,
             )
             .stderr(log)
             .spawn()
-            .with_context(|| format!("could not run {}", tools.java.display()))?;
+            .with_context(|| format!("could not run {}", tools.java.display()))
+            .map_err(Start::Failed)?;
         let mut server = Self { child, port };
+        // Apalache says so once it is bound: a process already listening on the port would answer
+        // a connection too.
+        let listening = format!("is running on port {port}");
         for _ in 0..checks {
-            if TcpStream::connect((Ipv4Addr::LOCALHOST, port)).is_ok() {
-                return Ok(server);
-            }
-            if let Some(status) = server
+            let exited = server
                 .child
                 .try_wait()
-                .context("could not check on the Apalache server")?
-            {
-                bail!(
+                .context("could not check on the Apalache server")
+                .map_err(Start::Failed)?;
+            if let Some(status) = exited {
+                return Err(Start::Exited(anyhow::anyhow!(
                     "the Apalache server exited with {status} before it listened; its log: {}",
                     log_tail(&log_path)
-                );
+                )));
+            }
+            let said = fs::read_to_string(&log_path).unwrap_or_default();
+            if said.contains(&listening) && TcpStream::connect((Ipv4Addr::LOCALHOST, port)).is_ok()
+            {
+                return Ok(server);
             }
             std::thread::sleep(Duration::from_millis(200));
         }
-        bail!(
-            "the Apalache server did not listen on port {port} after {checks} checks 200 ms apart; \
-             its log: {}",
+        Err(Start::Failed(anyhow::anyhow!(
+            "the Apalache server did not listen on port {port} after {checks} checks 200 ms \
+             apart; its log: {}",
             log_tail(&log_path)
-        )
+        )))
     }
 
     /// The endpoint Quint connects to.
@@ -356,12 +397,12 @@ const MODEL_FIX: &str = "the trace above is a behaviour that breaks the property
 const SEEDED_FIX: &str = "a property no longer catches the bug it exists for: restore it, or \
                           seed a bug it does catch and say why in docs/spec/runner.md";
 
-/// Runs the gate on the tree at `root` with `tools`, writing every step's output to `out`, and
-/// reports whether it passed.
+/// Runs the gate on the tree at `root` with the tools `find_tools` finds, looked for only once
+/// the tree holds specs, writing every step's output to `out`, and reports whether it passed.
 pub(crate) fn run(
     root: &Path,
     checks: &Checks<'_>,
-    tools: &Tools,
+    find_tools: &dyn Fn() -> anyhow::Result<Tools>,
     options: Options<'_>,
     out: &mut impl Write,
 ) -> anyhow::Result<bool> {
@@ -370,6 +411,7 @@ pub(crate) fn run(
         return Ok(false);
     }
     let started = Instant::now();
+    let tools = &find_tools()?;
     let workspace = Workspace::create(root, tools)?;
     let mut gate = Gate {
         root,
@@ -539,7 +581,8 @@ impl<W: Write> Gate<'_, W> {
             .env("TMPDIR", &self.workspace.tmp)
             .env("NO_COLOR", "1");
         let started = Instant::now();
-        let (passed, printed) = capture(&mut command, self.out)?;
+        let (passed, printed) = crate::check::tee(&mut command, self.out, true)?;
+        let printed = String::from_utf8_lossy(&printed).into_owned();
         writeln!(
             self.out,
             "xtask: quint {} took {}s",
@@ -548,42 +591,6 @@ impl<W: Write> Gate<'_, W> {
         )?;
         Ok((passed, printed))
     }
-}
-
-/// Runs `command` with stdout and stderr together, passing what it prints on to `out` as it
-/// comes, and returns whether it passed and what it printed.
-fn capture(command: &mut Command, out: &mut impl Write) -> anyhow::Result<(bool, String)> {
-    let program = command.get_program().to_string_lossy().into_owned();
-    let (mut output, writer) = std::io::pipe().context("could not open a pipe")?;
-    command
-        .stdin(Stdio::null())
-        .stdout(writer.try_clone().context("could not share a pipe")?)
-        .stderr(writer);
-    let spawned = command.spawn();
-    // The command holds the pipe's write ends until they are replaced; let them go, so the reads
-    // below end when the command and whatever it started are done.
-    command.stdout(Stdio::null()).stderr(Stdio::null());
-    let mut child = spawned.with_context(|| format!("could not run {program}"))?;
-    let mut printed = Vec::new();
-    let mut buffer = [0_u8; 8192];
-    loop {
-        let read = output
-            .read(&mut buffer)
-            .with_context(|| format!("could not read what {program} printed"))?;
-        let Some(chunk) = buffer.get(..read).filter(|chunk| !chunk.is_empty()) else {
-            break;
-        };
-        out.write_all(chunk)
-            .with_context(|| format!("could not pass on what {program} printed"))?;
-        printed.extend_from_slice(chunk);
-    }
-    let status = child
-        .wait()
-        .with_context(|| format!("could not wait for {program}"))?;
-    Ok((
-        status.success(),
-        String::from_utf8_lossy(&printed).into_owned(),
-    ))
 }
 
 /// What TLC made of a seeded bug.
@@ -742,7 +749,7 @@ module tests {
     /// Runs the gate with `checks` on `root`, and returns whether it passed and what it said.
     fn gate(root: &Path, checks: &Checks<'_>, traces: Option<&Path>) -> (bool, String) {
         let mut out = Vec::new();
-        let passed = run(root, checks, &pinned(), Options { traces }, &mut out).unwrap();
+        let passed = run(root, checks, &|| Ok(pinned()), Options { traces }, &mut out).unwrap();
         (passed, String::from_utf8(out).unwrap())
     }
 
@@ -862,17 +869,13 @@ module tests {
     #[test]
     fn a_tree_without_specs_fails() {
         let root = tempfile::tempdir().unwrap();
-        let tools = Tools {
-            quint: PathBuf::from("unused"),
-            java: PathBuf::from("unused"),
-            apalache: PathBuf::from("unused"),
-        };
         let mut out = Vec::new();
+        let unused = || -> anyhow::Result<Tools> { panic!("no tools needed") };
         assert!(
             !run(
                 root.path(),
                 &RUNNER,
-                &tools,
+                &unused,
                 Options { traces: None },
                 &mut out
             )
@@ -904,7 +907,7 @@ module tests {
         let error = run(
             root.path(),
             &checks,
-            &tools,
+            &|| Ok(tools.clone()),
             Options { traces: None },
             &mut Vec::new(),
         )
@@ -941,13 +944,22 @@ module tests {
             java: bin.join("java"),
             ..pinned()
         };
-        let error = super::Server::start(&silent, &workspace, 1)
+        let silence = super::Server::start(&silent, &workspace, 1)
             .err()
             .unwrap()
             .to_string();
         assert!(
-            error.contains("did not listen on port") && error.contains("after 1 checks"),
-            "{error}"
+            silence.contains("did not listen on port") && silence.contains("after 1 checks"),
+            "{silence}"
+        );
+        let squatter = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let taken = squatter.local_addr().unwrap().port();
+        assert!(
+            matches!(
+                super::Server::start_on(&silent, &workspace, taken, 3),
+                Err(super::Start::Failed(_))
+            ),
+            "another process answering on the port is not the server"
         );
     }
 
@@ -1072,6 +1084,10 @@ module tests {
     fn only_specs_and_pinned_tools_affect_the_gate() {
         assert!(affected_by(Path::new("spec/runner/runner.qnt")));
         assert!(affected_by(Path::new("xtask/tools.toml")));
+        assert!(
+            affected_by(Path::new("xtask/src/spec.rs")),
+            "the gate's own definition"
+        );
         assert!(!affected_by(Path::new("docs/spec/runner.md")));
         assert!(!affected_by(Path::new("specs/x.qnt")));
     }

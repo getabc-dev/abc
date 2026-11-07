@@ -1124,9 +1124,29 @@ pub(crate) fn pinned(home: &Path, name: &str) -> anyhow::Result<PathBuf> {
     Manifest::load(home)?.tool(name)?.installed(home)
 }
 
-/// `cargo xtask tool`: runs a pinned tool's `executable` with the given arguments in `root`.
-pub(crate) fn run(executable: &Path, root: &Path, args: &[OsString]) -> anyhow::Result<ExitCode> {
-    let status = Command::new(executable)
+/// The installed runtime of the tool `name` pinned in the repository at `home`, if it has one.
+pub(crate) fn runtime(home: &Path, name: &str) -> anyhow::Result<Option<PathBuf>> {
+    let manifest = Manifest::load(home)?;
+    let tool = manifest.tool(name)?;
+    manifest
+        .runtime_of(tool)?
+        .map(|runtime| runtime.installed(home))
+        .transpose()
+}
+
+/// `cargo xtask tool`: runs a pinned tool's `executable` with the given arguments in `root`, with
+/// the directory of its `runtime`, if it has one, first on `PATH`.
+pub(crate) fn run(
+    executable: &Path,
+    runtime: Option<&Path>,
+    root: &Path,
+    args: &[OsString],
+) -> anyhow::Result<ExitCode> {
+    let mut command = Command::new(executable);
+    if let Some(runtime) = runtime {
+        command.env("PATH", path_with(runtime)?);
+    }
+    let status = command
         .args(args)
         .current_dir(root)
         .status()
@@ -1272,7 +1292,19 @@ fn download_once(url: &str, timeouts: [Duration; 3], bytes: &mut Vec<u8>) -> Res
     if !bytes.is_empty() {
         request = request.header("Range", format!("bytes={}-", bytes.len()));
     }
-    let mut response = request.call().map_err(Failed::of)?;
+    let mut response = match request.call() {
+        Ok(response) => response,
+        Err(ureq::Error::StatusCode(416)) if !bytes.is_empty() => {
+            // Every byte arrived before the last try broke off, so no range is left to ask for:
+            // fetch the whole again, as the end of the body was never confirmed.
+            bytes.clear();
+            return Err(Failed {
+                cause: anyhow::anyhow!("{url} has no bytes past those received"),
+                transient: true,
+            });
+        }
+        Err(error) => return Err(Failed::of(error)),
+    };
     if response.status() != 206 {
         // A whole body: the server ignored the range, or none was asked for.
         bytes.clear();
@@ -2092,6 +2124,19 @@ targets.aarch64-unknown-linux-gnu = {{ platform = "linux-arm64", sha256 = "{sha2
             "no answer, then a body that stops, each timed out"
         );
         assert_eq!(server.join().unwrap().len(), 3, "three connections");
+    }
+
+    #[test]
+    fn a_download_that_received_everything_before_it_broke_off_is_fetched_again() {
+        let unfinished: &[u8] = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n7\r\narchive\r\n";
+        let unsatisfiable: &[u8] = b"HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */7\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        let (url, server) = scripted(vec![turn(unfinished), turn(unsatisfiable), turn(WHOLE)]);
+        let (bytes, pauses) = fetch(&url, 3);
+        assert_eq!(bytes.unwrap(), b"archive");
+        assert_eq!(pauses, [0, 1], "nothing left to ask for: the whole again");
+        let requests = server.join().unwrap();
+        assert!(requests[1].contains("range: bytes=7-"), "{}", requests[1]);
+        assert!(!requests[2].contains("range:"), "{}", requests[2]);
     }
 
     #[test]
@@ -3635,6 +3680,32 @@ targets.aarch64-unknown-linux-gnu = {{ platform = "linux-arm64", sha256 = "{rt}"
             ["rt", "fake"],
             "selecting a tool selects its runtime"
         );
+    }
+
+    #[test]
+    fn a_tool_run_by_hand_has_its_runtime_first_on_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = dir.path().join("rt-home/bin/rt");
+        write_executable(&runtime, b"#!/bin/sh\nexit 0\n");
+        let tool = dir.path().join("tool");
+        write_executable(&tool, b"#!/bin/sh\nrt || exit 7\nexit 4\n");
+        assert_eq!(
+            super::run(&tool, Some(&runtime), dir.path(), &[]).unwrap(),
+            ExitCode::from(4),
+            "the runtime is found"
+        );
+        assert_eq!(
+            super::run(&tool, None, dir.path(), &[]).unwrap(),
+            ExitCode::from(7),
+            "without it, it is not"
+        );
+        let checkout = crate::testing::checkout();
+        assert_eq!(
+            super::runtime(&checkout, "apalache").unwrap(),
+            Some(crate::testing::pinned_for_tests("jre")),
+            "Apalache runs on the pinned JRE"
+        );
+        assert_eq!(super::runtime(&checkout, "quint").unwrap(), None);
     }
 
     #[test]

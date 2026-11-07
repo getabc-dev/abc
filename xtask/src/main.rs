@@ -338,6 +338,8 @@ struct Invocation<'a> {
     root: PathBuf,
     /// A pinned tool's executable, by name.
     tool: &'a dyn Fn(&str) -> anyhow::Result<PathBuf>,
+    /// The executable of the runtime a pinned tool runs on, by the tool's name, if it has one.
+    runtime: &'a dyn Fn(&str) -> anyhow::Result<Option<PathBuf>>,
     /// An environment variable.
     env: &'a dyn Fn(&str) -> Option<OsString>,
 }
@@ -354,6 +356,7 @@ impl Invocation<'static> {
             home,
             root,
             tool: &pinned_tool,
+            runtime: &pinned_runtime,
             env: &env_var,
         })
     }
@@ -362,6 +365,11 @@ impl Invocation<'static> {
 /// A tool pinned in the repository xtask was built from.
 fn pinned_tool(name: &str) -> anyhow::Result<PathBuf> {
     tools::pinned(&repo_root()?, name)
+}
+
+/// The runtime of a tool pinned in the repository xtask was built from.
+fn pinned_runtime(name: &str) -> anyhow::Result<Option<PathBuf>> {
+    tools::runtime(&repo_root()?, name)
 }
 
 fn env_var(name: &str) -> Option<OsString> {
@@ -503,7 +511,7 @@ fn perform(
             tools::pin(home, &mut io::stdout().lock())?;
             Ok(ExitCode::SUCCESS)
         }
-        Task::Tool { name, args } => tools::run(&tool(&name)?, root, &args),
+        Task::Tool { name, args } => run_tool(invocation, &name, &args),
         Task::Build => run_web(WebTask::Build, root, tool, report),
         Task::Pnpm { args } => run_web(WebTask::Pnpm(args), root, tool, report),
         Task::E2e => run_web(WebTask::E2e, root, tool, report),
@@ -546,6 +554,21 @@ const fn gate_of(task: &Task) -> Option<(gate::Gate, gate::Wait)> {
     }
 }
 
+/// `cargo xtask tool NAME ARGS`: runs the pinned tool `name` in the tree, with its runtime first
+/// on `PATH` if it has one.
+fn run_tool(
+    invocation: &Invocation<'_>,
+    name: &str,
+    args: &[OsString],
+) -> anyhow::Result<ExitCode> {
+    tools::run(
+        &(invocation.tool)(name)?,
+        (invocation.runtime)(name)?.as_deref(),
+        &invocation.root,
+        args,
+    )
+}
+
 /// `cargo xtask spec`: the specs' gate on `root`, with the pinned tools `tool` finds, writing
 /// traces into `traces` when given.
 fn run_spec(
@@ -557,7 +580,7 @@ fn run_spec(
     Ok(verdict(spec::run(
         root,
         &spec::RUNNER,
-        &spec::Tools::pinned(tool)?,
+        &|| spec::Tools::pinned(tool),
         spec::Options { traces },
         report,
     )?))
@@ -703,11 +726,12 @@ fn check(
         warm: &postgres::warm,
         sqlx: &|| tool("cargo-sqlx"),
     };
+    let spec = || spec::Tools::pinned(tool);
     let tools = check::Tools {
         nextest: tool("cargo-nextest")?,
         shellcheck: tool("shellcheck")?,
         web: Some(web::Toolchain::pinned(tool)?),
-        spec: Some(spec::Tools::pinned(tool)?),
+        spec: Some(&spec),
     };
     check::run(
         root,
@@ -915,10 +939,6 @@ mod tests {
         script(&dir.join("cargo-nextest"), "exit 0\n");
         script(&dir.join("shellcheck"), "exit 0\n");
         script(&dir.join("cargo-fuzz"), "exit 77\n");
-        // The fixtures hold no specs, so Quint, Apalache and the JRE are resolved but never run.
-        script(&dir.join("quint"), "exit 9\n");
-        script(&dir.join("apalache"), "exit 9\n");
-        script(&dir.join("jre"), "exit 9\n");
         // The fixtures hold no web app, so node and pnpm are resolved but never run.
         script(&dir.join("node"), "exit 9\n");
         script(&dir.join("pnpm"), "exit 9\n");
@@ -940,6 +960,7 @@ mod tests {
             home: home.to_path_buf(),
             root: root.to_path_buf(),
             tool: &tool,
+            runtime: &|_| Ok(None),
             env,
         };
         run(task, &invocation, &mut Vec::new())

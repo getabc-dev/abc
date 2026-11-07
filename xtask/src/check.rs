@@ -219,14 +219,28 @@ impl Failure {
 }
 
 /// The pinned tools the check runs.
-#[derive(Debug)]
-pub(crate) struct Tools {
+pub(crate) struct Tools<'a> {
     pub(crate) nextest: PathBuf,
     pub(crate) shellcheck: PathBuf,
     /// node and pnpm, for a tree with the web app.
     pub(crate) web: Option<crate::web::Toolchain>,
-    /// Quint, Apalache and the JRE, for a tree with formal specs.
-    pub(crate) spec: Option<crate::spec::Tools>,
+    /// Finds Quint, Apalache and the JRE, for a tree with formal specs: only when the specs' gate
+    /// runs, as checking their pins reads hundreds of megabytes.
+    pub(crate) spec: Option<&'a dyn Fn() -> anyhow::Result<crate::spec::Tools>>,
+}
+
+impl std::fmt::Debug for Tools<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Tools")
+            .field("nextest", &self.nextest)
+            .field("shellcheck", &self.shellcheck)
+            .field("web", &self.web)
+            .field(
+                "spec",
+                &self.spec.map(|_| "found when the specs' gate runs"),
+            )
+            .finish()
+    }
 }
 
 /// How the check reaches Postgres.
@@ -274,7 +288,7 @@ pub(crate) struct Options<'a> {
 /// Where a check's steps run and build.
 struct Run<'a, W> {
     root: &'a Path,
-    tools: &'a Tools,
+    tools: &'a Tools<'a>,
     postgres: &'a Postgres<'a>,
     /// Builds go here when given, and wherever cargo is configured to otherwise.
     target_dir: Option<&'a Path>,
@@ -292,7 +306,7 @@ pub(crate) fn run(
     root: &Path,
     tree: Tree<'_>,
     options: Options<'_>,
-    tools: &Tools,
+    tools: &Tools<'_>,
     postgres: &Postgres<'_>,
     out: &mut impl Write,
 ) -> anyhow::Result<bool> {
@@ -434,15 +448,23 @@ impl<W: Write> Run<'_, W> {
                 "xtask: nothing under spec/ changed; skipping the specs' gate"
             )?,
             Some(_) | None => {
-                let tools = self.tools.spec.as_ref().context(
-                    "the tree holds specs, but Quint, Apalache and the JRE were not given; run \
-                     `cargo xtask setup`",
+                let find = self.tools.spec.context(
+                    "the tree holds specs, but Quint, Apalache and the JRE were not given",
                 )?;
                 let options = crate::spec::Options { traces: None };
-                if !crate::spec::run(self.root, &crate::spec::RUNNER, tools, options, self.out)? {
+                let outcome =
+                    crate::spec::run(self.root, &crate::spec::RUNNER, find, options, self.out);
+                let passed = match outcome {
+                    Ok(passed) => passed,
+                    Err(error) => {
+                        writeln!(self.out, "xtask spec: {error:#}")?;
+                        false
+                    }
+                };
+                if !passed {
                     self.failures.push(Failure {
                         step: "specs".to_owned(),
-                        fix: "fix what `xtask spec` lists above; `cargo xtask spec` repeats the \
+                        fix: "fix what `xtask spec` says above; `cargo xtask spec` repeats the \
                               specs' gate alone"
                             .to_owned(),
                     });
@@ -684,23 +706,47 @@ impl<W: Write> Run<'_, W> {
         if command.get_current_dir().is_none() {
             command.current_dir(self.root);
         }
-        let (mut output, writer) = std::io::pipe().context("could not open a pipe")?;
-        command
-            .stdin(Stdio::null())
-            .stdout(writer.try_clone().context("could not share a pipe")?)
-            .stderr(writer);
-        let spawned = command.spawn();
-        // The command holds the pipe's write ends until they are replaced; let them go, so the
-        // copy below ends when the step and whatever it started are done.
-        command.stdout(Stdio::null()).stderr(Stdio::null());
-        let mut child = spawned.with_context(|| format!("could not run {program}"))?;
-        std::io::copy(&mut output, self.out)
-            .with_context(|| format!("could not pass on what {program} printed"))?;
-        let status = child
-            .wait()
-            .with_context(|| format!("could not wait for {program}"))?;
-        Ok(status.success())
+        let (passed, _) = tee(command, self.out, false)?;
+        Ok(passed)
     }
+}
+
+/// Runs `command` with its stdout and stderr together passed on to `out` as they come, and
+/// reports whether it passed, with what it printed when `keep` asks for it.
+pub(crate) fn tee(
+    command: &mut Command,
+    out: &mut impl Write,
+    keep: bool,
+) -> anyhow::Result<(bool, Vec<u8>)> {
+    let program = command.get_program().to_string_lossy().into_owned();
+    let (mut output, writer) = std::io::pipe().context("could not open a pipe")?;
+    command
+        .stdin(Stdio::null())
+        .stdout(writer.try_clone().context("could not share a pipe")?)
+        .stderr(writer);
+    let spawned = command.spawn();
+    // The command holds the pipe's write ends until they are replaced; let them go, so the reads
+    // below end when the command and whatever it started are done.
+    command.stdout(Stdio::null()).stderr(Stdio::null());
+    let mut child = spawned.with_context(|| format!("could not run {program}"))?;
+    let mut printed = Vec::new();
+    let mut chunk = vec![0_u8; 8192];
+    loop {
+        let read = std::io::Read::read(&mut output, &mut chunk)
+            .with_context(|| format!("could not read what {program} printed"))?;
+        let Some(bytes) = chunk.get(..read).filter(|bytes| !bytes.is_empty()) else {
+            break;
+        };
+        out.write_all(bytes)
+            .with_context(|| format!("could not pass on what {program} printed"))?;
+        if keep {
+            printed.extend_from_slice(bytes);
+        }
+    }
+    let status = child
+        .wait()
+        .with_context(|| format!("could not wait for {program}"))?;
+    Ok((status.success(), printed))
 }
 
 /// The nextest run for `scope` of `workspace` in the repository at `root`, with its nextest
@@ -1669,7 +1715,7 @@ mod tests {
     fn spec_gate_in(
         dir: &Path,
         changed: Option<&[PathBuf]>,
-        spec: Option<crate::spec::Tools>,
+        spec: Option<&dyn Fn() -> anyhow::Result<crate::spec::Tools>>,
     ) -> anyhow::Result<(Vec<String>, String)> {
         let tools = Tools {
             nextest: PathBuf::from("unused"),
@@ -1739,9 +1785,52 @@ mod tests {
                 "{touched}: {error}"
             );
         }
+        let no_jvm = tempfile::tempdir().unwrap();
+        crate::testing::script(&no_jvm.path().join("java"), "exit 3\n");
+        fs::write(
+            specs.path().join("spec/runner/runner.qnt"),
+            "module runner { val x: int = 1 }\n",
+        )
+        .unwrap();
+        let broken = || {
+            crate::spec::Tools::pinned(&|name| {
+                Ok(match name {
+                    "jre" => no_jvm.path().join("java"),
+                    _ => crate::testing::pinned_for_tests(name),
+                })
+            })
+        };
+        let (unstarted, said_unstarted) = spec_gate_in(specs.path(), None, Some(&broken)).unwrap();
+        assert_eq!(unstarted, ["specs"], "{said_unstarted}");
+        assert!(
+            said_unstarted.contains("the Apalache server exited with exit status: 3"),
+            "the cause is said, and the rest of the check goes on: {said_unstarted}"
+        );
+        fs::write(
+            specs.path().join("spec/runner/runner.qnt"),
+            "module runner { val x: int = true }\n",
+        )
+        .unwrap();
+        let missing = || -> anyhow::Result<crate::spec::Tools> {
+            anyhow::bail!("quint is not installed: run `cargo xtask setup`")
+        };
+        let (uninstalled, said_uninstalled) =
+            spec_gate_in(specs.path(), None, Some(&missing)).unwrap();
+        assert_eq!(uninstalled, ["specs"], "{said_uninstalled}");
+        assert!(
+            said_uninstalled.contains("xtask spec: quint is not installed"),
+            "{said_uninstalled}"
+        );
+        let unused = || -> anyhow::Result<crate::spec::Tools> { panic!("found but not needed") };
+        let (skipped_again, _) =
+            spec_gate_in(specs.path(), Some(&elsewhere), Some(&unused)).unwrap();
+        assert!(
+            skipped_again.is_empty(),
+            "a skipped gate never looks for its tools"
+        );
         let pinned =
-            crate::spec::Tools::pinned(&|name| Ok(crate::testing::pinned_for_tests(name))).unwrap();
-        let (failures, said) = spec_gate_in(specs.path(), None, Some(pinned)).unwrap();
+            || crate::spec::Tools::pinned(&|name| Ok(crate::testing::pinned_for_tests(name)));
+        let (failures, said) = spec_gate_in(specs.path(), None, Some(&pinned)).unwrap();
         assert_eq!(failures, ["specs"], "{said}");
         assert!(
             said.contains("typecheck spec/runner/runner.qnt: fix each type error above"),

@@ -20,7 +20,7 @@ module leases {
 }
 
 /// The graph: bounces, a back edge, escalation and its answer, and a new version published
-/// while the run is under way, with one crash or one worker going offline.
+/// while the run is under way, with no faults, which `leases` covers.
 module flow {
   import runnerTypes.* from "./runner"
   import runner(
