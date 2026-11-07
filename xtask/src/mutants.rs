@@ -669,8 +669,9 @@ mod tests {
             .collect();
         assert_eq!(runner, test_runner(), "{config}");
         // The runner as Cargo starts it: the test binary and its arguments come after.
-        let output = std::process::Command::new(&runner[0])
-            .args(&runner[1..])
+        let (shell, arguments) = runner.split_first().unwrap();
+        let output = std::process::Command::new(shell)
+            .args(arguments)
             .args([
                 "sh",
                 "-c",

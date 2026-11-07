@@ -1496,7 +1496,7 @@ mod tests {
         let here = Invocation::new(None).unwrap();
         assert_eq!(
             here.root,
-            super::crate::testing::checkout(),
+            crate::testing::checkout(),
             "the tree defaults to xtask's own"
         );
         assert_eq!(here.home, here.root, "and so do the tools");
@@ -1518,7 +1518,7 @@ mod tests {
         );
         assert_eq!(
             elsewhere.home,
-            super::crate::testing::checkout(),
+            crate::testing::checkout(),
             "the tools stay xtask's own"
         );
         assert!(
