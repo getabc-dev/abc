@@ -10,6 +10,7 @@ use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, ExitCode, ExitStatus};
+use std::time::Duration;
 
 use anyhow::{Context, bail, ensure};
 use flate2::read::GzDecoder;
@@ -118,6 +119,10 @@ pub(crate) struct Tool {
     /// executable's path in that directory, and each target's `tree-sha256` pins the directory.
     #[serde(default)]
     tree: bool,
+    /// Another pinned tool, listed before this one, whose executable's directory goes first on
+    /// `PATH` whenever xtask runs this one, for a tool that runs on it: Apalache's launcher runs
+    /// the pinned JRE's `java`.
+    runtime: Option<String>,
 }
 
 /// Where a tool comes from.
@@ -152,6 +157,9 @@ struct IndexEntry {
 struct Asset {
     /// The target's name in the project's asset file names.
     platform: String,
+    /// The executable's path inside this target's archive, where it differs from the tool's
+    /// `binary`, as a macOS JRE keeps it under `Contents/Home/`.
+    binary: Option<String>,
     /// Lowercase hex sha256 of the downloaded archive.
     sha256: String,
     /// Lowercase hex sha256 of the installed executable, checked whenever xtask uses it.
@@ -192,6 +200,24 @@ impl Manifest {
             );
             tool.validate()
                 .with_context(|| format!("tool {:?}", tool.name))?;
+            if let Some(runtime) = &tool.runtime {
+                let listed = raw
+                    .tool
+                    .iter()
+                    .take_while(|earlier| earlier.name != tool.name)
+                    .find(|earlier| &earlier.name == runtime);
+                let listed = listed.with_context(|| {
+                    format!(
+                        "tool {:?}: its runtime {runtime:?} must be a tool listed before it",
+                        tool.name
+                    )
+                })?;
+                ensure!(
+                    listed.runtime.is_none(),
+                    "tool {:?}: its runtime {runtime:?} must not need a runtime itself",
+                    tool.name
+                );
+            }
         }
         Ok(Self { tools: raw.tool })
     }
@@ -205,13 +231,28 @@ impl Manifest {
         for name in only {
             self.tool(name)?;
         }
+        let chosen = |tool: &Tool| only.contains(&tool.name) || (for_tests && tool.for_tests);
+        let runtimes: BTreeSet<String> = self
+            .tools
+            .iter()
+            .filter(|tool| chosen(tool))
+            .filter_map(|tool| tool.runtime.clone())
+            .collect();
         Ok(Self {
             tools: self
                 .tools
                 .into_iter()
-                .filter(|tool| only.contains(&tool.name) || (for_tests && tool.for_tests))
+                .filter(|tool| chosen(tool) || runtimes.contains(&tool.name))
                 .collect(),
         })
+    }
+
+    /// The runtime `tool` runs on, if it has one.
+    fn runtime_of(&self, tool: &Tool) -> anyhow::Result<Option<&Tool>> {
+        tool.runtime
+            .as_deref()
+            .map(|name| self.tool(name))
+            .transpose()
     }
 
     pub(crate) fn tool(&self, name: &str) -> anyhow::Result<&Tool> {
@@ -279,9 +320,12 @@ impl Tool {
                 );
             }
             let url = self.render(self.url.as_deref().unwrap_or_default(), asset);
+            ensure!(
+                asset.binary.is_none() || self.binary.is_some(),
+                "{target}: a target's binary replaces the tool's `binary`, which it needs"
+            );
             let binary = self
-                .binary
-                .as_ref()
+                .binary_template(asset)
                 .map(|template| self.render(template, asset))
                 .unwrap_or_default();
             let render = |template: &Option<String>| {
@@ -472,9 +516,15 @@ impl Tool {
             .with_context(|| format!("no asset for {target}"))
     }
 
+    /// The executable's path template inside `asset`: the target's own, else the tool's; `None`
+    /// when the asset is the executable itself.
+    fn binary_template<'a>(&'a self, asset: &'a Asset) -> Option<&'a str> {
+        asset.binary.as_deref().or(self.binary.as_deref())
+    }
+
     /// The executable in a downloaded asset: a member of the archive, or the asset itself.
     fn executable_in(&self, download: &[u8], asset: &Asset) -> anyhow::Result<Vec<u8>> {
-        match &self.binary {
+        match self.binary_template(asset) {
             Some(member) => extract(download, Path::new(&self.render(member, asset))),
             None => Ok(download.to_vec()),
         }
@@ -507,9 +557,13 @@ impl Tool {
     /// installed directory of a tool installed as one.
     fn executable(&self, root: &Path, target: Target) -> anyhow::Result<PathBuf> {
         let dir = self.version_dir(root);
-        match (&self.binary, self.tree) {
-            (Some(member), true) => Ok(dir.join(self.render(member, self.asset(target)?))),
-            _ => Ok(dir.join(&self.name)),
+        if !self.tree {
+            return Ok(dir.join(&self.name));
+        }
+        let asset = self.asset(target)?;
+        match self.binary_template(asset) {
+            Some(member) => Ok(dir.join(self.render(member, asset))),
+            None => Ok(dir.join(&self.name)),
         }
     }
 
@@ -574,7 +628,14 @@ impl Tool {
         Ok(executable)
     }
 
-    fn status(&self, root: &Path, target: Target) -> anyhow::Result<Status> {
+    /// The installed tool's state, its version run with `runtime`, the tool it runs on, first on
+    /// `PATH`.
+    fn status(
+        &self,
+        root: &Path,
+        target: Target,
+        runtime: Option<&Self>,
+    ) -> anyhow::Result<Status> {
         let executable = self.executable(root, target)?;
         if !executable.is_file() {
             return Ok(Status::Missing);
@@ -607,7 +668,11 @@ impl Tool {
             .version_args
             .clone()
             .unwrap_or_else(|| vec!["--version".to_owned()]);
-        let output = Command::new(&executable)
+        let mut version = Command::new(&executable);
+        if let Some(runtime) = runtime {
+            version.env("PATH", path_with(&runtime.executable(root, target)?)?);
+        }
+        let output = version
             .args(version_args)
             .output()
             .with_context(|| format!("could not run {} --version", executable.display()))?;
@@ -718,12 +783,18 @@ fn install_unready(
     fetch: &mut impl FnMut(&str) -> anyhow::Result<Vec<u8>>,
 ) -> anyhow::Result<()> {
     for tool in &manifest.tools {
-        if tool.status(root, target)? == Status::Ready {
+        if tool.status(root, target, manifest.runtime_of(tool)?)? == Status::Ready {
             writeln!(out, "ok       {} {}", tool.name, tool.version)?;
         } else {
             let url = tool.download_url(target)?;
             writeln!(out, "install  {} {} from {url}", tool.name, tool.version)?;
-            install(root, tool, target, &fetch(&url)?)?;
+            install(
+                root,
+                tool,
+                manifest.runtime_of(tool)?,
+                target,
+                &fetch(&url)?,
+            )?;
         }
         remove_other_versions(root, tool)?;
     }
@@ -750,7 +821,7 @@ fn report(
 ) -> anyhow::Result<ExitCode> {
     let mut ready = true;
     for tool in &manifest.tools {
-        match tool.status(root, target)? {
+        match tool.status(root, target, manifest.runtime_of(tool)?)? {
             Status::Ready => writeln!(out, "ok       {} {}", tool.name, tool.version)?,
             Status::Missing => {
                 ready = false;
@@ -843,11 +914,18 @@ fn pin_text(
             set_crate_pin(&mut document, &tool.name, &sha256)?;
             continue;
         }
+        // One archive may serve every target, as Apalache's does: fetch each URL once.
+        let mut archives: BTreeMap<String, Vec<u8>> = BTreeMap::new();
         for target in Target::ALL {
             let asset = tool.asset(target)?;
             let url = tool.download_url(target)?;
-            let archive = fetch(&url)?;
-            let sha256 = sha256_hex(&archive);
+            if !archives.contains_key(&url) {
+                archives.insert(url.clone(), fetch(&url)?);
+            }
+            let archive: &[u8] = archives
+                .get(&url)
+                .context("the archive was fetched above")?;
+            let sha256 = sha256_hex(archive);
             let mut sources = Vec::new();
             if let Some(template) = &tool.checksums {
                 let checksums_url = tool.render(template, asset);
@@ -866,10 +944,10 @@ fn pin_text(
                     .with_context(|| format!("{} {} on {target}", tool.name, tool.version))?;
                 sources.push("matches the digest GitHub recorded on upload".to_owned());
             }
-            let binary_sha256 = sha256_hex(&tool.executable_in(&archive, asset)?);
+            let binary_sha256 = sha256_hex(&tool.executable_in(archive, asset)?);
             let tree_same = !tool.tree
                 || asset.tree_sha256.as_deref()
-                    == Some(Tree::of_archive(&archive)?.sha256().as_str());
+                    == Some(Tree::of_archive(archive)?.sha256().as_str());
             let state =
                 if sha256 == asset.sha256 && binary_sha256 == asset.binary_sha256 && tree_same {
                     "same"
@@ -897,11 +975,11 @@ fn pin_text(
                     &tool.name,
                     target,
                     "tree-sha256",
-                    &Tree::of_archive(&archive)?.sha256(),
+                    &Tree::of_archive(archive)?.sha256(),
                 )?;
             }
             if let Some(member) = tool.library_member(asset) {
-                let library_sha256 = sha256_hex(&extract(&archive, &member)?);
+                let library_sha256 = sha256_hex(&extract(archive, &member)?);
                 set_pin(
                     &mut document,
                     &tool.name,
@@ -1093,17 +1171,149 @@ pub(crate) fn feed(child: &mut Child, input: &mut dyn Read) -> std::io::Result<b
     }
 }
 
-/// Downloads `url`, up to [`MAX_ARCHIVE_BYTES`].
+/// How many tries in a row may fail without receiving anything before a download gives up.
+const DOWNLOAD_ATTEMPTS: u32 = 4;
+
+/// Downloads `url`, up to [`MAX_ARCHIVE_BYTES`]. `pin` and `setup` download hundreds of
+/// megabytes, which one reset or stall should not throw away: a connection that fails, breaks
+/// off or stalls ([`DOWNLOAD_TIMEOUTS`]) is tried again after a pause, five seconds longer after
+/// each try in a row that received nothing, asking only for the bytes still missing, until
+/// [`DOWNLOAD_ATTEMPTS`] tries in a row receive nothing. An answer with an
+/// HTTP error status is final.
 pub(crate) fn download(url: &str) -> anyhow::Result<Vec<u8>> {
-    let mut response = ureq::get(url)
-        .call()
-        .with_context(|| format!("could not download {url}"))?;
+    download_with(
+        url,
+        DOWNLOAD_ATTEMPTS,
+        DOWNLOAD_TIMEOUTS,
+        &mut |fruitless| {
+            std::thread::sleep(Duration::from_secs(
+                5_u64.saturating_mul(u64::from(fruitless)),
+            ));
+        },
+    )
+}
+
+/// [`download`], giving up after `attempts` tries in a row that receive nothing, each within
+/// `timeouts` (as [`DOWNLOAD_TIMEOUTS`]), with `pause` called before each new try with the
+/// number of fruitless tries so far.
+fn download_with(
+    url: &str,
+    attempts: u32,
+    timeouts: [Duration; 3],
+    pause: &mut dyn FnMut(u32),
+) -> anyhow::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    let mut tries: u32 = 0;
+    let mut fruitless: u32 = 0;
+    loop {
+        tries = tries.saturating_add(1);
+        let before = bytes.len();
+        let Err(error) = download_once(url, timeouts, &mut bytes) else {
+            return Ok(bytes);
+        };
+        fruitless = if bytes.len() > before {
+            0
+        } else {
+            fruitless.saturating_add(1)
+        };
+        if !error.transient || fruitless >= attempts {
+            return Err(error.cause).with_context(|| {
+                format!(
+                    "could not download {url} (try {tries}, {fruitless} in a row receiving \
+                     nothing, {} bytes received)",
+                    bytes.len()
+                )
+            });
+        }
+        pause(fruitless);
+    }
+}
+
+/// A download that failed, and whether trying again may help.
+struct Failed {
+    cause: anyhow::Error,
+    transient: bool,
+}
+
+impl Failed {
+    /// A failure that trying again may mend: anything but an HTTP error status or a body over
+    /// the limit.
+    fn of(cause: ureq::Error) -> Self {
+        let transient = !matches!(
+            cause,
+            ureq::Error::StatusCode(_) | ureq::Error::BodyExceedsLimit(_)
+        );
+        Self {
+            cause: cause.into(),
+            transient,
+        }
+    }
+}
+
+/// How long a download may take to connect, to answer, and to deliver its body: a connection
+/// that stalls fails, and is tried again for the rest, rather than hang the command.
+const DOWNLOAD_TIMEOUTS: [Duration; 3] = [
+    Duration::from_secs(30),
+    Duration::from_secs(60),
+    Duration::from_secs(600),
+];
+
+/// One try at downloading the rest of `url` into `bytes`, which holds what earlier tries
+/// received, within `timeouts`. What arrives stays in `bytes` when the try fails.
+fn download_once(url: &str, timeouts: [Duration; 3], bytes: &mut Vec<u8>) -> Result<(), Failed> {
+    let [connect, answer, body] = timeouts;
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_connect(Some(connect))
+        .timeout_recv_response(Some(answer))
+        .timeout_recv_body(Some(body))
+        .build()
+        .into();
+    let mut request = agent.get(url);
+    if !bytes.is_empty() {
+        request = request.header("Range", format!("bytes={}-", bytes.len()));
+    }
+    let mut response = request.call().map_err(Failed::of)?;
+    if response.status() != 206 {
+        // A whole body: the server ignored the range, or none was asked for.
+        bytes.clear();
+    } else if !resumes_at(&response, bytes.len()) {
+        bytes.clear();
+        return Err(Failed {
+            cause: anyhow::anyhow!("{url} answered a range other than the one asked for"),
+            transient: true,
+        });
+    }
+    let remaining =
+        MAX_ARCHIVE_BYTES.saturating_sub(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
+    let mut reader = response.body_mut().with_config().limit(remaining).reader();
+    let mut chunk = vec![0_u8; 65_536];
+    loop {
+        match reader.read(&mut chunk) {
+            Ok(0) => return Ok(()),
+            Ok(read) => bytes.extend_from_slice(chunk.get(..read).unwrap_or_default()),
+            Err(error) => {
+                let over_limit = error
+                    .get_ref()
+                    .and_then(|inner| inner.downcast_ref::<ureq::Error>())
+                    .is_some_and(|inner| matches!(inner, ureq::Error::BodyExceedsLimit(_)));
+                return Err(Failed {
+                    cause: anyhow::Error::new(error),
+                    transient: !over_limit,
+                });
+            }
+        }
+    }
+}
+
+/// Whether a partial answer starts where `received` bytes end, as its `Content-Range` says.
+fn resumes_at<B>(response: &ureq::http::Response<B>, received: usize) -> bool {
     response
-        .body_mut()
-        .with_config()
-        .limit(MAX_ARCHIVE_BYTES)
-        .read_to_vec()
-        .with_context(|| format!("could not read {url}"))
+        .headers()
+        .get("content-range")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("bytes "))
+        .and_then(|range| range.split_once('-'))
+        .is_some_and(|(start, _)| start.parse::<usize>().ok() == Some(received))
 }
 
 /// The sha256 a published checksums file gives for `file_name`. The file either lists
@@ -1144,7 +1354,13 @@ pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
 
 /// Verifies a downloaded release asset or `.crate` file and installs the tool's executable from
 /// it.
-fn install(root: &Path, tool: &Tool, target: Target, download: &[u8]) -> anyhow::Result<()> {
+fn install(
+    root: &Path,
+    tool: &Tool,
+    runtime: Option<&Tool>,
+    target: Target,
+    download: &[u8],
+) -> anyhow::Result<()> {
     let (binary, library) = match tool.source()? {
         Source::Release { .. } => verified_release(tool, target, download)?,
         Source::Crate { name, sha256 } => {
@@ -1159,13 +1375,13 @@ fn install(root: &Path, tool: &Tool, target: Target, download: &[u8]) -> anyhow:
         }
     };
     if tool.tree {
-        return place(root, tool, target, |staging| {
+        return place(root, tool, runtime, target, |staging| {
             tar::Archive::new(GzDecoder::new(download))
                 .unpack(staging)
                 .context("could not unpack the archive")
         });
     }
-    place(root, tool, target, |staging| {
+    place(root, tool, runtime, target, |staging| {
         place_files(tool, staging, &binary, library.as_ref())
     })
 }
@@ -1275,6 +1491,7 @@ fn build_crate(root: &Path, tool: &Tool, name: &str, archive: &[u8]) -> anyhow::
 fn place(
     root: &Path,
     tool: &Tool,
+    runtime: Option<&Tool>,
     target: Target,
     fill: impl FnOnce(&Path) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
@@ -1289,7 +1506,7 @@ fn place(
     fs::rename(&staging, &destination)
         .with_context(|| format!("could not move {} into place", staging.display()))?;
 
-    match tool.status(root, target)? {
+    match tool.status(root, target, runtime)? {
         Status::Ready => Ok(()),
         Status::Missing => bail!("{} vanished after install", tool.name),
         Status::Modified { sha256 }
@@ -1332,16 +1549,40 @@ fn place_files(
     Ok(())
 }
 
-/// The files of a tool installed as a directory: each path relative to the directory, with its
-/// sha256 and whether it is executable. Directories are implied by the files in them; anything
-/// else, such as a symbolic link, is refused, so the manifest covers everything the tool can load.
+/// The files of a tool installed as a directory: each path relative to the directory, with what
+/// it holds. Directories are implied by the entries in them. A symbolic link must lead, within
+/// the directory, to one of its files; anything else, such as a link out of it or a device, is
+/// refused, so the manifest covers everything the tool can load.
 #[derive(Debug, PartialEq, Eq)]
-struct Tree(BTreeMap<String, (String, bool)>);
+struct Tree(BTreeMap<String, Entry>);
+
+/// What one path of a [`Tree`] holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Entry {
+    /// A regular file: its sha256 and whether it is executable.
+    File { sha256: String, executable: bool },
+    /// A symbolic link, and the path it holds, as written.
+    Link { target: String },
+}
 
 impl Tree {
+    /// The tree of `entries`, once every link in it leads to one of its files.
+    fn new(entries: BTreeMap<String, Entry>) -> anyhow::Result<Self> {
+        for (path, entry) in &entries {
+            if let Entry::Link { target } = entry {
+                let resolved = link_destination(path, target)?;
+                ensure!(
+                    matches!(entries.get(&resolved), Some(Entry::File { .. })),
+                    "{path} links to {target}, which is not a file of the tool's directory"
+                );
+            }
+        }
+        Ok(Self(entries))
+    }
+
     /// The files of a gzipped tarball as it unpacks: a hard link holds what its target holds.
     fn of_archive(archive: &[u8]) -> anyhow::Result<Self> {
-        let mut files = BTreeMap::new();
+        let mut entries = BTreeMap::new();
         let mut tarball = tar::Archive::new(GzDecoder::new(archive));
         for entry in tarball
             .entries()
@@ -1356,28 +1597,51 @@ impl Tree {
                 entry
                     .read_to_end(&mut bytes)
                     .with_context(|| format!("could not read {path} from the archive"))?;
-                files.insert(path, (sha256_hex(&bytes), mode & 0o100 != 0));
+                entries.insert(
+                    path,
+                    Entry::File {
+                        sha256: sha256_hex(&bytes),
+                        executable: mode & 0o100 != 0,
+                    },
+                );
             } else if kind.is_hard_link() {
                 let target = entry
                     .link_name()
                     .context("a hard link has an unreadable target")?
                     .with_context(|| format!("the hard link {path} has no target"))?;
                 let target = tree_path(&target)?;
-                let (sha256, _) = files
-                    .get(&target)
-                    .with_context(|| format!("{path} links to {target}, which comes after it"))?
-                    .clone();
-                files.insert(path, (sha256, mode & 0o100 != 0));
+                let Some(Entry::File { sha256, .. }) = entries.get(&target) else {
+                    bail!("{path} links to {target}, which is not a file before it");
+                };
+                let sha256 = sha256.clone();
+                entries.insert(
+                    path,
+                    Entry::File {
+                        sha256,
+                        executable: mode & 0o100 != 0,
+                    },
+                );
+            } else if kind.is_symlink() {
+                let target = entry
+                    .link_name()
+                    .context("a symbolic link has an unreadable target")?
+                    .with_context(|| format!("the symbolic link {path} has no target"))?;
+                entries.insert(
+                    path,
+                    Entry::Link {
+                        target: link_text(&target)?,
+                    },
+                );
             } else if !kind.is_dir() {
-                bail!("{path} in the archive is neither a file nor a directory");
+                bail!("{path} in the archive is neither a file, a link nor a directory");
             }
         }
-        Ok(Self(files))
+        Self::new(entries)
     }
 
     /// The files under `dir`, as installed.
     fn of_dir(dir: &Path) -> anyhow::Result<Self> {
-        let mut files = BTreeMap::new();
+        let mut entries = BTreeMap::new();
         let mut pending = vec![dir.to_path_buf()];
         while let Some(current) = pending.pop() {
             for entry in fs::read_dir(&current)
@@ -1388,30 +1652,56 @@ impl Tree {
                     .with_context(|| format!("could not inspect {}", path.display()))?;
                 if metadata.is_dir() {
                     pending.push(path);
-                } else if metadata.is_file() {
-                    let relative = path
-                        .strip_prefix(dir)
-                        .context("a listed file lies outside its directory")?;
-                    files.insert(
-                        tree_path(relative)?,
-                        (
-                            file_sha256(&path)?,
-                            metadata.permissions().mode() & 0o100 != 0,
-                        ),
+                    continue;
+                }
+                let relative = tree_path(
+                    path.strip_prefix(dir)
+                        .context("a listed file lies outside its directory")?,
+                )?;
+                if metadata.is_file() {
+                    entries.insert(
+                        relative,
+                        Entry::File {
+                            sha256: file_sha256(&path)?,
+                            executable: metadata.permissions().mode() & 0o100 != 0,
+                        },
+                    );
+                } else if metadata.is_symlink() {
+                    let target = fs::read_link(&path)
+                        .with_context(|| format!("could not read the link {}", path.display()))?;
+                    entries.insert(
+                        relative,
+                        Entry::Link {
+                            target: link_text(&target)?,
+                        },
                     );
                 } else {
-                    bail!("{} is neither a file nor a directory", path.display());
+                    bail!(
+                        "{} is neither a file, a link nor a directory",
+                        path.display()
+                    );
                 }
             }
         }
-        Ok(Self(files))
+        Self::new(entries)
     }
 
-    /// The manifest: a line per file, `<sha256> <x or -> <path>`, in path order.
+    /// The manifest: a line per entry, in path order. A file's line is `<sha256> <x or -> <path>`;
+    /// a link's is `<sha256 of the path it holds> l <path>`.
     fn manifest(&self) -> String {
         let mut manifest = String::new();
-        for (path, (sha256, executable)) in &self.0 {
-            let mode = if *executable { 'x' } else { '-' };
+        for (path, entry) in &self.0 {
+            let (sha256, mode) = match entry {
+                Entry::File {
+                    sha256,
+                    executable: true,
+                } => (sha256.clone(), 'x'),
+                Entry::File {
+                    sha256,
+                    executable: false,
+                } => (sha256.clone(), '-'),
+                Entry::Link { target } => (sha256_hex(target.as_bytes()), 'l'),
+            };
             // Writing to a String cannot fail.
             if writeln!(manifest, "{sha256} {mode} {path}").is_err() {
                 break;
@@ -1424,6 +1714,38 @@ impl Tree {
     fn sha256(&self) -> String {
         sha256_hex(self.manifest().as_bytes())
     }
+}
+
+/// A link's target as UTF-8 text.
+fn link_text(target: &Path) -> anyhow::Result<String> {
+    target
+        .to_str()
+        .map(str::to_owned)
+        .with_context(|| format!("the link target {} is not UTF-8", target.display()))
+}
+
+/// The path in the tool's directory that the link at `path` (as [`tree_path`] names it) leads to
+/// through `target`: relative to the link's directory, never above the tool's directory.
+fn link_destination(path: &str, target: &str) -> anyhow::Result<String> {
+    ensure!(
+        !target.starts_with('/'),
+        "{path} links to {target}, outside the tool's directory"
+    );
+    let mut parts: Vec<&str> = path.split('/').collect();
+    parts.pop();
+    for part in target.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                ensure!(
+                    parts.pop().is_some(),
+                    "{path} links to {target}, outside the tool's directory"
+                );
+            }
+            part => parts.push(part),
+        }
+    }
+    Ok(parts.join("/"))
 }
 
 /// `path` as the manifest names it: relative, `/`-separated, without `.` parts, and UTF-8.
@@ -1656,6 +1978,155 @@ targets.aarch64-unknown-linux-gnu = {{ platform = "linux-arm64", sha256 = "{sha2
         downloads.get()
     }
 
+    /// What a scripted server does with one connection: writes `reply`, then holds the
+    /// connection open (a stall) or closes it.
+    struct Turn {
+        reply: &'static [u8],
+        hold: bool,
+    }
+
+    /// Serves one connection per turn on a local port, in order, and returns the URL and a
+    /// handle that yields each request's head.
+    fn scripted(turns: Vec<Turn>) -> (String, std::thread::JoinHandle<Vec<String>>) {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/tool.tar.gz", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            let mut held = Vec::new();
+            for turn in turns {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0_u8; 4096];
+                let read = stream.read(&mut request).unwrap();
+                requests.push(String::from_utf8_lossy(&request[..read]).into_owned());
+                stream.write_all(turn.reply).unwrap();
+                if turn.hold {
+                    held.push(stream);
+                }
+            }
+            requests
+        });
+        (url, server)
+    }
+
+    const WHOLE: &[u8] =
+        b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\nConnection: close\r\n\r\narchive";
+    const BROKEN_OFF: &[u8] =
+        b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\nConnection: close\r\n\r\nar";
+    const REST: &[u8] = b"HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 2-6/7\r\nContent-Length: 5\r\nConnection: close\r\n\r\nchive";
+
+    fn turn(reply: &'static [u8]) -> Turn {
+        Turn { reply, hold: false }
+    }
+
+    /// Downloads `url` with short timeouts, and returns the result and the pauses it took.
+    fn fetch(url: &str, attempts: u32) -> (anyhow::Result<Vec<u8>>, Vec<u32>) {
+        let short = std::time::Duration::from_millis(300);
+        let mut pauses = Vec::new();
+        let result = super::download_with(url, attempts, [short, short, short], &mut |fruitless| {
+            pauses.push(fruitless);
+        });
+        (result, pauses)
+    }
+
+    #[test]
+    fn a_download_that_breaks_off_resumes_where_it_stopped() {
+        let (url, server) = scripted(vec![turn(BROKEN_OFF), turn(REST)]);
+        let (bytes, pauses) = fetch(&url, 2);
+        assert_eq!(bytes.unwrap(), b"archive", "the rest is appended");
+        assert_eq!(
+            pauses,
+            [0],
+            "a try that received something is not fruitless"
+        );
+        let requests = server.join().unwrap();
+        assert!(!requests[0].contains("Range"), "{}", requests[0]);
+        assert!(
+            requests[1].contains("\r\nrange: bytes=2-\r\n"),
+            "{}",
+            requests[1]
+        );
+    }
+
+    #[test]
+    fn a_download_starts_again_when_the_range_is_ignored_or_wrong() {
+        let (ignored, ignoring) = scripted(vec![turn(BROKEN_OFF), turn(WHOLE)]);
+        assert_eq!(
+            fetch(&ignored, 2).0.unwrap(),
+            b"archive",
+            "a whole answer replaces"
+        );
+        ignoring.join().unwrap();
+
+        let wrong: &[u8] = b"HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-6/7\r\nContent-Length: 7\r\nConnection: close\r\n\r\narchive";
+        let (url, server) = scripted(vec![turn(BROKEN_OFF), turn(wrong), turn(WHOLE)]);
+        let (bytes, pauses) = fetch(&url, 2);
+        assert_eq!(bytes.unwrap(), b"archive");
+        assert_eq!(pauses, [0, 1], "a wrong range throws the bytes away");
+        let requests = server.join().unwrap();
+        assert!(
+            !requests[2].contains("range:"),
+            "asked whole again: {}",
+            requests[2]
+        );
+    }
+
+    #[test]
+    fn a_download_that_stalls_times_out_and_resumes() {
+        let (url, server) = scripted(vec![
+            Turn {
+                reply: b"",
+                hold: true,
+            },
+            Turn {
+                reply: BROKEN_OFF,
+                hold: true,
+            },
+            turn(REST),
+        ]);
+        let (bytes, pauses) = fetch(&url, 2);
+        assert_eq!(bytes.unwrap(), b"archive");
+        assert_eq!(
+            pauses,
+            [1, 0],
+            "no answer, then a body that stops, each timed out"
+        );
+        assert_eq!(server.join().unwrap().len(), 3, "three connections");
+    }
+
+    #[test]
+    fn a_download_gives_up_after_tries_in_a_row_that_receive_nothing() {
+        let (url, server) = scripted(vec![turn(b""), turn(b"")]);
+        let (result, pauses) = fetch(&url, 2);
+        let error = format!("{:#}", result.unwrap_err());
+        assert!(
+            error.contains("(try 2, 2 in a row receiving nothing, 0 bytes received)"),
+            "{error}"
+        );
+        assert_eq!(pauses, [1], "no pause after the last try");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn a_download_is_the_whole_body() {
+        let (url, server) = scripted(vec![turn(WHOLE)]);
+        assert_eq!(super::download(&url).unwrap(), b"archive");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn an_http_error_is_final() {
+        let (url, server) = scripted(vec![turn(
+            b"HTTP/1.1 404 Not Found\r\nContent-Length: 4\r\nConnection: close\r\n\r\ngone",
+        )]);
+        let (result, pauses) = fetch(&url, 4);
+        let error = format!("{:#}", result.unwrap_err());
+        assert!(error.contains("(try 1, 1 in a row"), "{error}");
+        assert!(error.contains("404"), "{error}");
+        assert!(pauses.is_empty(), "never tried again");
+        assert_eq!(server.join().unwrap().len(), 1, "one connection");
+    }
+
     #[test]
     fn no_checked_in_pin_is_all_zeros() {
         let manifest = Manifest::load(&crate::testing::checkout()).unwrap();
@@ -1843,11 +2314,11 @@ targets.aarch64-unknown-linux-gnu = {{ platform = "linux-arm64", sha256 = "{sha2
         let stale = root.path().join(".tools/fake/1.0.0");
         fs::create_dir_all(&stale).unwrap();
 
-        install(root.path(), tool, Target::MacArm64, &archive).unwrap();
+        install(root.path(), tool, None, Target::MacArm64, &archive).unwrap();
         remove_other_versions(root.path(), tool).unwrap();
 
         assert_eq!(
-            tool.status(root.path(), Target::MacArm64).unwrap(),
+            tool.status(root.path(), Target::MacArm64, None).unwrap(),
             Status::Ready,
             "the installed script is the pinned one and reports the pinned version"
         );
@@ -1869,7 +2340,7 @@ targets.aarch64-unknown-linux-gnu = {{ platform = "linux-arm64", sha256 = "{sha2
         assert_eq!(install_from(root.path(), &manifest, SCRIPT), 1, "installed");
         let tool = only_tool(&manifest);
         assert_eq!(
-            tool.status(root.path(), Target::MacArm64).unwrap(),
+            tool.status(root.path(), Target::MacArm64, None).unwrap(),
             Status::Ready,
             "the raw executable is installed as downloaded"
         );
@@ -1940,7 +2411,7 @@ targets.aarch64-unknown-linux-gnu = {{ platform = "linux-arm64", sha256 = "{sha2
         ]);
         let manifest = pinned_with_library(&archive, SCRIPT, LIBRARY);
         let tool = only_tool(&manifest);
-        install(root.path(), tool, Target::MacArm64, &archive).unwrap();
+        install(root.path(), tool, None, Target::MacArm64, &archive).unwrap();
         let library = root.path().join(".tools/fake/1.2.3/libfake.so");
         assert_eq!(
             fs::read(&library).unwrap(),
@@ -1948,14 +2419,14 @@ targets.aarch64-unknown-linux-gnu = {{ platform = "linux-arm64", sha256 = "{sha2
             "beside the executable"
         );
         assert_eq!(
-            tool.status(root.path(), Target::MacArm64).unwrap(),
+            tool.status(root.path(), Target::MacArm64, None).unwrap(),
             Status::Ready
         );
         tool.installed(root.path()).unwrap();
 
         fs::write(&library, b"swapped").unwrap();
         assert_eq!(
-            tool.status(root.path(), Target::MacArm64).unwrap(),
+            tool.status(root.path(), Target::MacArm64, None).unwrap(),
             Status::LibraryModified {
                 sha256: sha256_hex(b"swapped")
             }
@@ -1973,7 +2444,7 @@ targets.aarch64-unknown-linux-gnu = {{ platform = "linux-arm64", sha256 = "{sha2
 
         fs::remove_file(&library).unwrap();
         assert_eq!(
-            tool.status(root.path(), Target::MacArm64).unwrap(),
+            tool.status(root.path(), Target::MacArm64, None).unwrap(),
             Status::Missing
         );
         let missing = tool.installed(root.path()).unwrap_err().to_string();
@@ -1997,6 +2468,7 @@ targets.aarch64-unknown-linux-gnu = {{ platform = "linux-arm64", sha256 = "{sha2
         let error = install(
             root.path(),
             only_tool(&manifest),
+            None,
             Target::MacArm64,
             &archive,
         )
@@ -2064,7 +2536,7 @@ targets.aarch64-unknown-linux-gnu = {{ platform = "linux-arm64", sha256 = "{sha2
         write_executable(&root.path().join(".tools/fake/1.2.3/fake"), swapped);
 
         assert_eq!(
-            tool.status(root.path(), Target::MacArm64).unwrap(),
+            tool.status(root.path(), Target::MacArm64, None).unwrap(),
             Status::Modified {
                 sha256: sha256_hex(swapped)
             },
@@ -2087,6 +2559,7 @@ targets.aarch64-unknown-linux-gnu = {{ platform = "linux-arm64", sha256 = "{sha2
         let error = install(
             root.path(),
             only_tool(&manifest),
+            None,
             Target::LinuxX64,
             &archive,
         )
@@ -2111,6 +2584,7 @@ targets.aarch64-unknown-linux-gnu = {{ platform = "linux-arm64", sha256 = "{sha2
         let error = install(
             root.path(),
             only_tool(&manifest),
+            None,
             Target::MacArm64,
             &archive,
         )
@@ -2130,7 +2604,7 @@ targets.aarch64-unknown-linux-gnu = {{ platform = "linux-arm64", sha256 = "{sha2
         let manifest = Manifest::parse(&manifest_text(SHA_A, &sha256_hex(drifted))).unwrap();
         let tool = only_tool(&manifest);
         assert_eq!(
-            tool.status(root.path(), Target::MacArm64).unwrap(),
+            tool.status(root.path(), Target::MacArm64, None).unwrap(),
             Status::Missing,
             "not installed"
         );
@@ -2139,7 +2613,7 @@ targets.aarch64-unknown-linux-gnu = {{ platform = "linux-arm64", sha256 = "{sha2
 
         write_executable(&root.path().join(".tools/fake/1.2.3/fake"), drifted);
         assert_eq!(
-            tool.status(root.path(), Target::MacArm64).unwrap(),
+            tool.status(root.path(), Target::MacArm64, None).unwrap(),
             Status::Drift {
                 said: "reports \"fake 1.2.4\"".to_owned()
             },
@@ -2176,7 +2650,7 @@ targets.aarch64-unknown-linux-gnu = {{ platform = "linux-arm64", sha256 = "{sha2
             write_executable(&root.path().join(".tools/fake/1.2.3/fake"), script);
             assert_eq!(
                 only_tool(&manifest)
-                    .status(root.path(), Target::MacArm64)
+                    .status(root.path(), Target::MacArm64, None)
                     .unwrap(),
                 Status::Drift {
                     said: said.to_owned()
@@ -2459,7 +2933,7 @@ targets.aarch64-unknown-linux-gnu = {{ platform = "linux-arm64", sha256 = "{sha2
         assert_eq!(install_from(root.path(), &manifest, &archive), 1, "built");
         assert_eq!(
             only_tool(&manifest)
-                .status(root.path(), Target::MacArm64)
+                .status(root.path(), Target::MacArm64, None)
                 .unwrap(),
             Status::Ready,
             "built with the pinned feature and without the default one"
@@ -2593,7 +3067,7 @@ targets.aarch64-unknown-linux-gnu = {{ platform = "linux-arm64", sha256 = "{sha2
         assert_eq!(install_from(root.path(), &manifest, &archive), 1, "built");
         let tool = only_tool(&manifest);
         assert_eq!(
-            tool.status(root.path(), Target::MacArm64).unwrap(),
+            tool.status(root.path(), Target::MacArm64, None).unwrap(),
             Status::Ready,
             "the built executable reports its version and matches its recorded sha256"
         );
@@ -2607,7 +3081,7 @@ targets.aarch64-unknown-linux-gnu = {{ platform = "linux-arm64", sha256 = "{sha2
         );
         assert!(
             matches!(
-                tool.status(root.path(), Target::MacArm64).unwrap(),
+                tool.status(root.path(), Target::MacArm64, None).unwrap(),
                 Status::Modified { .. }
             ),
             "a swapped build is caught by its recorded sha256"
@@ -2616,6 +3090,7 @@ targets.aarch64-unknown-linux-gnu = {{ platform = "linux-arm64", sha256 = "{sha2
         let error = install(
             root.path(),
             only_tool(&tampered),
+            None,
             Target::MacArm64,
             &archive,
         )
@@ -2669,14 +3144,31 @@ targets.aarch64-unknown-linux-gnu = {{ platform = "linux-arm64", sha256 = "{sha2
         };
         // #25's Coverage and Mutants jobs installed only cargo-nextest, and xtask's tests failed
         // there for want of shellcheck. node and pnpm build the web app the abc binary embeds,
-        // and run its tests.
+        // and run its tests. The JRE, Apalache and Quint check the specs.
         assert_eq!(
             names(&[], true),
-            ["cargo-nextest", "shellcheck", "node", "pnpm"]
+            [
+                "cargo-nextest",
+                "shellcheck",
+                "node",
+                "pnpm",
+                "jre",
+                "apalache",
+                "quint"
+            ]
         );
         assert_eq!(
             names(&["cargo-sqlx"], true),
-            ["cargo-nextest", "cargo-sqlx", "shellcheck", "node", "pnpm"],
+            [
+                "cargo-nextest",
+                "cargo-sqlx",
+                "shellcheck",
+                "node",
+                "pnpm",
+                "jre",
+                "apalache",
+                "quint"
+            ],
             "named tools join them"
         );
         assert!(names(&[], false).len() > 3, "all of them, with neither");
@@ -2768,11 +3260,11 @@ targets.aarch64-unknown-linux-gnu = {{ platform = "linux-arm64", sha256 = "{sha2
         );
         let manifest = pinned_tree(&archive, SCRIPT, &tree.sha256());
         let tool = only_tool(&manifest);
-        install(root.path(), tool, Target::MacArm64, &archive).unwrap();
+        install(root.path(), tool, None, Target::MacArm64, &archive).unwrap();
         let dir = root.path().join(".tools/fake/1.2.3");
         assert_eq!(Tree::of_dir(&dir).unwrap(), tree, "installed as it unpacks");
         assert_eq!(
-            tool.status(root.path(), Target::MacArm64).unwrap(),
+            tool.status(root.path(), Target::MacArm64, None).unwrap(),
             Status::Ready
         );
         assert_eq!(
@@ -2804,7 +3296,7 @@ targets.aarch64-unknown-linux-gnu = {{ platform = "linux-arm64", sha256 = "{sha2
             change();
             let sha256 = Tree::of_dir(&dir).unwrap().sha256();
             assert_eq!(
-                tool.status(root.path(), Target::MacArm64).unwrap(),
+                tool.status(root.path(), Target::MacArm64, None).unwrap(),
                 Status::TreeModified { sha256 },
                 "{what}"
             );
@@ -2835,6 +3327,7 @@ targets.aarch64-unknown-linux-gnu = {{ platform = "linux-arm64", sha256 = "{sha2
         let error = install(
             root.path(),
             only_tool(&manifest),
+            None,
             Target::MacArm64,
             &archive,
         )
@@ -2870,7 +3363,7 @@ targets.aarch64-unknown-linux-gnu = {{ platform = "linux-arm64", sha256 = "{sha2
     }
 
     #[test]
-    fn a_tree_holds_files_and_hard_links_only() {
+    fn a_tree_holds_files_and_links_to_its_own_files_only() {
         let linked = Tree::of_archive(&tarball_with_link(
             tar::EntryType::Link,
             "fake-1.2.3/pnpm",
@@ -2885,24 +3378,74 @@ targets.aarch64-unknown-linux-gnu = {{ platform = "linux-arm64", sha256 = "{sha2
             ),
             "a hard link holds what its target holds, with a mode of its own"
         );
+        let symlinked = Tree::of_archive(&tarball_with_link(
+            tar::EntryType::Symlink,
+            "fake-1.2.3/legal/fake",
+            "../fake",
+        ))
+        .unwrap();
+        assert_eq!(
+            symlinked.manifest(),
+            format!(
+                "{} x fake-1.2.3/fake\n{} l fake-1.2.3/legal/fake\n",
+                sha256_hex(SCRIPT),
+                sha256_hex(b"../fake")
+            ),
+            "a symbolic link is pinned by the path it holds"
+        );
+        assert_ne!(
+            symlinked.sha256(),
+            Tree::of_archive(&tarball_with_link(
+                tar::EntryType::Symlink,
+                "fake-1.2.3/legal/fake",
+                "./../fake",
+            ))
+            .unwrap()
+            .sha256(),
+            "a link that holds another path is another tree"
+        );
         for (kind, path, link, problem) in [
             (
                 tar::EntryType::Symlink,
                 "fake-1.2.3/pnpm",
-                "fake",
-                "fake-1.2.3/pnpm in the archive is neither a file nor a directory",
+                "../../outside",
+                "fake-1.2.3/pnpm links to ../../outside, outside the tool's directory",
+            ),
+            (
+                tar::EntryType::Symlink,
+                "fake-1.2.3/pnpm",
+                "/usr/bin/env",
+                "fake-1.2.3/pnpm links to /usr/bin/env, outside the tool's directory",
+            ),
+            (
+                tar::EntryType::Symlink,
+                "fake-1.2.3/pnpm",
+                "missing",
+                "fake-1.2.3/pnpm links to missing, which is not a file of the tool's directory",
+            ),
+            (
+                tar::EntryType::Symlink,
+                "fake-1.2.3/pnpm",
+                ".",
+                "fake-1.2.3/pnpm links to ., which is not a file of the tool's directory",
             ),
             (
                 tar::EntryType::Link,
                 "fake-1.2.3/pnpm",
                 "fake-1.2.3/later",
-                "fake-1.2.3/pnpm links to fake-1.2.3/later, which comes after it",
+                "fake-1.2.3/pnpm links to fake-1.2.3/later, which is not a file before it",
             ),
             (
                 tar::EntryType::Link,
                 "fake-1.2.3/pnpm",
                 "../outside",
                 "../outside leaves the tool's directory",
+            ),
+            (
+                tar::EntryType::Fifo,
+                "fake-1.2.3/pnpm",
+                "fake",
+                "fake-1.2.3/pnpm in the archive is neither a file, a link nor a directory",
             ),
         ] {
             let error = format!(
@@ -2911,15 +3454,218 @@ targets.aarch64-unknown-linux-gnu = {{ platform = "linux-arm64", sha256 = "{sha2
             );
             assert!(error.contains(problem), "{problem}: {error}");
         }
+    }
 
+    #[test]
+    fn an_installed_tree_reads_its_links_without_following_them() {
         let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join("legal")).unwrap();
         fs::write(dir.path().join("file"), b"x").unwrap();
-        std::os::unix::fs::symlink("file", dir.path().join("link")).unwrap();
+        std::os::unix::fs::symlink("../file", dir.path().join("legal/link")).unwrap();
+        assert_eq!(
+            Tree::of_dir(dir.path()).unwrap().manifest(),
+            format!(
+                "{} - file\n{} l legal/link\n",
+                sha256_hex(b"x"),
+                sha256_hex(b"../file")
+            ),
+            "an installed link is read, not followed"
+        );
+        std::os::unix::fs::symlink("/etc/hosts", dir.path().join("out")).unwrap();
         let error = format!("{:#}", Tree::of_dir(dir.path()).unwrap_err());
         assert!(
-            error.contains("link is neither a file nor a directory"),
+            error.contains("out links to /etc/hosts, outside the tool's directory"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn installs_a_tree_with_its_links_and_checks_them() {
+        let root = tempfile::tempdir().unwrap();
+        let archive = tarball_with_link(tar::EntryType::Symlink, "fake-1.2.3/again", "fake");
+        let tree = Tree::of_archive(&archive).unwrap();
+        let manifest = pinned_tree(&archive, SCRIPT, &tree.sha256());
+        let tool = only_tool(&manifest);
+        install(root.path(), tool, None, Target::MacArm64, &archive).unwrap();
+        let dir = root.path().join(".tools/fake/1.2.3");
+        assert_eq!(Tree::of_dir(&dir).unwrap(), tree, "installed as it unpacks");
+        let link = dir.join("fake-1.2.3/again");
+        assert_eq!(fs::read_link(&link).unwrap(), Path::new("fake"));
+        fs::remove_file(&link).unwrap();
+        fs::write(&link, SCRIPT).unwrap();
+        fs::set_permissions(&link, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            matches!(
+                tool.status(root.path(), Target::MacArm64, None).unwrap(),
+                Status::TreeModified { .. }
+            ),
+            "a link replaced by a copy of its file is another tree"
+        );
+    }
+
+    #[test]
+    fn a_target_may_keep_its_executable_elsewhere_in_its_archive() {
+        let root = tempfile::tempdir().unwrap();
+        let archive = tarball(&[
+            ("fake-1.2.3/fake", SCRIPT, 0o755),
+            ("fake-1.2.3/Contents/Home/fake", SCRIPT, 0o755),
+        ]);
+        let tree = Tree::of_archive(&archive).unwrap().sha256();
+        let text = manifest_text(&sha256_hex(&archive), &sha256_hex(SCRIPT))
+            .replace(
+                "binary = \"fake-{version}/fake\"\n",
+                "binary = \"fake-{version}/fake\"\ntree = true\n",
+            )
+            .replace(" }\n", &format!(", tree-sha256 = \"{tree}\" }}\n"))
+            .replace(
+                "platform = \"mac\",",
+                "platform = \"mac\", binary = \"fake-{version}/Contents/Home/fake\",",
+            );
+        let manifest = Manifest::parse(&text).unwrap();
+        let tool = only_tool(&manifest);
+        assert_eq!(
+            tool.executable(root.path(), Target::MacArm64).unwrap(),
+            root.path()
+                .join(".tools/fake/1.2.3/fake-1.2.3/Contents/Home/fake"),
+            "the target's own path"
+        );
+        assert_eq!(
+            tool.executable(root.path(), Target::LinuxX64).unwrap(),
+            root.path().join(".tools/fake/1.2.3/fake-1.2.3/fake"),
+            "the tool's path elsewhere"
+        );
+        install(root.path(), tool, None, Target::MacArm64, &archive).unwrap();
+        assert_eq!(
+            tool.status(root.path(), Target::MacArm64, None).unwrap(),
+            Status::Ready
+        );
+
+        let without_binary = manifest_text(SHA_A, SHA_B)
+            .replace("binary = \"fake-{version}/fake\"\n", "")
+            .replace(
+                "platform = \"mac\",",
+                "platform = \"mac\", binary = \"fake\",",
+            );
+        let unpaired = format!("{:#}", Manifest::parse(&without_binary).unwrap_err());
+        assert!(
+            unpaired.contains("a target's binary replaces the tool's `binary`, which it needs"),
+            "{unpaired}"
+        );
+        let escaping = text.replace("fake-{version}/Contents/Home/fake", "../fake");
+        let outside = format!("{:#}", Manifest::parse(&escaping).unwrap_err());
+        assert!(
+            outside.contains("aarch64-apple-darwin: binary \"../fake\" must be a relative path"),
+            "{outside}"
+        );
+    }
+
+    /// A tool list of `rt`, an executable asset, then `fake`, which runs on it.
+    fn with_runtime(runtime: &[u8], archive: &[u8]) -> String {
+        let rt = sha256_hex(runtime);
+        format!(
+            r#"[[tool]]
+name = "rt"
+version = "9.9.9"
+url = "https://example.com/rt-{{platform}}"
+attestations = "example/rt"
+targets.aarch64-apple-darwin = {{ platform = "mac", sha256 = "{rt}", binary-sha256 = "{rt}" }}
+targets.x86_64-unknown-linux-gnu = {{ platform = "linux-x64", sha256 = "{rt}", binary-sha256 = "{rt}" }}
+targets.aarch64-unknown-linux-gnu = {{ platform = "linux-arm64", sha256 = "{rt}", binary-sha256 = "{rt}" }}
+
+{}"#,
+            manifest_text(&sha256_hex(archive), &sha256_hex(RUNS_ON_RT))
+                .replace("# The tools.\n", "")
+                .replace("[[tool]]\n", "[[tool]]\nruntime = \"rt\"\n")
+        )
+    }
+
+    /// An executable that reports its version only when `rt` is first on `PATH`.
+    const RUNS_ON_RT: &[u8] = b"#!/bin/sh\nrt && echo 'fake 1.2.3'\n";
+
+    #[test]
+    fn a_runtime_comes_first_on_path_whenever_its_tool_runs() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime: &[u8] = b"#!/bin/sh\n[ \"$1\" = --version ] && echo 'rt 9.9.9'\nexit 0\n";
+        let archive = tarball(&[("fake-1.2.3/fake", RUNS_ON_RT, 0o755)]);
+        let manifest = Manifest::parse(&with_runtime(runtime, &archive)).unwrap();
+        let mut downloads = Vec::new();
+        install_unready(
+            root.path(),
+            &manifest,
+            Target::MacArm64,
+            &mut Vec::new(),
+            &mut |url: &str| {
+                downloads.push(url.to_owned());
+                Ok(if url.contains("/rt-") {
+                    runtime.to_vec()
+                } else {
+                    archive.clone()
+                })
+            },
+        )
+        .unwrap();
+        assert_eq!(downloads.len(), 2, "{downloads:?}");
+        let fake = only_tool(&manifest);
+        assert!(
+            matches!(
+                fake.status(root.path(), Target::MacArm64, None).unwrap(),
+                Status::Drift { said } if said.contains("rt")
+            ),
+            "without its runtime it cannot run"
+        );
+        let mut out = Vec::new();
+        assert_eq!(
+            report(root.path(), &manifest, Target::MacArm64, &mut out).unwrap(),
+            ExitCode::SUCCESS,
+            "{}",
+            String::from_utf8_lossy(&out)
+        );
+
+        let selected = Manifest::parse(&with_runtime(runtime, &archive))
+            .unwrap()
+            .select(&["fake".to_owned()], false)
+            .unwrap();
+        let names: Vec<&str> = selected
+            .tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            ["rt", "fake"],
+            "selecting a tool selects its runtime"
+        );
+    }
+
+    #[test]
+    fn a_runtime_is_a_tool_listed_before_that_needs_none() {
+        let valid = with_runtime(b"rt", b"fake");
+        let (rt, fake) = valid.split_at(valid.find("\n[[tool]]\nruntime").unwrap());
+        for (text, problem) in [
+            (
+                format!("{fake}\n{rt}"),
+                "tool \"fake\": its runtime \"rt\" must be a tool listed before it",
+            ),
+            (
+                valid.replace("runtime = \"rt\"", "runtime = \"fake\""),
+                "tool \"fake\": its runtime \"fake\" must be a tool listed before it",
+            ),
+            (
+                valid.replace("runtime = \"rt\"", "runtime = \"jre\""),
+                "tool \"fake\": its runtime \"jre\" must be a tool listed before it",
+            ),
+            (
+                format!(
+                    "{}\n{}",
+                    rt.replace("name = \"rt\"", "name = \"rt0\""),
+                    valid.replacen("name = \"rt\"", "name = \"rt\"\nruntime = \"rt0\"", 1)
+                ),
+                "must not need a runtime itself",
+            ),
+        ] {
+            let error = format!("{:#}", Manifest::parse(&text).unwrap_err());
+            assert!(error.contains(problem), "{problem}: {error}");
+        }
     }
 
     #[test]

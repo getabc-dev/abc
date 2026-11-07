@@ -2,13 +2,14 @@
 //!
 //! It covers the repository's two Cargo workspaces, the main one and xtask's own (`xtask/`), lints
 //! its shell scripts with the pinned shellcheck, and runs the web app's gates ([`crate::web`]):
-//! Biome, Oxlint, tsc, knip and Vitest, after installing and building it with the pinned pnpm.
-//! The fuzz workspace is `cargo xtask fuzz`'s.
+//! Biome, Oxlint, tsc, knip and Vitest, after installing and building it with the pinned pnpm,
+//! and the formal specs' gate ([`crate::spec`]). The fuzz workspace is `cargo xtask fuzz`'s.
 //!
 //! The main workspace's `abc` crate embeds the built web app (`web/dist`), so clippy and the tests
 //! of the main workspace need one. With `--changed`, the web gates run only when `web/` or the
 //! pinned node and pnpm changed, and the web app is built for the main workspace only when no
-//! build is there yet, so a change elsewhere does not wait for pnpm.
+//! build is there yet, so a change elsewhere does not wait for pnpm. Likewise the specs' gate
+//! runs only when `spec/` or the pinned tools changed.
 
 use std::collections::BTreeSet;
 use std::ffi::OsString;
@@ -76,6 +77,8 @@ pub(crate) struct Tree<'a> {
     pub(crate) scripts: &'a [&'a str],
     /// Whether the tree holds the web app (`web/`), which [`MAIN`]'s crates embed.
     pub(crate) web: bool,
+    /// Whether the tree holds formal specs (`spec/`).
+    pub(crate) spec: bool,
 }
 
 /// This repository: both workspaces, every script and the web app.
@@ -83,6 +86,7 @@ pub(crate) const REPOSITORY: Tree<'static> = Tree {
     workspaces: &[MAIN, XTASK],
     scripts: &SCRIPTS,
     web: true,
+    spec: true,
 };
 
 impl Workspace {
@@ -221,6 +225,8 @@ pub(crate) struct Tools {
     pub(crate) shellcheck: PathBuf,
     /// node and pnpm, for a tree with the web app.
     pub(crate) web: Option<crate::web::Toolchain>,
+    /// Quint, Apalache and the JRE, for a tree with formal specs.
+    pub(crate) spec: Option<crate::spec::Tools>,
 }
 
 /// How the check reaches Postgres.
@@ -399,6 +405,9 @@ impl<W: Write> Run<'_, W> {
                 Some(_) | None => self.web_gates(toolchain)?,
             }
         }
+        if tree.spec {
+            self.spec(changed_files)?;
+        }
         for &workspace in tree.workspaces {
             let (scope, packages) = match changed_files {
                 Some(files) => {
@@ -408,6 +417,37 @@ impl<W: Write> Run<'_, W> {
                 None => (Scope::Workspace, None),
             };
             self.workspace(workspace, &scope, packages)?;
+        }
+        Ok(())
+    }
+
+    /// Runs the specs' gate, unless `changed_files` are given and none of them can change what it
+    /// finds.
+    fn spec(&mut self, changed_files: Option<&[PathBuf]>) -> anyhow::Result<()> {
+        match changed_files {
+            _ if !crate::spec::present(self.root) => writeln!(
+                self.out,
+                "xtask: the tree holds no specs (spec/); skipping the specs' gate"
+            )?,
+            Some(files) if !files.iter().any(|path| crate::spec::affected_by(path)) => writeln!(
+                self.out,
+                "xtask: nothing under spec/ changed; skipping the specs' gate"
+            )?,
+            Some(_) | None => {
+                let tools = self.tools.spec.as_ref().context(
+                    "the tree holds specs, but Quint, Apalache and the JRE were not given; run \
+                     `cargo xtask setup`",
+                )?;
+                let options = crate::spec::Options { traces: None };
+                if !crate::spec::run(self.root, &crate::spec::RUNNER, tools, options, self.out)? {
+                    self.failures.push(Failure {
+                        step: "specs".to_owned(),
+                        fix: "fix what `xtask spec` lists above; `cargo xtask spec` repeats the \
+                              specs' gate alone"
+                            .to_owned(),
+                    });
+                }
+            }
         }
         Ok(())
     }
@@ -1349,11 +1389,13 @@ mod tests {
             nextest,
             shellcheck: crate::testing::pinned_for_tests("shellcheck"),
             web: None,
+            spec: None,
         };
         let tree = Tree {
             workspaces: &[MAIN],
             scripts: &[],
             web: false,
+            spec: false,
         };
         let passed = run(
             fixture.path(),
@@ -1430,6 +1472,7 @@ mod tests {
             nextest: PathBuf::from("unused"),
             shellcheck: crate::testing::pinned_for_tests("shellcheck"),
             web: None,
+            spec: None,
         };
         let unused = |_: &mut dyn std::io::Write| anyhow::bail!("no database");
         let no_sqlx = || anyhow::bail!("no query cache");
@@ -1441,6 +1484,7 @@ mod tests {
             workspaces: &[],
             scripts,
             web: false,
+            spec: false,
         };
         let mut out = Vec::new();
         let passed = run(dir, tree, PLAIN, &tools, &postgres, &mut out).unwrap();
@@ -1456,6 +1500,7 @@ mod tests {
             nextest: PathBuf::from("unused"),
             shellcheck: PathBuf::from("unused"),
             web,
+            spec: None,
         };
         let unused = |_: &mut dyn std::io::Write| anyhow::bail!("no database");
         let no_sqlx = || anyhow::bail!("no query cache");
@@ -1467,6 +1512,7 @@ mod tests {
             workspaces: &[],
             scripts: &[],
             web: true,
+            spec: false,
         };
         let mut out = Vec::new();
         let passed = run(dir, tree, PLAIN, &tools, &postgres, &mut out)?;
@@ -1532,6 +1578,7 @@ mod tests {
             nextest: crate::testing::pinned_for_tests("cargo-nextest"),
             shellcheck: PathBuf::from("unused"),
             web: Some(crate::testing::fake_web(&tools_dir, "")),
+            spec: None,
         };
         let unused = |_: &mut dyn std::io::Write| anyhow::bail!("no database");
         let no_sqlx = || anyhow::bail!("no query cache");
@@ -1543,6 +1590,7 @@ mod tests {
             workspaces: &[MAIN],
             scripts: &[],
             web: true,
+            spec: false,
         };
         let target = temp.path().join("target");
         let check = || {
@@ -1614,6 +1662,91 @@ mod tests {
         );
         let error = web_gates_in(empty.path(), None).unwrap_err().to_string();
         assert!(error.contains("run `cargo xtask setup`"), "{error}");
+    }
+
+    /// Runs only the specs' gate step on the tree at `dir`, for `changed` files when given, and
+    /// returns its failures' steps and what it said.
+    fn spec_gate_in(
+        dir: &Path,
+        changed: Option<&[PathBuf]>,
+        spec: Option<crate::spec::Tools>,
+    ) -> anyhow::Result<(Vec<String>, String)> {
+        let tools = Tools {
+            nextest: PathBuf::from("unused"),
+            shellcheck: PathBuf::from("unused"),
+            web: None,
+            spec,
+        };
+        let unused = |_: &mut dyn std::io::Write| anyhow::bail!("no database");
+        let no_sqlx = || anyhow::bail!("no query cache");
+        let postgres = super::Postgres {
+            warm: &unused,
+            sqlx: &no_sqlx,
+        };
+        let mut out = Vec::new();
+        let mut gate = super::Run {
+            root: dir,
+            tools: &tools,
+            postgres: &postgres,
+            target_dir: None,
+            annotations: crate::annotation::Step::new(Mode::Plain),
+            out: &mut out,
+            failures: Vec::new(),
+            web: None,
+        };
+        gate.spec(changed)?;
+        let steps = gate
+            .failures
+            .iter()
+            .map(|failure| failure.step.clone())
+            .collect();
+        Ok((steps, String::from_utf8(out)?))
+    }
+
+    #[test]
+    fn the_specs_gate_runs_when_specs_or_pins_change() {
+        let empty = tempfile::tempdir().unwrap();
+        let (none, without) = spec_gate_in(empty.path(), None, None).unwrap();
+        assert!(none.is_empty(), "{none:?}");
+        assert!(
+            without.contains("the tree holds no specs (spec/)"),
+            "{without}"
+        );
+
+        let specs = tempfile::tempdir().unwrap();
+        fs::create_dir_all(specs.path().join("spec/runner")).unwrap();
+        fs::write(
+            specs.path().join("spec/runner/runner.qnt"),
+            "module runner { val x: int = true }\n",
+        )
+        .unwrap();
+        let elsewhere = [
+            PathBuf::from("src/a.rs"),
+            PathBuf::from("docs/spec/runner.md"),
+        ];
+        let (skipped, unchanged) = spec_gate_in(specs.path(), Some(&elsewhere), None).unwrap();
+        assert!(skipped.is_empty(), "{skipped:?}");
+        assert!(
+            unchanged.contains("nothing under spec/ changed; skipping the specs' gate"),
+            "{unchanged}"
+        );
+        for touched in ["spec/runner/runner.qnt", "xtask/tools.toml"] {
+            let error = spec_gate_in(specs.path(), Some(&[PathBuf::from(touched)]), None)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("Quint, Apalache and the JRE were not given"),
+                "{touched}: {error}"
+            );
+        }
+        let pinned =
+            crate::spec::Tools::pinned(&|name| Ok(crate::testing::pinned_for_tests(name))).unwrap();
+        let (failures, said) = spec_gate_in(specs.path(), None, Some(pinned)).unwrap();
+        assert_eq!(failures, ["specs"], "{said}");
+        assert!(
+            said.contains("typecheck spec/runner/runner.qnt: fix each type error above"),
+            "{said}"
+        );
     }
 
     #[test]

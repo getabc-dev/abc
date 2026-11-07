@@ -21,6 +21,7 @@ mod release;
 mod review;
 mod rulesets;
 mod shell;
+mod spec;
 mod stop;
 mod task;
 #[cfg(test)]
@@ -172,6 +173,14 @@ enum Task {
         /// How long to fuzz, in seconds.
         #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u64).range(1..))]
         seconds: u64,
+    },
+    /// Check the formal specs in spec/ with the pinned Quint, Apalache and JRE: typecheck them,
+    /// run their tests, have TLC explore every state of each model and find each seeded bug.
+    Spec {
+        /// Also write ITF traces of each model's simulations into DIR, the input the runner's
+        /// trace replay reads; docs/spec/runner.md describes them.
+        #[arg(long, value_name = "DIR")]
+        traces: Option<PathBuf>,
     },
     /// Report deleted, skipped or weakened tests and changed gate files since the merge base.
     Integrity {
@@ -427,6 +436,7 @@ fn perform(
             &web::Toolchain::pinned(tool)?,
             report,
         )?)),
+        Task::Spec { traces } => run_spec(root, traces.as_deref(), tool, report),
         Task::Fuzz { seconds } => Ok(verdict(fuzz::run(
             root,
             &check::cargo(),
@@ -514,6 +524,7 @@ const fn gate_of(task: &Task) -> Option<(gate::Gate, gate::Wait)> {
         Task::Coverage { .. } => Some((gate::Gate::Coverage, gate::Wait::Yes)),
         Task::Mutants { .. } => Some((gate::Gate::Mutants, gate::Wait::Yes)),
         Task::Fuzz { .. } => Some((gate::Gate::Fuzz, gate::Wait::Yes)),
+        Task::Spec { .. } => Some((gate::Gate::Spec, gate::Wait::Yes)),
         Task::E2e => Some((gate::Gate::E2e, gate::Wait::Yes)),
         Task::Integrity { .. }
         | Task::GitCredential { .. }
@@ -533,6 +544,23 @@ const fn gate_of(task: &Task) -> Option<(gate::Gate, gate::Wait)> {
         | Task::Tool { .. }
         | Task::Hook { .. } => None,
     }
+}
+
+/// `cargo xtask spec`: the specs' gate on `root`, with the pinned tools `tool` finds, writing
+/// traces into `traces` when given.
+fn run_spec(
+    root: &Path,
+    traces: Option<&Path>,
+    tool: &dyn Fn(&str) -> anyhow::Result<PathBuf>,
+    report: &mut impl Write,
+) -> anyhow::Result<ExitCode> {
+    Ok(verdict(spec::run(
+        root,
+        &spec::RUNNER,
+        &spec::Tools::pinned(tool)?,
+        spec::Options { traces },
+        report,
+    )?))
 }
 
 /// `cargo xtask release ACTION`: the release workflow's steps.
@@ -679,6 +707,7 @@ fn check(
         nextest: tool("cargo-nextest")?,
         shellcheck: tool("shellcheck")?,
         web: Some(web::Toolchain::pinned(tool)?),
+        spec: Some(spec::Tools::pinned(tool)?),
     };
     check::run(
         root,
@@ -886,6 +915,10 @@ mod tests {
         script(&dir.join("cargo-nextest"), "exit 0\n");
         script(&dir.join("shellcheck"), "exit 0\n");
         script(&dir.join("cargo-fuzz"), "exit 77\n");
+        // The fixtures hold no specs, so Quint, Apalache and the JRE are resolved but never run.
+        script(&dir.join("quint"), "exit 9\n");
+        script(&dir.join("apalache"), "exit 9\n");
+        script(&dir.join("jre"), "exit 9\n");
         // The fixtures hold no web app, so node and pnpm are resolved but never run.
         script(&dir.join("node"), "exit 9\n");
         script(&dir.join("pnpm"), "exit 9\n");
@@ -1309,6 +1342,7 @@ mod tests {
             ),
             ("coverage", Task::Coverage { base: base() }),
             ("fuzz", Task::Fuzz { seconds: 1 }),
+            ("spec", Task::Spec { traces: None }),
             (
                 "mutants",
                 Task::Mutants {
