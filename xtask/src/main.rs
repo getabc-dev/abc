@@ -410,11 +410,7 @@ fn perform(
         Task::Coverage { base } => Ok(verdict(coverage::run(
             root,
             &base,
-            &coverage::Tools {
-                llvm_cov: tool("cargo-llvm-cov")?,
-                nextest: tool("cargo-nextest")?,
-                web: web::Toolchain::pinned(tool)?,
-            },
+            &coverage::Tools::pinned(tool)?,
             mode,
             report,
         )?)),
@@ -422,9 +418,7 @@ fn perform(
             root,
             &base,
             &mutants::Options { jobs, shard, mode },
-            &tool("cargo-mutants")?,
-            &tool("cargo-nextest")?,
-            &web::Toolchain::pinned(tool)?,
+            &mutants::Tools::pinned(tool)?,
             report,
         )?)),
         Task::Fuzz { seconds } => Ok(verdict(fuzz::run(
@@ -678,6 +672,7 @@ fn check(
     let tools = check::Tools {
         nextest: tool("cargo-nextest")?,
         shellcheck: tool("shellcheck")?,
+        postgres: check::postgres_bin(&tool)?,
         web: Some(web::Toolchain::pinned(tool)?),
     };
     check::run(
@@ -883,6 +878,8 @@ mod tests {
         // The fixtures hold no web app, so node and pnpm are resolved but never run.
         script(&dir.join("node"), "exit 9\n");
         script(&dir.join("pnpm"), "exit 9\n");
+        // The gates hand the tests Postgres's bin directory; the fixtures' tests never run it.
+        script(&dir.join("postgresql"), "exit 9\n");
     }
 
     fn dispatch(

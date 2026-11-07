@@ -4,8 +4,8 @@
 //! tailscaled and tailscale CLI, sudo, loginctl and browser. The setup code it opens the claim page
 //! with is checked against the real database.
 //!
-//! Postgres 18's programs come from `ABC_TEST_POSTGRES_BIN`, else from where Debian's
-//! `postgresql-18` or Homebrew's `postgresql@18` puts them.
+//! Postgres 18's programs are the pinned `postgresql` tool's, which xtask names in
+//! `ABC_TEST_POSTGRES_BIN`.
 
 #[cfg(test)]
 mod tests {
@@ -18,27 +18,20 @@ mod tests {
     use abc_store::testing::Fixture;
     use sqlx::PgPool;
 
-    /// Postgres 18's bin directory on this machine.
+    /// Postgres 18's bin directory: the pinned `postgresql` tool's, which `cargo xtask check`,
+    /// `coverage` and `mutants` give the tests. Never one from `PATH`.
     fn postgres_bin() -> PathBuf {
-        if let Some(dir) = std::env::var_os("ABC_TEST_POSTGRES_BIN") {
-            return PathBuf::from(dir);
-        }
-        [
-            "/usr/lib/postgresql/18/bin",
-            "/opt/homebrew/opt/postgresql@18/bin",
-            "/usr/local/opt/postgresql@18/bin",
-            "/home/linuxbrew/.linuxbrew/opt/postgresql@18/bin",
-        ]
-        .into_iter()
-        .map(PathBuf::from)
-        .find(|dir| dir.join("initdb").is_file())
-        .unwrap_or_else(|| {
-            panic!(
-                "these tests run abc's private Postgres for real: install Postgres 18 \
-                 (apt install postgresql-18, or brew install postgresql@18), or set \
-                 ABC_TEST_POSTGRES_BIN to its bin directory"
-            )
-        })
+        std::env::var_os("ABC_TEST_POSTGRES_BIN")
+            .map(PathBuf::from)
+            .filter(|bin| bin.join("initdb").is_file())
+            .unwrap_or_else(|| {
+                panic!(
+                    "these tests run abc's private Postgres for real: run them through `cargo \
+                     xtask check`, which gives them the pinned Postgres 18 (`cargo xtask setup \
+                     --for-tests` installs it), or set ABC_TEST_POSTGRES_BIN to a Postgres 18 bin \
+                     directory"
+                )
+            })
     }
 
     fn copy_tree(from: &Path, to: &Path) {

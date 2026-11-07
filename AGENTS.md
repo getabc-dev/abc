@@ -161,9 +161,9 @@ always read the committed `.sqlx/` cache (`SQLX_OFFLINE`), and `check` fails whe
 longer matches its queries, saying how to regenerate it.
 
 `abc server setup`'s end-to-end test (`crates/abc/tests/server_setup.rs`) runs abc's private
-Postgres for real, so it needs Postgres 18's programs: `ABC_TEST_POSTGRES_BIN`, else Debian's
-`postgresql-18` (`/usr/lib/postgresql/18/bin`) or Homebrew's `postgresql@18`. It fails, naming
-them, when none is there.
+Postgres for real, with Postgres 18's programs from the pinned `for-tests` tool `postgresql`
+(theseus-rs's attested builds): `check`, `coverage` and `mutants` give the tests its bin directory
+as `ABC_TEST_POSTGRES_BIN`, and the test never looks on `PATH`.
 
 CI runs `check`, `e2e`, `integrity`, `coverage`, `mutants` (in eight shards, reported as one
 `Mutants` check), `review` and `fuzz` (for a minute; for an hour nightly on `main`) on every pull

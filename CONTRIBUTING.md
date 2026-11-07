@@ -81,8 +81,8 @@ postgres = "/opt/homebrew/opt/postgresql@18/bin"
 Its tests run against fakes of launchctl, systemctl, loginctl, sudo, the browser, tailscaled and
 the tailscale CLI (`crates/abc-host/tests/fakes`), which record every call and run what each
 service definition says. `crates/abc/tests/server_setup.rs` runs the real abc server on a real
-Postgres 18 under them, so it needs Postgres 18's programs: `brew install postgresql@18` on macOS
-or `postgresql-18` on Debian and Ubuntu, or `ABC_TEST_POSTGRES_BIN` naming their directory.
+Postgres 18 under them: the pinned `postgresql` tool's, which `cargo xtask setup` installs
+and `cargo xtask check` hands the test as `ABC_TEST_POSTGRES_BIN`.
 
 To work on the web app with Vite's dev server and its instant reloads:
 
