@@ -618,9 +618,31 @@ impl Tool {
             Ok(Status::Ready)
         } else {
             Ok(Status::Drift {
-                reported: stdout.lines().next().unwrap_or_default().trim().to_owned(),
+                said: version_run(output.status, &stdout, &stderr),
             })
         }
+    }
+}
+
+/// What a version run that did not report the pinned version did, as the rest of a sentence
+/// beginning "`--version` …": the version it reported, or, when it failed or printed nothing, its
+/// exit status and what it said on stderr, so a binary that cannot even start says why.
+fn version_run(status: ExitStatus, stdout: &str, stderr: &str) -> String {
+    let reported = stdout.lines().map(str::trim).find(|line| !line.is_empty());
+    if status.success()
+        && let Some(reported) = reported
+    {
+        return format!("reports {reported:?}");
+    }
+    let stderr = stderr.trim();
+    let said = if stderr.is_empty() {
+        "nothing on stderr".to_owned()
+    } else {
+        format!("on stderr: {stderr}")
+    };
+    match reported {
+        Some(reported) => format!("{status}, reporting {reported:?}, with {said}"),
+        None => format!("{status} and prints nothing on stdout, with {said}"),
     }
 }
 
@@ -667,9 +689,10 @@ enum Status {
     TreeModified {
         sha256: String,
     },
-    /// Installed with the pinned sha256, but `--version` does not report the pinned version.
+    /// Installed with the pinned sha256, but `--version` does not report the pinned version:
+    /// `said` is what it did instead, as [`version_run`] words it.
     Drift {
-        reported: String,
+        said: String,
     },
 }
 
@@ -761,11 +784,11 @@ fn report(
                     tool.name, tool.version
                 )?;
             }
-            Status::Drift { reported } => {
+            Status::Drift { said } => {
                 ready = false;
                 writeln!(
                     out,
-                    "drift    {} {}: the installed binary reports {reported:?}",
+                    "drift    {} {}: the installed binary's `--version` {said}",
                     tool.name, tool.version
                 )?;
             }
@@ -1275,8 +1298,8 @@ fn place(
             "{} changed while it was installed: a sha256 is now {sha256}",
             tool.name
         ),
-        Status::Drift { reported } => bail!(
-            "{} {} was installed, but `--version` reports {reported:?}",
+        Status::Drift { said } => bail!(
+            "{} {} was installed, but its `--version` {said}",
             tool.name,
             tool.version
         ),
@@ -2118,10 +2141,49 @@ targets.aarch64-unknown-linux-gnu = {{ platform = "linux-arm64", sha256 = "{sha2
         assert_eq!(
             tool.status(root.path(), Target::MacArm64).unwrap(),
             Status::Drift {
-                reported: "fake 1.2.4".to_owned()
+                said: "reports \"fake 1.2.4\"".to_owned()
             },
             "a pinned binary reporting another version has drifted"
         );
+    }
+
+    #[test]
+    fn a_version_run_that_fails_says_how_and_why() {
+        let broken: &[u8] =
+            b"#!/bin/sh\necho 'fake: /lib64/libc.so.6: version GLIBC_2.34 not found' >&2\nexit 1\n";
+        let silent: &[u8] = b"#!/bin/sh\n";
+        let failing: &[u8] = b"#!/bin/sh\necho 'fake 1.2.3'\nexit 3\n";
+        for (script, said, why) in [
+            (
+                broken,
+                "exit status: 1 and prints nothing on stdout, with on stderr: fake: \
+                 /lib64/libc.so.6: version GLIBC_2.34 not found",
+                "a binary that cannot start says why",
+            ),
+            (
+                silent,
+                "exit status: 0 and prints nothing on stdout, with nothing on stderr",
+                "a binary that prints nothing",
+            ),
+            (
+                failing,
+                "exit status: 3, reporting \"fake 1.2.3\", with nothing on stderr",
+                "a run that fails even with the right version",
+            ),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let manifest = Manifest::parse(&manifest_text(SHA_A, &sha256_hex(script))).unwrap();
+            write_executable(&root.path().join(".tools/fake/1.2.3/fake"), script);
+            assert_eq!(
+                only_tool(&manifest)
+                    .status(root.path(), Target::MacArm64)
+                    .unwrap(),
+                Status::Drift {
+                    said: said.to_owned()
+                },
+                "{why}"
+            );
+        }
     }
 
     #[test]
