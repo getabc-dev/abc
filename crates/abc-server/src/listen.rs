@@ -10,11 +10,10 @@
 //!    distinction.)
 //! 2. **Only the sidecar can reach the socket.** [`SidecarSocket::bind`] refuses a parent directory
 //!    with any "other" permission bit, removes a stale socket file, binds, and sets the socket to
-//!    0660. `abc server setup` puts it in `<home>/run/` (0700), where only the user reaches it: abc
-//!    server and abc's own tailscaled run as that user, and Serve proxies
-//!    `https://<name>.<tailnet>.ts.net/` to `unix:<home>/run/abc.sock` (abc-host's `root`).
-//! 3. **There is no TCP listener with identity**, so a stray `ports:` mapping or a `0.0.0.0` bind
-//!    exposes health checks at most, never forgeable identity.
+//!    0660. `abc server setup` puts it in its private `run/`, which only abc's own tailscaled, run
+//!    as the same user, reaches: Serve proxies the node's `https://` URL to it.
+//! 3. **There is no TCP listener with identity**, so an ops address bound to `0.0.0.0` exposes
+//!    health checks at most, never forgeable identity.
 //! 4. **Defence in depth.** `TailnetCaller` is `FromRequestParts<SidecarState>` only, so identity
 //!    handlers cannot be mounted on the ops router. The ops router is built inside `ops::serve`.
 //!    `clippy.toml` disallows `axum::serve`, so the two functions here are the only places that
