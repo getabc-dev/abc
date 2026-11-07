@@ -90,7 +90,7 @@ pub fn setup(
     let tailscale = Tailscale::new(home, &config.programs);
     services.install(&tailscaled_service(&tailscale))?;
     let mut node = tailscale.wait_answering(&host.timing)?;
-    if !(node.running() && node.dns_name().is_some()) {
+    if !node.running() {
         node = tailscale.log_in(
             console,
             &host.timing,

@@ -1,7 +1,10 @@
 #!/bin/sh
 # A stand-in for abc's tailscale CLI, answering for the fake daemon: status, up (which waits for
 # the person to follow the login link the fake browser opens), serve (only as root), serve
-# status and logout.
+# status and logout. Switches in state/: up-fails (up is refused), needs-approval (the tailnet
+# approves new devices; the first status that says so approves it), no-dns (the node runs with
+# no DNS name, as without MagicDNS) and garbled (status answers something that is not JSON).
+# A waiting up leaves its process id in state/up.pid.
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 # shellcheck source-path=SCRIPTDIR source=../bin/lib.sh
 . "$ROOT/bin/lib.sh"
@@ -20,7 +23,14 @@ fi
 NAME=abc.tailfake.ts.net
 case "$1 ${2:-}" in
 "status --json")
-	if [ -f "$STATE/logged-in" ]; then
+	if [ -f "$STATE/garbled" ]; then
+		echo "not json"
+	elif [ -f "$STATE/logged-in" ] && [ -f "$STATE/needs-approval" ]; then
+		rm -f "$STATE/needs-approval"
+		printf '{"BackendState":"NeedsMachineAuth","AuthURL":"","Self":{"DNSName":""}}\n'
+	elif [ -f "$STATE/logged-in" ] && [ -f "$STATE/no-dns" ]; then
+		printf '{"BackendState":"Running","AuthURL":"","Self":{"DNSName":""}}\n'
+	elif [ -f "$STATE/logged-in" ]; then
 		printf '{"BackendState":"Running","AuthURL":"","Self":{"DNSName":"%s."}}\n' "$NAME"
 	elif [ -f "$STATE/up-started" ]; then
 		printf '{"BackendState":"NeedsLogin","AuthURL":"https://login.tailscale.com/a/fake","Self":{"DNSName":""}}\n'
@@ -35,7 +45,12 @@ case "$1 ${2:-}" in
 		exit 0
 		;;
 	esac
+	if [ -f "$STATE/up-fails" ]; then
+		echo "backend error: invalid key: unable to validate API key" >&2
+		exit 1
+	fi
 	touch "$STATE/up-started"
+	echo "$$" >"$STATE/up.pid"
 	while [ ! -f "$STATE/logged-in" ]; do
 		sleep 0.05
 	done

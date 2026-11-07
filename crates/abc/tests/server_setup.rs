@@ -300,6 +300,25 @@ mod tests {
         // Claimed now: a restore would replace the owner.
         let fixture = Fixture::new(pool.clone()).await;
         fixture.claim(&Fixture::alice()).await.unwrap();
+        let claimed = succeeded(&machine.abc(&["setup"]));
+        assert!(
+            claimed.contains("abc is already claimed; open https://abc.tailfake.ts.net"),
+            "no claim page for a claimed server: {claimed}"
+        );
+        let bogus = machine.root().join("bogus.dump");
+        std::fs::write(&bogus, "not a dump").unwrap();
+        let unreadable = machine.abc(&["restore", "--force", bogus.to_str().unwrap()]);
+        assert_eq!(
+            unreadable.status.code(),
+            Some(1),
+            "{}",
+            text(&unreadable.stderr)
+        );
+        assert!(
+            text(&unreadable.stderr).contains("name a file abc server backup wrote"),
+            "{}",
+            text(&unreadable.stderr)
+        );
         let refused = machine.abc(&["restore", file.to_str().unwrap()]);
         assert_eq!(refused.status.code(), Some(2), "{}", text(&refused.stderr));
         assert!(
@@ -315,5 +334,76 @@ mod tests {
             .unwrap();
         assert_eq!(workspaces, 0, "the unclaimed server is back");
         restored.close().await;
+    }
+
+    /// `abc <args>` with a clean environment and only `env`.
+    fn bare(args: &[&str], env: &[(&str, &Path)]) -> Output {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_abc"));
+        command.args(args).env_clear();
+        for (name, value) in env {
+            command.env(name, value);
+        }
+        if let Some(profile) = std::env::var_os("LLVM_PROFILE_FILE") {
+            command.env("LLVM_PROFILE_FILE", profile);
+        }
+        command.output().unwrap()
+    }
+
+    #[test]
+    fn commands_before_setup_say_to_run_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("server");
+        let env = [("HOME", dir.path()), ("ABC_SERVER_HOME", home.as_path())];
+        let code = bare(&["server", "setup-code"], &env);
+        assert_eq!(code.status.code(), Some(2), "{}", text(&code.stderr));
+        assert!(
+            text(&code.stderr).contains("run abc server setup, or set ABC_DATABASE_URL"),
+            "{}",
+            text(&code.stderr)
+        );
+        for args in [
+            &["server", "status"][..],
+            &["server", "backup"],
+            &["server", "upgrade"],
+        ] {
+            let output = bare(args, &env);
+            assert_eq!(output.status.code(), Some(2), "{args:?}");
+            assert!(
+                text(&output.stderr).ends_with("run abc server setup\n"),
+                "{args:?}: {}",
+                text(&output.stderr)
+            );
+        }
+        let restore = bare(&["server", "restore", "x.dump"], &env);
+        assert_eq!(restore.status.code(), Some(2), "{}", text(&restore.stderr));
+        let nothing = bare(&["server", "uninstall"], &env);
+        assert!(nothing.status.success(), "{}", text(&nothing.stderr));
+        let homeless = bare(&["server", "status"], &[]);
+        assert_eq!(homeless.status.code(), Some(2), "no HOME");
+        assert!(
+            text(&homeless.stderr).contains("set HOME"),
+            "{}",
+            text(&homeless.stderr)
+        );
+    }
+
+    #[test]
+    fn the_server_needs_its_socket_named() {
+        let output = bare(&["server"], &[]).status.code();
+        assert_eq!(output, Some(2), "a configuration error");
+        let mut command = Command::new(env!("CARGO_BIN_EXE_abc"));
+        let named = command
+            .arg("server")
+            .env_clear()
+            .env("ABC_PUBLIC_URL", "https://abc.example.ts.net")
+            .env("ABC_DATABASE_URL", "postgres://abc@127.0.0.1:1/abc")
+            .output()
+            .unwrap();
+        assert_eq!(named.status.code(), Some(2), "{}", text(&named.stderr));
+        assert!(
+            text(&named.stderr).contains("ABC_SIDECAR_SOCKET is required to run the server"),
+            "{}",
+            text(&named.stderr)
+        );
     }
 }

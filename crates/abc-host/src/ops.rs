@@ -77,16 +77,12 @@ fn read_answer(answer: &str) -> Readiness {
 pub(crate) fn wait_ready(addr: SocketAddr, timing: &Timing, fix: &str) -> Result<(), HostError> {
     let start = Instant::now();
     loop {
-        let readiness = probe(addr);
-        if readiness == Readiness::Ready {
-            return Ok(());
-        }
+        let last = match probe(addr) {
+            Readiness::Ready => return Ok(()),
+            Readiness::NotReady(said) => format!("it said {said}"),
+            Readiness::Unreachable(error) => format!("nothing answered on {addr}: {error}"),
+        };
         if start.elapsed() >= timing.server {
-            let last = match readiness {
-                Readiness::NotReady(said) => format!("it said {said}"),
-                Readiness::Unreachable(error) => format!("nothing answered on {addr}: {error}"),
-                Readiness::Ready => String::new(),
-            };
             return Err(HostError::Timeout {
                 what: format!("abc server reporting ready ({last})"),
                 seconds: timing.server.as_secs(),

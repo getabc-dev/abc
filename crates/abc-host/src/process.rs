@@ -304,10 +304,18 @@ mod tests {
             "the first executable one"
         );
         assert_eq!(find_on_path(&path, "other"), None, "absent");
+        // An empty entry means the current directory to a shell; abc never looks there. Each test
+        // runs in a process of its own (nextest), so changing directory touches no other test.
+        std::env::set_current_dir(&second).unwrap();
+        assert_eq!(
+            find_on_path(&OsString::from(":"), "tool"),
+            None,
+            "an empty entry finds nothing, not the current directory's program"
+        );
         assert_eq!(
             find_on_path(&OsString::new(), "tool"),
             None,
-            "an empty PATH finds nothing, not the current directory"
+            "an empty PATH finds nothing"
         );
     }
 }

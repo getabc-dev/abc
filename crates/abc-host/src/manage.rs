@@ -28,18 +28,16 @@ pub fn upgrade(host: &Host, console: &mut Console<'_>) -> Result<(), HostError> 
     let services = Services::new(host);
     let postgres = Postgres::new(&host.home, &config.programs);
     for service in definitions(host, &config)? {
-        let part = service.part;
         if !services.install(&service)? {
-            services.restart(part)?;
+            services.restart(service.part)?;
         }
-        console.line(&format!("Restarted {}.", part.title()));
-        if part == Part::Postgres {
-            postgres.wait_ready(
-                &host.timing,
-                &format!("read {}", services.log_hint(Part::Postgres)),
-            )?;
-        }
+        console.line(&format!("Restarted {}.", service.part.title()));
     }
+    // abc server waits for Postgres itself; this wait names Postgres when it is the one down.
+    postgres.wait_ready(
+        &host.timing,
+        &format!("read {}", services.log_hint(Part::Postgres)),
+    )?;
     ops::wait_ready(
         config.ops_addr,
         &host.timing,

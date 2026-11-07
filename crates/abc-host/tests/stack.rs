@@ -519,6 +519,15 @@ mod tests {
             said.contains("https://login.tailscale.com/a/fake\n  (opened in your browser"),
             "the link is printed too: {said}"
         );
+        let up = std::fs::read_to_string(machine.state("up.pid")).unwrap();
+        let alive = std::process::Command::new("kill")
+            .args(["-0", up.trim()])
+            .status()
+            .unwrap();
+        assert!(
+            !alive.success(),
+            "tailscale up is stopped, not left waiting"
+        );
     }
 
     #[test]
@@ -761,5 +770,412 @@ mod tests {
         }
         // Uninstalling nothing succeeds.
         abc_host::uninstall(&host, false, &mut Console::new(&mut said)).unwrap();
+    }
+
+    /// `setup` on `machine` with `timing` changed by `adjust`, and what it said.
+    fn setup_with(machine: &Machine, adjust: impl FnOnce(&mut Timing)) -> (HostError, String) {
+        let mut host = machine.host();
+        adjust(&mut host.timing);
+        let mut said = Vec::new();
+        let error = abc_host::setup(
+            &host,
+            &SetupOptions {
+                exe: PathBuf::from("/x"),
+                auth_key: None,
+            },
+            &mut Console::new(&mut said),
+        )
+        .unwrap_err();
+        (error, String::from_utf8(said).unwrap())
+    }
+
+    fn replace_program(machine: &Machine, name: &str, script: &str) {
+        let path = machine.root().join(name);
+        std::fs::write(&path, script).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[test]
+    fn a_cluster_of_another_postgres_is_refused_with_the_way_back() {
+        let machine = Machine::new(Os::Linux);
+        std::fs::create_dir_all(machine.home().postgres()).unwrap();
+        std::fs::write(machine.home().postgres().join("PG_VERSION"), "17\n").unwrap();
+        let (error, _said) = setup_with(&machine, |_| {});
+        assert!(
+            matches!(&error, HostError::ClusterVersion { found, .. } if found == "17"),
+            "{error:?}"
+        );
+        assert!(error.to_string().contains("abc server restore"), "{error}");
+        assert!(
+            !machine
+                .take_calls()
+                .iter()
+                .any(|call| call.starts_with("initdb")),
+            "never initialised over it"
+        );
+    }
+
+    #[test]
+    fn a_postgres_that_never_answers_times_out_naming_its_log() {
+        let machine = Machine::new(Os::MacOs);
+        replace_program(&machine, "programs/pg/pg_isready", "#!/bin/sh\nexit 2\n");
+        let (error, _said) = setup_with(&machine, |timing| {
+            timing.postgres = Duration::from_millis(200);
+        });
+        assert!(
+            matches!(&error, HostError::Timeout { what, fix, .. }
+                if what == "abc's Postgres accepting connections" && fix.contains("logs/postgres.log")),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn a_tailscaled_that_never_answers_times_out_with_the_fix() {
+        let machine = Machine::new(Os::Linux);
+        replace_program(&machine, "programs/tailscaled", "#!/bin/sh\nexit 1\n");
+        let (error, _said) = setup_with(&machine, |timing| {
+            timing.tailscaled = Duration::from_millis(200);
+        });
+        assert!(
+            matches!(&error, HostError::Timeout { what, fix, .. }
+                if what.starts_with("abc's tailscaled answering (")
+                    && fix == "check abc's tailscaled with abc server status, and its log"),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn an_answer_abc_cannot_read_names_the_programs_to_check() {
+        let machine = Machine::new(Os::MacOs);
+        std::fs::write(machine.state("garbled"), "").unwrap();
+        let (error, _said) = setup_with(&machine, |_| {});
+        assert!(
+            matches!(&error, HostError::TailscaleAnswer { command, .. } if command.ends_with("status --json")),
+            "{error:?}"
+        );
+        assert!(error.to_string().contains("[programs]"), "{error}");
+    }
+
+    #[test]
+    fn a_refused_login_shows_what_tailscale_said() {
+        let machine = Machine::new(Os::MacOs);
+        std::fs::write(machine.state("up-fails"), "").unwrap();
+        let (error, _said) = setup_with(&machine, |_| {});
+        assert!(
+            matches!(&error, HostError::Failed { output, fix, .. }
+                if output.contains("invalid key")
+                    && fix == "read Tailscale's message above, then run abc server setup again"),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn a_tailnet_that_approves_devices_is_told_to_approve_abc() {
+        let machine = Machine::new(Os::MacOs);
+        std::fs::write(machine.state("needs-approval"), "").unwrap();
+        let (result, said) = machine.setup(None);
+        assert!(result.is_ok(), "{said}");
+        assert_eq!(
+            said.matches("approve `abc` at https://login.tailscale.com/admin/machines")
+                .count(),
+            1,
+            "said once: {said}"
+        );
+    }
+
+    #[test]
+    fn a_root_step_that_did_not_take_names_the_command_to_run() {
+        let machine = Machine::new(Os::MacOs);
+        std::fs::write(machine.state("sudo-does-nothing"), "").unwrap();
+        let (error, _said) = setup_with(&machine, |_| {});
+        assert!(
+            matches!(&error, HostError::ServeNotSet { command, .. } if command.contains(" serve --bg unix:")),
+            "{error:?}"
+        );
+        // On Linux with Serve already set, lingering alone, which also did not take.
+        let linux = Machine::new(Os::Linux);
+        std::fs::write(
+            linux.state("serve.json"),
+            format!(
+                "{{\"Web\":{{\"abc.tailfake.ts.net:443\":{{\"Handlers\":{{\"/\":{{\"Proxy\":\"unix:{}\"}}}}}}}}}}",
+                linux.socket("abc.sock")
+            ),
+        )
+        .unwrap();
+        std::fs::write(linux.state("sudo-does-nothing"), "").unwrap();
+        let (lingering, told) = setup_with(&linux, |_| {});
+        assert!(
+            lingering.to_string().contains("lingering is still off")
+                && lingering
+                    .to_string()
+                    .contains("sudo loginctl enable-linger 501"),
+            "{lingering}"
+        );
+        assert!(
+            !told.contains("Serve on abc's own node"),
+            "only lingering: {told}"
+        );
+    }
+
+    #[test]
+    fn upgrade_after_a_program_moved_reloads_the_changed_definitions() {
+        for os in [Os::MacOs, Os::Linux] {
+            let machine = Machine::new(os);
+            let (result, said) = machine.setup(None);
+            assert!(result.is_ok(), "{said}");
+            let moved = machine.root().join("programs/abc-moved");
+            std::fs::copy(machine.programs().abc, &moved).unwrap();
+            let mut config = Config::require(&machine.home()).unwrap();
+            config.programs.abc = moved.clone();
+            config.save(&machine.home()).unwrap();
+            machine.take_calls();
+            let mut upgrading = Vec::new();
+            abc_host::upgrade(&machine.host(), &mut Console::new(&mut upgrading)).unwrap();
+            let calls = machine.take_calls();
+            let expected: &[&str] = match os {
+                Os::MacOs => &[
+                    "launchctl bootout gui/501/dev.getabc.server",
+                    "launchctl bootstrap gui/501",
+                ],
+                Os::Linux => &[
+                    "systemctl --user daemon-reload",
+                    "systemctl --user restart abc-server.service",
+                ],
+            };
+            for call in expected {
+                assert!(
+                    calls.iter().any(|made| made.starts_with(call)),
+                    "{os:?}: {call}: {calls:#?}"
+                );
+            }
+            assert!(
+                calls.iter().any(|call| call.starts_with("abc server")),
+                "the moved abc runs: {calls:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn status_says_when_the_node_moved_serve_points_elsewhere_or_the_node_logged_out() {
+        let machine = Machine::new(Os::MacOs);
+        let (result, said) = machine.setup(None);
+        assert!(result.is_ok(), "{said}");
+        let mut config = Config::require(&machine.home()).unwrap();
+        config.public_url =
+            Some(abc_protocol::url::PublicUrl::parse("https://abc-old.tailfake.ts.net").unwrap());
+        config.save(&machine.home()).unwrap();
+        std::fs::write(
+            machine.state("serve.json"),
+            "{\"Web\":{\"abc.tailfake.ts.net:443\":{\"Handlers\":{\"/\":{\"Proxy\":\"unix:/elsewhere\"}}}}}",
+        )
+        .unwrap();
+        let lines = abc_host::status(&machine.host()).unwrap().lines();
+        assert!(
+            lines.iter().any(|line| line.contains(
+                "logged in as https://abc.tailfake.ts.net, which is not the configured URL"
+            )),
+            "{lines:#?}"
+        );
+        assert!(
+            lines.iter().any(|line| line.contains(&format!(
+                "https://abc.tailfake.ts.net/ goes to unix:/elsewhere, not unix:{}",
+                machine.socket("abc.sock")
+            ))),
+            "{lines:#?}"
+        );
+        std::fs::remove_file(machine.state("logged-in")).unwrap();
+        let logged_out = abc_host::status(&machine.host()).unwrap().lines();
+        assert!(
+            logged_out
+                .iter()
+                .any(|line| line.contains("not logged in (NeedsLogin)")),
+            "{logged_out:#?}"
+        );
+        assert!(
+            logged_out
+                .iter()
+                .any(|line| line.contains("unknown until abc's node is logged in")),
+            "{logged_out:#?}"
+        );
+        std::fs::write(machine.state("garbled"), "").unwrap();
+        let report = abc_host::status(&machine.host()).unwrap();
+        let fixes: Vec<&str> = report
+            .checks
+            .iter()
+            .filter_map(|check| check.fix.as_deref())
+            .collect();
+        assert!(
+            fixes
+                .iter()
+                .any(|fix| fix.contains("tail -n 50") && fix.contains("tailscaled.log")),
+            "{fixes:#?}"
+        );
+    }
+
+    #[test]
+    fn a_dump_that_does_not_load_leaves_the_database_and_restarts_the_server() {
+        for os in [Os::MacOs, Os::Linux] {
+            let machine = Machine::new(os);
+            let (result, said) = machine.setup(None);
+            assert!(result.is_ok(), "{said}");
+            std::fs::write(machine.state("db-abc"), "the data\n").unwrap();
+            let broken = machine.root().join("broken.dump");
+            std::fs::write(&broken, "FAKE DUMP\nBROKEN\n").unwrap();
+            let mut restoring = Vec::new();
+            let error =
+                abc_host::restore(&machine.host(), &broken, &mut Console::new(&mut restoring))
+                    .unwrap_err();
+            assert!(
+                error.to_string().contains("abc's database is unchanged"),
+                "{error}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(machine.state("db-abc")).unwrap(),
+                "the data\n",
+                "{os:?}: untouched"
+            );
+            assert!(
+                !machine.state("db-abc_restoring").exists(),
+                "the half-loaded copy is dropped"
+            );
+            let back = (0..200).any(|_| {
+                std::thread::sleep(Duration::from_millis(20));
+                machine.alive("abc.daemon")
+            });
+            assert!(back, "{os:?}: abc server runs again");
+        }
+    }
+
+    #[test]
+    fn backup_and_restore_need_a_running_postgres_and_a_failed_dump_leaves_no_file() {
+        let machine = Machine::new(Os::Linux);
+        let (result, said) = machine.setup(None);
+        assert!(result.is_ok(), "{said}");
+        let host = machine.host();
+        replace_program(
+            &machine,
+            "programs/pg/pg_dump",
+            "#!/bin/sh\necho 'pg_dump: error: connection failed' >&2\nexit 1\n",
+        );
+        let file = machine.root().join("x.dump");
+        let error =
+            abc_host::backup(&host, Some(&file), time::OffsetDateTime::UNIX_EPOCH).unwrap_err();
+        assert!(error.to_string().contains("connection failed"), "{error}");
+        assert!(!file.exists(), "no half a backup");
+        let good = machine.root().join("good.dump");
+        std::fs::write(&good, "FAKE DUMP\nx\n").unwrap();
+        let pid = std::fs::read_to_string(machine.state("abc-postgres.service.pid")).unwrap();
+        std::process::Command::new("kill")
+            .args(["-9", pid.trim()])
+            .status()
+            .unwrap();
+        let mut restoring = Vec::new();
+        let down = abc_host::restore(&host, &good, &mut Console::new(&mut restoring)).unwrap_err();
+        assert!(
+            down.to_string()
+                .contains("check abc's Postgres with abc server status"),
+            "{down}"
+        );
+        assert!(machine.alive("abc.daemon"), "abc server was never stopped");
+    }
+
+    #[test]
+    fn uninstall_without_a_reachable_node_says_to_remove_it_in_the_console() {
+        let machine = Machine::new(Os::Linux);
+        let (result, said) = machine.setup(None);
+        assert!(result.is_ok(), "{said}");
+        std::fs::remove_file(machine.programs().tailscale).unwrap();
+        let mut uninstalling = Vec::new();
+        abc_host::uninstall(&machine.host(), true, &mut Console::new(&mut uninstalling)).unwrap();
+        let told = String::from_utf8(uninstalling).unwrap();
+        assert!(
+            told.contains("Could not log abc's node out (") && told.contains("admin console"),
+            "{told}"
+        );
+        assert!(told.contains("Deleted "), "{told}");
+        assert!(!machine.home().exists(), "purged");
+        for daemon in ["postgres.daemon", "tailscaled.daemon", "abc.daemon"] {
+            assert!(!machine.alive(daemon), "{daemon} stopped");
+        }
+        let calls = machine.take_calls();
+        let disabled = calls
+            .iter()
+            .rposition(|call| call.starts_with("systemctl --user disable --now"))
+            .unwrap();
+        assert!(
+            calls
+                .iter()
+                .skip(disabled)
+                .any(|call| call == "systemctl --user daemon-reload"),
+            "systemd forgets the removed units: {calls:#?}"
+        );
+    }
+
+    #[test]
+    fn a_node_without_a_name_is_told_to_turn_on_magicdns() {
+        let machine = Machine::new(Os::MacOs);
+        std::fs::write(machine.state("no-dns"), "").unwrap();
+        let (error, _said) = setup_with(&machine, |_| {});
+        assert!(
+            matches!(&error, HostError::TailscaleAnswer { reason, .. } if reason.contains("turn on MagicDNS")),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn launchd_still_unloading_an_agent_is_waited_for() {
+        let machine = Machine::new(Os::MacOs);
+        let (result, said) = machine.setup(None);
+        assert!(result.is_ok(), "{said}");
+        std::fs::write(machine.state("bootout-lingers"), "").unwrap();
+        let moved = machine.root().join("programs/abc-moved");
+        std::fs::copy(machine.programs().abc, &moved).unwrap();
+        let mut config = Config::require(&machine.home()).unwrap();
+        config.programs.abc = moved;
+        config.save(&machine.home()).unwrap();
+        machine.take_calls();
+        let mut upgrading = Vec::new();
+        abc_host::upgrade(&machine.host(), &mut Console::new(&mut upgrading)).unwrap();
+        let bootstraps = machine
+            .take_calls()
+            .into_iter()
+            .filter(|call| call.starts_with("launchctl bootstrap"))
+            .count();
+        assert_eq!(
+            bootstraps, 2,
+            "one refused while unloading, then one loaded"
+        );
+        assert!(machine.alive("abc.daemon"), "running");
+    }
+
+    #[test]
+    fn without_a_browser_the_link_is_printed_to_open_by_hand() {
+        let machine = Machine::new(Os::Linux);
+        let mut host = machine.host();
+        host.path = std::ffi::OsString::new();
+        let mut said = Vec::new();
+        abc_host::open_in_browser(
+            &host,
+            &mut Console::new(&mut said),
+            "https://x.example/#code=1",
+        );
+        assert_eq!(
+            String::from_utf8(said).unwrap(),
+            "  https://x.example/#code=1\n  (open it in a browser)\n",
+            "printed"
+        );
+        replace_program(&machine, "bin/xdg-open", "#!/bin/sh\nexit 3\n");
+        let mut failed = Vec::new();
+        abc_host::open_in_browser(
+            &machine.host(),
+            &mut Console::new(&mut failed),
+            "https://x.example/",
+        );
+        assert!(
+            String::from_utf8(failed)
+                .unwrap()
+                .ends_with("(open it in a browser)\n"),
+            "a browser that fails to open is no browser"
+        );
     }
 }

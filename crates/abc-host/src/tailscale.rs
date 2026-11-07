@@ -142,7 +142,8 @@ impl<'a> Tailscale<'a> {
     }
 
     /// Brings the node up and waits until it runs. When it needs a login, `open` is given the
-    /// link once, and the console says where it is.
+    /// link once, and the console says where it is. Whether the running node has a name is the
+    /// caller's question.
     pub(crate) fn log_in(
         &self,
         console: &mut Console<'_>,
@@ -157,7 +158,7 @@ impl<'a> Tailscale<'a> {
         let mut approval = false;
         loop {
             let status = self.status()?;
-            if status.running() && status.dns_name().is_some() {
+            if status.running() {
                 reap(&mut child);
                 return Ok(status);
             }

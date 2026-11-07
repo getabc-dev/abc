@@ -202,3 +202,99 @@ impl<'out> Console<'out> {
         let _unwritten = writeln!(self.out, "{text}").and_then(|()| self.out.flush());
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::OsString;
+    use std::path::Path;
+    use std::time::Duration;
+
+    use super::{Console, Host, HostError, Os, Timing};
+
+    fn env(pairs: &'static [(&'static str, &'static str)]) -> impl Fn(&str) -> Option<OsString> {
+        move |name| {
+            pairs
+                .iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| OsString::from(value))
+        }
+    }
+
+    #[test]
+    fn this_build_knows_its_system_and_its_socket_limit() {
+        let os = Os::current();
+        assert_eq!(os == Os::MacOs, cfg!(target_os = "macos"), "{os:?}");
+        assert_eq!(Os::MacOs.name(), "macOS", "names");
+        assert_eq!(Os::Linux.name(), "Linux", "names");
+    }
+
+    #[test]
+    fn the_host_is_read_from_the_environment() {
+        let host = Host::discover(env(&[
+            ("HOME", "/u/ada"),
+            ("PATH", "/bin:/usr/bin"),
+            ("XDG_CONFIG_HOME", "/cfg"),
+            ("XDG_DATA_HOME", "/data"),
+        ]))
+        .unwrap();
+        assert_eq!(host.os, Os::current(), "this system");
+        assert_eq!(host.path, OsString::from("/bin:/usr/bin"), "PATH");
+        assert_eq!(
+            host.uid,
+            rustix::process::getuid().as_raw(),
+            "this process's user"
+        );
+        let (services, home) = match host.os {
+            Os::MacOs => (
+                "/u/ada/Library/LaunchAgents",
+                "/u/ada/Library/Application Support/abc/server",
+            ),
+            Os::Linux => ("/cfg/systemd/user", "/data/abc/server"),
+        };
+        assert_eq!(host.services_dir, Path::new(services), "services");
+        assert_eq!(host.home.dir(), Path::new(home), "home");
+        assert_eq!(
+            host.timing.login,
+            Duration::from_mins(15),
+            "a person's pace"
+        );
+        let no_xdg = Host::discover(env(&[("HOME", "/u/ada"), ("XDG_CONFIG_HOME", "")])).unwrap();
+        if no_xdg.os == Os::Linux {
+            assert_eq!(
+                no_xdg.services_dir,
+                Path::new("/u/ada/.config/systemd/user"),
+                "an empty XDG_CONFIG_HOME counts as unset"
+            );
+        }
+        assert_eq!(no_xdg.path, OsString::new(), "no PATH, no system programs");
+        assert!(
+            matches!(Host::discover(env(&[])), Err(HostError::NoHomeDir)),
+            "no HOME"
+        );
+        assert!(
+            matches!(
+                Host::discover(env(&[("ABC_SERVER_HOME", "/srv/abc")])),
+                Err(HostError::NoHomeDir)
+            ),
+            "the services still need HOME"
+        );
+    }
+
+    #[test]
+    fn production_waits_leave_a_person_time() {
+        let timing = Timing::production();
+        assert!(timing.poll < timing.service, "{timing:?}");
+        assert!(timing.postgres >= Duration::from_secs(60), "{timing:?}");
+        assert!(timing.server >= Duration::from_secs(120), "{timing:?}");
+    }
+
+    #[test]
+    fn the_console_writes_lines() {
+        let mut out = Vec::new();
+        let mut console = Console::new(&mut out);
+        assert_eq!(format!("{console:?}"), "Console", "debug");
+        console.line("one");
+        console.line("two");
+        assert_eq!(out, b"one\ntwo\n", "a line each");
+    }
+}
