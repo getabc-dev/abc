@@ -39,7 +39,11 @@
           { "context": "Mutants", "integration_id": 15368 },
           { "context": "Integrity", "integration_id": 15368 },
           { "context": "Gemini review", "integration_id": 15368 },
-          { "context": "Fuzz protocol decoding", "integration_id": 15368 }
+          { "context": "Fuzz protocol decoding", "integration_id": 15368 },
+          { "context": "Release dry run inputs", "integration_id": 15368 },
+          { "context": "Build the web app", "integration_id": 15368 },
+          { "context": "Render the Homebrew formula", "integration_id": 15368 },
+          { "context": "Release dry run", "integration_id": 15368 }
         ]
       }
     },

@@ -60,7 +60,8 @@ pub(crate) const XTASK: Workspace = Workspace {
 };
 
 /// The shell scripts of the repository, which shellcheck lints.
-pub(crate) const SCRIPTS: [&str; 4] = [
+pub(crate) const SCRIPTS: [&str; 5] = [
+    ".github/release/publish.sh",
     "xtask/hooks/hook.sh",
     "xtask/vm/entrypoint.sh",
     "xtask/vm/agent-exec",
@@ -1633,14 +1634,7 @@ mod tests {
         let root = crate::testing::checkout();
         let listed = git(
             &root,
-            &[
-                "ls-files",
-                "--cached",
-                "--others",
-                "--exclude-standard",
-                "xtask/hooks",
-                "xtask/vm",
-            ],
+            &["ls-files", "--cached", "--others", "--exclude-standard"],
         );
         let scripts: BTreeSet<&str> = listed
             .lines()

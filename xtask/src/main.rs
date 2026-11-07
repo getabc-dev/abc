@@ -17,6 +17,7 @@ mod junit;
 mod mutants;
 mod postgres;
 mod pr;
+mod release;
 mod review;
 mod rulesets;
 mod shell;
@@ -56,6 +57,59 @@ enum RulesetAction {
     Check,
     /// Put the ruleset on GitHub with your own gh login, replacing the rulesets it supersedes.
     Apply,
+}
+
+/// What `cargo xtask release` does.
+#[derive(Debug, Subcommand)]
+enum ReleaseAction {
+    /// Fetch Tailscale's source at the pin in packaging/tailscale.toml into target/tailscale,
+    /// once the pinned tag still names the pinned commit.
+    TailscaleSource,
+    /// Install the Go that packaging/tailscale.toml pins, for this machine, into target/go, once
+    /// Tailscale's go.mod names it and go.dev's archive matches its pinned sha256.
+    Go,
+    /// Build the web app with the pinned node and pnpm and pack web/dist into
+    /// `target/web/web-<HEAD>.tar.gz`, the one web app every target's package embeds.
+    Web,
+    /// Build abc for TARGET with the web app `release web` packed for HEAD, and tailscaled from
+    /// target/tailscale, and package each with its licence in target/dist. It runs no node.
+    Package {
+        /// The Rust target triple, such as aarch64-apple-darwin.
+        #[arg(long, value_parser = release::Target::parse)]
+        target: release::Target,
+    },
+    /// Fail unless TAG is `v` and the workspace's version.
+    CheckTag {
+        /// The tag being released, such as v0.1.0.
+        tag: String,
+    },
+    /// Render the Homebrew formula from `packaging/homebrew/abc.rb` for the archives of all four
+    /// targets in DIST, each at `BASE_URL/<archive>`, into OUT.
+    Formula {
+        /// The directory holding every target's archives.
+        #[arg(long)]
+        dist: PathBuf,
+        /// Where the archives are downloaded from: the release's download URL, or a file:// URL.
+        #[arg(long)]
+        base_url: String,
+        /// The formula to write.
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Write to OUT how the tap job updates the tap to FORMULA (`create`, `update <sha>` or
+    /// `keep`), from CURRENT, the tap's Formula/abc.rb as GitHub's contents API gives it, which
+    /// is left out when the tap has none. Fails when the tap holds a newer version.
+    TapPlan {
+        /// The rendered formula.
+        #[arg(long)]
+        formula: PathBuf,
+        /// The tap's current formula, as GitHub's contents API's JSON.
+        #[arg(long)]
+        current: Option<PathBuf>,
+        /// The plan to write.
+        #[arg(long)]
+        out: PathBuf,
+    },
 }
 
 /// What `cargo xtask task` does with the current task.
@@ -176,6 +230,11 @@ enum Task {
     Work {
         #[command(subcommand)]
         action: TaskAction,
+    },
+    /// Build, package and describe a release: the release workflow's steps (brief decision 52).
+    Release {
+        #[command(subcommand)]
+        action: ReleaseAction,
     },
     /// Check or apply the branch rules for main in .github/rulesets/main.json.
     Rulesets {
@@ -417,6 +476,7 @@ fn perform(
         ),
         Task::Pr { action } => run_pr(action, root, &env, report),
         Task::Rulesets { action } => run_rulesets(action, root, report),
+        Task::Release { action } => run_release(action, root, tool, report),
         Task::Work { action } => run_task(action, root, report),
         Task::Setup {
             for_tests,
@@ -464,6 +524,7 @@ const fn gate_of(task: &Task) -> Option<(gate::Gate, gate::Wait)> {
         | Task::Review { .. }
         | Task::Work { .. }
         | Task::Rulesets { .. }
+        | Task::Release { .. }
         | Task::Build
         | Task::Pnpm { .. }
         | Task::Setup { .. }
@@ -474,9 +535,73 @@ const fn gate_of(task: &Task) -> Option<(gate::Gate, gate::Wait)> {
     }
 }
 
-/// `cargo xtask hook EVENT`: reads the hook input on stdin and prints the answer, in JSON, on
-/// stdout. A stop whose check failed with no state to count it in prints its reason and exits
-/// [`hook::UNKEPT_STATUS`], for the launcher to count.
+/// `cargo xtask release ACTION`: the release workflow's steps.
+fn run_release(
+    action: ReleaseAction,
+    root: &Path,
+    tool: &dyn Fn(&str) -> anyhow::Result<PathBuf>,
+    report: &mut impl Write,
+) -> anyhow::Result<ExitCode> {
+    match action {
+        ReleaseAction::TailscaleSource => {
+            release::tailscale_source(root, release::TAILSCALE_REPOSITORY, report)?;
+        }
+        ReleaseAction::Web => {
+            let toolchain = web::Toolchain::pinned(tool)?;
+            return Ok(verdict(release::pack_web(
+                root,
+                &toolchain,
+                &mut web::run_here,
+                report,
+            )?));
+        }
+        ReleaseAction::Package { target } => {
+            return Ok(verdict(release::package(
+                root,
+                target,
+                &mut web::run_here,
+                report,
+            )?));
+        }
+        ReleaseAction::Go => {
+            release::go(
+                root,
+                (std::env::consts::OS, std::env::consts::ARCH),
+                release::GO_DOWNLOADS,
+                &mut |url| tools::download(url),
+                report,
+            )?;
+        }
+        ReleaseAction::CheckTag { tag } => release::check_tag(root, &tag)?,
+        ReleaseAction::Formula {
+            dist,
+            base_url,
+            out,
+        } => {
+            let formula = release::formula(root, &dist, &base_url)?;
+            std::fs::write(&out, formula)
+                .with_context(|| format!("could not write {}", out.display()))?;
+            writeln!(report, "xtask release: wrote {}", out.display())?;
+        }
+        ReleaseAction::TapPlan {
+            formula,
+            current,
+            out,
+        } => {
+            let read = |path: &Path| {
+                std::fs::read_to_string(path)
+                    .with_context(|| format!("could not read {}", path.display()))
+            };
+            let current = current.as_deref().map(read).transpose()?;
+            let plan = release::tap_plan(&read(&formula)?, current.as_deref())?;
+            std::fs::write(&out, format!("{plan}\n"))
+                .with_context(|| format!("could not write {}", out.display()))?;
+            writeln!(report, "xtask release: the tap job will {plan}")?;
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
 /// The commands that run the web app's toolchain.
 enum WebTask {
     Build,
@@ -511,6 +636,9 @@ fn run_web(
     }
 }
 
+/// `cargo xtask hook EVENT`: reads the hook input on stdin and prints the answer, in JSON, on
+/// stdout. A stop whose check failed with no state to count it in prints its reason and exits
+/// [`hook::UNKEPT_STATUS`], for the launcher to count.
 fn run_hook(event: hook::Event, home: &Path, report: &mut impl Write) -> anyhow::Result<ExitCode> {
     let mut input = String::new();
     let mut log = Vec::new();
@@ -734,7 +862,8 @@ mod tests {
     use std::process::ExitCode;
 
     use super::{
-        Cli, Invocation, RulesetAction, Task, TaskAction, run, serve_tokens, user_home, verdict,
+        Cli, Invocation, ReleaseAction, RulesetAction, Task, TaskAction, release, run,
+        serve_tokens, user_home, verdict,
     };
     use crate::testing::{git, repository_with_change, script};
 
@@ -814,6 +943,217 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("cargo-sqlx is not a fake tool"), "{error}");
+    }
+
+    /// A home with fake tools and a repository whose workspace is version 0.3.0.
+    fn release_tree(temp: &Path) -> (PathBuf, PathBuf) {
+        let home = temp.join("home");
+        fs::create_dir_all(home.join("tools")).unwrap();
+        fake_tools(&home.join("tools"));
+        // A clone whose HEAD is origin's main, as a release's checkout of its tag is.
+        let root = crate::testing::clone_with_origin(temp);
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace.package]\nversion = \"0.3.0\"\n",
+        )
+        .unwrap();
+        (home, root)
+    }
+
+    #[test]
+    fn the_release_commands_check_the_tag_and_need_the_pin() {
+        let temp = tempfile::tempdir().unwrap();
+        let (home, root) = release_tree(temp.path());
+        let no_env = |_: &str| None;
+        let tag = |tag: &str| Task::Release {
+            action: ReleaseAction::CheckTag {
+                tag: tag.to_owned(),
+            },
+        };
+        let package = || Task::Release {
+            action: ReleaseAction::Package {
+                target: release::Target::LinuxIntel,
+            },
+        };
+        assert_eq!(
+            dispatch(tag("v0.3.0"), &home, &root, &no_env).unwrap(),
+            ExitCode::SUCCESS,
+            "the workspace's version"
+        );
+        let other = dispatch(tag("v0.2.0"), &home, &root, &no_env).unwrap_err();
+        assert!(other.to_string().contains("does not release"), "{other}");
+        let source = Task::Release {
+            action: ReleaseAction::TailscaleSource,
+        };
+        let go = Task::Release {
+            action: ReleaseAction::Go,
+        };
+        assert_eq!(
+            dispatch(go, &home, &root, &no_env).unwrap_err().to_string(),
+            "could not read packaging/tailscale.toml",
+            "Go's pin comes first"
+        );
+        assert_eq!(
+            dispatch(source, &home, &root, &no_env)
+                .unwrap_err()
+                .to_string(),
+            "could not read packaging/tailscale.toml",
+            "the pin comes first"
+        );
+        assert_eq!(
+            dispatch(package(), &home, &root, &no_env)
+                .unwrap_err()
+                .to_string(),
+            "could not read packaging/tailscale.toml",
+            "packaging needs the pin too"
+        );
+        fs::create_dir_all(root.join("packaging")).unwrap();
+        fs::copy(
+            crate::testing::checkout().join(release::TAILSCALE_PIN),
+            root.join(release::TAILSCALE_PIN),
+        )
+        .unwrap();
+        assert_eq!(
+            dispatch(package(), &home, &root, &no_env).unwrap(),
+            ExitCode::FAILURE,
+            "no Tailscale source was fetched"
+        );
+        let web = Task::Release {
+            action: ReleaseAction::Web,
+        };
+        assert_eq!(
+            dispatch(web, &home, &root, &no_env).unwrap(),
+            ExitCode::FAILURE,
+            "a tree without the web app has none to build"
+        );
+    }
+
+    #[test]
+    fn the_release_formula_command_writes_the_formula() {
+        let temp = tempfile::tempdir().unwrap();
+        let (home, root) = release_tree(temp.path());
+        let no_env = |_: &str| None;
+        let real = crate::testing::checkout();
+        fs::create_dir_all(root.join("packaging/homebrew")).unwrap();
+        for file in [release::TAILSCALE_PIN, release::FORMULA_TEMPLATE] {
+            fs::copy(real.join(file), root.join(file)).unwrap();
+        }
+        let dist = temp.path().join("dist");
+        fs::create_dir_all(&dist).unwrap();
+        let pin = fs::read_to_string(real.join(release::TAILSCALE_PIN)).unwrap();
+        let tailscale = pin
+            .lines()
+            .find_map(|line| line.strip_prefix("version = \""))
+            .and_then(|rest| rest.strip_suffix('"'))
+            .unwrap();
+        for target in release::Target::ALL {
+            fs::write(dist.join(format!("abc-0.3.0-{target}.tar.gz")), "a").unwrap();
+            fs::write(
+                dist.join(format!("tailscaled-{tailscale}-{target}.tar.gz")),
+                "t",
+            )
+            .unwrap();
+        }
+        let formula = |out: PathBuf| Task::Release {
+            action: ReleaseAction::Formula {
+                dist: dist.clone(),
+                base_url: "file:///dist".to_owned(),
+                out,
+            },
+        };
+        let out = temp.path().join("abc.rb");
+        assert_eq!(
+            dispatch(formula(out.clone()), &home, &root, &no_env).unwrap(),
+            ExitCode::SUCCESS,
+            "renders the formula"
+        );
+        let written = fs::read_to_string(&out).unwrap();
+        assert!(
+            written.contains("url \"file:///dist/abc-0.3.0-x86_64-unknown-linux-gnu.tar.gz\""),
+            "{written}"
+        );
+        let unwritable = dispatch(
+            formula(temp.path().join("missing/abc.rb")),
+            &home,
+            &root,
+            &no_env,
+        )
+        .unwrap_err();
+        assert!(
+            unwritable.to_string().starts_with("could not write "),
+            "{unwritable}"
+        );
+    }
+
+    #[test]
+    fn the_tap_plan_command_writes_the_plan() {
+        let temp = tempfile::tempdir().unwrap();
+        let (home, root) = release_tree(temp.path());
+        let no_env = |_: &str| None;
+        let formula = temp.path().join("abc.rb");
+        fs::write(&formula, "class Abc < Formula\n  version \"0.3.0\"\nend\n").unwrap();
+        let current = temp.path().join("current.json");
+        // GitHub's contents response for a formula of abc 0.2.0.
+        fs::write(
+            &current,
+            r#"{"sha": "blob", "content": "ICB2ZXJzaW9uICIwLjIuMCIK\n", "encoding": "base64"}"#,
+        )
+        .unwrap();
+        let out = temp.path().join("plan");
+        let plan = |tapped: Option<PathBuf>, rendered: PathBuf| Task::Release {
+            action: ReleaseAction::TapPlan {
+                formula: rendered,
+                current: tapped,
+                out: out.clone(),
+            },
+        };
+        for (tapped, expected) in [(Some(current.clone()), "update blob\n"), (None, "create\n")] {
+            assert_eq!(
+                dispatch(plan(tapped, formula.clone()), &home, &root, &no_env).unwrap(),
+                ExitCode::SUCCESS,
+                "plans {expected}"
+            );
+            assert_eq!(
+                fs::read_to_string(&out).unwrap(),
+                expected,
+                "writes the plan"
+            );
+        }
+        let missing = temp.path().join("missing.rb");
+        assert_eq!(
+            dispatch(plan(None, missing.clone()), &home, &root, &no_env)
+                .unwrap_err()
+                .to_string(),
+            format!("could not read {}", missing.display()),
+            "without a formula"
+        );
+        fs::remove_file(&current).unwrap();
+        assert_eq!(
+            dispatch(
+                plan(Some(current.clone()), formula.clone()),
+                &home,
+                &root,
+                &no_env
+            )
+            .unwrap_err()
+            .to_string(),
+            format!("could not read {}", current.display()),
+            "without the tap's formula"
+        );
+        let blocked = Task::Release {
+            action: ReleaseAction::TapPlan {
+                formula,
+                current: None,
+                out: temp.path().join("missing/plan"),
+            },
+        };
+        assert!(
+            dispatch(blocked, &home, &root, &no_env)
+                .unwrap_err()
+                .to_string()
+                .starts_with("could not write "),
+            "an unwritable plan"
+        );
     }
 
     #[test]
@@ -1156,7 +1496,7 @@ mod tests {
         let here = Invocation::new(None).unwrap();
         assert_eq!(
             here.root,
-            super::repo_root().unwrap(),
+            super::crate::testing::checkout(),
             "the tree defaults to xtask's own"
         );
         assert_eq!(here.home, here.root, "and so do the tools");
@@ -1178,7 +1518,7 @@ mod tests {
         );
         assert_eq!(
             elsewhere.home,
-            super::repo_root().unwrap(),
+            super::crate::testing::checkout(),
             "the tools stay xtask's own"
         );
         assert!(

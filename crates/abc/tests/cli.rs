@@ -1,6 +1,6 @@
-//! The `abc` binary end to end: `abc server setup-code` against a real database, configuration
-//! errors and their exit codes, `abc server` and `abc worker` stopping cleanly on SIGTERM, and
-//! `abc worker enrol`'s refusals.
+//! The `abc` binary end to end: `abc --version`, `abc server setup-code` against a real database,
+//! configuration errors and their exit codes, `abc server` and `abc worker` stopping cleanly on
+//! SIGTERM, and `abc worker enrol`'s refusals.
 
 #[cfg(test)]
 mod tests {
@@ -38,6 +38,18 @@ mod tests {
 
     fn text(bytes: &[u8]) -> String {
         String::from_utf8_lossy(bytes).into_owned()
+    }
+
+    #[test]
+    fn version_prints_the_released_version() {
+        // The Homebrew formula's test matches this line against the version the release tagged.
+        let output = run(&mut abc(&["--version"], "unused"));
+        assert!(output.status.success(), "{}", text(&output.stderr));
+        assert_eq!(
+            text(&output.stdout),
+            format!("abc {}\n", env!("CARGO_PKG_VERSION")),
+            "the workspace's version, which the release tag must match"
+        );
     }
 
     #[tokio::test]

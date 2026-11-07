@@ -177,15 +177,13 @@ describe("ThemeMenu", () => {
     expect(document.activeElement).toBe(screen.getByRole("button", { name: "Theme: Dark" }));
 
     await userEvent.keyboard("{Enter}");
-    // The menu highlights its first item once it has opened; a key pressed before that is lost,
-    // and {End}{Enter} sent at once chose Light about one run in two. Each key waits for the
-    // highlight it moves.
     const reopened = await screen.findByRole("menu");
-    const [light, , system] = within(reopened).getAllByRole("menuitemradio");
+    // The menu takes focus a moment after it opens; a key pressed before then is lost.
     await waitFor(() => {
-      expect(document.activeElement).toBe(light);
+      expect(reopened.contains(document.activeElement)).toBe(true);
     });
     await userEvent.keyboard("{End}");
+    const system = within(reopened).getByRole("menuitemradio", { name: "System" });
     await waitFor(() => {
       expect(document.activeElement).toBe(system);
     });
