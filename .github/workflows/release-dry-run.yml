@@ -1,0 +1,306 @@
+name: Release dry run
+
+# A pull request or merge-queue run that changes what a release builds from builds and installs
+# abc exactly as a release does (release.yml), and publishes nothing:
+#
+# - Inputs: whether the change touches what a release builds from. When it does not, the web,
+#   build, formula and install jobs are skipped, so a change that cannot alter a release costs
+#   one small job.
+# - Web: the web app built once with the pinned node and pnpm, on Ubuntu, and packed for the
+#   commit (`cargo xtask release web`); no build runs node.
+# - Build: abc for macOS and Linux on arm64 and x86_64, with that web app embedded, and
+#   tailscaled from Tailscale's source at the pin in packaging/tailscale.toml, with the Go it
+#   pins, checked against go.dev's sha256. macOS builds on Apple silicon, cross-compiling x86_64
+#   with Apple's toolchain; Linux builds natively on each architecture in an AlmaLinux 8
+#   container, so abc needs no glibc newer than 2.28, which `cargo xtask release package` checks.
+# - Formula: the Homebrew formula rendered for those archives at file:///tmp/abc-release.
+# - Install: the formula installed, tested and linted with brew on each of the four platforms,
+#   each on a native runner; nothing named tailscale may reach brew's bin.
+# - Release dry run: the verdict. It passes when nothing a release builds from changed and the
+#   jobs were skipped, or when every one of them ran and passed. Like every job here but the
+#   matrices, it is a required check; the matrices report through it.
+#
+# Its web, build, formula and install jobs are release.yml's with Rust caches added, the tag check
+# left out and the web job gated on the inputs; an xtask test (release::tests) keeps them so. Caches live
+# only here: no published build reads one.
+
+on:
+  pull_request:
+  merge_group:
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  inputs:
+    name: Release dry run inputs
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      changed: ${{ steps.diff.outputs.changed }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # What a release builds from: the workspace and its toolchain, the web app, the packaging
+      # pins and template, all of xtask (it builds and packages), the licence it ships and these
+      # workflows. The pull request's merge commit, or the merge group's, against its base.
+      - name: Find whether the change touches what a release builds from
+        id: diff
+        run: |
+          git fetch --quiet --no-tags --depth=1 origin "$BASE"
+          git diff --name-only "$BASE" HEAD -- \
+            .cargo Cargo.lock Cargo.toml LICENSE crates packaging rust-toolchain.toml web xtask \
+            .github/workflows/release.yml .github/workflows/release-dry-run.yml \
+            > "$RUNNER_TEMP/inputs"
+          if [ -s "$RUNNER_TEMP/inputs" ]; then
+            echo "A release builds from these changed files:"
+            cat "$RUNNER_TEMP/inputs"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Nothing a release builds from changed: the build, formula and install jobs are skipped."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          fi
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+
+  web:
+    name: Build the web app
+    needs: inputs
+    if: needs.inputs.outputs.changed == 'true'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    # The web app is built once, here, where the pinned node runs: Node's official Linux builds
+    # need a newer glibc than the AlmaLinux 8 container the Linux targets build in. Every build
+    # downloads the archive and embeds exactly it; none runs node.
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the pinned Rust toolchain
+        run: rustup toolchain install --no-self-update
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: xtask -> ../target
+      - name: Install the pinned node and pnpm
+        run: cargo xtask setup node pnpm
+      - name: Check the installed tools against their pins
+        run: cargo xtask doctor node pnpm
+      - name: Build the web app and pack it for this commit
+        run: cargo xtask release web
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: web-app
+          path: target/web/*.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: web
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    container: ${{ matrix.container }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            runner: macos-26
+            container: ""
+          - target: x86_64-apple-darwin
+            runner: macos-26
+            container: ""
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+            container: almalinux:8.10@sha256:2d0f2eb2a83cc09dbc2eb92fade4dbe8f709628149e81aa00aec70630406603b
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-26.04
+            container: almalinux:8.10@sha256:2d0f2eb2a83cc09dbc2eb92fade4dbe8f709628149e81aa00aec70630406603b
+    steps:
+      # The container has no compiler, git or Rust. rustup-init is pinned by version and sha256;
+      # it then installs the toolchain rust-toolchain.toml pins. The checkout belongs to the
+      # runner's user, not the container's root, so git is told to trust it.
+      - name: Install the C compiler, git and rustup in the AlmaLinux 8 container
+        if: runner.os == 'Linux'
+        run: |
+          dnf install --assumeyes --setopt=install_weak_deps=False gcc git tar gzip
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          case "$(uname -m)" in
+            x86_64) sum=b1c8cb14e30889e7e2999e6b69e62d9e9b9ffc0f4df8180564d306d9680e6c55 ;;
+            aarch64) sum=9f608c142e0e38a78957d0661ba1dfaf0b6fb37184cfaa4b9a0aa57af6184282 ;;
+            *) echo "no pinned rustup-init for $(uname -m)" >&2; exit 1 ;;
+          esac
+          curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+            --output /tmp/rustup-init \
+            "https://static.rust-lang.org/rustup/archive/1.29.3/$(uname -m)-unknown-linux-gnu/rustup-init"
+          echo "$sum  /tmp/rustup-init" | sha256sum --check --strict
+          chmod +x /tmp/rustup-init
+          /tmp/rustup-init -y --no-modify-path --profile minimal --default-toolchain none
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the pinned Rust toolchain
+        run: rustup toolchain install --no-self-update
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: ${{ matrix.target }}
+          # xtask is a workspace of its own, built into the root's target/ (.cargo/config.toml).
+          workspaces: |
+            . -> target
+            xtask -> ../target
+      - name: Fetch Tailscale's source at the pinned tag and commit
+        run: cargo xtask release tailscale-source
+      - name: Install the Go Tailscale names, checked against go.dev's sha256
+        run: cargo xtask release go
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: web-app
+          path: target/web
+      - name: Build and package abc, with that web app, and tailscaled
+        run: cargo xtask release package --target "$TARGET"
+        env:
+          TARGET: ${{ matrix.target }}
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-${{ matrix.target }}
+          path: target/dist/*.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  formula:
+    name: Render the Homebrew formula
+    needs: build
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the pinned Rust toolchain
+        run: rustup toolchain install --no-self-update
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: xtask -> ../target
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/dist
+      # Every install job puts the archives at the same path, so one formula serves them all.
+      - name: Render the formula for the archives at file:///tmp/abc-release
+        run: >-
+          cargo xtask release formula --dist "$RUNNER_TEMP/dist"
+          --base-url file:///tmp/abc-release --out "$RUNNER_TEMP/abc.rb"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: homebrew-formula
+          path: ${{ runner.temp }}/abc.rb
+          if-no-files-found: error
+          retention-days: 7
+
+  install:
+    name: Install with Homebrew on ${{ matrix.os }}
+    needs: [build, formula]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        # Each platform on a native runner, so no archive is published without being installed
+        # and run where it is meant to run.
+        include:
+          - os: macOS arm64
+            runner: macos-26
+          - os: macOS x86_64
+            runner: macos-15-intel
+          - os: Linux x86_64
+            runner: ubuntu-26.04
+          - os: Linux arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: /tmp/abc-release
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: homebrew-formula
+          path: ${{ runner.temp }}/formula
+      # Homebrew installs formulae only from taps, so the rendered formula goes into a local one.
+      # A Linux runner without Homebrew gets it from Homebrew's installer at a pinned commit.
+      - name: Install, test and lint the formula with Homebrew
+        run: |
+          if [ "$RUNNER_OS" = Linux ]; then
+            if [ ! -x /home/linuxbrew/.linuxbrew/bin/brew ]; then
+              curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+                --output "$RUNNER_TEMP/install-homebrew.sh" \
+                https://raw.githubusercontent.com/Homebrew/install/7986efac25016e41eed7e471666140c06f9d97cf/install.sh
+              NONINTERACTIVE=1 bash "$RUNNER_TEMP/install-homebrew.sh"
+            fi
+            eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
+          fi
+          before=$(command -v tailscale || echo none)
+          brew tap-new --no-git abc-release/dry-run
+          cp "$RUNNER_TEMP/formula/abc.rb" "$(brew --repository abc-release/dry-run)/Formula/abc.rb"
+          brew install --formula abc-release/dry-run/abc
+          brew test abc-release/dry-run/abc
+          brew style abc-release/dry-run/abc
+          linked=$(find "$(brew --prefix)/bin" -name 'tailscale*' -print)
+          if [ -n "$linked" ]; then
+            echo "the formula linked tailscale onto the PATH: $linked" >&2
+            exit 1
+          fi
+          after=$(command -v tailscale || echo none)
+          if [ "$after" != "$before" ]; then
+            echo "the tailscale command changed from $before to $after" >&2
+            exit 1
+          fi
+          abc --version
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+          HOMEBREW_NO_INSTALL_CLEANUP: "1"
+          HOMEBREW_NO_ANALYTICS: "1"
+          HOMEBREW_NO_ENV_HINTS: "1"
+
+  dry-run:
+    name: Release dry run
+    # Reports on every run, whatever the other jobs did.
+    if: always()
+    needs: [inputs, web, build, formula, install]
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Every job ran and passed, or none had to
+        run: |
+          echo "inputs: $INPUTS (changed: $CHANGED), web: $WEB, builds: $BUILD, formula: $FORMULA, installs: $INSTALL"
+          [ "$INPUTS" = success ] || exit 1
+          if [ "$CHANGED" = true ]; then expected=success; else expected=skipped; fi
+          [ "$WEB" = "$expected" ] && [ "$BUILD" = "$expected" ] && [ "$FORMULA" = "$expected" ] \
+            && [ "$INSTALL" = "$expected" ]
+        env:
+          INPUTS: ${{ needs.inputs.result }}
+          CHANGED: ${{ needs.inputs.outputs.changed }}
+          WEB: ${{ needs.web.result }}
+          BUILD: ${{ needs.build.result }}
+          FORMULA: ${{ needs.formula.result }}
+          INSTALL: ${{ needs.install.result }}

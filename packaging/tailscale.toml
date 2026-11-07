@@ -1,0 +1,17 @@
+# The tailscaled that abc's Homebrew formula installs privately into abc's own libexec, never onto
+# the PATH (brief decision 52): abc runs it as a tailnet node of its own, beside any Tailscale the
+# user runs. The release workflow builds it from Tailscale's source at this tag, for each target;
+# `cargo xtask release tailscale-source` refuses a tag that no longer names this commit. Renovate
+# proposes new versions with their commits.
+version = "1.104.5"
+commit = "73a48057aaf5f60e4f770b398e9b7af576b01dbe"
+
+# The Go that builds it: the version Tailscale's go.mod names, which `cargo xtask release go`
+# checks, and the sha256 go.dev publishes for each archive the release workflow downloads
+# (https://go.dev/dl/), which it checks before unpacking. Renovate proposes new versions; copy
+# the new archives' sha256s from go.dev with each.
+[go]
+version = "1.27.3"
+sha256.darwin-arm64 = "dd3908cf20959d798c1e06ebe5b72213f0505ce01373b40ce3110975a6cd99c2"
+sha256.linux-amd64 = "65efbc80fdc1fa2cd2631cad5b481777a68e8725f34e89f50fc6ac714e379b40"
+sha256.linux-arm64 = "a06e99309dbcbdca1a8ccd2282c3ee146e55930886e26b4f1193269587165f49"

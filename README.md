@@ -4,24 +4,27 @@ abc is an open-source, self-hosted software factory for developers. Agents take 
 to shipped pull request on your own machines, and every PR carries one HTML artifact that lets you
 trust it without reading the code.
 
-**Status: in development. Nothing is installable yet.** There are no releases, and the parts below
+**Status: in development. Nothing is usable yet.** There are no releases yet, and the parts below
 describe the design being built, not features you can use today.
 
 ## Install
 
-abc has no release yet; the first one brings the Homebrew tap. From then on, a Mac or a Linux
-machine becomes abc's server with two commands:
+From its first release, Homebrew installs abc on macOS 12 or newer and on Linux with glibc 2.28 or
+newer (RHEL 8, Debian 10, Ubuntu 20.04 and later), on arm64 or x86_64, and one command makes the
+machine abc's server:
 
 ```sh
 brew install getabc-dev/tap/abc
 abc server setup
 ```
 
-Setup runs a private Postgres and abc's own Tailscale node, asks for your password once (Tailscale
-lets only root point Serve at abc), installs the services that keep them running, and opens the
-claim page in your browser with a setup code filled in. It never touches the Tailscale you already
-run. [Running abc's server](docs/server.md) covers what it sets up, `abc server status`,
-upgrades, backups and uninstalling.
+Homebrew installs the `abc` binary, Postgres 18, and abc's own private `tailscaled` and `tailscale`,
+which stay in abc's directory and off your `PATH`, so your own `tailscale` command is never
+shadowed. Setup runs a private Postgres and abc's own Tailscale node, asks for your password once
+(Tailscale lets only root point Serve at abc), installs the services that keep them running, and
+opens the claim page in your browser with a setup code filled in. It never touches the Tailscale
+you already run. [Running abc's server](docs/server.md) covers what it sets up,
+`abc server status`, upgrades, backups and uninstalling.
 
 ## How a change moves
 

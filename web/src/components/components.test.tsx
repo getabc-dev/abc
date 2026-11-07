@@ -178,11 +178,16 @@ describe("ThemeMenu", () => {
 
     await userEvent.keyboard("{Enter}");
     const reopened = await screen.findByRole("menu");
-    // The menu takes focus a moment after it opens; keys pressed before then go nowhere.
+    // The menu takes focus a moment after it opens; a key pressed before then is lost.
     await waitFor(() => {
       expect(reopened.contains(document.activeElement)).toBe(true);
     });
-    await userEvent.keyboard("{End}{Enter}");
+    await userEvent.keyboard("{End}");
+    const system = within(reopened).getByRole("menuitemradio", { name: "System" });
+    await waitFor(() => {
+      expect(document.activeElement).toBe(system);
+    });
+    await userEvent.keyboard("{Enter}");
     expect(document.documentElement.classList.contains("dark")).toBe(false);
     expect(window.localStorage.getItem("abc-theme")).toBeNull();
     expect(await screen.findByRole("button", { name: "Theme: System" })).toBeDefined();

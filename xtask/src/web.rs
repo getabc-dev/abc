@@ -170,7 +170,7 @@ pub(crate) fn build_here(
 }
 
 /// Runs `command` with this process's output, and reports whether it passed.
-fn run_here(command: &mut Command) -> anyhow::Result<bool> {
+pub(crate) fn run_here(command: &mut Command) -> anyhow::Result<bool> {
     let program = command.get_program().to_string_lossy().into_owned();
     Ok(command
         .status()
