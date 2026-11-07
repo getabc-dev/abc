@@ -34,6 +34,9 @@
 # the crate's default features. Renovate bumps `version` from crates.io; keep `version` before
 # `crate`, with only comments between them.
 #
+# `reported-version` is what the executable's `--version` names, for a release whose number adds
+# a build revision as its last part; it must be `version` without that part.
+#
 # `for-tests = true` marks a tool the tests run. `cargo xtask setup --for-tests` installs exactly
 # those, and every CI job that runs tests uses it; `cargo xtask rulesets check` fails a job that
 # runs `check`, `coverage` or `mutants` without it, and a test that runs a pinned tool not marked
@@ -201,3 +204,23 @@ tree = true
 targets.aarch64-apple-darwin = { platform = "darwin-arm64", sha256 = "446c334d493bdfc6cc2db693764d1812fca06456f6a4be7996a13d7008780239", binary-sha256 = "be145d57690a2cabc1f770a62446c7b39a52af72ff2348fb9eaa69f1809bf250", tree-sha256 = "2f2889a8bc310ceee09fcf4058088da83c6e7d6a8e2fa8d211f2d8be7fbc21fb" }
 targets.x86_64-unknown-linux-gnu = { platform = "linux-x64", sha256 = "2c58959fd5df5cb9f4e72784c08a60ffc7ee558fed9b04b22254e29112203a51", binary-sha256 = "46e1d356cdef24c2f8a202de1b00e111fb95f2ded50f80f026ca5bcc0b8d6693", tree-sha256 = "58eb36f07771f4a0e2a48c67c442e424562c24f6ab2de5aef9deaf6b77e645c1" }
 targets.aarch64-unknown-linux-gnu = { platform = "linux-arm64", sha256 = "ce5a5b95a9974a0bbd713a5ef74416dbcd0e3fdf11f69ea92c5995b9c18ccb47", binary-sha256 = "cd5359326a79f3d24de2f6e1080581221737234fc201d8b5f660dc930966c264", tree-sha256 = "3da4057f5234394562bbb3787a6dada0a1fd6452d2017158bdede1b9ca66f648" }
+
+# Postgres 18's server programs, which `abc server setup`'s end-to-end test runs for real
+# (crates/abc/tests/server_setup.rs); xtask gives the tests their bin directory as
+# ABC_TEST_POSTGRES_BIN. theseus-rs builds them from Postgres's source in GitHub Actions, publishes
+# each archive's sha256 and attests it (SLSA provenance from its release workflow), as the
+# postgresql_embedded crate relies on. The archive holds lib/ and share/ the programs load, so it
+# is installed whole (`tree`). The tests only: abc's users get Homebrew's postgresql@18.
+[[tool]]
+name = "postgresql"
+for-tests = true
+version = "18.6.1"
+url = "https://github.com/theseus-rs/postgresql-binaries/releases/download/{version}/postgresql-{version}-{platform}.tar.gz"
+reported-version = "18.6"
+checksums = "https://github.com/theseus-rs/postgresql-binaries/releases/download/{version}/postgresql-{version}-{platform}.tar.gz.sha256"
+attestations = "theseus-rs/postgresql-binaries"
+binary = "postgresql-{version}-{platform}/bin/postgres"
+tree = true
+targets.aarch64-apple-darwin = { platform = "aarch64-apple-darwin", sha256 = "89e91cc80650a43d22c018b95ca356a0c9e15838a1182fed2880bfb5d7d9c9a6", binary-sha256 = "d6688852af4db60285432f3bec9486e17b838c2f3f772b7484029abb0e4ff770", tree-sha256 = "c553407ea2a2303f61a392b129039820815a78d0154f4db246328c101a23b7c2" }
+targets.x86_64-unknown-linux-gnu = { platform = "x86_64-unknown-linux-gnu", sha256 = "e84b02dd8d0ce5879fb697330a789231c8b8f8d958dae3ad4d90fecc710b1315", binary-sha256 = "5bc8957ed11c87924a63120ac01cca1a33068702ab434b58ee892605224f93e0", tree-sha256 = "a2a6f833a6628e440ef452450432cec6617e72d5de3b68cb9c21c66cb29cf8a8" }
+targets.aarch64-unknown-linux-gnu = { platform = "aarch64-unknown-linux-gnu", sha256 = "1ab47fa2f06ff70454309ad02e5d89c46488300d43977231481fd6b160b9d556", binary-sha256 = "cf3017f283714e212b24d73fbe830d826db4d7b786d9fe1a3c13b835d4af8514", tree-sha256 = "b2dd8e761075d3323954d4de81649dd5d00f4db41b49f94c44220a2ec86e0e78" }
