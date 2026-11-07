@@ -134,9 +134,10 @@ fn last_lines(text: &str, count: usize) -> String {
     lines.get(skip..).unwrap_or_default().join("\n")
 }
 
-/// `word` as a shell reads it back: bare when it holds only characters no shell treats
-/// specially, else in single quotes.
-pub(crate) fn quote(word: &OsStr) -> String {
+/// `word` as a shell reads it back, for a command line shown to a person: bare when it holds only
+/// characters no shell treats specially, else in single quotes.
+#[must_use]
+pub fn quote(word: &OsStr) -> String {
     let text = word.to_string_lossy();
     let plain = !text.is_empty()
         && text.bytes().all(|byte| {

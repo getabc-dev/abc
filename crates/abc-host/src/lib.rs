@@ -43,14 +43,9 @@ use std::time::Duration;
 pub use error::HostError;
 pub use home::ServerHome;
 pub use manage::{Backup, backup, restore, uninstall, upgrade};
+pub use process::quote as shell_word;
 pub use setup::{SetupOptions, Stack, open_in_browser, setup};
 pub use status::{Check, Report, status};
-
-/// `word` as a shell reads it back, for a command the person is told to run.
-#[must_use]
-pub fn shell_word(word: &std::ffi::OsStr) -> String {
-    process::quote(word)
-}
 
 /// The URL abc server connects to its private Postgres with, from the configuration setup wrote.
 ///
