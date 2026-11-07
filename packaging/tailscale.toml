@@ -1,6 +1,6 @@
-# The tailscaled that abc's Homebrew formula installs privately into abc's own libexec, never onto
-# the PATH (brief decision 52): abc runs it as a tailnet node of its own, beside any Tailscale the
-# user runs. The release workflow builds it from Tailscale's source at this tag, for each target;
+# The tailscaled and tailscale CLI that abc's Homebrew formula installs privately into abc's own
+# libexec, never onto the PATH (brief decision 52): abc runs the daemon as a tailnet node of its
+# own, beside any Tailscale the user runs, and drives it with the CLI on its own socket. The release workflow builds it from Tailscale's source at this tag, for each target;
 # `cargo xtask release tailscale-source` refuses a tag that no longer names this commit. Renovate
 # proposes new versions with their commits.
 version = "1.104.5"
