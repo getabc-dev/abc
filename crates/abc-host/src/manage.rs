@@ -160,16 +160,16 @@ pub fn uninstall(host: &Host, purge: bool, console: &mut Console<'_>) -> Result<
          (it is listed as logged out).",
     );
     let home = host.home.dir();
+    if !host.home.exists() {
+        return Ok(());
+    }
     if purge {
-        match fs::remove_dir_all(home) {
-            Ok(()) => console.line(&format!(
-                "Deleted {} and all of abc's data.",
-                home.display()
-            )),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(source) => return Err(HostError::io(home, source)),
-        }
-    } else if host.home.exists() {
+        fs::remove_dir_all(home).map_err(|source| HostError::io(home, source))?;
+        console.line(&format!(
+            "Deleted {} and all of abc's data.",
+            home.display()
+        ));
+    } else {
         console.line(&format!(
             "abc's data stays in {}: abc server setup runs it again, and --purge deletes it.",
             home.display()

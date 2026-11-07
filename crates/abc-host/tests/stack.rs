@@ -1184,4 +1184,58 @@ mod tests {
             "a browser that fails to open is no browser"
         );
     }
+
+    #[test]
+    fn a_cluster_version_that_cannot_be_read_is_an_error_not_a_new_cluster() {
+        let machine = Machine::new(Os::MacOs);
+        std::fs::create_dir_all(machine.home().postgres().join("PG_VERSION")).unwrap();
+        let (error, _said) = setup_with(&machine, |_| {});
+        assert!(
+            matches!(&error, HostError::Io { path, .. } if path.ends_with("postgres/PG_VERSION")),
+            "{error:?}"
+        );
+        assert!(
+            !machine
+                .take_calls()
+                .iter()
+                .any(|call| call.starts_with("initdb")),
+            "never initialised over it"
+        );
+    }
+
+    #[test]
+    fn a_backup_where_no_file_can_be_made_is_an_io_error() {
+        let machine = Machine::new(Os::Linux);
+        let nowhere = machine.root().join("missing/dir/x.dump");
+        let error = abc_host::backup(
+            &machine.host(),
+            Some(&nowhere),
+            time::OffsetDateTime::UNIX_EPOCH,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&error, HostError::Io { path, .. } if *path == nowhere),
+            "not mistaken for an existing backup: {error:?}"
+        );
+    }
+
+    #[test]
+    fn purging_nothing_succeeds_and_a_purge_that_fails_says_so() {
+        let machine = Machine::new(Os::Linux);
+        let mut host = machine.host();
+        let mut said = Vec::new();
+        let locked = machine.home().dir().join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        std::fs::write(locked.join("f"), "").unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let error = abc_host::uninstall(&host, true, &mut Console::new(&mut said)).unwrap_err();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            matches!(&error, HostError::Io { path, .. } if path == machine.home().dir()),
+            "{error:?}"
+        );
+        host.home = ServerHome::at(machine.root().join("never-made"));
+        abc_host::uninstall(&host, true, &mut Console::new(&mut said)).unwrap();
+        assert!(!host.home.exists(), "still nothing");
+    }
 }

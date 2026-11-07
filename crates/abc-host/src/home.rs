@@ -217,19 +217,18 @@ pub(crate) fn write_private(path: &Path, text: &str) -> Result<bool, HostError> 
     let mut staged = path.as_os_str().to_owned();
     staged.push(".new");
     let staged = PathBuf::from(staged);
-    match fs::remove_file(&staged) {
-        Ok(()) => {}
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(source) => return Err(HostError::io(&staged, source)),
-    }
+    // A staged file is left only by a crash mid-write: it is overwritten, and made private
+    // whatever mode it had.
     let write = || -> io::Result<()> {
         use std::io::Write as _;
-        use std::os::unix::fs::OpenOptionsExt as _;
+        use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
         let mut file = fs::OpenOptions::new()
             .write(true)
-            .create_new(true)
+            .create(true)
+            .truncate(true)
             .mode(0o600)
             .open(&staged)?;
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
         file.write_all(text.as_bytes())?;
         file.sync_all()
     };
@@ -424,9 +423,23 @@ mod tests {
             !scratch.path().join("f.new").exists(),
             "nothing staged is left"
         );
+        // A crash's leftover, open to others, is overwritten and made private.
+        std::fs::write(scratch.path().join("f.new"), "stale and longer").unwrap();
+        std::fs::set_permissions(
+            scratch.path().join("f.new"),
+            std::fs::Permissions::from_mode(0o666),
+        )
+        .unwrap();
+        assert!(write_private(&path, "three").unwrap(), "written past it");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "three", "whole");
+        let replaced = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(replaced, 0o600, "private again");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
         assert!(
-            matches!(write_private(&path, "two"), Err(HostError::Insecure { .. })),
+            matches!(
+                write_private(&path, "three"),
+                Err(HostError::Insecure { .. })
+            ),
             "an unchanged file others can read is refused"
         );
         let dir = scratch.path().join("d");
