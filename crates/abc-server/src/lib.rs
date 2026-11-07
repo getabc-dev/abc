@@ -2,7 +2,7 @@
 //!
 //! | Listener | Transport | Routes | Identity |
 //! | --- | --- | --- | --- |
-//! | sidecar | Unix socket shared only with the Tailscale sidecar | the whole API, the worker WebSocket, SSE, the web app | `Tailscale-User-Login`, trusted |
+//! | sidecar | Unix socket that only abc's own tailscaled, through Serve, reaches | the whole API, the worker WebSocket, SSE, the web app | `Tailscale-User-Login`, trusted |
 //! | ops | TCP, loopback by default | `/healthz`, `/readyz` | none, and no data |
 //!
 //! The public webhook listener (later) will be a third, with its own router and no identity.
