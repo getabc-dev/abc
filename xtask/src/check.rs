@@ -1668,6 +1668,34 @@ mod tests {
         );
     }
 
+    /// An agent VM's file sharing keeps the guest's file modes apart from the host's files: the
+    /// host saw `.github/release/publish.sh` go from 100755 to 100644 while the VM still saw it
+    /// executable, so a commit made on the host with `git add -A` or `commit -a` would drop the
+    /// bit. Every script is executable in git's index, which is what a commit records.
+    #[test]
+    fn every_script_is_executable_in_the_index() {
+        let root = crate::testing::checkout();
+        let staged = git(&root, &["ls-files", "--stage", "--"]);
+        let modes: std::collections::BTreeMap<&str, &str> = staged
+            .lines()
+            .filter_map(|line| {
+                let (meta, path) = line.split_once('\t')?;
+                Some((path, meta.split(' ').next()?))
+            })
+            .collect();
+        let wrong: Vec<String> = super::SCRIPTS
+            .into_iter()
+            .filter(|script| modes.get(script) != Some(&"100755"))
+            .map(|script| format!("{script} ({})", modes.get(script).unwrap_or(&"not staged")))
+            .collect();
+        assert!(
+            wrong.is_empty(),
+            "not executable in git's index: {}; run `git update-index --chmod=+x <file>` and \
+             `chmod +x <file>`, then commit",
+            wrong.join(", ")
+        );
+    }
+
     #[test]
     fn the_xtask_workspace_is_reached_by_its_manifest() {
         assert_eq!(
