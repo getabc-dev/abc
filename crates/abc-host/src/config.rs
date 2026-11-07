@@ -206,5 +206,11 @@ mod tests {
             matches!(Config::load(&home), Err(HostError::Insecure { .. })),
             "others may read it"
         );
+        std::fs::remove_file(home.config()).unwrap();
+        std::fs::create_dir(home.config()).unwrap();
+        assert!(
+            matches!(Config::load(&home), Err(HostError::Io { .. })),
+            "one that cannot be read is an error, never absent"
+        );
     }
 }

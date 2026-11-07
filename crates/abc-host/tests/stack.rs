@@ -189,6 +189,11 @@ mod tests {
         let (stack, said) = machine.setup(None);
         let stack = stack.unwrap_or_else(|error| panic!("{error}\n{said}"));
         first_setup_ran_the_stack(&machine, &stack, &said);
+        assert_eq!(
+            abc_host::database_url(&machine.host()).unwrap(),
+            stack.database_url,
+            "the day-2 commands reach the database setup made"
+        );
         let report = abc_host::status(&machine.host()).unwrap();
         assert!(report.healthy(), "{:#?}", report.lines());
         second_setup_changes_nothing(&machine);
@@ -762,6 +767,7 @@ mod tests {
         let mut said = Vec::new();
         let now = time::OffsetDateTime::UNIX_EPOCH;
         for error in [
+            abc_host::database_url(&host).unwrap_err(),
             abc_host::upgrade(&host, &mut Console::new(&mut said)).unwrap_err(),
             abc_host::backup(&host, None, now).unwrap_err(),
             abc_host::restore(&host, Path::new("/x"), &mut Console::new(&mut said)).unwrap_err(),

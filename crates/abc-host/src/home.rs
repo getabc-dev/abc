@@ -429,5 +429,11 @@ mod tests {
             matches!(write_private(&path, "two"), Err(HostError::Insecure { .. })),
             "an unchanged file others can read is refused"
         );
+        let dir = scratch.path().join("d");
+        std::fs::create_dir(&dir).unwrap();
+        assert!(
+            matches!(write_private(&dir, "x"), Err(HostError::Io { path: failed, .. }) if failed == dir),
+            "what cannot be read is an error, never a new file"
+        );
     }
 }
