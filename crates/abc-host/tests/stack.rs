@@ -57,6 +57,14 @@ mod tests {
             machine
         }
 
+        /// A machine with the stack set up on it.
+        fn set_up(os: Os) -> Self {
+            let machine = Self::new(os);
+            let (result, said) = machine.setup(None);
+            assert!(result.is_ok(), "{said}");
+            machine
+        }
+
         fn root(&self) -> &Path {
             self.dir.path()
         }
@@ -541,9 +549,7 @@ mod tests {
 
     #[test]
     fn status_names_the_fix_for_each_broken_part() {
-        let machine = Machine::new(Os::Linux);
-        let (result, said) = machine.setup(None);
-        result.unwrap_or_else(|error| panic!("{error}\n{said}"));
+        let machine = Machine::set_up(Os::Linux);
         // abc server dies, Serve is lost and lingering is turned off.
         let abc_pid = std::fs::read_to_string(machine.state("abc-server.service.pid")).unwrap();
         std::process::Command::new("kill")
@@ -636,9 +642,7 @@ mod tests {
 
     #[test]
     fn backup_writes_a_private_dump_and_restore_puts_it_back_with_the_server_stopped() {
-        let machine = Machine::new(Os::MacOs);
-        let (result, said) = machine.setup(None);
-        result.unwrap_or_else(|error| panic!("{error}\n{said}"));
+        let machine = Machine::set_up(Os::MacOs);
         let host = machine.host();
         std::fs::write(machine.state("db-abc"), "the original\n").unwrap();
         let at = time::OffsetDateTime::from_unix_timestamp(1_793_000_000).unwrap();
@@ -709,26 +713,35 @@ mod tests {
 
     #[test]
     fn upgrade_restarts_each_service_and_uninstall_keeps_the_data_unless_purged() {
-        let machine = Machine::new(Os::MacOs);
-        let (result, said) = machine.setup(None);
-        result.unwrap_or_else(|error| panic!("{error}\n{said}"));
+        let machine = Machine::set_up(Os::MacOs);
         let host = machine.host();
         machine.take_calls();
         let mut upgrading = Vec::new();
         abc_host::upgrade(&host, &mut Console::new(&mut upgrading)).unwrap();
-        let kickstarts: Vec<String> = machine
+        let restarts: Vec<String> = machine
             .take_calls()
             .into_iter()
-            .filter(|call| call.starts_with("launchctl kickstart -k"))
+            .filter(|call| {
+                call.starts_with("launchctl kickstart -k")
+                    || call.starts_with("launchctl bootout")
+                    || call.starts_with("launchctl bootstrap")
+            })
             .collect();
         assert_eq!(
-            kickstarts,
+            restarts,
             [
-                "launchctl kickstart -k gui/501/dev.getabc.postgres",
-                "launchctl kickstart -k gui/501/dev.getabc.tailscaled",
-                "launchctl kickstart -k gui/501/dev.getabc.server",
+                "launchctl bootout gui/501/dev.getabc.server".to_owned(),
+                "launchctl kickstart -k gui/501/dev.getabc.postgres".to_owned(),
+                "launchctl kickstart -k gui/501/dev.getabc.tailscaled".to_owned(),
+                format!(
+                    "launchctl bootstrap gui/501 {}",
+                    machine
+                        .root()
+                        .join("services/dev.getabc.server.plist")
+                        .display()
+                ),
             ],
-            "each restarted, in order"
+            "abc server stops first, so Postgres restarts with no session open, and starts last"
         );
 
         let mut uninstalling = Vec::new();
@@ -930,9 +943,7 @@ mod tests {
     #[test]
     fn upgrade_after_a_program_moved_reloads_the_changed_definitions() {
         for os in [Os::MacOs, Os::Linux] {
-            let machine = Machine::new(os);
-            let (result, said) = machine.setup(None);
-            assert!(result.is_ok(), "{said}");
+            let machine = Machine::set_up(os);
             let moved = machine.root().join("programs/abc-moved");
             std::fs::copy(machine.programs().abc, &moved).unwrap();
             let mut config = Config::require(&machine.home()).unwrap();
@@ -967,9 +978,7 @@ mod tests {
 
     #[test]
     fn status_says_when_the_node_moved_serve_points_elsewhere_or_the_node_logged_out() {
-        let machine = Machine::new(Os::MacOs);
-        let (result, said) = machine.setup(None);
-        assert!(result.is_ok(), "{said}");
+        let machine = Machine::set_up(Os::MacOs);
         let mut config = Config::require(&machine.home()).unwrap();
         config.public_url =
             Some(abc_protocol::url::PublicUrl::parse("https://abc-old.tailfake.ts.net").unwrap());
@@ -1025,9 +1034,7 @@ mod tests {
     #[test]
     fn a_dump_that_does_not_load_leaves_the_database_and_restarts_the_server() {
         for os in [Os::MacOs, Os::Linux] {
-            let machine = Machine::new(os);
-            let (result, said) = machine.setup(None);
-            assert!(result.is_ok(), "{said}");
+            let machine = Machine::set_up(os);
             std::fs::write(machine.state("db-abc"), "the data\n").unwrap();
             let broken = machine.root().join("broken.dump");
             std::fs::write(&broken, "FAKE DUMP\nBROKEN\n").unwrap();
@@ -1058,9 +1065,7 @@ mod tests {
 
     #[test]
     fn backup_and_restore_need_a_running_postgres_and_a_failed_dump_leaves_no_file() {
-        let machine = Machine::new(Os::Linux);
-        let (result, said) = machine.setup(None);
-        assert!(result.is_ok(), "{said}");
+        let machine = Machine::set_up(Os::Linux);
         let host = machine.host();
         replace_program(
             &machine,
@@ -1091,9 +1096,7 @@ mod tests {
 
     #[test]
     fn uninstall_without_a_reachable_node_says_to_remove_it_in_the_console() {
-        let machine = Machine::new(Os::Linux);
-        let (result, said) = machine.setup(None);
-        assert!(result.is_ok(), "{said}");
+        let machine = Machine::set_up(Os::Linux);
         std::fs::remove_file(machine.programs().tailscale).unwrap();
         let mut uninstalling = Vec::new();
         abc_host::uninstall(&machine.host(), true, &mut Console::new(&mut uninstalling)).unwrap();
@@ -1134,9 +1137,7 @@ mod tests {
 
     #[test]
     fn launchd_still_unloading_an_agent_is_waited_for() {
-        let machine = Machine::new(Os::MacOs);
-        let (result, said) = machine.setup(None);
-        assert!(result.is_ok(), "{said}");
+        let machine = Machine::set_up(Os::MacOs);
         std::fs::write(machine.state("bootout-lingers"), "").unwrap();
         let moved = machine.root().join("programs/abc-moved");
         std::fs::copy(machine.programs().abc, &moved).unwrap();
@@ -1254,6 +1255,138 @@ mod tests {
             matches!(&error, HostError::Failed { command, output, .. }
                 if command.contains("bootstrap gui/501") && output.contains("Bootstrap failed: 125")),
             "{error:?}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("logged in at its desktop (not over SSH alone)"),
+            "names the login session launchd needs: {error}"
+        );
+    }
+
+    #[test]
+    fn purge_deletes_only_a_home_that_is_abcs() {
+        let machine = Machine::new(Os::Linux);
+        let mut host = machine.host();
+        let mut said = Vec::new();
+        // ABC_SERVER_HOME mistyped as a directory of the person's own.
+        let theirs = machine.root().join("theirs");
+        std::fs::create_dir(&theirs).unwrap();
+        std::fs::set_permissions(&theirs, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::write(theirs.join("precious"), "keep me").unwrap();
+        host.home = ServerHome::at(theirs.clone());
+        let error = abc_host::uninstall(&host, true, &mut Console::new(&mut said)).unwrap_err();
+        assert!(
+            matches!(&error, HostError::NotAbcsHome { path } if *path == theirs),
+            "{error:?}"
+        );
+        assert!(
+            theirs.join("precious").exists(),
+            "nothing of theirs is deleted"
+        );
+        // abc's home, opened to others, is not taken for abc's own either.
+        std::fs::set_permissions(machine.home().dir(), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        let open = abc_host::uninstall(&machine.host(), true, &mut Console::new(&mut said));
+        assert!(matches!(open, Err(HostError::Insecure { .. })), "{open:?}");
+        assert!(machine.home().config().exists(), "kept");
+    }
+
+    #[test]
+    fn a_login_that_fails_midway_leaves_no_tailscale_up_behind() {
+        let machine = Machine::new(Os::MacOs);
+        std::fs::write(machine.root().join("bin/open"), "#!/bin/sh\n").unwrap();
+        std::fs::write(machine.state("garbled-once-up"), "").unwrap();
+        let (error, _said) = setup_with(&machine, |_| {});
+        assert!(
+            matches!(error, HostError::TailscaleAnswer { .. }),
+            "{error:?}"
+        );
+        let up = std::fs::read_to_string(machine.state("up.pid")).unwrap();
+        let alive = std::process::Command::new("kill")
+            .args(["-0", up.trim()])
+            .status()
+            .unwrap();
+        assert!(
+            !alive.success(),
+            "tailscale up is stopped with the setup that started it"
+        );
+    }
+
+    #[test]
+    fn a_swap_that_fails_puts_abcs_database_back() {
+        let machine = Machine::set_up(Os::Linux);
+        std::fs::write(machine.state("db-abc"), "the data\n").unwrap();
+        let good = machine.root().join("good.dump");
+        std::fs::write(&good, "FAKE DUMP\nthe backup\n").unwrap();
+        std::fs::write(machine.state("rename-fails"), "").unwrap();
+        let mut restoring = Vec::new();
+        let error = abc_host::restore(&machine.host(), &good, &mut Console::new(&mut restoring))
+            .unwrap_err();
+        assert!(error.to_string().contains("being accessed"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(machine.state("db-abc")).unwrap(),
+            "the data\n",
+            "abc's database is back in place"
+        );
+        assert!(
+            !machine.state("db-abc_replaced").exists(),
+            "under its own name"
+        );
+        assert_eq!(
+            std::fs::read_to_string(machine.state("abc-connections")).unwrap(),
+            "ALTER DATABASE abc WITH ALLOW_CONNECTIONS true\n",
+            "and open to connections again"
+        );
+    }
+
+    #[test]
+    fn a_bad_dump_is_reported_even_when_the_server_will_not_start_again() {
+        let machine = Machine::set_up(Os::MacOs);
+        std::fs::write(machine.state("bootstrap-refuses"), "").unwrap();
+        let broken = machine.root().join("broken.dump");
+        std::fs::write(&broken, "FAKE DUMP\nBROKEN\n").unwrap();
+        let mut host = machine.host();
+        host.timing.service = Duration::from_millis(200);
+        let mut restoring = Vec::new();
+        let error =
+            abc_host::restore(&host, &broken, &mut Console::new(&mut restoring)).unwrap_err();
+        assert!(
+            error.to_string().contains("abc's database is unchanged"),
+            "the dump's own failure: {error}"
+        );
+        let told = String::from_utf8(restoring).unwrap();
+        assert!(
+            told.contains("abc server did not start again") && told.contains("Bootstrap failed"),
+            "and the server's, said: {told}"
+        );
+    }
+
+    #[test]
+    fn status_on_macos_tells_a_loaded_agent_from_a_running_one() {
+        let machine = Machine::set_up(Os::MacOs);
+        let pid = std::fs::read_to_string(machine.state("dev.getabc.server.pid")).unwrap();
+        std::process::Command::new("kill")
+            .args(["-9", pid.trim()])
+            .status()
+            .unwrap();
+        let report = abc_host::status(&machine.host()).unwrap();
+        let server = report
+            .checks
+            .iter()
+            .find(|check| check.part == "server service")
+            .unwrap();
+        assert!(!server.healthy, "{:#?}", report.lines());
+        assert_eq!(
+            server.detail, "dev.getabc.server is installed but not running",
+            "loaded is not running"
+        );
+        // Setup starts the loaded agent again.
+        let (repaired, said_repairing) = machine.setup(None);
+        assert!(repaired.is_ok(), "{said_repairing}");
+        assert!(
+            abc_host::status(&machine.host()).unwrap().healthy(),
+            "running again"
         );
     }
 }

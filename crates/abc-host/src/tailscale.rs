@@ -5,6 +5,7 @@
 //! the daemon listens on no port of its own (`--port=0`).
 
 use std::ffi::OsString;
+use std::io::Read as _;
 use std::path::Path;
 use std::process::Child;
 use std::time::Instant;
@@ -153,13 +154,27 @@ impl<'a> Tailscale<'a> {
     ) -> Result<NodeStatus, HostError> {
         let up = self.up_command(auth_key);
         let mut child = up.spawn(NOT_ANSWERING)?;
+        let watched = self.watch_login(&up, &mut child, console, timing, open);
+        // However the watch ends, `tailscale up` ends with it.
+        reap(&mut child);
+        watched
+    }
+
+    /// Watches `child`, the running `up`, until the node runs, `up` fails or time runs out.
+    fn watch_login(
+        &self,
+        up: &Invocation,
+        child: &mut Child,
+        console: &mut Console<'_>,
+        timing: &Timing,
+        open: &mut dyn FnMut(&mut Console<'_>, &str),
+    ) -> Result<NodeStatus, HostError> {
         let start = Instant::now();
         let mut opened = false;
         let mut approval = false;
         loop {
             let status = self.status()?;
             if status.running() {
-                reap(&mut child);
                 return Ok(status);
             }
             if !status.auth_url.is_empty() && !opened {
@@ -179,9 +194,17 @@ impl<'a> Tailscale<'a> {
                 .map_err(|source| HostError::io(up.program(), source))?
                 && !ended.success()
             {
-                let output = child
-                    .wait_with_output()
-                    .map_err(|source| HostError::io(up.program(), source))?;
+                let mut output = std::process::Output {
+                    status: ended,
+                    stdout: Vec::new(),
+                    stderr: Vec::new(),
+                };
+                if let Some(mut stdout) = child.stdout.take() {
+                    let _read = stdout.read_to_end(&mut output.stdout);
+                }
+                if let Some(mut stderr) = child.stderr.take() {
+                    let _read = stderr.read_to_end(&mut output.stderr);
+                }
                 return Err(up.failed(
                     ended,
                     &output,
@@ -189,7 +212,6 @@ impl<'a> Tailscale<'a> {
                 ));
             }
             if start.elapsed() >= timing.login {
-                reap(&mut child);
                 return Err(HostError::Timeout {
                     what: "abc's node logging in to your tailnet".to_owned(),
                     seconds: timing.login.as_secs(),

@@ -291,10 +291,6 @@ Every pull request that changes what a release builds from (the workspace, the w
 Rust caches, as the `Release dry run` check (`.github/workflows/release-dry-run.yml`), publishing
 nothing; any other pull request skips them, and the check passes. A release never reads a cache.
 
-**No tag `v*` is pushed before I2 lands.** The formula already installs Postgres 18 and abc's
-tailscaled, the foundation `abc server setup` (I2) builds on, but until I2 an install gives a
-binary that sets nothing up.
-
 1. **Bump the version.** In a pull request, set `[workspace.package] version` in `Cargo.toml` to
    the new release number, then update both lockfiles that name the workspace's crates, since
    `check` builds with `--locked` and never updates them itself, and run the checks:

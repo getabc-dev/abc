@@ -192,6 +192,16 @@ pub enum HostError {
         /// The command that sets it.
         command: String,
     },
+    /// `--purge` was asked to delete a directory that is not abc server's home.
+    #[error(
+        "{} holds no abc server configuration (config.toml), so it is not abc's to delete: check \
+         ABC_SERVER_HOME, or delete the directory yourself if you mean to",
+        path.display()
+    )]
+    NotAbcsHome {
+        /// The directory.
+        path: PathBuf,
+    },
     /// A backup would overwrite a file.
     #[error("{} exists already: name another file, or move this one aside", path.display())]
     BackupExists {
@@ -201,6 +211,33 @@ pub enum HostError {
 }
 
 impl HostError {
+    /// Whether the person fixes it in how abc is set up or configured, rather than in what
+    /// happened while it ran: the binary exits 2 for these, which a service manager does not
+    /// retry. Every variant is decided here, so a new one is decided too.
+    #[must_use]
+    pub const fn is_setup_problem(&self) -> bool {
+        match self {
+            Self::NoHomeDir
+            | Self::Insecure { .. }
+            | Self::SocketPathTooLong { .. }
+            | Self::UnusablePath { .. }
+            | Self::Config { .. }
+            | Self::NotSetUp { .. }
+            | Self::ProgramMissing { .. }
+            | Self::PostgresVersion { .. }
+            | Self::ClusterVersion { .. }
+            | Self::SystemProgramMissing { .. }
+            | Self::NotAbcsHome { .. }
+            | Self::BackupExists { .. } => true,
+            Self::Io { .. }
+            | Self::Spawn { .. }
+            | Self::Failed { .. }
+            | Self::Timeout { .. }
+            | Self::TailscaleAnswer { .. }
+            | Self::ServeNotSet { .. } => false,
+        }
+    }
+
     pub(crate) fn io(path: &Path, source: std::io::Error) -> Self {
         Self::Io {
             path: path.to_path_buf(),
@@ -223,6 +260,33 @@ fn shown_output(output: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::HostError;
+
+    #[test]
+    fn mistakes_in_the_setup_are_told_from_failures_while_running() {
+        let path = || std::path::PathBuf::from("/x");
+        for setup in [
+            HostError::NoHomeDir,
+            HostError::NotAbcsHome { path: path() },
+            HostError::NotSetUp { path: path() },
+            HostError::BackupExists { path: path() },
+        ] {
+            assert!(setup.is_setup_problem(), "{setup:?}");
+        }
+        for running in [
+            HostError::Timeout {
+                what: "x".to_owned(),
+                seconds: 1,
+                fix: "y".to_owned(),
+            },
+            HostError::ServeNotSet {
+                socket: path(),
+                command: "z".to_owned(),
+            },
+            HostError::io(&path(), std::io::Error::other("gone")),
+        ] {
+            assert!(!running.is_setup_problem(), "{running:?}");
+        }
+    }
 
     #[test]
     fn a_failed_program_shows_its_output_indented_under_the_fix() {

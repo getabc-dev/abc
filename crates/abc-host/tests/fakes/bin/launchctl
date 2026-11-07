@@ -71,7 +71,13 @@ print)
 		echo "Could not find service \"$label\" in domain for user gui" >&2
 		exit 113
 	fi
-	echo "state = running"
+	printf '%s = {\n' "gui/501/$label"
+	if running "$label"; then
+		echo "	state = running"
+	else
+		echo "	state = not running"
+	fi
+	echo "}"
 	;;
 kickstart)
 	if [ "$2" = -k ]; then

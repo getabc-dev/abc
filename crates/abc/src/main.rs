@@ -358,22 +358,8 @@ fn discover_host() -> Result<Host, Failure> {
 
 /// A host failure: one a person fixes in the setup or configuration exits 2, the rest 1.
 fn host_failure(error: HostError) -> Failure {
-    let fix_the_setup = matches!(
-        error,
-        HostError::NoHomeDir
-            | HostError::Insecure { .. }
-            | HostError::SocketPathTooLong { .. }
-            | HostError::UnusablePath { .. }
-            | HostError::Config { .. }
-            | HostError::NotSetUp { .. }
-            | HostError::ProgramMissing { .. }
-            | HostError::PostgresVersion { .. }
-            | HostError::ClusterVersion { .. }
-            | HostError::SystemProgramMissing { .. }
-            | HostError::BackupExists { .. }
-    );
     // `report` prints the error with its causes.
-    if fix_the_setup {
+    if error.is_setup_problem() {
         Failure::Config(Box::new(error))
     } else {
         Failure::Run(Box::new(error))
@@ -453,10 +439,10 @@ fn backup(file: Option<&std::path::Path>) -> Result<(), Failure> {
         abc_host::backup(&host, file, time::OffsetDateTime::now_utc()).map_err(host_failure)?;
     writeln!(
         std::io::stdout().lock(),
-        "Wrote {} ({} bytes). Restore it with: abc server restore '{}'",
+        "Wrote {} ({} bytes). Restore it with: abc server restore {}",
         written.path.display(),
         written.bytes,
-        written.path.display()
+        abc_host::shell_word(written.path.as_os_str())
     )
     .map_err(|error| Failure::Run(Box::new(error)))
 }

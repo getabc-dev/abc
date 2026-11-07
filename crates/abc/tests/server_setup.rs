@@ -140,6 +140,15 @@ mod tests {
             0o600,
             "private"
         );
+        let quoted = machine.root().join("Ada's backup.dump");
+        let said = succeeded(&machine.abc(&["backup", quoted.to_str().unwrap()]));
+        assert!(
+            said.contains(&format!(
+                "Restore it with: abc server restore '{}'",
+                quoted.display().to_string().replace('\'', r"'\''")
+            )),
+            "a command a shell reads back whole: {said}"
+        );
         let again = machine.abc(&["backup", file.to_str().unwrap()]);
         assert_eq!(again.status.code(), Some(2), "never overwritten");
 
@@ -224,6 +233,12 @@ mod tests {
         assert_eq!(restore.status.code(), Some(2), "{}", text(&restore.stderr));
         let nothing = bare(&["server", "uninstall"], &env);
         assert!(nothing.status.success(), "{}", text(&nothing.stderr));
+        // A home that is not abc's is never purged: a mistake to fix, so exit 2.
+        std::fs::create_dir(&home).unwrap();
+        std::fs::write(home.join("precious"), "keep me").unwrap();
+        let refused = bare(&["server", "uninstall", "--purge"], &env);
+        assert_eq!(refused.status.code(), Some(2), "{}", text(&refused.stderr));
+        assert!(home.join("precious").exists(), "kept");
         let homeless = bare(&["server", "status"], &[]);
         assert_eq!(homeless.status.code(), Some(2), "no HOME");
         assert!(

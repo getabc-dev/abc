@@ -21,6 +21,8 @@ pub(crate) const ROLE: &str = "abc";
 pub(crate) const DATABASE: &str = "abc";
 /// The database a restore loads into before it takes [`DATABASE`]'s place.
 const RESTORING: &str = "abc_restoring";
+/// Where abc's database steps aside while the restored one takes its name.
+const REPLACED: &str = "abc_replaced";
 /// The port, which names the socket file; nothing listens on it over TCP.
 const PORT: &str = "5432";
 
@@ -223,17 +225,78 @@ impl<'a> Postgres<'a> {
             );
             return Err(error);
         }
+        // abc's database steps aside before the restored one takes its name, and comes back if
+        // that fails, so there is an `abc` database at every step but the instant between.
         self.psql(
             "postgres",
-            &format!("DROP DATABASE IF EXISTS {DATABASE} WITH (FORCE)"),
+            &format!("DROP DATABASE IF EXISTS {REPLACED} WITH (FORCE)"),
             fix,
         )?;
-        self.psql(
+        let had_one = self.database_exists(DATABASE)?;
+        if had_one {
+            // A database is renamed only with no session open on it: no new ones, and the open
+            // ones ended, waiting up to five seconds for each to go.
+            self.psql(
+                "postgres",
+                &format!("ALTER DATABASE {DATABASE} WITH ALLOW_CONNECTIONS false"),
+                fix,
+            )?;
+            let aside = self
+                .psql(
+                    "postgres",
+                    &format!(
+                        "SELECT pg_terminate_backend(pid, 5000) FROM pg_stat_activity \
+                         WHERE datname = '{DATABASE}'"
+                    ),
+                    fix,
+                )
+                .and_then(|_ended| {
+                    self.psql(
+                        "postgres",
+                        &format!("ALTER DATABASE {DATABASE} RENAME TO {REPLACED}"),
+                        fix,
+                    )
+                });
+            if let Err(error) = aside {
+                self.allow_connections(DATABASE);
+                return Err(error);
+            }
+        }
+        if let Err(error) = self.psql(
             "postgres",
             &format!("ALTER DATABASE {RESTORING} RENAME TO {DATABASE}"),
             fix,
-        )
-        .map(|_printed| ())
+        ) {
+            if had_one {
+                let _back = self.psql(
+                    "postgres",
+                    &format!("ALTER DATABASE {REPLACED} RENAME TO {DATABASE}"),
+                    fix,
+                );
+                self.allow_connections(DATABASE);
+            }
+            return Err(error);
+        }
+        if had_one {
+            self.psql(
+                "postgres",
+                &format!("DROP DATABASE IF EXISTS {REPLACED} WITH (FORCE)"),
+                fix,
+            )?;
+        }
+        Ok(())
+    }
+}
+
+impl Postgres<'_> {
+    /// Opens `database` to connections again after a swap that did not happen; what this cannot
+    /// do, the swap's own error has already said.
+    fn allow_connections(&self, database: &str) {
+        let _allowed = self.psql(
+            "postgres",
+            &format!("ALTER DATABASE {database} WITH ALLOW_CONNECTIONS true"),
+            "",
+        );
     }
 }
 

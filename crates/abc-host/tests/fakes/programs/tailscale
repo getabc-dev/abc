@@ -3,7 +3,8 @@
 # the person to follow the login link the fake browser opens), serve (only as root), serve
 # status and logout. Switches in state/: up-fails (up is refused), needs-approval (the tailnet
 # approves new devices; the first status that says so approves it), no-dns (the node runs with
-# no DNS name, as without MagicDNS) and garbled (status answers something that is not JSON).
+# no DNS name, as without MagicDNS), garbled (status answers something that is not JSON) and
+# garbled-once-up (the same, once up has started).
 # A waiting up leaves its process id in state/up.pid.
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 # shellcheck source-path=SCRIPTDIR source=../bin/lib.sh
@@ -23,7 +24,7 @@ fi
 NAME=abc.tailfake.ts.net
 case "$1 ${2:-}" in
 "status --json")
-	if [ -f "$STATE/garbled" ]; then
+	if [ -f "$STATE/garbled" ] || { [ -f "$STATE/garbled-once-up" ] && [ -f "$STATE/up-started" ]; }; then
 		echo "not json"
 	elif [ -f "$STATE/logged-in" ] && [ -f "$STATE/needs-approval" ]; then
 		rm -f "$STATE/needs-approval"

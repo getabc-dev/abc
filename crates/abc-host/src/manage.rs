@@ -6,6 +6,7 @@ use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 
 use crate::config::Config;
+use crate::home::private;
 use crate::ops;
 use crate::postgres::{Postgres, backup_name};
 use crate::services::{Part, Services};
@@ -27,17 +28,23 @@ pub fn upgrade(host: &Host, console: &mut Console<'_>) -> Result<(), HostError> 
     config.programs.check(&host.home.config())?;
     let services = Services::new(host);
     let postgres = Postgres::new(&host.home, &config.programs);
-    for service in definitions(host, &config)? {
+    let [postgres_service, tailscaled_service, server_service] = definitions(host, &config)?;
+    // abc server goes first: Postgres stops only once its sessions end (launchd's SIGTERM is
+    // Postgres's smart shutdown), and the server's pool keeps them open.
+    services.stop(Part::Server)?;
+    for service in [postgres_service, tailscaled_service] {
         if !services.install(&service)? {
             services.restart(service.part)?;
         }
         console.line(&format!("Restarted {}.", service.part.title()));
     }
-    // abc server waits for Postgres itself; this wait names Postgres when it is the one down.
     postgres.wait_ready(
         &host.timing,
         &format!("read {}", services.log_hint(Part::Postgres)),
     )?;
+    // Installing a stopped service starts it, with its definition rewritten if it changed.
+    services.install(&server_service)?;
+    console.line("Restarted abc server.");
     ops::wait_ready(
         config.ops_addr,
         &host.timing,
@@ -122,8 +129,15 @@ pub fn restore(host: &Host, file: &Path, console: &mut Console<'_>) -> Result<()
     services.stop(Part::Server)?;
     console.line("Stopped abc server.");
     let restored = postgres.restore(file);
-    services.start(Part::Server)?;
-    restored?;
+    let started = services.start(Part::Server);
+    if let Err(load) = restored {
+        // The load's failure is the one to fix; the server's, if any, is said beside it.
+        if let Err(start) = started {
+            console.line(&format!("abc server did not start again either: {start}"));
+        }
+        return Err(load);
+    }
+    started?;
     console.line(&format!("Loaded {} into abc's database.", file.display()));
     ops::wait_ready(
         config.ops_addr,
@@ -141,6 +155,16 @@ pub fn restore(host: &Host, file: &Path, console: &mut Console<'_>) -> Result<()
 /// [`HostError`], each naming its fix.
 pub fn uninstall(host: &Host, purge: bool, console: &mut Console<'_>) -> Result<(), HostError> {
     let config = Config::load(&host.home)?;
+    // A purge deletes the home whole, so it must be abc's: holding abc's configuration and
+    // private to this user. Checked before anything changes.
+    if purge && host.home.exists() {
+        if config.is_none() {
+            return Err(HostError::NotAbcsHome {
+                path: host.home.dir().to_path_buf(),
+            });
+        }
+        private(host.home.dir())?;
+    }
     let services = Services::new(host);
     if let Some(config) = &config {
         let tailscale = Tailscale::new(&host.home, &config.programs);

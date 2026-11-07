@@ -160,11 +160,18 @@ impl<'a> Services<'a> {
         let manager = self.manager()?;
         match self.host.os {
             Os::MacOs => {
-                let loaded = self.state(part)? == ServiceState::Running;
-                if loaded && !changed {
+                let loaded = self.launchd(part)?;
+                if let (Some(running), false) = (loaded, changed) {
+                    // Loaded with this definition: started again if it has stopped.
+                    if !running {
+                        manager
+                            .arg("kickstart")
+                            .arg(self.launchd_target(part))
+                            .run(&fix)?;
+                    }
                     return Ok(false);
                 }
-                if loaded {
+                if loaded.is_some() {
                     manager
                         .clone()
                         .arg("bootout")
@@ -187,13 +194,20 @@ impl<'a> Services<'a> {
     }
 
     /// `launchctl bootstrap`, retried while launchd finishes a `bootout` of the same label,
-    /// which it does in the background.
+    /// which it does in the background. The agents run in the user's login session (`gui/<uid>`),
+    /// which a Mac has only while someone is logged in at its desktop, so the failure says so.
     fn bootstrap(
         &self,
         manager: &Invocation,
         plist: &std::path::Path,
         fix: &str,
     ) -> Result<(), HostError> {
+        let fix = format!(
+            "{fix}; abc's services run in your login session, which a Mac has only while you are \
+             logged in at its desktop (not over SSH alone): log in there, or turn on automatic \
+             login so they start after a restart"
+        );
+        let fix = fix.as_str();
         let call = manager
             .clone()
             .arg("bootstrap")
@@ -232,7 +246,7 @@ impl<'a> Services<'a> {
         match self.host.os {
             // An agent that is booted out stays out until it is bootstrapped again.
             Os::MacOs => {
-                if self.state(part)? != ServiceState::Running {
+                if self.launchd(part)?.is_none() {
                     return Ok(());
                 }
                 manager
@@ -252,12 +266,15 @@ impl<'a> Services<'a> {
         let fix = format!("run abc server setup to reinstall {}", part.title());
         let manager = self.manager()?;
         match self.host.os {
-            Os::MacOs => {
-                if self.state(part)? == ServiceState::Running {
-                    return Ok(());
-                }
-                self.bootstrap(&manager, &self.definition(part), &fix)
-            }
+            Os::MacOs => match self.launchd(part)? {
+                Some(true) => Ok(()),
+                Some(false) => manager
+                    .arg("kickstart")
+                    .arg(self.launchd_target(part))
+                    .run(&fix)
+                    .map(|_printed| ()),
+                None => self.bootstrap(&manager, &self.definition(part), &fix),
+            },
             Os::Linux => manager
                 .args(["start", part.service_name(Os::Linux).as_str()])
                 .run(&fix)
@@ -300,12 +317,7 @@ impl<'a> Services<'a> {
         }
         let manager = self.manager()?;
         let running = match self.host.os {
-            Os::MacOs => manager
-                .arg("print")
-                .arg(self.launchd_target(part))
-                .output("")?
-                .status
-                .success(),
+            Os::MacOs => self.launchd(part)? == Some(true),
             Os::Linux => {
                 let asked = manager
                     .args(["is-active", part.service_name(Os::Linux).as_str()])
@@ -318,6 +330,24 @@ impl<'a> Services<'a> {
         } else {
             ServiceState::Stopped
         })
+    }
+
+    /// Whether launchd has `part` loaded (`None` when not), and if so whether its process runs:
+    /// `launchctl print` succeeds for a loaded agent, and says `state = running` while it runs.
+    fn launchd(&self, part: Part) -> Result<Option<bool>, HostError> {
+        let printed = self
+            .manager()?
+            .arg("print")
+            .arg(self.launchd_target(part))
+            .output("")?;
+        if !printed.status.success() {
+            return Ok(None);
+        }
+        Ok(Some(
+            String::from_utf8_lossy(&printed.stdout)
+                .lines()
+                .any(|line| line.trim() == "state = running"),
+        ))
     }
 
     /// The command that shows `part`'s recent output.

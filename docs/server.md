@@ -68,6 +68,10 @@ run `abc server setup` again.
 | Logs | `logs/<name>.log` in abc's home | `journalctl --user -u abc-<name>.service` |
 
 Each starts when you log in (on Linux, at boot, thanks to lingering) and restarts if it fails.
+On a Mac, launchd runs them in your login session, which exists only while you are logged in at
+the Mac's desktop: an SSH session alone has none, so set up a headless Mac from its desktop (or
+Screen Sharing) once, and turn on automatic login if it must come back on its own after a power
+cut.
 abc server's health and readiness answer on `127.0.0.1:7071` (`/healthz`, `/readyz`); nothing
 else listens on TCP.
 

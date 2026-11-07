@@ -112,9 +112,12 @@ impl Programs {
     }
 }
 
-/// The major version in `postgres --version`'s answer, such as `postgres (PostgreSQL) 18.1`.
+/// The major version in `postgres --version`'s answer: the word after `(PostgreSQL)`, as in
+/// `postgres (PostgreSQL) 18.1`, which builds may follow with their own name, as Homebrew's
+/// `(Homebrew)` and Debian's `(Debian 18.1-1.pgdg13+1)` do.
 fn postgres_major(said: &str) -> Option<&str> {
-    let version = said.trim().rsplit(' ').next()?;
+    let (_, after) = said.split_once("(PostgreSQL) ")?;
+    let version = after.split_whitespace().next()?;
     version.split(['.', 'b', 'r']).next()
 }
 
@@ -230,6 +233,21 @@ mod tests {
             postgres_major("postgres (PostgreSQL) 19rc1"),
             Some("19"),
             "rc"
+        );
+        assert_eq!(
+            postgres_major("postgres (PostgreSQL) 18.1 (Homebrew)"),
+            Some("18"),
+            "Homebrew's, which names itself after the version"
+        );
+        assert_eq!(
+            postgres_major("postgres (PostgreSQL) 18.1 (Debian 18.1-1.pgdg13+1)"),
+            Some("18"),
+            "Debian's"
+        );
+        assert_eq!(
+            postgres_major("PostgreSQL 18.1"),
+            None,
+            "not postgres's answer"
         );
     }
 

@@ -1,6 +1,7 @@
 #!/bin/sh
 # A stand-in for psql, knowing only the statements abc sends. A database is a file,
-# state/db-<name>, holding what was loaded into it.
+# state/db-<name>, holding what was loaded into it. With state/rename-fails, renaming the restored
+# database into abc's place fails.
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 # shellcheck source-path=SCRIPTDIR source=../../bin/lib.sh
 . "$ROOT/bin/lib.sh"
@@ -13,8 +14,21 @@ case "$sql" in
 "CREATE DATABASE abc") echo "empty" >"$STATE/db-abc" ;;
 "CREATE DATABASE abc_restoring") : >"$STATE/db-abc_restoring" ;;
 "DROP DATABASE IF EXISTS abc_restoring"*) rm -f "$STATE/db-abc_restoring" ;;
-"DROP DATABASE IF EXISTS abc WITH (FORCE)") rm -f "$STATE/db-abc" ;;
-"ALTER DATABASE abc_restoring RENAME TO abc") mv "$STATE/db-abc_restoring" "$STATE/db-abc" ;;
+"SELECT 1 FROM pg_database WHERE datname = 'abc_replaced'")
+	if [ -f "$STATE/db-abc_replaced" ]; then echo 1; fi
+	;;
+"DROP DATABASE IF EXISTS abc_replaced WITH (FORCE)") rm -f "$STATE/db-abc_replaced" ;;
+"ALTER DATABASE abc WITH ALLOW_CONNECTIONS "*) echo "$sql" >"$STATE/abc-connections" ;;
+"SELECT pg_terminate_backend(pid, 5000) FROM pg_stat_activity WHERE datname = 'abc'") ;;
+"ALTER DATABASE abc RENAME TO abc_replaced") mv "$STATE/db-abc" "$STATE/db-abc_replaced" ;;
+"ALTER DATABASE abc_replaced RENAME TO abc") mv "$STATE/db-abc_replaced" "$STATE/db-abc" ;;
+"ALTER DATABASE abc_restoring RENAME TO abc")
+	if [ -f "$STATE/rename-fails" ]; then
+		echo "ERROR:  database \"abc\" is being accessed by other users" >&2
+		exit 1
+	fi
+	mv "$STATE/db-abc_restoring" "$STATE/db-abc"
+	;;
 *)
 	echo "the fake psql does not know: $sql" >&2
 	exit 3
