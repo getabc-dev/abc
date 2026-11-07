@@ -899,6 +899,24 @@ mod tests {
             refused.to_string().contains("chmod 700 it"),
             "the message says what to do"
         );
+        // No container shares the directory any more: the group gets nothing either.
+        let shared = socket_dir();
+        std::fs::set_permissions(shared.path(), std::fs::Permissions::from_mode(0o750)).unwrap();
+        let shared_settings = config(
+            &pool,
+            shared.path().join("abc.sock"),
+            LinkTimings::default(),
+        );
+        let refused_shared = abc_server::run(shared_settings, async {})
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                refused_shared,
+                ServeError::SocketDirTooOpen { mode: 0o750, .. }
+            ),
+            "a directory the group can reach: {refused_shared:?}"
+        );
         let dir = socket_dir();
         let in_the_way = dir.path().join("abc.sock");
         std::fs::write(&in_the_way, "not a socket").unwrap();

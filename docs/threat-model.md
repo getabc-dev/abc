@@ -204,7 +204,7 @@ only this user controls that node: its state and its socket sit in the private h
 | STRIDE | Threat | Mitigation | Rule | Status |
 | --- | --- | --- | --- | --- |
 | Elevation of privilege | Setup's root step does more than it says. | One `sudo` of one printed command, built from fixed words with every path an argument (never spliced into a shell script); nothing else runs as root, and a second run asks nothing. Tests check the exact command line. | I3 | Built |
-| Spoofing | Another user of the machine connects to `abc.sock` and sends forged identity headers. | The socket's directory is the home's `run/` (0700); abc server refuses a directory with any permission for others. | I4 | Built |
+| Spoofing | Another user of the machine connects to `abc.sock` and sends forged identity headers. | The socket's directory is the home's `run/` (0700); abc server refuses a directory with any permission for its group or others, and makes the socket 0600. | I4 | Built |
 | Spoofing | Another user of the machine connects to Postgres, which trusts its socket. | Postgres listens on no TCP address (`listen_addresses=''`, host connections rejected), and its socket is in the same 0700 directory with `unix_socket_permissions=0700`. | I4 | Built |
 | Tampering | Another user of the machine changes Serve or logs abc's node out through its tailscaled. | tailscaled's socket and state are in the private home; changing Serve to a socket needs root besides. | I4 | Built |
 | Tampering | abc changes the user's own Tailscale. | Every Tailscale call names abc's socket; abc runs the tailscale and tailscaled its install or `config.toml` names, never one on the `PATH`. Tests run a `PATH` tailscale that fails if called. | I3 | Built |
