@@ -121,24 +121,61 @@ const PER_PAGE: usize = 100;
 /// description edit or a review never starts one. A test keeps `.github/workflows/ci.yml` so.
 pub(crate) const PUSH_WORKFLOW: &str = "ci.yml";
 
+/// How many pages of a pull request's timeline [`timeline`] reads at most: 5,000 items. GitHub
+/// sets no limit of its own, and a timeline read in part would miss its latest events, so a longer
+/// one fails instead of being read without end.
+const TIMELINE_PAGES: usize = 50;
+
+/// How many pages of runs [`push_of`] reads at most: GitHub lists no more than 1,000 runs for a
+/// query filtered by `event` or `head_sha`, so a full tenth page is the last there is.
+const RUN_PAGES: usize = 10;
+
+/// Reads pages 1 to `limit` of a list, page `index` being at `path(index)`, through `page`, and
+/// gives each answer, with its path, to `each`, which returns how many items it held. It stops
+/// after the first page with fewer than [`PER_PAGE`] items and returns whether one came: `false`
+/// when page `limit` was full too. Every list is read to a bound, so a page that is always full
+/// never makes a read without end.
+fn read_pages(
+    limit: usize,
+    path: impl Fn(usize) -> String,
+    page: &mut impl FnMut(&str) -> anyhow::Result<Value>,
+    mut each: impl FnMut(&str, &Value) -> anyhow::Result<usize>,
+) -> anyhow::Result<bool> {
+    for index in 1..=limit {
+        let path = path(index);
+        let answer = page(&path)?;
+        if each(&path, &answer)? < PER_PAGE {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// Every item of the pull request `number`'s timeline, oldest first, read through `page` (a path
-/// under the repository answered with its JSON).
+/// under the repository answered with its JSON). Fails on a timeline longer than
+/// [`TIMELINE_PAGES`] pages.
 pub(crate) fn timeline(
     number: u64,
     page: &mut impl FnMut(&str) -> anyhow::Result<Value>,
 ) -> anyhow::Result<Vec<Value>> {
     let mut items = Vec::new();
-    for index in 1_u32.. {
-        let path = format!("issues/{number}/timeline?per_page={PER_PAGE}&page={index}");
-        let answer = page(&path)?;
-        let batch = answer
-            .as_array()
-            .with_context(|| format!("GitHub answered {path} with no list"))?;
-        items.extend(batch.iter().cloned());
-        if batch.len() < PER_PAGE {
-            break;
-        }
-    }
+    let complete = read_pages(
+        TIMELINE_PAGES,
+        |index| format!("issues/{number}/timeline?per_page={PER_PAGE}&page={index}"),
+        page,
+        |path, answer| {
+            let batch = answer
+                .as_array()
+                .with_context(|| format!("GitHub answered {path} with no list"))?;
+            items.extend(batch.iter().cloned());
+            Ok(batch.len())
+        },
+    )?;
+    anyhow::ensure!(
+        complete,
+        "the timeline of pull request #{number} has more than {} items, more than xtask reads",
+        TIMELINE_PAGES * PER_PAGE
+    );
     Ok(items)
 }
 
@@ -166,32 +203,36 @@ pub(crate) fn push_of(
         }
     };
     let mut recorded = false;
-    for number in 1_u32.. {
-        let path = format!(
-            "actions/workflows/{PUSH_WORKFLOW}/runs?event=pull_request&head_sha={}&per_page={PER_PAGE}&page={number}",
-            head.sha
-        );
-        let answer = page(&path)?;
-        let runs = answer
-            .get("workflow_runs")
-            .and_then(Value::as_array)
-            .with_context(|| format!("GitHub answered {path} without workflow_runs"))?;
-        for run in runs {
-            let text = |pointer: &str| run.pointer(pointer).and_then(Value::as_str);
-            // The same commit can head another pull request, from a fork or another branch.
-            if text("/head_repository/full_name") != Some(head.repository)
-                || text("/head_branch") != Some(head.branch)
-                || text("/head_sha") != Some(head.sha)
-            {
-                continue;
+    // A full last page ends the list too: GitHub lists no run past it.
+    read_pages(
+        RUN_PAGES,
+        |index| {
+            format!(
+                "actions/workflows/{PUSH_WORKFLOW}/runs?event=pull_request&head_sha={}&per_page={PER_PAGE}&page={index}",
+                head.sha
+            )
+        },
+        page,
+        |path, answer| {
+            let runs = answer
+                .get("workflow_runs")
+                .and_then(Value::as_array)
+                .with_context(|| format!("GitHub answered {path} without workflow_runs"))?;
+            for run in runs {
+                let text = |pointer: &str| run.pointer(pointer).and_then(Value::as_str);
+                // The same commit can head another pull request, from a fork or another branch.
+                if text("/head_repository/full_name") != Some(head.repository)
+                    || text("/head_branch") != Some(head.branch)
+                    || text("/head_sha") != Some(head.sha)
+                {
+                    continue;
+                }
+                recorded = true;
+                keep(push(run, "a workflow run")?);
             }
-            recorded = true;
-            keep(push(run, "a workflow run")?);
-        }
-        if runs.len() < PER_PAGE {
-            break;
-        }
-    }
+            Ok(runs.len())
+        },
+    )?;
     for item in timeline {
         match item.get("event").and_then(Value::as_str) {
             Some("head_ref_force_pushed") => {
@@ -298,7 +339,11 @@ mod tests {
         let mut asked = Vec::new();
         let items = super::timeline(7, &mut |path: &str| {
             asked.push(path.to_owned());
-            let count = if path.ends_with("&page=1") { 100 } else { 1 };
+            let count = match path.rsplit_once("&page=") {
+                Some((_, "1")) => 100,
+                Some((_, "2")) => 1,
+                _ => anyhow::bail!("no page {path}"),
+            };
             Ok(serde_json::Value::Array(vec![
                 json!({"event": "labeled"});
                 count
@@ -312,6 +357,52 @@ mod tests {
                 "issues/7/timeline?per_page=100&page=1",
                 "issues/7/timeline?per_page=100&page=2"
             ]
+        );
+    }
+
+    /// A timeline whose pages are all full is read to [`super::TIMELINE_PAGES`] pages and no
+    /// further, and fails: read in part, it would miss its latest events.
+    #[test]
+    fn a_timeline_longer_than_xtask_reads_fails() {
+        let mut asked = 0_usize;
+        let error = super::timeline(7, &mut |_: &str| {
+            asked += 1;
+            Ok(serde_json::Value::Array(vec![json!({}); super::PER_PAGE]))
+        })
+        .unwrap_err();
+        assert_eq!(asked, super::TIMELINE_PAGES);
+        assert_eq!(
+            error.to_string(),
+            "the timeline of pull request #7 has more than 5000 items, more than xtask reads"
+        );
+    }
+
+    /// Runs are read page by page to GitHub's last, [`super::RUN_PAGES`], however full it is.
+    #[test]
+    fn runs_are_read_to_the_last_page_github_lists() {
+        let head = super::Head {
+            sha: "abc",
+            repository: "o/r",
+            branch: "x",
+        };
+        let other = json!({
+            "head_sha": "def",
+            "head_branch": "x",
+            "head_repository": {"full_name": "o/r"},
+            "actor": {"login": "snehilvj"},
+            "created_at": "2026-11-05T09:00:00Z",
+        });
+        let mut asked = Vec::new();
+        let push = super::push_of(head, &[], &mut |path: &str| {
+            asked.push(path.to_owned());
+            Ok(json!({"workflow_runs": vec![other.clone(); super::PER_PAGE]}))
+        })
+        .unwrap();
+        assert_eq!(push, None, "no run is of this head");
+        assert_eq!(asked.len(), super::RUN_PAGES);
+        assert!(
+            asked.last().unwrap().ends_with("&per_page=100&page=10"),
+            "{asked:?}"
         );
     }
 

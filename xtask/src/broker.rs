@@ -625,15 +625,43 @@ fn listening(files: &Files) -> bool {
         .any(|socket| UnixStream::connect(socket).is_ok())
 }
 
-/// The process id in the pid file at `path`, if there is one.
-fn read_pid(path: &Path) -> Option<u32> {
+/// The id of a process that may be signalled: a positive `pid_t` above 1. `kill` reads 0 as the
+/// caller's own process group, -1 as every process the user may signal and any other negative
+/// number as a whole process group, and 1 is init, never a broker; none of them can be made into
+/// one, so no pid file, however written, makes [`signal`] reach past one process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Pid(i32);
+
+impl std::str::FromStr for Pid {
+    type Err = anyhow::Error;
+
+    fn from_str(text: &str) -> anyhow::Result<Self> {
+        let pid: i32 = text
+            .parse()
+            .with_context(|| format!("{text:?} is not a process id"))?;
+        anyhow::ensure!(
+            pid > 1,
+            "{pid} names no single process that may be signalled"
+        );
+        Ok(Self(pid))
+    }
+}
+
+impl std::fmt::Display for Pid {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+/// The process id in the pid file at `path`, if it holds one that may be signalled.
+fn read_pid(path: &Path) -> Option<Pid> {
     fs::read_to_string(path).ok()?.trim().parse().ok()
 }
 
 /// Sends SIGTERM to `pid` once `ps` shows it is session `session`'s broker, then SIGKILL if it is
 /// still that broker `patience` later, and waits `patience` again for it to go; says what it did.
 /// Fails, naming the pid, when it cannot be signalled or is still that broker after SIGKILL.
-fn signal_broker(pid: u32, session: &str, patience: Duration) -> anyhow::Result<String> {
+fn signal_broker(pid: Pid, session: &str, patience: Duration) -> anyhow::Result<String> {
     if !is_broker(pid, session) {
         return Ok(format!(
             "process {pid} is no longer the token broker of {session}; left alone"
@@ -686,7 +714,7 @@ const POLL: Duration = Duration::from_millis(200);
 /// Whether process `pid` is running `broker --session <session>`, by one `ps` showing its state
 /// and command line: a process that is gone, a zombie (exited, not yet reaped) or one running
 /// anything else is not.
-fn is_broker(pid: u32, session: &str) -> bool {
+fn is_broker(pid: Pid, session: &str) -> bool {
     let Ok(output) = Command::new("ps")
         .args(["-o", "stat=", "-o", "command=", "-p", &pid.to_string()])
         .stdin(Stdio::null())
@@ -706,8 +734,8 @@ fn is_broker(pid: u32, session: &str) -> bool {
             .any(|window| window == ["broker", "--session", session])
 }
 
-/// Sends `signal` to `pid` with `kill`; whether it was delivered.
-fn signal(pid: u32, signal: &str) -> bool {
+/// Sends `signal` to process `pid` alone with `kill`; whether it was delivered.
+fn signal(pid: Pid, signal: &str) -> bool {
     Command::new("kill")
         .args(["-s", signal, &pid.to_string()])
         .stdin(Stdio::null())
@@ -1596,14 +1624,61 @@ mod tests {
     #[test]
     fn a_broker_that_may_still_run_keeps_its_files_and_fails_loudly() {
         let dir = tempfile::tempdir().unwrap();
-        let (files, _control) = hung(dir.path(), 1);
-        std::fs::remove_file(&files.pid).unwrap();
+        let (files, _control) = hung(dir.path(), None);
         let said = format!(
             "{:?}",
             super::shut_down(&files, "abc-w", Duration::from_millis(300))
         );
         assert!(said.contains("may still be running"), "{said}");
         assert!(files.control.exists() && files.tokens.exists(), "{said}");
+    }
+
+    /// `kill` reads 0 as the caller's process group, -1 as every process the user may signal,
+    /// other negative numbers as groups, and 1 is init: no such pid file is read as a pid.
+    #[test]
+    fn only_a_single_process_other_than_init_is_a_pid() {
+        for text in [
+            "0",
+            "1",
+            "-1",
+            "-2",
+            "+0",
+            "2147483648",
+            "4294967295",
+            "",
+            "x",
+        ] {
+            assert!(text.parse::<super::Pid>().is_err(), "{text:?}");
+        }
+        assert_eq!("2".parse::<super::Pid>().unwrap(), super::Pid(2));
+        assert_eq!(
+            "2147483647".parse::<super::Pid>().unwrap().to_string(),
+            "2147483647"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("abc-w.pid");
+        for text in ["0\n", "1\n", "-1\n"] {
+            std::fs::write(&path, text).unwrap();
+            assert_eq!(super::read_pid(&path), None, "{text:?}");
+        }
+    }
+
+    /// A broker that does not answer and whose pid file names 0, 1 or -1 is never signalled
+    /// through it: `kill 0` would stop this test's own process group, `kill -1` every process it
+    /// may signal.
+    #[test]
+    fn a_pid_file_naming_a_group_or_init_is_never_signalled() {
+        for pid in ["0", "1", "-1"] {
+            let dir = tempfile::tempdir().unwrap();
+            let (files, _control) = hung(dir.path(), None);
+            std::fs::write(&files.pid, format!("{pid}\n")).unwrap();
+            let said = format!(
+                "{:?}",
+                super::shut_down(&files, "abc-w", Duration::from_millis(300))
+            );
+            assert!(said.contains("may still be running"), "{pid}: {said}");
+            assert!(!said.contains("SIGTERM"), "{pid}: {said}");
+        }
     }
 
     /// A broker that, on SIGTERM, became another program at the same pid got SIGKILL: the
@@ -1624,7 +1699,7 @@ mod tests {
             .stderr(std::process::Stdio::null())
             .spawn()
             .unwrap();
-        let (files, _control) = hung(dir.path(), child.id());
+        let (files, _control) = hung(dir.path(), Some(child.id()));
         let said = format!(
             "{:?}",
             super::shut_down(&files, "abc-w", Duration::from_millis(500))
@@ -1655,12 +1730,16 @@ mod tests {
 
     /// The files of a broker that hung, as on 2026-11-06: a control socket that takes the
     /// connection and never answers, its token socket and its pid file naming `pid`.
-    fn hung(dir: &Path, pid: u32) -> (Files, std::os::unix::net::UnixListener) {
+    /// Session `abc-w`'s files in `dir` for a broker that listens on both sockets and never
+    /// answers, with a pid file naming `pid` when there is one.
+    fn hung(dir: &Path, pid: Option<u32>) -> (Files, std::os::unix::net::UnixListener) {
         let files = files(dir, "abc-w");
         std::fs::create_dir_all(files.control.parent().unwrap()).unwrap();
         let control = std::os::unix::net::UnixListener::bind(&files.control).unwrap();
         drop(std::os::unix::net::UnixListener::bind(&files.tokens).unwrap());
-        std::fs::write(&files.pid, format!("{pid}\n")).unwrap();
+        if let Some(pid) = pid {
+            std::fs::write(&files.pid, format!("{pid}\n")).unwrap();
+        }
         (files, control)
     }
 
@@ -1671,7 +1750,7 @@ mod tests {
     fn a_broker_that_does_not_answer_is_stopped_with_sigterm() {
         let dir = tempfile::tempdir().unwrap();
         let mut child = fake_broker(false);
-        let (files, _control) = hung(dir.path(), child.id());
+        let (files, _control) = hung(dir.path(), Some(child.id()));
         let said = super::shut_down(&files, "abc-w", Duration::from_secs(1)).unwrap();
         assert!(
             said.starts_with("the broker did not answer `stop` within 1 s: ")
@@ -1692,7 +1771,7 @@ mod tests {
     fn a_broker_that_outlives_sigterm_is_killed() {
         let dir = tempfile::tempdir().unwrap();
         let mut child = fake_broker(true);
-        let (files, _control) = hung(dir.path(), child.id());
+        let (files, _control) = hung(dir.path(), Some(child.id()));
         let said = super::shut_down(&files, "abc-w", Duration::from_millis(500)).unwrap();
         assert!(
             said.contains(&format!(
@@ -1736,7 +1815,7 @@ mod tests {
             .stderr(std::process::Stdio::null())
             .spawn()
             .unwrap();
-        let (files, control) = hung(dir.path(), other.id());
+        let (files, control) = hung(dir.path(), Some(other.id()));
         drop(control);
         let said = super::shut_down(&files, "abc-w", Duration::from_secs(1)).unwrap();
         assert!(

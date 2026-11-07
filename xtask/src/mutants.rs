@@ -346,10 +346,31 @@ impl Run<'_> {
     }
 }
 
-/// Cargo configuration, forced over the environment, for everything cargo-mutants has cargo
-/// build and run: `TMPDIR` is `temp`, this process's own, not cargo-mutants' scratch directory,
+/// How much memory, in KiB, each test process of a mutants run may make writable: 2 GiB, where
+/// no unmutated test of either workspace comes near. A mutant that turns a loop endless can make
+/// a test allocate without bound; on 2026-11-07 one filled a CI runner's memory in seconds and
+/// GitHub shut the runner down, which cancels the job and reports no mutant. Limited, the test
+/// aborts, and the mutant is caught.
+const TEST_MEMORY_KIB: u32 = 2 * 1024 * 1024;
+
+/// The runner Cargo starts each test binary through, on Linux: a shell that limits the data
+/// segment (`RLIMIT_DATA`, which since Linux 4.7 counts every private writable mapping, so the
+/// heap however allocated) to [`TEST_MEMORY_KIB`] and then becomes the test. macOS does not
+/// enforce that limit on mappings, and CI and agent VMs run Linux.
+fn test_runner() -> [String; 4] {
+    [
+        "sh".to_owned(),
+        "-c".to_owned(),
+        format!("ulimit -d {TEST_MEMORY_KIB} && exec \"$@\""),
+        "sh".to_owned(),
+    ]
+}
+
+/// Cargo configuration for everything cargo-mutants has cargo build and run. `TMPDIR`, forced
+/// over the environment, is `temp`, this process's own, not cargo-mutants' scratch directory,
 /// which is inside the checkout's git repository and Cargo workspace and can make paths too long
-/// for a Unix socket.
+/// for a Unix socket. On Linux each test binary runs through [`test_runner`], so a mutant that
+/// allocates without bound fails its test instead of exhausting the machine.
 fn test_env_config(temp: &Path) -> anyhow::Result<String> {
     let text = |path: &Path, what: &str| {
         path.to_str().map(str::to_owned).with_context(|| {
@@ -369,6 +390,15 @@ fn test_env_config(temp: &Path) -> anyhow::Result<String> {
     env.insert("TMPDIR", forced(text(temp, "the temporary directory")?));
     let mut config = toml_edit::DocumentMut::new();
     config.insert("env", toml_edit::Item::Table(env));
+    let mut linux = toml_edit::Table::new();
+    linux.insert(
+        "runner",
+        toml_edit::value(test_runner().into_iter().collect::<toml_edit::Array>()),
+    );
+    let mut target = toml_edit::Table::new();
+    target.set_implicit(true);
+    target.insert("cfg(target_os = \"linux\")", toml_edit::Item::Table(linux));
+    config.insert("target", toml_edit::Item::Table(target));
     Ok(config.to_string())
 }
 
@@ -559,7 +589,7 @@ mod tests {
 
     use super::{
         Options, Outcome, Shard, annotate, changes_rust, describe, listed, outcome, run,
-        test_env_config, timeout_multiplier,
+        test_env_config, test_runner, timeout_multiplier,
     };
     use crate::annotation::Mode;
     use crate::testing::{repository_with_change, script};
@@ -622,6 +652,42 @@ mod tests {
             let error = test_env_config(Path::new(invalid)).unwrap_err();
             assert!(error.to_string().contains("not UTF-8"), "{error}");
         }
+    }
+
+    /// Each test binary of a mutants run on Linux starts through the runner, which limits its
+    /// memory: a mutant that made a test allocate without bound filled a CI runner's memory
+    /// and had the runner shut down.
+    #[test]
+    fn every_test_runs_with_its_memory_limited_on_linux() {
+        let config: toml_edit::DocumentMut =
+            test_env_config(Path::new("/tmp")).unwrap().parse().unwrap();
+        let runner: Vec<&str> = config["target"]["cfg(target_os = \"linux\")"]["runner"]
+            .as_array()
+            .unwrap_or_else(|| panic!("no runner: {config}"))
+            .iter()
+            .filter_map(toml_edit::Value::as_str)
+            .collect();
+        assert_eq!(runner, test_runner(), "{config}");
+        // The runner as Cargo starts it: the test binary and its arguments come after.
+        let output = std::process::Command::new(&runner[0])
+            .args(&runner[1..])
+            .args([
+                "sh",
+                "-c",
+                "ulimit -S -d; ulimit -H -d; echo \"$@\"",
+                "sh",
+                "--exact",
+                "a test",
+            ])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "2097152\n2097152\n--exact a test\n",
+            "the binary gets the limit, hard so that it cannot raise it, and its arguments as \
+             they were"
+        );
     }
 
     #[test]
