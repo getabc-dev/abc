@@ -219,6 +219,16 @@ impl Manifest {
         })
     }
 
+    /// The installed tool `name`, which must be one the tests run, in the tree at `tree`.
+    fn for_tests(&self, tree: &Path, name: &str) -> anyhow::Result<PathBuf> {
+        let tool = self.tool(name)?;
+        ensure!(
+            tool.for_tests,
+            "{name} is not marked `for-tests` in {MANIFEST}"
+        );
+        tool.installed(tree)
+    }
+
     pub(crate) fn tool(&self, name: &str) -> anyhow::Result<&Tool> {
         self.tools
             .iter()
@@ -1059,6 +1069,22 @@ fn check_attested(
 /// The executable of the tool `name` pinned in the repository at `home`, checked against its pin.
 pub(crate) fn pinned(home: &Path, name: &str) -> anyhow::Result<PathBuf> {
     Manifest::load(home)?.tool(name)?.installed(home)
+}
+
+/// A tool the tests of the tree at `tree` run, such as the Postgres a gate hands them: pinned
+/// `for-tests` in that tree's own tool list and installed in its own `.tools/`, as its `cargo
+/// xtask setup --for-tests` put it there. Under `--root` the gates' own programs stay xtask's
+/// ([`pinned`]), so a pull request cannot change what judges it; these are the tree's code
+/// running the tree's tests, which no trust boundary separates.
+pub(crate) fn for_tests(tree: &Path, name: &str) -> anyhow::Result<PathBuf> {
+    Manifest::load(tree)
+        .and_then(|manifest| manifest.for_tests(tree, name))
+        .with_context(|| {
+            format!(
+                "the tests of {} run its own {name}: run `cargo xtask setup --for-tests` in {0}",
+                tree.display()
+            )
+        })
 }
 
 /// `cargo xtask tool`: runs a pinned tool's `executable` with the given arguments in `root`.
@@ -2004,6 +2030,77 @@ targets.aarch64-unknown-linux-gnu = {{ platform = "linux-arm64", sha256 = "{sha2
             fs::read(&executable).unwrap(),
             SCRIPT,
             "and replaced by the pinned build"
+        );
+    }
+
+    #[test]
+    fn the_tests_tools_come_from_the_tree_under_test() {
+        let temp = tempfile::tempdir().unwrap();
+        let archive = tarball(&[("fake-1.2.3/fake", SCRIPT, 0o755)]);
+        let text = manifest_text(&sha256_hex(&archive), &sha256_hex(SCRIPT))
+            .replace("name = \"fake\"\n", "name = \"fake\"\nfor-tests = true\n");
+        let manifest = Manifest::parse(&text).unwrap();
+        let tree_with = |name: &str, text: &str| {
+            let tree = temp.path().join(name);
+            fs::create_dir_all(tree.join("xtask")).unwrap();
+            fs::write(tree.join(super::MANIFEST), text).unwrap();
+            tree
+        };
+        let home = tree_with("home", &text);
+        let tree = tree_with("tree", &text);
+        install(
+            &home,
+            only_tool(&manifest),
+            Target::host().unwrap(),
+            &archive,
+        )
+        .unwrap();
+
+        let missing = super::for_tests(&tree, "fake").unwrap_err();
+        let shown = format!("{missing:#}");
+        assert!(
+            shown.contains(&format!(
+                "the tests of {} run its own fake: run `cargo xtask setup --for-tests` in {}",
+                tree.display(),
+                tree.display()
+            )),
+            "xtask's own install does not stand in for the tree's: {shown}"
+        );
+        assert!(shown.contains("fake 1.2.3 is not installed"), "{shown}");
+
+        install(
+            &tree,
+            only_tool(&manifest),
+            Target::host().unwrap(),
+            &archive,
+        )
+        .unwrap();
+        assert_eq!(
+            super::for_tests(&tree, "fake").unwrap(),
+            tree.join(".tools/fake/1.2.3/fake"),
+            "the tree's own install"
+        );
+
+        let unmarked = tree_with("unmarked", &text.replace("for-tests = true\n", ""));
+        install(
+            &unmarked,
+            only_tool(&manifest),
+            Target::host().unwrap(),
+            &archive,
+        )
+        .unwrap();
+        let shown = format!("{:#}", super::for_tests(&unmarked, "fake").unwrap_err());
+        assert!(
+            shown.contains("fake is not marked `for-tests` in xtask/tools.toml"),
+            "only a tool the tree's tests run: {shown}"
+        );
+        let shown = format!(
+            "{:#}",
+            super::for_tests(&temp.path().join("none"), "fake").unwrap_err()
+        );
+        assert!(
+            shown.contains("could not read"),
+            "a tree with no tool list: {shown}"
         );
     }
 

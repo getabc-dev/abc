@@ -44,12 +44,16 @@ pub(crate) struct Tools {
 }
 
 impl Tools {
-    /// The pinned ones, found with `tool`.
-    pub(crate) fn pinned(tool: &dyn Fn(&str) -> anyhow::Result<PathBuf>) -> anyhow::Result<Self> {
+    /// The pinned ones: the gate's own programs found with `tool`, and the tools the tests run,
+    /// from the tree under test, found with `test_tool`.
+    pub(crate) fn pinned(
+        tool: &dyn Fn(&str) -> anyhow::Result<PathBuf>,
+        test_tool: &dyn Fn(&str) -> anyhow::Result<PathBuf>,
+    ) -> anyhow::Result<Self> {
         Ok(Self {
             llvm_cov: tool("cargo-llvm-cov")?,
             nextest: tool("cargo-nextest")?,
-            postgres: check::postgres_bin(tool)?,
+            postgres: check::postgres_bin(test_tool)?,
             web: web::Toolchain::pinned(tool)?,
         })
     }
