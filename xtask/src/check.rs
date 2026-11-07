@@ -19,6 +19,7 @@ use std::process::{Command, Stdio};
 use anyhow::{Context, ensure};
 use serde::Deserialize;
 
+use crate::annotation::Mode;
 use crate::git::{default_branch, git};
 
 /// Root files whose change can affect every crate of every workspace.
@@ -38,6 +39,10 @@ pub(crate) struct Workspace {
     /// Directories outside its crates, beside [`SHARED_DIRS`], whose change can affect all of them.
     dirs: &'static [&'static str],
 }
+
+/// nextest's configuration for every workspace, from the repository root: no retries, a timeout
+/// for hung tests and the `JUnit` report ([`crate::junit::REPORT`]).
+pub(crate) const NEXTEST_CONFIG: &str = ".config/nextest.toml";
 
 /// The main workspace: the crates abc ships.
 pub(crate) const MAIN: Workspace = Workspace {
@@ -102,6 +107,16 @@ impl Workspace {
     /// workspace.
     pub(crate) const fn dir(self) -> &'static str {
         self.dir
+    }
+
+    /// The arguments that give nextest the repository's configuration, `root`/[`NEXTEST_CONFIG`],
+    /// whichever workspace it runs: by default nextest reads `.config/nextest.toml` beside the
+    /// workspace's root manifest, which xtask's workspace, and any copy of it, does not have.
+    pub(crate) fn nextest_config_args(root: &Path) -> [OsString; 2] {
+        [
+            "--config-file".into(),
+            root.join(NEXTEST_CONFIG).into_os_string(),
+        ]
     }
 
     /// The arguments that point cargo at this workspace from the repository root.
@@ -257,6 +272,18 @@ const QUERY_CACHE_FIX: &str = "regenerate the crate's .sqlx/ against a migrated 
     crates/<crate> tool cargo-sqlx sqlx prepare --database-url \
     postgres://postgres@127.0.0.1:55432/abc_prepare -- --all-targets --all-features --locked`";
 
+/// How a check runs.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Options<'a> {
+    /// Clippy and the tests cover only the crates that the changes since the merge base with the
+    /// default branch can affect.
+    pub(crate) changed: bool,
+    /// Builds go here when given, and wherever cargo is configured to otherwise.
+    pub(crate) target_dir: Option<&'a Path>,
+    /// In [`Mode::Actions`], each failing test is also an annotation.
+    pub(crate) mode: Mode,
+}
+
 /// Where a check's steps run and build.
 struct Run<'a, W> {
     root: &'a Path,
@@ -264,25 +291,29 @@ struct Run<'a, W> {
     postgres: &'a Postgres<'a>,
     /// Builds go here when given, and wherever cargo is configured to otherwise.
     target_dir: Option<&'a Path>,
+    /// The step's annotations, across every workspace's failing tests.
+    annotations: crate::annotation::Step,
     out: &'a mut W,
     failures: Vec<Failure>,
     /// node and pnpm, when the tree holds the web app.
     web: Option<&'a crate::web::Toolchain>,
 }
 
-/// Runs the check of `tree` from `root` and reports whether it passed. With `changed`, clippy and
-/// the tests cover only the crates that the changes since the merge base with the default branch
-/// can affect. Builds go to `target_dir` when given, and wherever cargo is configured to
-/// otherwise. Every step's output goes to `out`.
+/// Runs the check of `tree` from `root` with `options` and reports whether it passed. Every step's
+/// output goes to `out`.
 pub(crate) fn run(
     root: &Path,
     tree: Tree<'_>,
-    changed: bool,
+    options: Options<'_>,
     tools: &Tools,
     postgres: &Postgres<'_>,
-    target_dir: Option<&Path>,
     out: &mut impl Write,
 ) -> anyhow::Result<bool> {
+    let Options {
+        changed,
+        target_dir,
+        mode,
+    } = options;
     if !review_size(root, out)? {
         return Ok(false);
     }
@@ -303,34 +334,14 @@ pub(crate) fn run(
         tools,
         postgres,
         target_dir,
+        annotations: crate::annotation::Step::new(mode),
         out,
         failures: Vec::new(),
         web,
     };
-    run.shellcheck(tree.scripts)?;
-    if let Some(toolchain) = web {
-        match &changed_files {
-            _ if !crate::web::present(root) => writeln!(
-                run.out,
-                "xtask: the tree holds no web app (web/package.json); skipping the web gates"
-            )?,
-            Some(files) if !files.iter().any(|path| crate::web::affected_by(path)) => writeln!(
-                run.out,
-                "xtask: nothing under web/ changed; skipping the web gates"
-            )?,
-            Some(_) | None => run.web_gates(toolchain)?,
-        }
-    }
-    for &workspace in tree.workspaces {
-        let (scope, packages) = match &changed_files {
-            Some(files) => {
-                let packages = workspace_packages(root, workspace)?;
-                (affected(workspace, &packages, files), Some(packages))
-            }
-            None => (Scope::Workspace, None),
-        };
-        run.workspace(workspace, &scope, packages)?;
-    }
+    let gates = run.gates(tree, changed_files.as_deref());
+    write!(run.out, "{}", run.annotations.finish())?;
+    gates?;
     let Run { failures, .. } = run;
     if failures.is_empty() {
         writeln!(out, "xtask check: passed")?;
@@ -344,7 +355,7 @@ pub(crate) fn run(
 }
 
 /// Whether the changes since the merge base with the default branch fit the Gemini review's
-/// limit, measured on the same diff the review sends, so an oversized change is split before it
+/// limit, measured as the review measures the change, so an oversized change is split before it
 /// reaches CI rather than after. Where no default branch is known, as in a fresh clone or CI's
 /// checkout, it says so and passes: the review job enforces the limit there.
 fn review_size(root: &Path, out: &mut impl Write) -> anyhow::Result<bool> {
@@ -356,7 +367,7 @@ fn review_size(root: &Path, out: &mut impl Write) -> anyhow::Result<bool> {
         }
     };
     let merge_base = crate::git::merge_base(root, &branch)?;
-    let (diff, _) = crate::git::reviewable_diff(root, &merge_base, 3)?;
+    let (diff, _) = crate::git::reviewable_diff(root, &merge_base, crate::git::To::WorkingTree)?;
     if let Err(error) = crate::review::check_size("the diff", diff.len()) {
         writeln!(out, "xtask: since {branch}, {error}")?;
         return Ok(false);
@@ -390,6 +401,36 @@ fn database(root: &Path, scope: &Scope, packages: &[Package]) -> Database {
 }
 
 impl<W: Write> Run<'_, W> {
+    /// Runs every gate of `tree`: shellcheck, the web app's gates when it holds the web app, then
+    /// each workspace's, limited to `changed_files` when given.
+    fn gates(&mut self, tree: Tree<'_>, changed_files: Option<&[PathBuf]>) -> anyhow::Result<()> {
+        self.shellcheck(tree.scripts)?;
+        if let Some(toolchain) = self.web {
+            match changed_files {
+                _ if !crate::web::present(self.root) => writeln!(
+                    self.out,
+                    "xtask: the tree holds no web app (web/package.json); skipping the web gates"
+                )?,
+                Some(files) if !files.iter().any(|path| crate::web::affected_by(path)) => writeln!(
+                    self.out,
+                    "xtask: nothing under web/ changed; skipping the web gates"
+                )?,
+                Some(_) | None => self.web_gates(toolchain)?,
+            }
+        }
+        for &workspace in tree.workspaces {
+            let (scope, packages) = match changed_files {
+                Some(files) => {
+                    let packages = workspace_packages(self.root, workspace)?;
+                    (affected(workspace, &packages, files), Some(packages))
+                }
+                None => (Scope::Workspace, None),
+            };
+            self.workspace(workspace, &scope, packages)?;
+        }
+        Ok(())
+    }
+
     /// Lints `scripts` with shellcheck, which follows what they source.
     fn shellcheck(&mut self, scripts: &[&str]) -> anyhow::Result<()> {
         if scripts.is_empty() {
@@ -512,13 +553,7 @@ impl<W: Write> Run<'_, W> {
         if database.needs_server() {
             (self.postgres.warm)(self.out)?;
         }
-        if !self.step(&mut test_command(self.tools, workspace, scope))? {
-            self.failures.push(Failure::new(
-                "tests",
-                workspace,
-                "fix the cause of each failing test above; never skip or weaken a test",
-            ));
-        }
+        self.tests(workspace, scope)?;
         // A workspace of binaries alone, such as xtask's, has no doctests to run.
         let doc_test_args = if packages.iter().any(|package| package.library) {
             scope.doc_test_args()
@@ -589,6 +624,23 @@ impl<W: Write> Run<'_, W> {
         Ok(current)
     }
 
+    /// Runs the tests of `scope` of `workspace`; in
+    /// [`Mode::Actions`], each failing test is also an annotation.
+    fn tests(&mut self, workspace: Workspace, scope: &Scope) -> anyhow::Result<()> {
+        let report = self.root.join(workspace.dir()).join(crate::junit::REPORT);
+        crate::junit::clear(&report)?;
+        if !self.step(&mut test_command(self.tools, self.root, workspace, scope))? {
+            self.failures.push(Failure::new(
+                "tests",
+                workspace,
+                "fix the cause of each failing test above; never skip or weaken a test",
+            ));
+            let failed = crate::junit::annotations(&report, workspace.dir(), "tests");
+            write!(self.out, "{}", self.annotations.emit(&failed))?;
+        }
+        Ok(())
+    }
+
     /// Runs one step from the repository root, building into the run's target directory when it
     /// has one, and reports whether it passed. The step's output, stdout and stderr together, goes
     /// to the run's `out`: a hook's stdout carries only its answer, and the agent reads why a
@@ -625,12 +677,14 @@ impl<W: Write> Run<'_, W> {
     }
 }
 
-/// The nextest run for `scope` of `workspace`, with property tests seeded by
-/// [`PROPTEST_RNG_SEED`] and Postgres's programs at [`POSTGRES_BIN`].
-fn test_command(tools: &Tools, workspace: Workspace, scope: &Scope) -> Command {
+/// The nextest run for `scope` of `workspace` in the repository at `root`, with its nextest
+/// configuration, property tests seeded by [`PROPTEST_RNG_SEED`] and Postgres's programs at
+/// [`POSTGRES_BIN`].
+fn test_command(tools: &Tools, root: &Path, workspace: Workspace, scope: &Scope) -> Command {
     let mut command = Command::new(&tools.nextest);
     command
         .args(["nextest", "run"])
+        .args(Workspace::nextest_config_args(root))
         .args(workspace.manifest_args())
         .args(scope.cargo_args())
         .arg("--locked")
@@ -816,10 +870,18 @@ mod tests {
     use std::collections::BTreeSet;
 
     use super::{
-        MAIN, POSTGRES_BIN, PROPTEST_RNG_SEED, Package, Scope, Tools, Tree, XTASK, affected,
-        changed_since, postgres_bin, review_size, run, test_command,
+        MAIN, Options, POSTGRES_BIN, PROPTEST_RNG_SEED, Package, Scope, Tools, Tree, XTASK,
+        affected, changed_since, postgres_bin, review_size, run, test_command,
     };
+    use crate::annotation::Mode;
     use crate::git::default_branch;
+
+    /// A whole check, outside GitHub Actions, building where cargo is configured to.
+    const PLAIN: Options<'static> = Options {
+        changed: false,
+        target_dir: None,
+        mode: Mode::Plain,
+    };
     use crate::testing::{clone_with_origin, git, repository};
 
     fn package(name: &str, dir: &str, library: bool, path_dependencies: &[&str]) -> Package {
@@ -927,7 +989,7 @@ mod tests {
 
     #[test]
     fn metadata_reads_which_crates_use_sqlx_and_keep_a_query_cache() {
-        let root = crate::repo_root().unwrap();
+        let root = crate::testing::checkout();
         let packages = super::workspace_packages(&root, MAIN).unwrap();
         let find = |name: &str| {
             packages
@@ -1023,7 +1085,7 @@ mod tests {
 
     #[test]
     fn xtask_metadata_reads_from_its_own_workspace() {
-        let root = crate::repo_root().unwrap();
+        let root = crate::testing::checkout();
         let packages = super::workspace_packages(&root, XTASK).unwrap();
         let names: Vec<(&str, &Path)> = packages
             .iter()
@@ -1264,8 +1326,14 @@ mod tests {
         )
         .unwrap();
         fs::copy(
-            crate::repo_root().unwrap().join("rust-toolchain.toml"),
+            crate::testing::checkout().join("rust-toolchain.toml"),
             root.join("rust-toolchain.toml"),
+        )
+        .unwrap();
+        fs::create_dir(root.join(".config")).unwrap();
+        fs::write(
+            root.join(super::NEXTEST_CONFIG),
+            crate::testing::read_in_repository(super::NEXTEST_CONFIG),
         )
         .unwrap();
         fs::create_dir(root.join("src")).unwrap();
@@ -1301,11 +1369,11 @@ mod tests {
             warm: &no_postgres,
             sqlx: &no_sqlx,
         };
-        check_in(&fixture, &postgres)
+        check_in(&fixture, &postgres, Mode::Plain)
     }
 
     /// Runs the whole check on `fixture` with Postgres reached through `postgres`.
-    fn check_in(fixture: &TempDir, postgres: &super::Postgres<'_>) -> (bool, String) {
+    fn check_in(fixture: &TempDir, postgres: &super::Postgres<'_>, mode: Mode) -> (bool, String) {
         let nextest = crate::testing::pinned_for_tests("cargo-nextest");
         let target_dir = fixture.path().join("target");
         let mut out = Vec::new();
@@ -1323,10 +1391,13 @@ mod tests {
         let passed = run(
             fixture.path(),
             tree,
-            false,
+            Options {
+                changed: false,
+                target_dir: Some(&target_dir),
+                mode,
+            },
             &tools,
             postgres,
-            Some(&target_dir),
             &mut out,
         )
         .unwrap();
@@ -1359,7 +1430,7 @@ mod tests {
             warm: &warm,
             sqlx: &resolve,
         };
-        let (passed, out) = check_in(&fixture, &postgres);
+        let (passed, out) = check_in(&fixture, &postgres, Mode::Plain);
         let calls = fs::read_to_string(&log).unwrap_or_default();
         (passed, out, warmed.get(), calls)
     }
@@ -1406,7 +1477,7 @@ mod tests {
             web: false,
         };
         let mut out = Vec::new();
-        let passed = run(dir, tree, false, &tools, &postgres, None, &mut out).unwrap();
+        let passed = run(dir, tree, PLAIN, &tools, &postgres, &mut out).unwrap();
         (passed, String::from_utf8(out).unwrap())
     }
 
@@ -1433,7 +1504,7 @@ mod tests {
             web: true,
         };
         let mut out = Vec::new();
-        let passed = run(dir, tree, false, &tools, &postgres, None, &mut out)?;
+        let passed = run(dir, tree, PLAIN, &tools, &postgres, &mut out)?;
         Ok((passed, String::from_utf8(out)?))
     }
 
@@ -1515,10 +1586,13 @@ mod tests {
             let passed = run(
                 &work,
                 tree,
-                true,
+                Options {
+                    changed: true,
+                    target_dir: Some(&target),
+                    mode: Mode::Plain,
+                },
                 &tools,
                 &postgres,
-                Some(&target),
                 &mut out,
             )
             .unwrap();
@@ -1593,7 +1667,7 @@ mod tests {
 
     #[test]
     fn the_repositorys_scripts_are_all_listed() {
-        let root = crate::repo_root().unwrap();
+        let root = crate::testing::checkout();
         let listed = git(
             &root,
             &["ls-files", "--cached", "--others", "--exclude-standard"],
@@ -1622,19 +1696,26 @@ mod tests {
             MAIN.manifest_args().is_empty(),
             "the main workspace is the root's"
         );
-        let command = test_command(&command_tools(), XTASK, &Scope::Workspace);
+        let command = test_command(
+            &command_tools(),
+            Path::new("/work/abc"),
+            XTASK,
+            &Scope::Workspace,
+        );
         let args: Vec<&OsStr> = command.get_args().collect();
         assert_eq!(
             args,
             [
                 "nextest",
                 "run",
+                "--config-file",
+                "/work/abc/.config/nextest.toml",
                 "--manifest-path",
                 "xtask/Cargo.toml",
                 "--workspace",
                 "--locked"
             ],
-            "nextest runs xtask's own tests"
+            "nextest runs xtask's own tests with the repository's configuration"
         );
     }
 
@@ -1686,6 +1767,35 @@ mod tests {
         assert!(out.contains("  tests: "), "{out}");
     }
 
+    /// #33: a failing xtask test showed only "exit code 1" in the pull request's checks. Inside
+    /// GitHub Actions, each failing test is now an annotation at its panic, with its message.
+    #[test]
+    fn a_failing_test_is_annotated_in_github_actions() {
+        let fixture = fixture(
+            "failing-annotated",
+            &CLEAN.replace("add_one(1), 2", "add_one(1), 3"),
+        );
+        let no_postgres = |_: &mut dyn std::io::Write| anyhow::bail!("fixtures use no database");
+        let no_sqlx = || anyhow::bail!("fixtures keep no query cache");
+        let postgres = super::Postgres {
+            warm: &no_postgres,
+            sqlx: &no_sqlx,
+        };
+        let (passed, out) = check_in(&fixture, &postgres, Mode::Actions);
+        assert!(!passed, "{out}");
+        let annotation = out
+            .lines()
+            .find(|line| line.starts_with("::error "))
+            .unwrap_or_else(|| panic!("no annotation: {out}"));
+        assert!(
+            annotation.starts_with(
+                "::error file=src/lib.rs,line=13,title=Test failed%3A fixture-failing-annotated \
+                 tests%3A%3Aadds_one::"
+            ) && annotation.contains("left: 2%0A right: 3"),
+            "{annotation}"
+        );
+    }
+
     #[test]
     fn a_failing_doctest_fails() {
         let lib = CLEAN.replace(
@@ -1731,7 +1841,12 @@ mod tests {
 
     #[test]
     fn the_tests_get_postgres_from_the_pinned_tool() {
-        let command = test_command(&command_tools(), MAIN, &Scope::Workspace);
+        let command = test_command(
+            &command_tools(),
+            Path::new("/work/abc"),
+            MAIN,
+            &Scope::Workspace,
+        );
         let bin = command
             .get_envs()
             .find(|(name, _)| *name == POSTGRES_BIN)
@@ -1762,7 +1877,12 @@ mod tests {
 
     #[test]
     fn property_tests_run_with_a_fixed_seed() {
-        let command = test_command(&command_tools(), MAIN, &Scope::Workspace);
+        let command = test_command(
+            &command_tools(),
+            Path::new("/work/abc"),
+            MAIN,
+            &Scope::Workspace,
+        );
         let seed = command
             .get_envs()
             .find(|(name, _)| *name == "PROPTEST_RNG_SEED")

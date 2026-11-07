@@ -7,8 +7,9 @@
 //! (<https://github.com/actions/toolkit/blob/main/packages/core/src/command.ts>). Elsewhere the
 //! output is unchanged.
 //!
-//! GitHub keeps at most ten annotations of each level per step, so [`commands`] prints at most
-//! [`PER_LEVEL`] of each, the last of them saying how many more the log lists.
+//! GitHub keeps at most ten annotations of each level per step, whichever part of the step printed
+//! them, so every source in one step prints through one [`Step`], which prints at most
+//! [`PER_LEVEL`] of each level, the last of them saying how many more the log lists.
 
 use std::ffi::OsString;
 use std::fmt::{self, Write as _};
@@ -120,46 +121,108 @@ fn property(text: &str) -> String {
     data(text).replace(':', "%3A").replace(',', "%2C")
 }
 
-/// The workflow commands for `annotations` in `mode`, one per line: none in [`Mode::Plain`], and
-/// at most [`PER_LEVEL`] of each level in [`Mode::Actions`], where the last one kept says how many
-/// more the log lists.
-pub(crate) fn commands(mode: Mode, annotations: &[Annotation]) -> String {
-    let mut text = String::new();
-    if mode == Mode::Plain {
-        return text;
+/// One GitHub Actions step's annotations, across every source that prints them (each workspace's
+/// failing tests, then the lines coverage finds untested, say). It prints each annotation as it
+/// comes, up to [`PER_LEVEL`] less one of each level, and holds the rest; [`Step::finish`] then
+/// prints the one held, or a single note saying how many more the log lists. In [`Mode::Plain`] it
+/// prints nothing.
+#[derive(Debug)]
+pub(crate) struct Step {
+    mode: Mode,
+    errors: Tally,
+    warnings: Tally,
+    notices: Tally,
+}
+
+/// The levels, in the order [`Step::finish`] closes them.
+const LEVELS: [Level; 3] = [Level::Error, Level::Warning, Level::Notice];
+
+/// What a [`Step`] did with one level's annotations.
+#[derive(Debug, Default)]
+struct Tally {
+    /// How many it printed.
+    shown: usize,
+    /// The first it held back, printed by [`Step::finish`] when it is the only one.
+    first: Option<Annotation>,
+    /// How many it held back.
+    held: usize,
+}
+
+impl Step {
+    pub(crate) fn new(mode: Mode) -> Self {
+        Self {
+            mode,
+            errors: Tally::default(),
+            warnings: Tally::default(),
+            notices: Tally::default(),
+        }
     }
-    for level in [Level::Error, Level::Warning, Level::Notice] {
-        let of_level: Vec<&Annotation> = annotations
-            .iter()
-            .filter(|annotation| annotation.level == level)
-            .collect();
-        let shown = if of_level.len() > PER_LEVEL {
-            PER_LEVEL.saturating_sub(1)
-        } else {
-            of_level.len()
-        };
-        for annotation in of_level.iter().take(shown) {
-            // Writing to a String cannot fail.
-            if writeln!(text, "{annotation}").is_err() {
-                break;
+
+    const fn tally(&mut self, level: Level) -> &mut Tally {
+        match level {
+            Level::Error => &mut self.errors,
+            Level::Warning => &mut self.warnings,
+            Level::Notice => &mut self.notices,
+        }
+    }
+
+    /// The workflow commands for `annotations`, one per line, as many as the step still prints.
+    pub(crate) fn emit(&mut self, annotations: &[Annotation]) -> String {
+        let mut text = String::new();
+        if self.mode == Mode::Plain {
+            return text;
+        }
+        for annotation in annotations {
+            let held = self.tally(annotation.level);
+            if held.shown < PER_LEVEL.saturating_sub(1) {
+                held.shown = held.shown.saturating_add(1);
+                // Writing to a String cannot fail.
+                if writeln!(text, "{annotation}").is_err() {
+                    break;
+                }
+            } else {
+                held.held = held.held.saturating_add(1);
+                if held.first.is_none() {
+                    held.first = Some(annotation.clone());
+                }
             }
         }
-        let rest = of_level.len().saturating_sub(shown);
-        if rest > 0 {
-            let remainder = Annotation {
-                level,
-                file: None,
-                lines: None,
-                title: format!("{rest} more"),
-                message: format!(
-                    "{rest} more findings of this level; the job's log lists every one"
-                ),
+        text
+    }
+
+    /// The step's last commands: for each level, the one annotation held back, or a note saying
+    /// how many more the log lists. Afterwards nothing is held.
+    pub(crate) fn finish(&mut self) -> String {
+        let mut text = String::new();
+        for level in LEVELS {
+            let held = std::mem::take(self.tally(level));
+            let last = match (held.held, held.first) {
+                (1, Some(only)) => only,
+                (0, _) | (_, None) => continue,
+                (rest, Some(_)) => Annotation {
+                    level,
+                    file: None,
+                    lines: None,
+                    title: format!("{rest} more"),
+                    message: format!(
+                        "{rest} more findings of this level; the job's log lists every one"
+                    ),
+                },
             };
-            if writeln!(text, "{remainder}").is_err() {
+            if writeln!(text, "{last}").is_err() {
                 break;
             }
         }
+        text
     }
+}
+
+/// The workflow commands for `annotations` in `mode` when they are the step's only ones: a
+/// [`Step`] that prints them all, then finishes.
+pub(crate) fn commands(mode: Mode, annotations: &[Annotation]) -> String {
+    let mut step = Step::new(mode);
+    let mut text = step.emit(annotations);
+    text.push_str(&step.finish());
     text
 }
 
@@ -167,7 +230,7 @@ pub(crate) fn commands(mode: Mode, annotations: &[Annotation]) -> String {
 mod tests {
     use std::ffi::OsString;
 
-    use super::{Annotation, Level, Mode, PER_LEVEL, commands};
+    use super::{Annotation, Level, Mode, PER_LEVEL, Step, commands};
 
     #[test]
     fn annotates_only_inside_github_actions() {
@@ -229,14 +292,53 @@ mod tests {
         assert_eq!(lines.len(), PER_LEVEL + 1, "{text}");
         assert_eq!(lines[0], "::error file=a.rs,line=1,title=t::m1");
         assert_eq!(lines[8], "::error file=a.rs,line=9,title=t::m9");
+        assert_eq!(lines[9], "::warning title=w::w");
         assert_eq!(
-            lines[9],
+            lines[10],
             "::error title=3 more::3 more findings of this level; the job's log lists every one"
         );
-        assert_eq!(lines[10], "::warning title=w::w");
         let exactly: Vec<Annotation> = many.into_iter().take(PER_LEVEL).collect();
         let ten = commands(Mode::Actions, &exactly);
         assert_eq!(ten.lines().count(), PER_LEVEL, "ten fit: {ten}");
         assert!(!ten.contains("more"), "and need no summary: {ten}");
+    }
+
+    /// `check` annotated each failing workspace's tests on its own, so one step could print ten
+    /// errors for each, and GitHub dropped all past the tenth without a word.
+    #[test]
+    fn one_step_keeps_ten_across_its_sources() {
+        let failing = |workspace: &str, count: u64| -> Vec<Annotation> {
+            (1..=count)
+                .map(|n| Annotation::error(&format!("{workspace}/a.rs"), "t", format!("m{n}")))
+                .collect()
+        };
+        let mut step = Step::new(Mode::Actions);
+        let mut text = step.emit(&failing("main", 10));
+        text.push_str(&step.emit(&failing("xtask", 3)));
+        text.push_str(&step.finish());
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), PER_LEVEL, "ten in all: {text}");
+        assert_eq!(
+            lines.last().copied(),
+            Some(
+                "::error title=4 more::4 more findings of this level; the job's log lists every one"
+            ),
+            "one note for both workspaces: {text}"
+        );
+        assert_eq!(step.finish(), "", "a finished step holds nothing");
+
+        let mut exactly = Step::new(Mode::Actions);
+        let mut ten = exactly.emit(&failing("main", 9));
+        ten.push_str(&exactly.emit(&failing("xtask", 1)));
+        ten.push_str(&exactly.finish());
+        assert_eq!(ten.lines().count(), PER_LEVEL, "{ten}");
+        assert!(
+            ten.ends_with("::error file=xtask/a.rs,title=t::m1\n"),
+            "the tenth is kept: {ten}"
+        );
+
+        let mut plain = Step::new(Mode::Plain);
+        assert_eq!(plain.emit(&failing("main", 12)), "");
+        assert_eq!(plain.finish(), "");
     }
 }

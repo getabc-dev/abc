@@ -389,7 +389,7 @@ mod tests {
         )
         .unwrap();
         assert!(needed(dir.path()), "sqlx itself");
-        assert!(needed(&crate::repo_root().unwrap()), "this workspace");
+        assert!(needed(&crate::testing::checkout()), "this workspace");
     }
 
     #[test]

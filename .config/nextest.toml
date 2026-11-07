@@ -6,6 +6,11 @@ fail-fast = false
 # A test still running after two minutes is hung: stop it and fail.
 slow-timeout = { period = "30s", terminate-after = 4 }
 
+# A JUnit report of every run, at target/nextest/default/junit.xml: check, coverage and mutants
+# read it to annotate each failing test with its panic in GitHub Actions (xtask/src/junit.rs).
+[profile.default.junit]
+path = "junit.xml"
+
 # The opt-in real-tailnet check runs abc server setup, which waits for abc's node to join the
 # tailnet, and then for Serve's first certificate, which takes minutes.
 [[profile.default.overrides]]

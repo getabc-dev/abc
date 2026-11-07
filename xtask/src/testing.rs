@@ -156,10 +156,26 @@ pub(crate) fn repository_with_change(path: &Path, files: &[(&str, &str)]) -> Pat
     repo
 }
 
+/// The file at `path` in this repository, for a test that checks it. Read at run time from
+/// [`crate::repo_root`], never with `include_str!`, so the tests build in a copy of xtask/ alone.
+/// The checkout the tests read around xtask: the one xtask was built from, or, when xtask's tests
+/// run in a copy of `xtask/` alone, as `cargo xtask mutants` runs them, the checkout that names
+/// at run time in [`crate::mutants::TEST_REPOSITORY`]. Only tests read it; the shipped binary
+/// finds its checkout from where it was built alone.
+pub(crate) fn checkout() -> PathBuf {
+    std::env::var_os(crate::mutants::TEST_REPOSITORY)
+        .map_or_else(|| crate::repo_root().unwrap(), PathBuf::from)
+}
+
+pub(crate) fn read_in_repository(path: &str) -> String {
+    let file = checkout().join(path);
+    fs::read_to_string(&file).unwrap_or_else(|error| panic!("{}: {error}", file.display()))
+}
+
 /// The pinned tool `name` of this repository, for a test that runs it. It must be marked
 /// `for-tests` in xtask/tools.toml, or CI's test jobs would not install it.
 pub(crate) fn pinned_for_tests(name: &str) -> PathBuf {
-    let repo = crate::repo_root().unwrap();
+    let repo = checkout();
     let manifest = crate::tools::Manifest::load(&repo).unwrap();
     assert!(
         manifest.tool(name).unwrap().for_tests,
@@ -219,8 +235,14 @@ pub(crate) fn abc_tree(root: &Path) {
     )
     .unwrap();
     fs::copy(
-        crate::repo_root().unwrap().join("rust-toolchain.toml"),
+        checkout().join("rust-toolchain.toml"),
         root.join("rust-toolchain.toml"),
+    )
+    .unwrap();
+    fs::create_dir_all(root.join(".config")).unwrap();
+    fs::write(
+        root.join(crate::check::NEXTEST_CONFIG),
+        read_in_repository(crate::check::NEXTEST_CONFIG),
     )
     .unwrap();
     fs::write(

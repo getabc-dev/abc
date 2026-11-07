@@ -197,7 +197,7 @@ mod tests {
 
     #[test]
     fn the_checked_in_seeds_and_target_exist() {
-        let root = crate::repo_root().unwrap();
+        let root = crate::testing::checkout();
         assert!(
             root.join(super::FUZZ_DIR)
                 .join("fuzz_targets")
@@ -228,7 +228,7 @@ mod tests {
 
     #[test]
     fn the_fuzz_workspace_keeps_the_main_workspace_lints_and_rust_version() {
-        let root = crate::repo_root().unwrap();
+        let root = crate::testing::checkout();
         let [(main_lints, fuzz_lints), (main_rust, fuzz_rust)] = lints_and_rust_versions(&root);
         assert!(main_lints.is_object(), "the main workspace sets lints");
         assert_eq!(

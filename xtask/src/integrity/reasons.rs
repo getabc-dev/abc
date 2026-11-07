@@ -370,14 +370,14 @@ mod tests {
 
     #[test]
     fn the_pull_request_template_agrees_with_the_parser() {
-        let template = include_str!("../../../.github/pull_request_template.md");
-        let untouched = explained(&[], template);
+        let template = crate::testing::read_in_repository(".github/pull_request_template.md");
+        let untouched = explained(&[], &template);
         assert!(
             untouched.section && untouched.complete() && untouched.extra.is_empty(),
             "the template's \"None\" passes when nothing is flagged, and its hint is no entry"
         );
         assert_eq!(
-            explained(&flagged(), template).unexplained,
+            explained(&flagged(), &template).unexplained,
             flagged(),
             "\"None\" explains no flagged test"
         );

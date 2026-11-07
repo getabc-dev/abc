@@ -2,8 +2,10 @@
 //! were at a revision.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::Read as _;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail, ensure};
 
@@ -47,6 +49,67 @@ pub(crate) fn default_branch(root: &Path) -> anyhow::Result<String> {
     )
 }
 
+/// How long a fetch the gates make for themselves may take: a minute, ample for one branch of a
+/// repository this size, so a stalled network fails the fetch rather than hanging the command.
+pub(crate) const FETCH_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Fetches `branch` from `remote` in `root`, never waiting on a person: git gets no stdin, no
+/// terminal prompt (`GIT_TERMINAL_PROMPT=0`) and no askpass program, which git would still run
+/// with terminal prompts off, so a remote that wants credentials the configured helpers do not
+/// have fails at once; and git is stopped after `timeout`.
+pub(crate) fn fetch(
+    root: &Path,
+    remote: &str,
+    branch: &str,
+    timeout: Duration,
+) -> anyhow::Result<()> {
+    let mut child = Command::new("git")
+        .args(["-c", "core.askPass=", "fetch", "--quiet", remote, branch])
+        .current_dir(root)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_ASKPASS", "")
+        .env_remove("SSH_ASKPASS")
+        .env("SSH_ASKPASS_REQUIRE", "never")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("could not run git")?;
+    // Read what git says beside it, so a full pipe never stalls git; a remote helper git leaves
+    // running past the timeout keeps only this thread waiting.
+    let mut stderr = child.stderr.take().context("git has no stderr")?;
+    let (said, heard) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut text = String::new();
+        let _unread = stderr.read_to_string(&mut text);
+        let _unheard = said.send(text);
+    });
+    let started = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().context("could not wait for git fetch")? {
+            break status;
+        }
+        if started.elapsed() >= timeout {
+            child.kill().context("could not stop git fetch")?;
+            child.wait().context("could not reap git fetch")?;
+            bail!(
+                "git fetch {remote} {branch} took longer than {} seconds and was stopped",
+                timeout.as_secs()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let message = heard
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap_or_default();
+    ensure!(
+        status.success(),
+        "git fetch {remote} {branch} failed: {}",
+        message.trim()
+    );
+    Ok(())
+}
+
 /// The commit where `HEAD` left `base`.
 pub(crate) fn merge_base(root: &Path, base: &str) -> anyhow::Result<String> {
     Ok(git(root, &["merge-base", "HEAD", base])
@@ -76,48 +139,190 @@ pub(crate) fn diff(root: &Path, commit: &str, context: u32) -> anyhow::Result<St
 /// The pathspec attribute that marks a generated file in `.gitattributes`.
 pub(crate) const GENERATED: &str = "linguist-generated";
 
-/// The diff from `commit` to the working tree without generated files, and the generated files it
-/// left out. Which files are generated comes from `.gitattributes` as it was at `commit`, never
-/// from the working tree, so a change cannot hide its own code by marking it generated.
+/// Where a diff ends: the working tree, as `check` and `pr` measure a change before it is pushed,
+/// or a commit, as the review reads a pull request from git's objects alone, never through its
+/// files on disk.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum To<'a> {
+    WorkingTree,
+    Commit(&'a str),
+}
+
+impl To<'_> {
+    /// The arguments that end a `git diff` from `commit` here.
+    fn range<'b>(self, commit: &'b str) -> Vec<&'b str>
+    where
+        Self: 'b,
+    {
+        match self {
+            Self::WorkingTree => vec![commit],
+            Self::Commit(head) => vec![commit, head],
+        }
+    }
+}
+
+/// `git diff` from `commit` to `to` with `options`, over `pathspecs`, reading `.gitattributes` as
+/// it was at `commit`.
+fn diff_at(
+    root: &Path,
+    commit: &str,
+    to: To<'_>,
+    options: &[&str],
+    pathspecs: &[&str],
+) -> anyhow::Result<String> {
+    let attr_source = format!("--attr-source={commit}");
+    let mut args = vec![
+        attr_source.as_str(),
+        "-c",
+        "core.quotePath=false",
+        "diff",
+        "--no-color",
+        "--no-ext-diff",
+        "--no-textconv",
+        "-M",
+    ];
+    args.extend_from_slice(options);
+    args.extend(to.range(commit));
+    args.push("--");
+    args.extend_from_slice(pathspecs);
+    git(root, &args)
+}
+
+/// The pathspec that leaves generated files out.
+fn not_generated() -> String {
+    format!(":(exclude,attr:{GENERATED})")
+}
+
+/// The diff drivers whose function boundaries the review's context follows: git's built-in
+/// `rust` driver, set for `*.rs` in `.gitattributes`. git has no driver for TypeScript, YAML or
+/// TOML, and without one any line that starts with a letter counts as a function's start, so
+/// `--function-context` there sends whole blocks for a one-line change; git's `markdown` and
+/// `bash` drivers make a whole section or everything after a function its context.
+const FUNCTION_DRIVERS: [&str; 1] = ["rust"];
+
+/// The change from `commit` to `to` as the review's size limit measures it: the plain diff with
+/// three lines of context, without generated files, and the generated files it left out. Which
+/// files are generated comes from `.gitattributes` as it was at `commit`, never from the change,
+/// so a change cannot hide its own code by marking it generated.
 pub(crate) fn reviewable_diff(
     root: &Path,
     commit: &str,
-    context: u32,
+    to: To<'_>,
 ) -> anyhow::Result<(String, Vec<String>)> {
-    let attr_source = format!("--attr-source={commit}");
-    let diff = git(
+    let diff = diff_at(root, commit, to, &["-U3"], &[".", &not_generated()])?;
+    let generated = diff_at(
         root,
-        &[
-            &attr_source,
-            "-c",
-            "core.quotePath=false",
-            "diff",
-            "--no-color",
-            "--no-ext-diff",
-            "-M",
-            &format!("-U{context}"),
-            commit,
-            "--",
-            ".",
-            &format!(":(exclude,attr:{GENERATED})"),
-        ],
-    )?;
-    let generated = git(
-        root,
-        &[
-            &attr_source,
-            "-c",
-            "core.quotePath=false",
-            "diff",
-            "--no-ext-diff",
-            "-M",
-            "--name-only",
-            commit,
-            "--",
-            &format!(":(attr:{GENERATED})"),
-        ],
+        commit,
+        to,
+        &["--name-only"],
+        &[&format!(":(attr:{GENERATED})")],
     )?;
     Ok((diff, generated.lines().map(str::to_owned).collect()))
+}
+
+/// The diff the review reads, from `commit` to `to`, without generated files: each change in a
+/// file whose diff driver knows its functions ([`FUNCTION_DRIVERS`]) with its whole function as
+/// context (`--function-context`), and every other change with three lines, as
+/// [`reviewable_diff`] measures it. The drivers come from `.gitattributes` at `commit`.
+pub(crate) fn context_diff(root: &Path, commit: &str, to: To<'_>) -> anyhow::Result<String> {
+    let drivers: Vec<String> = FUNCTION_DRIVERS
+        .iter()
+        .map(|driver| format!(":(attr:diff={driver})"))
+        .collect();
+    let others: Vec<String> = FUNCTION_DRIVERS
+        .iter()
+        .map(|driver| format!(":(exclude,attr:diff={driver})"))
+        .collect();
+    let excluded = not_generated();
+    let mut with_functions: Vec<&str> = drivers.iter().map(String::as_str).collect();
+    with_functions.push(&excluded);
+    let mut rest: Vec<&str> = vec!["."];
+    rest.extend(others.iter().map(String::as_str));
+    rest.push(&excluded);
+    let mut diff = diff_at(root, commit, to, &["--function-context"], &with_functions)?;
+    diff.push_str(&diff_at(root, commit, to, &["-U3"], &rest)?);
+    Ok(diff)
+}
+
+/// The files the review may read in full beside the diff: those changed from `commit` to `to`
+/// that existed at `commit` too (an added file is whole in the diff already), not generated (by
+/// `.gitattributes` at `commit`), with their paths at `to`.
+pub(crate) fn modified_files(root: &Path, commit: &str, to: To<'_>) -> anyhow::Result<Vec<String>> {
+    let listing = diff_at(
+        root,
+        commit,
+        to,
+        &["--diff-filter=MR", "--name-only"],
+        &[".", &not_generated()],
+    )?;
+    Ok(listing.lines().map(str::to_owned).collect())
+}
+
+/// A file at a commit, as [`blobs`] reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Blob {
+    /// A regular file of at most the size asked for, in UTF-8.
+    Text(String),
+    /// A regular file larger than that, unread.
+    TooLarge(u64),
+    /// Not a regular file of text: a symlink, a submodule, or bytes that are not UTF-8.
+    NotText,
+}
+
+/// The files `paths` at `revision`, read from git's objects alone, never the filesystem: only
+/// regular files (modes 100644 and 100755) of at most `max_bytes` are read, so a symlink is never
+/// followed and a large blob never loaded. A path missing at `revision` is left out.
+pub(crate) fn blobs(
+    root: &Path,
+    revision: &str,
+    paths: &[String],
+    max_bytes: u64,
+) -> anyhow::Result<Vec<(String, Blob)>> {
+    let listing = git(
+        root,
+        &["ls-tree", "-r", "-l", "-z", "--full-tree", revision],
+    )?;
+    let mut entries = BTreeMap::new();
+    for entry in listing.split('\0').filter(|entry| !entry.is_empty()) {
+        let (fields, path) = entry
+            .split_once('\t')
+            .with_context(|| format!("git ls-tree listed {entry:?} without a path"))?;
+        let fields: Vec<&str> = fields.split_whitespace().collect();
+        let [mode, _, object, size] = fields[..] else {
+            bail!("git ls-tree listed {entry:?}, not a mode, type, object and size");
+        };
+        entries.insert(path, (mode, object, size));
+    }
+    let mut read = Vec::new();
+    for path in paths {
+        let Some(&(mode, object, size)) = entries.get(path.as_str()) else {
+            continue;
+        };
+        let blob = if mode == "100644" || mode == "100755" {
+            let size: u64 = size
+                .parse()
+                .with_context(|| format!("git ls-tree gave {path} the size {size:?}"))?;
+            if size > max_bytes {
+                Blob::TooLarge(size)
+            } else {
+                let output = Command::new("git")
+                    .args(["cat-file", "blob", object])
+                    .current_dir(root)
+                    .output()
+                    .context("could not run git")?;
+                ensure!(
+                    output.status.success(),
+                    "git cat-file blob {object} ({path}) failed: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                );
+                String::from_utf8(output.stdout).map_or(Blob::NotText, Blob::Text)
+            }
+        } else {
+            Blob::NotText
+        };
+        read.push((path.clone(), blob));
+    }
+    Ok(read)
 }
 
 /// The content of `path` at `revision`, or `None` when the file did not exist there.
@@ -235,10 +440,14 @@ fn hunk_start(header: &str) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
+    use std::fmt::Write as _;
     use std::fs;
 
+    use std::time::Duration;
+
     use super::{
-        Change, added_lines, changes, diff, merge_base, parse_name_status, reviewable_diff, show,
+        Blob, Change, To, added_lines, blobs, changes, context_diff, diff, merge_base,
+        parse_name_status, reviewable_diff, show,
     };
     use crate::testing::{git, repository};
 
@@ -306,7 +515,7 @@ mod tests {
         git(&repo, &["commit", "--quiet", "-m", "change"]);
 
         let base = merge_base(&repo, "base").unwrap();
-        let (text, generated) = reviewable_diff(&repo, &base, 3).unwrap();
+        let (text, generated) = reviewable_diff(&repo, &base, To::Commit("HEAD")).unwrap();
         assert_eq!(
             generated,
             ["gen/cache.json"],
@@ -324,6 +533,203 @@ mod tests {
             text.contains("+src.rs linguist-generated"),
             "and so is the change to .gitattributes"
         );
+    }
+
+    #[test]
+    fn the_review_diff_shows_whole_functions_and_lists_modified_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = repository(&temp.path().join("repo"));
+        fs::write(repo.join(".gitattributes"), "*.rs diff=rust\n").unwrap();
+        let body = |value: &str| {
+            format!(
+                "mod tests {{\n    fn first() {{\n        let a = 1;\n        let b = 2;\n        \
+                 let c = 3;\n        let d = 4;\n        let value = {value};\n    }}\n\n    fn \
+                 second() {{\n        let unrelated = 0;\n    }}\n}}\n"
+            )
+        };
+        fs::write(repo.join("a.rs"), body("1")).unwrap();
+        fs::write(repo.join("gone.rs"), "fn gone() {}\n").unwrap();
+        git(&repo, &["add", "--all"]);
+        git(&repo, &["commit", "--quiet", "-m", "base"]);
+        git(&repo, &["branch", "base"]);
+        fs::write(repo.join("a.rs"), body("2")).unwrap();
+        fs::write(repo.join("new.rs"), "fn new() {}\n").unwrap();
+        fs::remove_file(repo.join("gone.rs")).unwrap();
+        git(&repo, &["add", "--all"]);
+        git(&repo, &["commit", "--quiet", "-m", "change"]);
+        let base = merge_base(&repo, "base").unwrap();
+        let text = context_diff(&repo, &base, To::Commit("HEAD")).unwrap();
+        assert!(
+            text.contains(" fn first() {\n         let a = 1;"),
+            "the changed function is whole, past three lines of context: {text}"
+        );
+        assert!(
+            !text.contains("let unrelated"),
+            "git's rust driver ends it at the next function, not at the end of the module: {text}"
+        );
+        assert_eq!(
+            super::modified_files(&repo, &base, To::Commit("HEAD")).unwrap(),
+            ["a.rs"],
+            "an added file is whole in the diff and a deleted one is gone"
+        );
+    }
+
+    /// git treats any line that starts with a letter as a function's start in a file with no
+    /// diff driver, so with function context a one-line change in TSX or YAML counted the whole
+    /// block around it against the review's limit.
+    #[test]
+    fn the_measured_size_is_the_change_itself_whatever_the_language() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = repository(&temp.path().join("repo"));
+        fs::write(repo.join(".gitattributes"), "*.rs diff=rust\n").unwrap();
+        let tests = |changed: &str| {
+            let mut cases = String::new();
+            for case in 0..200 {
+                let name = if case == 100 { changed } else { "unchanged" };
+                writeln!(
+                    cases,
+                    "  it(\"case {case} is {name}\", () => expect({case}).toBe({case}));"
+                )
+                .unwrap();
+            }
+            format!("describe(\"menu\", () => {{\n{cases}}});\n")
+        };
+        let jobs = |runner: &str| {
+            let mut steps = String::new();
+            for step in 0..200 {
+                let run = if step == 100 { runner } else { "true" };
+                writeln!(steps, "      - run: {run} {step}").unwrap();
+            }
+            format!("jobs:\n  check:\n    steps:\n{steps}")
+        };
+        fs::write(repo.join("menu.test.tsx"), tests("old")).unwrap();
+        fs::write(repo.join("ci.yml"), jobs("true")).unwrap();
+        git(&repo, &["add", "--all"]);
+        git(&repo, &["commit", "--quiet", "-m", "base"]);
+        git(&repo, &["branch", "base"]);
+        fs::write(repo.join("menu.test.tsx"), tests("new")).unwrap();
+        fs::write(repo.join("ci.yml"), jobs("false")).unwrap();
+        git(&repo, &["commit", "--quiet", "--all", "-m", "change"]);
+        let base = merge_base(&repo, "base").unwrap();
+        for to in [To::WorkingTree, To::Commit("HEAD")] {
+            let (measured, _) = reviewable_diff(&repo, &base, to).unwrap();
+            assert!(
+                measured.len() < 1_500,
+                "two changed lines with three lines of context, not their blocks ({} bytes): \
+                 {measured}",
+                measured.len()
+            );
+        }
+        let context = context_diff(&repo, &base, To::Commit("HEAD")).unwrap();
+        assert!(
+            context.len() < 1_500 && !context.contains("case 0 is"),
+            "the review's context follows functions only where a diff driver knows them: \
+             {context}"
+        );
+    }
+
+    #[test]
+    fn reads_only_small_regular_files_from_objects() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = repository(&temp.path().join("repo"));
+        fs::write(repo.join("small.rs"), "fn a() {}\n").unwrap();
+        fs::write(repo.join("run.sh"), "#!/bin/sh\n").unwrap();
+        fs::write(repo.join("large.txt"), "x".repeat(65)).unwrap();
+        fs::write(repo.join("limit.txt"), "x".repeat(64)).unwrap();
+        fs::write(repo.join("image.png"), [0xff, 0xfe, 0x00]).unwrap();
+        std::os::unix::fs::symlink("/etc/hostname", repo.join("link")).unwrap();
+        git(&repo, &["add", "--all"]);
+        git(&repo, &["update-index", "--chmod=+x", "run.sh"]);
+        let head = git(&repo, &["rev-parse", "HEAD"]);
+        git(
+            &repo,
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                &format!("160000,{},sub", head.trim()),
+            ],
+        );
+        git(&repo, &["commit", "--quiet", "-m", "files"]);
+        // The working tree no longer matches: only the commit's objects are read.
+        fs::write(repo.join("small.rs"), "on disk\n").unwrap();
+        let paths: Vec<String> = [
+            "small.rs",
+            "run.sh",
+            "limit.txt",
+            "large.txt",
+            "image.png",
+            "link",
+            "sub",
+            "gone",
+        ]
+        .map(str::to_owned)
+        .into();
+        assert_eq!(
+            blobs(&repo, "HEAD", &paths, 64).unwrap(),
+            [
+                ("small.rs".to_owned(), Blob::Text("fn a() {}\n".to_owned())),
+                ("run.sh".to_owned(), Blob::Text("#!/bin/sh\n".to_owned())),
+                ("limit.txt".to_owned(), Blob::Text("x".repeat(64))),
+                ("large.txt".to_owned(), Blob::TooLarge(65)),
+                ("image.png".to_owned(), Blob::NotText),
+                ("link".to_owned(), Blob::NotText),
+                ("sub".to_owned(), Blob::NotText),
+            ],
+            "a symlink is never followed, a submodule never entered, a missing path left out"
+        );
+    }
+
+    /// `pr open` and `pr update` fetch the default branch. git asked for credentials on the
+    /// terminal, or through an askpass program, and waited for an answer that never came.
+    #[test]
+    fn a_fetch_never_asks_for_credentials() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = repository(&temp.path().join("repo"));
+        let asked = temp.path().join("asked");
+        crate::testing::script(
+            &temp.path().join("askpass"),
+            &format!("touch {}\necho secret\n", asked.display()),
+        );
+        git(
+            &repo,
+            &[
+                "config",
+                "core.askPass",
+                temp.path().join("askpass").to_str().unwrap(),
+            ],
+        );
+        let (url, server) = crate::testing::serve(vec![("401 Unauthorized", "")]);
+        let error = super::fetch(
+            &repo,
+            &format!("{url}/abc.git"),
+            "main",
+            Duration::from_secs(30),
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("terminal prompts disabled"),
+            "it fails at once, saying why: {error}"
+        );
+        assert!(!asked.exists(), "no askpass program is run");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn a_stalled_fetch_is_stopped() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = repository(&temp.path().join("repo"));
+        // Accepts connections and never answers.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/abc.git", listener.local_addr().unwrap());
+        let started = std::time::Instant::now();
+        let error = super::fetch(&repo, &url, "main", Duration::from_secs(1)).unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(10), "{error}");
+        assert_eq!(
+            error.to_string(),
+            format!("git fetch {url} main took longer than 1 seconds and was stopped")
+        );
+        drop(listener);
     }
 
     #[test]
