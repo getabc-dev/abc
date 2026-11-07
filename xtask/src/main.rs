@@ -71,8 +71,9 @@ enum ReleaseAction {
     /// Build the web app with the pinned node and pnpm and pack web/dist into
     /// `target/web/web-<HEAD>.tar.gz`, the one web app every target's package embeds.
     Web,
-    /// Build abc for TARGET with the web app `release web` packed for HEAD, and tailscaled from
-    /// target/tailscale, and package each with its licence in target/dist. It runs no node.
+    /// Build abc for TARGET with the web app `release web` packed for HEAD, and tailscaled and
+    /// tailscale from target/tailscale, and package each with its licence in target/dist. It runs
+    /// no node.
     Package {
         /// The Rust target triple, such as aarch64-apple-darwin.
         #[arg(long, value_parser = release::Target::parse)]
@@ -1046,7 +1047,7 @@ mod tests {
         for target in release::Target::ALL {
             fs::write(dist.join(format!("abc-0.3.0-{target}.tar.gz")), "a").unwrap();
             fs::write(
-                dist.join(format!("tailscaled-{tailscale}-{target}.tar.gz")),
+                dist.join(format!("tailscale-{tailscale}-{target}.tar.gz")),
                 "t",
             )
             .unwrap();
@@ -1490,12 +1491,11 @@ mod tests {
 
     #[test]
     fn a_real_invocation_reads_this_checkout_and_the_environment() {
+        // xtask's own tree is the one it was built in: in a copy of `xtask/` that `cargo xtask
+        // mutants` builds, the copy's, not the checkout the tests read (`testing::checkout`).
+        let own = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
         let here = Invocation::new(None).unwrap();
-        assert_eq!(
-            here.root,
-            crate::testing::checkout(),
-            "the tree defaults to xtask's own"
-        );
+        assert_eq!(here.root, own, "the tree defaults to xtask's own");
         assert_eq!(here.home, here.root, "and so do the tools");
         assert_eq!(
             (here.env)("PATH"),
@@ -1513,11 +1513,7 @@ mod tests {
             temp.path().canonicalize().unwrap(),
             "--root, canonical"
         );
-        assert_eq!(
-            elsewhere.home,
-            crate::testing::checkout(),
-            "the tools stay xtask's own"
-        );
+        assert_eq!(elsewhere.home, own, "the tools stay xtask's own");
         assert!(
             Invocation::new(Some(temp.path().join("absent"))).is_err(),
             "a --root that does not exist"

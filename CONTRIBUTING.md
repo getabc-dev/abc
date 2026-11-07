@@ -281,7 +281,7 @@ hold only caches); each version keeps its state apart, so delete the old version
 
 A tag `v<version>` that a maintainer pushes releases abc: the Release workflow
 (`.github/workflows/release.yml`) builds the web app once, then abc with it embedded and abc's
-private tailscaled for macOS and Linux on arm64 and x86_64, renders the Homebrew formula for them and installs, tests and lints it with
+private tailscaled and tailscale CLI for macOS and Linux on arm64 and x86_64, renders the Homebrew formula for them and installs, tests and lints it with
 Homebrew on each of the four platforms, each on a native runner (`macos-26` for Apple silicon,
 `macos-15-intel` for Intel Macs, `ubuntu-26.04` for x86_64 Linux and `ubuntu-24.04-arm` for
 arm64 Linux). Only then does it attest every archive and `SHA256SUMS`, publish the GitHub Release
@@ -328,7 +328,7 @@ older formula, and refuses to move it backwards. A full re-run (*Re-run all jobs
 archives again, which need not match byte for byte the ones a draft already holds: the publish job
 then refuses, and while the release is still a draft that nobody has seen, delete it and re-run.
 A failure that the code causes is fixed in a pull request and released as a new version under a
-new tag: never move or reuse a tag. The tailscaled it carries, and the Go that builds it with
+new tag: never move or reuse a tag. The tailscaled and tailscale it carries, and the Go that builds them with
 go.dev's sha256 for each archive, are pinned in `packaging/tailscale.toml`, which Renovate bumps,
 and the formula's template is `packaging/homebrew/abc.rb`; `cargo xtask release` builds,
 packages and renders them as the workflow does. `Formula/abc.rb` in the tap is rendered from that
