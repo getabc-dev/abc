@@ -100,29 +100,6 @@ fn opens_only_what_integrity_the_review_and_the_rulesets_would_pass() {
         stale.contains("names `src/u.rs::tests::gone`, which has no flagged change"),
         "#25 kept three stale entries: {stale}"
     );
-    // #33: the B1 reviews found a data-loss bug and 8 more issues every gate passed. They run
-    // before the pull request opens, and its description says what they found.
-    let unreviewed_text = REASONED.split("## Review findings").next().unwrap();
-    let unreviewed = refusal(open("t", body(temp.path(), unreviewed_text)), &work);
-    assert!(
-        unreviewed.contains("## Review findings")
-            && unreviewed.contains("/code-review high")
-            && unreviewed.contains("/security-review"),
-        "{unreviewed}"
-    );
-    let blank = refusal(
-        open(
-            "t",
-            body(
-                temp.path(),
-                &format!(
-                    "{unreviewed_text}## Review findings\n\n<!-- what they found -->\n\n## After\n\nx\n"
-                ),
-            ),
-        ),
-        &work,
-    );
-    assert!(blank.contains("## Review findings"), "{blank}");
     let empty = refusal(open("t", body(temp.path(), "\n")), &work);
     assert!(
         empty.ends_with("is empty; a pull request needs a description"),
@@ -181,6 +158,35 @@ fn opens_only_what_integrity_the_review_and_the_rulesets_would_pass() {
     git(&work, &["checkout", "--quiet", "--detach"]);
     let detached = refusal(open("t", body(temp.path(), REASONED)), &work);
     assert!(detached.starts_with("HEAD is on no branch"), "{detached}");
+}
+
+/// #33: the B1 reviews found a data-loss bug and 8 more issues every gate passed, after the pull
+/// request opened. They run before it opens, and its description says what they found.
+#[test]
+fn opens_only_with_the_review_findings() {
+    let temp = tempfile::tempdir().unwrap();
+    let work = checkout(temp.path());
+    let unreviewed_text = REASONED.split("## Review findings").next().unwrap();
+    let unreviewed = refusal(open("t", body(temp.path(), unreviewed_text)), &work);
+    assert!(
+        unreviewed.contains("## Review findings")
+            && unreviewed.contains("/code-review high")
+            && unreviewed.contains("/security-review"),
+        "{unreviewed}"
+    );
+    let blank = refusal(
+        open(
+            "t",
+            body(
+                temp.path(),
+                &format!(
+                    "{unreviewed_text}## Review findings\n\n<!-- what they found -->\n\n## After\n\nx\n"
+                ),
+            ),
+        ),
+        &work,
+    );
+    assert!(blank.contains("## Review findings"), "{blank}");
 }
 
 #[test]
