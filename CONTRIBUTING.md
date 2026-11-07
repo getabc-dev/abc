@@ -249,6 +249,72 @@ compatibility between releases: after a version bump in `xtask/tools.toml`, run
 `cargo xtask setup` and `cargo xtask vm image`, and `stop --purge` and `start` each session (they
 hold only caches); each version keeps its state apart, so delete the old version's directory.
 
+## Release abc (maintainers)
+
+A tag `v<version>` that a maintainer pushes releases abc: the Release workflow
+(`.github/workflows/release.yml`) builds the web app once, then abc with it embedded and abc's
+private tailscaled for macOS and Linux on arm64 and x86_64, renders the Homebrew formula for them and installs, tests and lints it with
+Homebrew on each of the four platforms, each on a native runner (`macos-26` for Apple silicon,
+`macos-15-intel` for Intel Macs, `ubuntu-26.04` for x86_64 Linux and `ubuntu-24.04-arm` for
+arm64 Linux). Only then does it attest every archive and `SHA256SUMS`, publish the GitHub Release
+and push the formula to [getabc-dev/homebrew-tap](https://github.com/getabc-dev/homebrew-tap).
+Every pull request that changes what a release builds from (the workspace, the web app,
+`packaging/`, xtask or the two release workflows) runs the same builds, formula and installs, with
+Rust caches, as the `Release dry run` check (`.github/workflows/release-dry-run.yml`), publishing
+nothing; any other pull request skips them, and the check passes. A release never reads a cache.
+
+**No tag `v*` is pushed before I2 lands.** The formula already installs Postgres 18 and abc's
+tailscaled, the foundation `abc server setup` (I2) builds on, but until I2 an install gives a
+binary that sets nothing up.
+
+1. **Bump the version.** In a pull request, set `[workspace.package] version` in `Cargo.toml` to
+   the new release number, then update both lockfiles that name the workspace's crates, since
+   `check` builds with `--locked` and never updates them itself, and run the checks:
+
+   ```sh
+   cargo update --workspace
+   cargo update --workspace --manifest-path fuzz/Cargo.toml
+   cargo xtask check
+   ```
+
+   Merge it.
+2. **Push the tag** on that merge commit; only maintainers may create tags:
+
+   ```sh
+   git fetch origin && git tag --sign v0.2.0 origin/main && git push origin v0.2.0
+   ```
+
+   The workflow refuses a tag that is not the workspace's version, or whose commit is not on
+   `main` (`cargo xtask release check-tag`). Releases queue: a tag pushed while another release
+   runs waits for it, and only one waits, so push the next tag once the previous release is done.
+3. **Check the release.** The run's jobs all pass; the release lists eight archives and
+   `SHA256SUMS`; the tap has a commit `abc 0.2.0`; and on a clean machine:
+
+   ```sh
+   gh release download v0.2.0 --repo getabc-dev/abc --pattern 'abc-*-aarch64-apple-darwin.tar.gz'
+   gh attestation verify abc-0.2.0-aarch64-apple-darwin.tar.gz --repo getabc-dev/abc
+   brew install getabc-dev/tap/abc && abc --version
+   ```
+
+**When a run fails.** Use *Re-run failed jobs*: the re-run reuses the archives the run already
+built and attested, so the publish job resumes the release where it stopped. It creates the
+release as a draft only when the tag has none, uploads only the assets it lacks, never replaces
+one, and publishes the draft once every asset is up; the tap job pushes only when the tap holds an
+older formula, and refuses to move it backwards. A full re-run (*Re-run all jobs*) builds the
+archives again, which need not match byte for byte the ones a draft already holds: the publish job
+then refuses, and while the release is still a draft that nobody has seen, delete it and re-run.
+A failure that the code causes is fixed in a pull request and released as a new version under a
+new tag: never move or reuse a tag. The tailscaled it carries, and the Go that builds it with
+go.dev's sha256 for each archive, are pinned in `packaging/tailscale.toml`, which Renovate bumps,
+and the formula's template is `packaging/homebrew/abc.rb`; `cargo xtask release` builds,
+packages and renders them as the workflow does. `Formula/abc.rb` in the tap is rendered from that
+template: never edit it there by hand.
+
+Once, before the first release: create the public repository `getabc-dev/homebrew-tap`, and a
+fine-grained token for that repository alone with Contents read and write. Store it as the secret
+`HOMEBREW_TAP_TOKEN` of the `release` environment, which only the tap job uses, and limit that
+environment's deployments to tags `v*`.
+
 ## Open a pull request
 
 - Keep one change per PR. Fill in the template: what and why, the plan it carries out, and test

@@ -98,6 +98,16 @@
       "allowedVersions": "/^\\d*[02468]\\./"
     },
     {
+      "description": "tailscaled and the Go that builds it (packaging/tailscale.toml) move together: `cargo xtask release go` refuses a Go other than the one Tailscale's go.mod names. go.dev's archive sha256s are pinned beside the version, and Renovate cannot compute them.",
+      "matchFileNames": [
+        "packaging/tailscale.toml"
+      ],
+      "groupName": "tailscaled and Go",
+      "prBodyNotes": [
+        "When Go's version changes, copy the sha256 go.dev publishes for each of the three archives in `packaging/tailscale.toml` from https://go.dev/dl/ and commit them: the release workflow refuses any other archive."
+      ]
+    },
+    {
       "description": "Pinned tools need new checksums with every version.",
       "matchFileNames": [
         "xtask/tools.toml"
@@ -146,6 +156,33 @@
       "depNameTemplate": "node",
       "datasourceTemplate": "node-version",
       "versioningTemplate": "node"
+    },
+    {
+      "customType": "regex",
+      "description": "The tailscaled abc's Homebrew formula carries (packaging/tailscale.toml): Tailscale's release and the commit its tag names.",
+      "managerFilePatterns": [
+        "/^packaging/tailscale\\.toml$/"
+      ],
+      "matchStrings": [
+        "version = \"(?<currentValue>[^\"]+)\"\\ncommit = \"(?<currentDigest>[0-9a-f]{40})\""
+      ],
+      "depNameTemplate": "tailscale/tailscale",
+      "datasourceTemplate": "github-tags",
+      "extractVersionTemplate": "^v(?<version>.+)$",
+      "versioningTemplate": "semver"
+    },
+    {
+      "customType": "regex",
+      "description": "The Go that builds abc's tailscaled (packaging/tailscale.toml): the version Tailscale's go.mod names.",
+      "managerFilePatterns": [
+        "/^packaging/tailscale\\.toml$/"
+      ],
+      "matchStrings": [
+        "\\[go\\]\\nversion = \"(?<currentValue>[^\"]+)\""
+      ],
+      "depNameTemplate": "go",
+      "datasourceTemplate": "golang-version",
+      "versioningTemplate": "semver"
     },
     {
       "customType": "regex",
