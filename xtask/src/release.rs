@@ -3,12 +3,12 @@
 //!
 //! - `tailscale-source` fetches Tailscale's source at the pin in [`TAILSCALE_PIN`], after checking
 //!   that the pinned tag still names the pinned commit.
-//! - `go` installs the Go that builds tailscaled into [`GO`]: the version Tailscale's `go.mod`
+//! - `go` installs the Go that builds Tailscale's programs into [`GO`]: the version Tailscale's `go.mod`
 //!   names, from go.dev, once its archive matches the sha256 the pin records from go.dev.
 //! - `package --target <triple>` builds the web app, then abc for the target with it embedded,
-//!   and tailscaled from that source, and packages each with its licence as
-//!   `abc-<version>-<target>.tar.gz` and `tailscaled-<version>-<target>.tar.gz` in [`DIST`]. A
-//!   Linux binary must need no glibc newer than [`GLIBC_FLOOR`], and tailscaled none at all.
+//!   and tailscaled and its tailscale CLI from that source, and packages each with its licence
+//!   as `abc-<version>-<target>.tar.gz` and `tailscale-<version>-<target>.tar.gz` in [`DIST`]. A
+//!   Linux binary must need no glibc newer than [`GLIBC_FLOOR`], and Tailscale's none at all.
 //! - `check-tag <tag>` fails unless the tag is `v` and the workspace's version, the one
 //!   `abc --version` prints, and the tagged commit is on `origin`'s `main`.
 //! - `formula` renders the Homebrew formula from [`FORMULA_TEMPLATE`] for the archives of all
@@ -31,7 +31,8 @@ use serde::Deserialize;
 
 use crate::{git, tools, web};
 
-/// The Tailscale version and commit the formula's tailscaled is built from, relative to the root.
+/// The Tailscale version and commit the formula's tailscaled and tailscale are built from,
+/// relative to the root.
 pub(crate) const TAILSCALE_PIN: &str = "packaging/tailscale.toml";
 
 /// The Homebrew formula's template, relative to the root.
@@ -49,7 +50,7 @@ pub(crate) const TAILSCALE_SOURCE: &str = "target/tailscale";
 /// Tailscale's repository.
 pub(crate) const TAILSCALE_REPOSITORY: &str = "https://github.com/tailscale/tailscale.git";
 
-/// Where `go` installs the Go that builds tailscaled, relative to the root.
+/// Where `go` installs the Go that builds Tailscale's programs, relative to the root.
 pub(crate) const GO: &str = "target/go";
 
 /// Where go.dev serves Go's release archives.
@@ -132,16 +133,18 @@ impl fmt::Display for Target {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum Program {
     Abc,
-    Tailscaled,
+    /// abc's own tailscaled and its tailscale CLI, from one Tailscale source: `abc server setup`
+    /// runs the daemon and drives it with the CLI, both private to abc's libexec.
+    Tailscale,
 }
 
 impl Program {
-    const ALL: [Self; 2] = [Self::Abc, Self::Tailscaled];
+    const ALL: [Self; 2] = [Self::Abc, Self::Tailscale];
 
     const fn name(self) -> &'static str {
         match self {
             Self::Abc => "abc",
-            Self::Tailscaled => "tailscaled",
+            Self::Tailscale => "tailscale",
         }
     }
 
@@ -155,7 +158,7 @@ impl Program {
 pub(crate) struct Versions {
     /// abc's: the workspace's version.
     abc: String,
-    /// The Tailscale release tailscaled is built from.
+    /// The Tailscale release tailscaled and tailscale are built from.
     tailscale: Pin,
 }
 
@@ -172,7 +175,7 @@ impl Versions {
     fn archive(&self, program: Program, target: Target) -> String {
         let version = match program {
             Program::Abc => &self.abc,
-            Program::Tailscaled => &self.tailscale.version,
+            Program::Tailscale => &self.tailscale.version,
         };
         format!("{}-{version}-{target}.tar.gz", program.name())
     }
@@ -199,7 +202,8 @@ fn workspace_version(root: &Path) -> anyhow::Result<String> {
     Ok(manifest.workspace.package.version)
 }
 
-/// The Tailscale release the formula's tailscaled is built from, and the Go that builds it.
+/// The Tailscale release the formula's tailscaled and tailscale are built from, and the Go that
+/// builds them.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Pin {
@@ -277,7 +281,7 @@ impl Pin {
         format!("v{}", self.version)
     }
 
-    /// The linker flags that stamp tailscaled with this version, as Tailscale's `build_dist.sh`
+    /// The linker flags that stamp Tailscale's programs with this version, as Tailscale's `build_dist.sh`
     /// does, stripping the symbol table as a distributed binary.
     fn ldflags(&self) -> String {
         let short = self.commit.get(..9).unwrap_or(&self.commit);
@@ -645,7 +649,8 @@ fn unpack_web(root: &Path, out: &mut impl Write) -> anyhow::Result<bool> {
     Ok(true)
 }
 
-/// Builds abc, with the web app [`pack_web`] packed for HEAD, and tailscaled for `target`, and
+/// Builds abc, with the web app [`pack_web`] packed for HEAD, and tailscaled and tailscale for
+/// `target`, and
 /// packages them in [`DIST`], running each command with `run`; reports whether every step
 /// passed, and says in `out` what failed and how to fix it. It runs no node: the web app is
 /// built once, on a machine node runs on, rather than once per target in its build environment.
@@ -677,27 +682,7 @@ pub(crate) fn package(
     }
     let target_dir = web::target_dir(root);
     let built = target_dir.join(target.triple());
-    for (command, failure) in [
-        (
-            rustup_target(root, target),
-            "rustup could not add the target",
-        ),
-        (
-            cargo_build(root, &target_dir, target),
-            "cargo build failed: fix each error above",
-        ),
-        (
-            go_build(
-                &root.join(GO).join("bin/go"),
-                &source,
-                &built.join("tailscaled"),
-                target,
-                &versions.tailscale,
-            ),
-            "go build of tailscaled failed: fix each error above; the Go version is the one \
-             Tailscale's go.mod names",
-        ),
-    ] {
+    for (command, failure) in build_steps(root, &source, &built, target, &versions) {
         let mut command = command;
         if !run(&mut command)? {
             writeln!(out, "xtask release: {target}: {failure}")?;
@@ -706,8 +691,13 @@ pub(crate) fn package(
     }
     let abc = built.join("release/abc");
     let tailscaled = built.join("tailscaled");
+    let tailscale = built.join("tailscale");
     if target.linux() {
-        for (binary, floor) in [(&abc, Some(GLIBC_FLOOR)), (&tailscaled, None)] {
+        for (binary, floor) in [
+            (&abc, Some(GLIBC_FLOOR)),
+            (&tailscaled, None),
+            (&tailscale, None),
+        ] {
             let bytes =
                 fs::read(binary).with_context(|| format!("could not read {}", binary.display()))?;
             if let Err(error) = within_glibc(&bytes, floor) {
@@ -719,11 +709,15 @@ pub(crate) fn package(
     let dist = root.join(DIST);
     fs::create_dir_all(&dist).with_context(|| format!("could not create {}", dist.display()))?;
     let mtime = commit_time(root)?;
-    for (program, binary, licences) in [
-        (Program::Abc, &abc, vec![("LICENSE", root.join("LICENSE"))]),
+    for (program, binaries, licences) in [
         (
-            Program::Tailscaled,
-            &tailscaled,
+            Program::Abc,
+            vec![("abc", abc)],
+            vec![("LICENSE", root.join("LICENSE"))],
+        ),
+        (
+            Program::Tailscale,
+            vec![("tailscaled", tailscaled), ("tailscale", tailscale)],
             vec![
                 ("LICENSE", source.join("LICENSE")),
                 ("PATENTS", source.join("PATENTS")),
@@ -731,7 +725,10 @@ pub(crate) fn package(
         ),
     ] {
         let name = versions.archive(program, target);
-        let mut files = vec![(program.name(), binary.clone(), 0o755)];
+        let mut files: Vec<(&str, PathBuf, u32)> = binaries
+            .into_iter()
+            .map(|(file, binary)| (file, binary, 0o755))
+            .collect();
         files.extend(
             licences
                 .into_iter()
@@ -742,6 +739,49 @@ pub(crate) fn package(
         writeln!(out, "xtask release: packaged {}", path.display())?;
     }
     Ok(true)
+}
+
+/// The commands that build abc and Tailscale's two programs for `target` into `built`, each with
+/// what to say when it fails, in the order they run.
+fn build_steps(
+    root: &Path,
+    source: &Path,
+    built: &Path,
+    target: Target,
+    versions: &Versions,
+) -> [(Command, &'static str); 4] {
+    let target_dir = web::target_dir(root);
+    let go = root.join(GO).join("bin/go");
+    let tailscale = |package: &str, program: &str| {
+        go_build(
+            &go,
+            source,
+            package,
+            &built.join(program),
+            target,
+            &versions.tailscale,
+        )
+    };
+    [
+        (
+            rustup_target(root, target),
+            "rustup could not add the target",
+        ),
+        (
+            cargo_build(root, &target_dir, target),
+            "cargo build failed: fix each error above",
+        ),
+        (
+            tailscale("./cmd/tailscaled", "tailscaled"),
+            "go build of tailscaled failed: fix each error above; the Go version is the one \
+             Tailscale's go.mod names",
+        ),
+        (
+            tailscale("./cmd/tailscale", "tailscale"),
+            "go build of tailscale failed: fix each error above; the Go version is the one \
+             Tailscale's go.mod names",
+        ),
+    ]
 }
 
 /// `rustup target add` for `target`, in `root` so the pinned toolchain gets it.
@@ -776,15 +816,23 @@ fn cargo_build(root: &Path, target_dir: &Path, target: Target) -> Command {
     command
 }
 
-/// The build of tailscaled from `source` for `target` into `output` with the Go at `go`. Linux
+/// The build of Tailscale's `package` (`./cmd/tailscaled` or `./cmd/tailscale`) from `source` for
+/// `target` into `output` with the Go at `go`. Linux
 /// builds are static, as Tailscale's own are; macOS builds use cgo, as Homebrew's do, with the
 /// platform's clang. Go never downloads another toolchain, and the modules are go.sum's.
-fn go_build(go: &Path, source: &Path, output: &Path, target: Target, pin: &Pin) -> Command {
+fn go_build(
+    go: &Path,
+    source: &Path,
+    package: &str,
+    output: &Path,
+    target: Target,
+    pin: &Pin,
+) -> Command {
     let mut command = Command::new(go);
     command
         .args(["build", "-trimpath", "-ldflags", &pin.ldflags(), "-o"])
         .arg(output)
-        .arg("./cmd/tailscaled")
+        .arg(package)
         .current_dir(source)
         .env("GOOS", if target.linux() { "linux" } else { "darwin" })
         .env("GOARCH", target.go_arch())
@@ -1300,9 +1348,9 @@ mod tests {
             "abc's archive carries abc's version"
         );
         assert_eq!(
-            versions.archive(Program::Tailscaled, Target::AppleIntel),
-            "tailscaled-1.104.5-x86_64-apple-darwin.tar.gz",
-            "tailscaled's carries Tailscale's"
+            versions.archive(Program::Tailscale, Target::AppleIntel),
+            "tailscale-1.104.5-x86_64-apple-darwin.tar.gz",
+            "Tailscale's carries Tailscale's"
         );
     }
 
@@ -1730,13 +1778,17 @@ mod tests {
             "the test runs the private tailscaled"
         );
         assert!(
+            rendered.contains("shell_output(\"#{libexec}/tailscale version\")"),
+            "and the private tailscale CLI"
+        );
+        assert!(
             rendered.contains("assert_match \"1.104.5\""),
             "and expects Tailscale's version"
         );
         for target in Target::ALL {
             for archive in [
                 format!("abc-1.2.3-{target}.tar.gz"),
-                format!("tailscaled-1.104.5-{target}.tar.gz"),
+                format!("tailscale-1.104.5-{target}.tar.gz"),
             ] {
                 assert!(
                     rendered.contains(&format!("url \"https://example.com/v1.2.3/{archive}\"\n")),
@@ -1749,10 +1801,15 @@ mod tests {
             }
         }
         assert!(
-            rendered.contains("libexec.install \"tailscaled\"")
+            rendered.contains("libexec.install \"tailscaled\", \"tailscale\"")
                 && rendered.contains("depends_on \"postgresql@18\"")
-                && rendered.contains("refute_path_exists bin/\"tailscaled\""),
-            "tailscaled stays in libexec, and Postgres 18 comes along"
+                && rendered.contains("refute_path_exists bin/\"tailscaled\"")
+                && rendered.contains("refute_path_exists bin/\"tailscale\""),
+            "tailscaled and tailscale stay in libexec, and Postgres 18 comes along"
+        );
+        assert!(
+            rendered.contains("assert_predicate libexec/\"tailscale\", :executable?"),
+            "the formula's test checks the CLI abc server setup drives"
         );
         assert!(
             rendered.contains(
@@ -1773,7 +1830,7 @@ mod tests {
         let full: String = ["url", "sha256"]
             .into_iter()
             .flat_map(|field| {
-                ["abc", "tailscaled"].into_iter().flat_map(move |program| {
+                ["abc", "tailscale"].into_iter().flat_map(move |program| {
                     Target::ALL
                         .into_iter()
                         .map(move |target| format!("@@{field} {program} {target}@@\n"))
@@ -1817,8 +1874,8 @@ mod tests {
             "an open field"
         );
         assert_eq!(
-            error(&full.replace("@@sha256 tailscaled x86_64-unknown-linux-gnu@@", "")),
-            "the template lacks @@sha256 tailscaled x86_64-unknown-linux-gnu@@",
+            error(&full.replace("@@sha256 tailscale x86_64-unknown-linux-gnu@@", "")),
+            "the template lacks @@sha256 tailscale x86_64-unknown-linux-gnu@@",
             "a missing field"
         );
         let failing =
@@ -1937,15 +1994,12 @@ mod tests {
                         .join("release/abc")
                 };
                 fs::create_dir_all(output.parent().unwrap()).unwrap();
-                fs::write(
-                    output,
-                    if go {
-                        elf(&[], b"tailscaled")
-                    } else {
-                        abc.to_vec()
-                    },
-                )
-                .unwrap();
+                let contents = if go {
+                    elf(&[], output.file_name().unwrap().as_encoded_bytes())
+                } else {
+                    abc.to_vec()
+                };
+                fs::write(output, contents).unwrap();
             }
             ran.borrow_mut().push(seen);
             Ok(passed)
@@ -1998,8 +2052,8 @@ mod tests {
                 .iter()
                 .map(|(program, _)| *program)
                 .collect::<Vec<_>>(),
-            ["rustup", "cargo", "go"],
-            "the target, abc and tailscaled, and no node"
+            ["rustup", "cargo", "go", "go"],
+            "the target, abc, tailscaled and tailscale, and no node"
         );
         assert_eq!(
             ran[0].args,
@@ -2077,6 +2131,30 @@ mod tests {
     }
 
     #[test]
+    fn builds_tailscales_cli_from_the_same_source() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = tree_with_source(&temp.path().join("tree"));
+        let (passed, said, ran) = packaged(&root, Target::LinuxArm, &linked(&["GLIBC_2.28"]), "");
+        assert!(passed, "{said}");
+        let (go, cli) = (&ran[2], &ran[3]);
+        assert_eq!(
+            cli.args[4..],
+            [
+                "-o",
+                &root
+                    .join("target/aarch64-unknown-linux-gnu/tailscale")
+                    .display()
+                    .to_string(),
+                "./cmd/tailscale"
+            ],
+            "and of its CLI, from the same source"
+        );
+        assert_eq!(cli.args[..4], go.args[..4], "stamped the same way");
+        assert_eq!(cli.env, go.env, "for the same target");
+        assert_eq!(cli.dir, go.dir, "in the same source");
+    }
+
+    #[test]
     fn packs_each_program_with_its_licences() {
         let temp = tempfile::tempdir().unwrap();
         let root = tree_with_source(&temp.path().join("tree"));
@@ -2110,33 +2188,41 @@ mod tests {
             ],
             "abc with its licence, dated by the commit"
         );
-        let tailscaled: Vec<(String, Vec<u8>)> =
-            entries(&dist.join("tailscaled-1.104.5-aarch64-unknown-linux-gnu.tar.gz"))
+        let tailscale: Vec<(String, u32, Vec<u8>)> =
+            entries(&dist.join("tailscale-1.104.5-aarch64-unknown-linux-gnu.tar.gz"))
                 .into_iter()
-                .map(|(name, _, _, _, _, contents)| (name, contents))
+                .map(|(name, mode, _, _, _, contents)| (name, mode, contents))
                 .collect();
         assert_eq!(
-            tailscaled,
+            tailscale,
             [
                 (
-                    "tailscaled-1.104.5-aarch64-unknown-linux-gnu/tailscaled".to_owned(),
+                    "tailscale-1.104.5-aarch64-unknown-linux-gnu/tailscaled".to_owned(),
+                    0o755,
                     elf(&[], b"tailscaled")
                 ),
                 (
-                    "tailscaled-1.104.5-aarch64-unknown-linux-gnu/LICENSE".to_owned(),
+                    "tailscale-1.104.5-aarch64-unknown-linux-gnu/tailscale".to_owned(),
+                    0o755,
+                    elf(&[], b"tailscale")
+                ),
+                (
+                    "tailscale-1.104.5-aarch64-unknown-linux-gnu/LICENSE".to_owned(),
+                    0o644,
                     b"BSD-3-Clause\n".to_vec()
                 ),
                 (
-                    "tailscaled-1.104.5-aarch64-unknown-linux-gnu/PATENTS".to_owned(),
+                    "tailscale-1.104.5-aarch64-unknown-linux-gnu/PATENTS".to_owned(),
+                    0o644,
                     b"patent grant\n".to_vec()
                 ),
             ],
-            "tailscaled with Tailscale's licence and patent grant"
+            "tailscaled and its CLI with Tailscale's licence and patent grant"
         );
         assert!(
             said.ends_with(&format!(
                 "xtask release: packaged {}\n",
-                dist.join("tailscaled-1.104.5-aarch64-unknown-linux-gnu.tar.gz")
+                dist.join("tailscale-1.104.5-aarch64-unknown-linux-gnu.tar.gz")
                     .display()
             )),
             "{said}"
