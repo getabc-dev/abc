@@ -810,7 +810,10 @@ struct Candidate {
 /// `origin` nor a merged pull request has is kept, naming them, and `--yes` then fails after
 /// purging the others.
 fn gc(host: &Host, backend: &dyn Backend, yes: bool, out: &mut impl Write) -> anyhow::Result<()> {
-    let candidates = finished(host, backend)?;
+    let (candidates, unfinished) = finished(host, backend, out)?;
+    for (name, why) in &unfinished {
+        writeln!(out, "{name}\tnot finished: {why}")?;
+    }
     if candidates.is_empty() {
         writeln!(out, "vm gc: no finished session to purge")?;
         return Ok(());
@@ -862,8 +865,14 @@ fn gc(host: &Host, backend: &dyn Backend, yes: bool, out: &mut impl Write) -> an
     Ok(())
 }
 
-/// The sessions that are not running and are finished, each with whether it must be kept.
-fn finished(host: &Host, backend: &dyn Backend) -> anyhow::Result<Vec<Candidate>> {
+/// The sessions that are not running and are finished, each with whether it must be kept; and
+/// the sessions whose branch GitHub merged that are not finished, each with why. A session that
+/// syncing finishes is synced, and that is said in `out`.
+fn finished(
+    host: &Host,
+    backend: &dyn Backend,
+    out: &mut impl Write,
+) -> anyhow::Result<(Vec<Candidate>, Vec<Unfinished>)> {
     let worktrees = session::worktrees(&host.repo)?;
     let volumes = backend.volumes()?;
     let mut ids: std::collections::BTreeSet<session::Id> = volumes
@@ -885,6 +894,7 @@ fn finished(host: &Host, backend: &dyn Backend) -> anyhow::Result<Vec<Candidate>
         }
     }
     let mut candidates = Vec::new();
+    let mut unfinished = Vec::new();
     for id in ids {
         let name = id.name();
         if backend.is_running(&name)? {
@@ -892,10 +902,16 @@ fn finished(host: &Host, backend: &dyn Backend) -> anyhow::Result<Vec<Candidate>
         }
         let state = id.state(&host.state);
         let why = match worktrees.iter().find(|worktree| worktree.session == id) {
-            None => Some(Finished::WorktreeGone),
-            Some(worktree) => merged(host, worktree, &state)?,
+            None => Finished::WorktreeGone,
+            Some(worktree) => match merged(host, worktree, &state, out)? {
+                Merge::Finished(why) => why,
+                Merge::Unfinished(why) => {
+                    unfinished.push((name, why));
+                    continue;
+                }
+                Merge::None => continue,
+            },
         };
-        let Some(why) = why else { continue };
         let kept = only_here(host, &state)?;
         let bytes: u64 = volumes
             .iter()
@@ -910,7 +926,7 @@ fn finished(host: &Host, backend: &dyn Backend) -> anyhow::Result<Vec<Candidate>
             kept,
         });
     }
-    Ok(candidates)
+    Ok((candidates, unfinished))
 }
 
 /// Why the finished session whose state is `state` must be kept, if it must: its repository
@@ -966,29 +982,79 @@ fn merged_pull(host: &Host, branch: &str) -> anyhow::Result<Option<Pull>> {
     Ok(pulls.into_iter().next())
 }
 
-/// Why `worktree`'s session, whose state is `state`, is finished, if GitHub merged its branch at
-/// the commit the worktree is at and the session repository's branch is at too. A session
+/// A session whose branch GitHub merged that is not finished: its name and why.
+type Unfinished = (String, String);
+
+/// What a merged pull request from a worktree's branch means for its session.
+enum Merge {
+    /// GitHub merged no pull request from the worktree's branch, or it has none.
+    None,
+    /// The session is finished.
+    Finished(Finished),
+    /// GitHub merged the branch, but the session is not finished, for this reason.
+    Unfinished(String),
+}
+
+/// Whether `worktree`'s session, whose state is `state`, is finished: GitHub merged its branch
+/// at the commit the worktree is at and the session repository's branch is at too. A session
 /// repository without the branch is not at the merge: nothing shows what it holds is merged.
+///
+/// An agent pushes from its VM, so the session's branch is at the merge while the worktree's
+/// branch on the host lags behind it until `vm sync`. Then the session is synced here, which moves
+/// the worktree's branch forward to the VM's and never back, and is finished; `out` says so.
 fn merged(
     host: &Host,
     worktree: &session::Worktree,
     state: &Path,
-) -> anyhow::Result<Option<Finished>> {
+    out: &mut impl Write,
+) -> anyhow::Result<Merge> {
     let Some(branch) = &worktree.branch else {
-        return Ok(None);
+        return Ok(Merge::None);
     };
     let Some(pull) = merged_pull(host, branch)? else {
-        return Ok(None);
+        return Ok(Merge::None);
+    };
+    let merge = &pull.head_ref_oid;
+    let finished = || {
+        Merge::Finished(Finished::Merged {
+            branch: branch.clone(),
+            number: pull.number,
+        })
     };
     let in_session = session::branches(state)?
         .into_iter()
         .find_map(|(name, commit)| (name == *branch).then_some(commit));
-    Ok((worktree.commit == pull.head_ref_oid
-        && in_session.as_deref() == Some(pull.head_ref_oid.as_str()))
-    .then(|| Finished::Merged {
-        branch: branch.clone(),
-        number: pull.number,
-    }))
+    let merged_at = format!(
+        "{branch} merged in #{} at {}",
+        pull.number,
+        session::short(merge)
+    );
+    match in_session {
+        Some(theirs) if theirs == *merge && worktree.commit == *merge => Ok(finished()),
+        Some(theirs) if theirs == *merge => {
+            let synced = Session::open(&worktree.path, &host.repo, &host.state)
+                .and_then(|session| session.sync());
+            match synced {
+                Ok(moved) => {
+                    writeln!(out, "vm gc: synced the worktree's {moved}")?;
+                    Ok(finished())
+                }
+                Err(error) => Ok(Merge::Unfinished(format!(
+                    "{merged_at}, which the VM's {branch} is at, but the worktree's is at {} and \
+                     could not be synced: {error:#}",
+                    session::short(&worktree.commit)
+                ))),
+            }
+        }
+        Some(theirs) => Ok(Merge::Unfinished(format!(
+            "{merged_at}, but the VM's {branch} is at {}, so what it holds is not all merged",
+            session::short(&theirs)
+        ))),
+        None => Ok(Merge::Unfinished(format!(
+            "{merged_at}, but the session's repository has no {branch}, so nothing shows its \
+             commits are merged"
+        ))),
+    }
 }
 
 /// `bytes` in gigabytes, to a tenth.

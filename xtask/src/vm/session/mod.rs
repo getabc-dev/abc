@@ -602,6 +602,8 @@ fn slug(name: &str) -> String {
 /// A worktree of the main clone, as `vm gc` sees it.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct Worktree {
+    /// Its directory.
+    pub(crate) path: PathBuf,
     /// Its session.
     pub(crate) session: Id,
     /// The branch checked out in it, without `refs/heads/`; none when its HEAD is detached.
@@ -622,11 +624,13 @@ pub(crate) fn worktrees(main: &Path) -> anyhow::Result<Vec<Worktree>> {
     let mut worktrees = Vec::new();
     // The first entry is the main clone itself.
     for entry in listing.split("\n\n").skip(1) {
+        let mut place = None;
         let mut session = None;
         let mut branch = None;
         let mut commit = None;
         for line in entry.lines() {
             if let Some(path) = line.strip_prefix("worktree ") {
+                place = Some(PathBuf::from(path));
                 session = Path::new(path)
                     .file_name()
                     .and_then(OsStr::to_str)
@@ -637,8 +641,9 @@ pub(crate) fn worktrees(main: &Path) -> anyhow::Result<Vec<Worktree>> {
                 commit = Some(head.to_owned());
             }
         }
-        if let (Some(session), Some(commit)) = (session, commit) {
+        if let (Some(path), Some(session), Some(commit)) = (place, session, commit) {
             worktrees.push(Worktree {
+                path,
                 session,
                 branch,
                 commit,
