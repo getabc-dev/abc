@@ -22,8 +22,14 @@
 # beside its executable at run time, as pnpm loads its dist/. `binary` is then the executable's
 # path in that directory, and a target's `tree-sha256` pins the directory: the sha256 of its
 # manifest, a line per file with the file's sha256, whether it is executable and its path.
-# `cargo xtask setup` refuses an archive holding anything but files and directories, and xtask
-# checks every installed file against that pin whenever it runs the tool.
+# A tree may also hold symbolic links, each to a file of the tree, as the Linux JRE links its legal
+# notices; the manifest pins the path a link holds. `cargo xtask setup` refuses an archive holding
+# anything else, or a link out of the tree, and xtask checks every installed file and link against
+# that pin whenever it runs the tool.
+# A target's `binary` replaces the tool's `binary` where its archive keeps the executable
+# elsewhere, as macOS's JRE does. `runtime` names a tool listed before this one whose executable's
+# directory goes first on PATH whenever xtask runs this one, its version check and `cargo xtask
+# tool` included, as Apalache's launcher runs the pinned JRE's java.
 # Renovate bumps `version` from the GitHub release named in the `url` line right after it, so
 # keep `version` and `url` adjacent and in that order.
 #
