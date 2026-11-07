@@ -195,8 +195,11 @@ pub(crate) fn push_of(
     for item in timeline {
         match item.get("event").and_then(Value::as_str) {
             Some("head_ref_force_pushed") => {
-                recorded |= item.get("commit_id").and_then(Value::as_str) == Some(head.sha);
-                keep(push(item, "a head_ref_force_pushed event")?);
+                // A force push of another commit made another head, not this one.
+                if item.get("commit_id").and_then(Value::as_str) == Some(head.sha) {
+                    recorded = true;
+                    keep(push(item, "a head_ref_force_pushed event")?);
+                }
             }
             Some("reopened") => keep(push(item, "a reopened event")?),
             _ => {}
@@ -341,6 +344,43 @@ mod tests {
             super::push_of(head, &forced("def"), &mut no_runs).unwrap(),
             None,
             "a force push to another commit is no push of this head"
+        );
+    }
+
+    /// A newer force push of another commit is not the head's push: the head's own, earlier one
+    /// stays the latest.
+    #[test]
+    fn a_newer_force_push_of_another_commit_is_not_the_latest_push() {
+        let timeline = [
+            json!({
+                "event": "head_ref_force_pushed",
+                "commit_id": "abc",
+                "actor": {"login": "alice"},
+                "created_at": "2026-11-05T09:00:00Z",
+            }),
+            json!({
+                "event": "head_ref_force_pushed",
+                "commit_id": "def",
+                "actor": {"login": "bob"},
+                "created_at": "2026-11-05T10:00:00Z",
+            }),
+        ];
+        let push = super::push_of(
+            super::Head {
+                sha: "abc",
+                repository: "o/r",
+                branch: "x",
+            },
+            &timeline,
+            &mut |_: &str| Ok(json!({"workflow_runs": []})),
+        )
+        .unwrap();
+        assert_eq!(
+            push,
+            Some(super::Push {
+                pusher: "alice".to_owned(),
+                at: "2026-11-05T09:00:00Z".to_owned(),
+            })
         );
     }
 
