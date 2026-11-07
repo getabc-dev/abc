@@ -28,7 +28,8 @@ pub(crate) const APP_LOGIN: &str = "getabc-dev-agent[bot]";
 #[derive(Debug, Subcommand)]
 pub(crate) enum Action {
     /// List pull request NUMBER's failing, cancelled and running checks, and its latest
-    /// merge-queue run's, with each failing check's annotations.
+    /// merge-queue run's, with each failing check's annotations; warn first when the default
+    /// branch moved on files it changes.
     Checks { number: u64 },
     /// Open a pull request from the current branch, pushed, into the default branch.
     Open {
@@ -210,7 +211,10 @@ pub(crate) fn send(
     out: &mut String,
 ) -> anyhow::Result<bool> {
     match plan {
-        Plan::Checks(number) => checks::run(repo, number, send, out),
+        Plan::Checks(number) => {
+            stale(repo, number, send, out)?;
+            checks::run(repo, number, send, out)
+        }
         Plan::Open {
             title,
             body,
@@ -242,6 +246,83 @@ pub(crate) fn send(
             diff_bytes,
         } => update(root, repo, send, (number, &body, &branch, diff_bytes), out),
     }
+}
+
+/// GitHub's compare API lists at most this many files.
+const COMPARE_FILES: usize = 300;
+
+/// Warns in `out` when the default branch moved on, since pull request `number`'s branch left it,
+/// files the pull request changes too, as GitHub's compare API shows them: the check before a
+/// merge that `pr open` makes before a pull request opens. #33 broke on its merge with main once
+/// #38 merged, though each passed alone.
+fn stale(repo: &Repo, number: u64, send: &mut Send<'_>, out: &mut String) -> anyhow::Result<()> {
+    let pull = github::get(send, repo.path(&format!("pulls/{number}")))?;
+    if text(&pull, "/state") != "open" {
+        return Ok(());
+    }
+    let base = text(&pull, "/base/ref").to_owned();
+    let head = text(&pull, "/head/sha").to_owned();
+    ensure!(
+        !base.is_empty() && !head.is_empty(),
+        "GitHub gave #{number} no base branch or head commit"
+    );
+    let files = |comparison: &Value| -> std::collections::BTreeSet<String> {
+        comparison
+            .get("files")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .flat_map(|file| {
+                ["/filename", "/previous_filename"]
+                    .into_iter()
+                    .map(|field| text(file, field).to_owned())
+            })
+            .filter(|path| !path.is_empty())
+            .collect()
+    };
+    let moved = github::get(send, repo.path(&format!("compare/{head}...{base}")))?;
+    let behind = moved.get("ahead_by").and_then(Value::as_u64).unwrap_or(0);
+    if behind == 0 {
+        return Ok(());
+    }
+    let changed = github::get(send, repo.path(&format!("compare/{base}...{head}")))?;
+    let both: Vec<String> = files(&changed)
+        .intersection(&files(&moved))
+        .cloned()
+        .collect();
+    let capped = [&moved, &changed].into_iter().any(|comparison| {
+        comparison
+            .get("files")
+            .and_then(Value::as_array)
+            .is_some_and(|listed| listed.len() >= COMPARE_FILES)
+    });
+    if both.is_empty() && !capped {
+        return Ok(());
+    }
+    say(
+        out,
+        &format!(
+            "pr: warning: {base} moved on by {behind} commit(s) since #{number}'s branch left it, \
+             changing {} file(s) #{number} changes too{}:",
+            both.len(),
+            if capped {
+                format!(", or more: GitHub lists at most {COMPARE_FILES} files of a comparison")
+            } else {
+                String::new()
+            }
+        ),
+    );
+    for path in &both {
+        say(out, &format!("  {path}"));
+    }
+    say(
+        out,
+        &format!(
+            "pr: merge it into the branch (`git merge origin/{base}`), check again and push \
+             before #{number} merges; never rebase a pushed branch"
+        ),
+    );
+    Ok(())
 }
 
 /// A string field of `value`, or nothing.

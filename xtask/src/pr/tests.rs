@@ -636,3 +636,68 @@ fn of_two_runs_in_one_second_the_first_listed_counts() {
     .unwrap();
     assert_eq!(push.pusher, APP_LOGIN);
 }
+
+/// #33 broke once #38 merged, and nothing said so before the merge. `pr checks` warns when the
+/// default branch moved, since the pull request's branch left it, on files the pull request
+/// changes, from GitHub's compare API.
+#[test]
+fn checks_warn_when_main_moved_on_the_pull_requests_files() {
+    let answer = |behind: u64, state: &'static str| {
+        move |request: &Request| -> Value {
+            match (request.method, request.path.as_str()) {
+                ("GET", "/repos/o/r/pulls/25") => {
+                    json!({"state": state, "base": {"ref": "main"}, "head": {"sha": "abc"}})
+                }
+                ("GET", "/repos/o/r/compare/abc...main") => json!({
+                    "ahead_by": behind,
+                    "files": [{"filename": "b.rs"}, {"filename": "c.rs", "previous_filename": "a.rs"}]
+                }),
+                ("GET", "/repos/o/r/compare/main...abc") => json!({
+                    "ahead_by": 3,
+                    "files": [{"filename": "a.rs"}, {"filename": "b.rs"}, {"filename": "d.rs"}]
+                }),
+                ("GET", path) if path.starts_with("/repos/o/r/actions/runs") => {
+                    json!({"workflow_runs": []})
+                }
+                ("POST", "/graphql") => {
+                    json!({"data": {"repository": {"pullRequest": {"commits": {"nodes": [
+                        {"commit": {"oid": "1111111111111111111111111111111111111111", "checkSuites": {"nodes": []}}}
+                    ]}}}}})
+                }
+                other => panic!("unexpected call {other:?}"),
+            }
+        }
+    };
+    let run = |behind: u64, state: &'static str| {
+        let reply = answer(behind, state);
+        let mut send = |request: &Request| Ok(reply(request));
+        let mut out = String::new();
+        let passed = send_plan(Plan::Checks(25), &mut send, &mut out);
+        (passed, out)
+    };
+    let (passed, out) = run(2, "open");
+    assert!(passed, "a warning, not a failure: {out}");
+    assert!(
+        out.starts_with(
+            "pr: warning: main moved on by 2 commit(s) since #25's branch left it, changing 2 \
+             file(s) #25 changes too:\n  a.rs\n  b.rs\npr: merge it into the branch (`git merge \
+             origin/main`), check again and push before #25 merges; never rebase a pushed \
+             branch\n#25 head at 111111111111"
+        ),
+        "{out}"
+    );
+    let (_, current) = run(0, "open");
+    assert!(current.starts_with("#25 head at"), "not behind: {current}");
+    let (_, merged) = run(2, "closed");
+    assert!(merged.starts_with("#25 head at"), "closed: {merged}");
+}
+
+/// Carries out `plan` for `o/r` through `send` in a checkout that is not used.
+fn send_plan(
+    plan: Plan,
+    send: &mut impl FnMut(&Request) -> anyhow::Result<Value>,
+    out: &mut String,
+) -> bool {
+    let temp = tempfile::tempdir().unwrap();
+    super::send(plan, temp.path(), &repo(), send, out).unwrap()
+}
