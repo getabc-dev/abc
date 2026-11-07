@@ -1491,12 +1491,11 @@ mod tests {
 
     #[test]
     fn a_real_invocation_reads_this_checkout_and_the_environment() {
+        // xtask's own tree is the one it was built in: in a copy of `xtask/` that `cargo xtask
+        // mutants` builds, the copy's, not the checkout the tests read (`testing::checkout`).
+        let own = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
         let here = Invocation::new(None).unwrap();
-        assert_eq!(
-            here.root,
-            crate::testing::checkout(),
-            "the tree defaults to xtask's own"
-        );
+        assert_eq!(here.root, own, "the tree defaults to xtask's own");
         assert_eq!(here.home, here.root, "and so do the tools");
         assert_eq!(
             (here.env)("PATH"),
@@ -1514,11 +1513,7 @@ mod tests {
             temp.path().canonicalize().unwrap(),
             "--root, canonical"
         );
-        assert_eq!(
-            elsewhere.home,
-            crate::testing::checkout(),
-            "the tools stay xtask's own"
-        );
+        assert_eq!(elsewhere.home, own, "the tools stay xtask's own");
         assert!(
             Invocation::new(Some(temp.path().join("absent"))).is_err(),
             "a --root that does not exist"
