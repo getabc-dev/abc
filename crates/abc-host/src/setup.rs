@@ -74,11 +74,15 @@ pub fn setup(
         console.line("Created abc's Postgres 18 cluster.");
     }
     services.install(&postgres_service(&postgres))?;
-    postgres.wait_ready(
-        &host.timing,
-        &format!(
-            "read its log ({}), then run abc server setup again",
-            services.log_hint(Part::Postgres)
+    stop_unless_ready(
+        &services,
+        Part::Postgres,
+        postgres.wait_ready(
+            &host.timing,
+            &format!(
+                "read its log ({}), then run abc server setup again",
+                services.log_hint(Part::Postgres)
+            ),
         ),
     )?;
     postgres.ensure_database()?;
@@ -88,8 +92,12 @@ pub fn setup(
     ));
 
     let tailscale = Tailscale::new(home, &config.programs);
-    services.install(&tailscaled_service(&tailscale))?;
-    let mut node = tailscale.wait_answering(&host.timing)?;
+    services.install(&tailscaled_service(home, &tailscale))?;
+    let mut node = stop_unless_ready(
+        &services,
+        Part::Tailscaled,
+        tailscale.wait_answering(&host.timing),
+    )?;
     if !node.running() {
         node = tailscale.log_in(
             console,
@@ -112,18 +120,36 @@ pub fn setup(
     root_step(host, &tailscale, dns_name, console)?;
 
     services.install(&server_service(home, &config, &public_url, &postgres))?;
-    ops::wait_ready(
-        config.ops_addr,
-        &host.timing,
-        &format!(
-            "read its log ({}), then run abc server setup again",
-            services.log_hint(Part::Server)
+    stop_unless_ready(
+        &services,
+        Part::Server,
+        ops::wait_ready(
+            config.ops_addr,
+            &host.timing,
+            &format!(
+                "read its log ({}), then run abc server setup again",
+                services.log_hint(Part::Server)
+            ),
         ),
     )?;
     console.line(&format!("abc server is ready at {public_url}."));
     Ok(Stack {
         public_url,
         database_url: postgres.database_url(),
+    })
+}
+
+/// `waited`, the wait for `part` to become ready; when it failed, `part`'s service is stopped first,
+/// so launchd's `KeepAlive` or systemd's restarts do not run a failing program over and over unseen,
+/// and the error says so. Setup starts it again.
+fn stop_unless_ready<T>(
+    services: &Services<'_>,
+    part: Part,
+    waited: Result<T, HostError>,
+) -> Result<T, HostError> {
+    waited.map_err(|error| {
+        let stopped = services.stop(part).is_ok();
+        error.with_service_stopped(part.title(), stopped)
     })
 }
 
@@ -241,24 +267,36 @@ pub(crate) fn definitions(host: &Host, config: &Config) -> Result<[Service; 3], 
     let tailscale = Tailscale::new(&host.home, &config.programs);
     Ok([
         postgres_service(&postgres),
-        tailscaled_service(&tailscale),
+        tailscaled_service(&host.home, &tailscale),
         server_service(&host.home, config, public_url, &postgres),
     ])
 }
 
+// Each service states the environment its program needs: launchd and systemd start it with next to
+// none, and nothing of the person's own shell reaches it.
+
+/// Postgres with `LC_ALL=C`: on macOS the postmaster refuses to start with no locale in its
+/// environment ("postmaster became multithreaded during startup"). The cluster is initdb'd with
+/// `--no-locale`, so C is its collation and its messages' language anyway.
 fn postgres_service(postgres: &Postgres<'_>) -> Service {
     Service {
         part: Part::Postgres,
         command: postgres.server_command(),
-        env: Vec::new(),
+        env: vec![("LC_ALL".to_owned(), "C".to_owned())],
     }
 }
 
-fn tailscaled_service(tailscale: &Tailscale<'_>) -> Service {
+/// tailscaled with its logs in abc's own Tailscale directory: without `TS_LOGS_DIR`, it keeps them
+/// in the system's (`/var/db/tailscale`, `/var/lib/tailscale`) when that exists, beside the
+/// person's own Tailscale.
+fn tailscaled_service(home: &crate::ServerHome, tailscale: &Tailscale<'_>) -> Service {
     Service {
         part: Part::Tailscaled,
         command: tailscale.daemon_command(),
-        env: Vec::new(),
+        env: vec![(
+            "TS_LOGS_DIR".to_owned(),
+            home.tailscale().to_string_lossy().into_owned(),
+        )],
     }
 }
 

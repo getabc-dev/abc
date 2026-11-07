@@ -850,6 +850,36 @@ mod tests {
                 if what == "abc's Postgres accepting connections" && fix.contains("logs/postgres.log")),
             "{error:?}"
         );
+        assert!(
+            error.to_string().contains("abc stopped its service"),
+            "says the failing service is not left restarting: {error}"
+        );
+        assert!(
+            !machine.alive("postgres.daemon")
+                && !machine.state("dev.getabc.postgres.loaded").exists(),
+            "launchd no longer restarts it"
+        );
+        let report = abc_host::status(&machine.host()).unwrap();
+        let service = report
+            .checks
+            .iter()
+            .find(|check| check.part == "postgres service")
+            .unwrap();
+        assert_eq!(
+            service.detail,
+            "dev.getabc.postgres is installed but not running",
+            "{:#?}",
+            report.lines()
+        );
+        // Once Postgres answers, setup starts it again.
+        std::fs::remove_file(machine.root().join("programs/pg/pg_isready")).unwrap();
+        std::fs::copy(
+            fakes().join("programs/pg/pg_isready"),
+            machine.root().join("programs/pg/pg_isready"),
+        )
+        .unwrap();
+        let (again, said) = machine.setup(None);
+        assert!(again.is_ok(), "{said}");
     }
 
     #[test]
@@ -862,7 +892,8 @@ mod tests {
         assert!(
             matches!(&error, HostError::Timeout { what, fix, .. }
                 if what.starts_with("abc's tailscaled answering (")
-                    && fix == "check abc's tailscaled with abc server status, and its log"),
+                    && fix.starts_with("check abc's tailscaled with abc server status, and its log; ")
+                    && fix.contains("abc stopped its service")),
             "{error:?}"
         );
     }

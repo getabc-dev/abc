@@ -9,5 +9,12 @@ if [ "$1" = --version ]; then
 	exit 0
 fi
 record postgres "$@"
+# As on macOS, where the postmaster refuses to start without a locale in its environment: setlocale
+# would start threads (Homebrew's own service sets LC_ALL for this).
+if [ -z "${LC_ALL:-}" ]; then
+	echo "FATAL:  postmaster became multithreaded during startup" >&2
+	echo "HINT:  Set the LC_ALL environment variable to a valid locale." >&2
+	exit 1
+fi
 echo "$$" >"$STATE/postgres.daemon"
 exec sleep 86400

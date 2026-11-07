@@ -238,6 +238,54 @@ impl HostError {
         }
     }
 
+    /// This error, from waiting for `service` to become ready, with what became of its service:
+    /// stopped, so it is not restarted over and over, or still running if stopping it failed.
+    #[must_use]
+    pub(crate) fn with_service_stopped(self, service: &str, stopped: bool) -> Self {
+        let said = if stopped {
+            format!(
+                "; abc stopped its service so that {service} is not restarted over and over, and \
+                 abc server setup starts it again"
+            )
+        } else {
+            format!("; {service}'s service could not be stopped and may be restarting")
+        };
+        match self {
+            Self::Timeout { what, seconds, fix } => Self::Timeout {
+                what,
+                seconds,
+                fix: fix + &said,
+            },
+            Self::Failed {
+                command,
+                status,
+                output,
+                fix,
+            } => Self::Failed {
+                command,
+                status,
+                output,
+                fix: fix + &said,
+            },
+            other @ (Self::NoHomeDir
+            | Self::Insecure { .. }
+            | Self::SocketPathTooLong { .. }
+            | Self::UnusablePath { .. }
+            | Self::Io { .. }
+            | Self::Config { .. }
+            | Self::NotSetUp { .. }
+            | Self::ProgramMissing { .. }
+            | Self::PostgresVersion { .. }
+            | Self::ClusterVersion { .. }
+            | Self::SystemProgramMissing { .. }
+            | Self::Spawn { .. }
+            | Self::TailscaleAnswer { .. }
+            | Self::ServeNotSet { .. }
+            | Self::NotAbcsHome { .. }
+            | Self::BackupExists { .. }) => other,
+        }
+    }
+
     pub(crate) fn io(path: &Path, source: std::io::Error) -> Self {
         Self::Io {
             path: path.to_path_buf(),
@@ -260,6 +308,41 @@ fn shown_output(output: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::HostError;
+
+    #[test]
+    fn a_failed_wait_says_what_became_of_the_service() {
+        let timeout = || HostError::Timeout {
+            what: "ready".to_owned(),
+            seconds: 1,
+            fix: "read its log".to_owned(),
+        };
+        let stopped = timeout().with_service_stopped("abc server", true);
+        assert!(
+            matches!(&stopped, HostError::Timeout { fix, .. } if fix == "read its log; abc stopped \
+                its service so that abc server is not restarted over and over, and abc server setup \
+                starts it again"),
+            "{stopped:?}"
+        );
+        let running = timeout().with_service_stopped("abc server", false);
+        assert!(
+            matches!(&running, HostError::Timeout { fix, .. }
+                if fix == "read its log; abc server's service could not be stopped and may be restarting"),
+            "{running:?}"
+        );
+        let failed = HostError::Failed {
+            command: "c".to_owned(),
+            status: "s".to_owned(),
+            output: String::new(),
+            fix: "f".to_owned(),
+        }
+        .with_service_stopped("x", true);
+        assert!(
+            matches!(&failed, HostError::Failed { fix, .. } if fix.starts_with("f; abc stopped")),
+            "{failed:?}"
+        );
+        let other = HostError::NoHomeDir.with_service_stopped("x", true);
+        assert!(matches!(other, HostError::NoHomeDir), "unchanged");
+    }
 
     #[test]
     fn mistakes_in_the_setup_are_told_from_failures_while_running() {
