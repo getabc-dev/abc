@@ -821,113 +821,195 @@ fn report(
 }
 
 /// `cargo xtask pin`: downloads every tool for every target and records the sha256 of each
-/// archive and of the executable in it, keeping the tool list's layout and comments.
+/// archive and of the executable in it, keeping the tool list's layout and comments. A tool whose
+/// downloads fail does not cost the others their pins: the tool list is written with every pin
+/// computed, then the command fails naming each tool it could not pin, for a second run.
 pub(crate) fn pin(root: &Path, out: &mut impl Write) -> anyhow::Result<()> {
     let path = root.join(MANIFEST);
     let text =
         fs::read_to_string(&path).with_context(|| format!("could not read {}", path.display()))?;
-    let pinned = pin_text(&text, out, &mut download)?;
-    fs::write(&path, pinned).with_context(|| format!("could not write {}", path.display()))
+    let pinned = pin_each(&text, out, &mut download)?;
+    fs::write(&path, &pinned.text)
+        .with_context(|| format!("could not write {}", path.display()))?;
+    pinned.result()
+}
+
+/// What [`pin_each`] did: the tool list with every pin it computed, and each tool it could not
+/// pin, with why.
+#[derive(Debug)]
+struct Pinned {
+    text: String,
+    failed: Vec<(String, anyhow::Error)>,
+}
+
+impl Pinned {
+    /// Fails, naming every tool left unpinned, unless all were pinned.
+    fn result(&self) -> anyhow::Result<()> {
+        if self.failed.is_empty() {
+            return Ok(());
+        }
+        let failures: Vec<String> = self
+            .failed
+            .iter()
+            .map(|(tool, error)| format!("{tool}: {error:#}"))
+            .collect();
+        bail!(
+            "could not pin {} of the tools; {MANIFEST} keeps the pins computed, and those tools              keep their old ones until `cargo xtask pin` runs again:\n{}",
+            failures.len(),
+            failures.join("\n")
+        )
+    }
 }
 
 /// The tool list `text` with every sha256 recomputed from downloads by `fetch`. Where a tool
-/// publishes checksums, each download must match them.
-fn pin_text(
+/// publishes checksums, each download must match them. A tool is pinned whole or not at all, and
+/// one that fails is recorded, not fatal.
+fn pin_each(
     text: &str,
     out: &mut impl Write,
     fetch: &mut impl FnMut(&str) -> anyhow::Result<Vec<u8>>,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<Pinned> {
     let manifest = Manifest::parse(text).with_context(|| format!("{MANIFEST} is invalid"))?;
     let mut document: DocumentMut = text.parse()?;
     let mut published: BTreeMap<String, String> = BTreeMap::new();
+    let mut failed = Vec::new();
     for tool in &manifest.tools {
-        if let Source::Crate {
-            name,
-            sha256: pinned,
-        } = tool.source()?
-        {
-            let sha256 = sha256_hex(&fetch(&tool.download_url(Target::MacArm64)?)?);
-            check_indexed(name, &tool.version, &sha256, fetch)
-                .with_context(|| format!("{} {}", tool.name, tool.version))?;
-            let state = if sha256 == pinned { "same" } else { "changed" };
-            writeln!(
-                out,
-                "{state:<8} {} {}: matches the crates.io index",
-                tool.name, tool.version
-            )?;
-            set_crate_pin(&mut document, &tool.name, &sha256)?;
-            continue;
-        }
-        for target in Target::ALL {
-            let asset = tool.asset(target)?;
-            let url = tool.download_url(target)?;
-            let archive = fetch(&url)?;
-            let sha256 = sha256_hex(&archive);
-            let mut sources = Vec::new();
-            if let Some(template) = &tool.checksums {
-                let checksums_url = tool.render(template, asset);
-                check_published(&checksums_url, &url, &sha256, &mut published, fetch)
-                    .with_context(|| format!("{} {} on {target}", tool.name, tool.version))?;
-                sources.push("matches the published checksum".to_owned());
+        let mut lines = Vec::new();
+        match pins_of(tool, &mut lines, &mut published, fetch) {
+            Ok(pins) => {
+                for line in lines {
+                    writeln!(out, "{line}")?;
+                }
+                for pin in pins {
+                    match pin {
+                        Pin::Crate(sha256) => set_crate_pin(&mut document, &tool.name, &sha256)?,
+                        Pin::Target {
+                            target,
+                            key,
+                            sha256,
+                        } => {
+                            set_pin(&mut document, &tool.name, target, key, &sha256)?;
+                        }
+                    }
+                }
             }
-            if let Some(repository) = &tool.attestations {
-                check_attested(repository, &sha256, fetch)
-                    .with_context(|| format!("{} {} on {target}", tool.name, tool.version))?;
-                sources.push(format!("attested on GitHub by {repository}"));
-            }
-            if let Some(template) = &tool.release_digests {
-                let release_url = tool.render(template, asset);
-                check_release_digest(&release_url, &url, &sha256, &mut published, fetch)
-                    .with_context(|| format!("{} {} on {target}", tool.name, tool.version))?;
-                sources.push("matches the digest GitHub recorded on upload".to_owned());
-            }
-            let binary_sha256 = sha256_hex(&tool.executable_in(&archive, asset)?);
-            let tree_same = !tool.tree
-                || asset.tree_sha256.as_deref()
-                    == Some(Tree::of_archive(&archive)?.sha256().as_str());
-            let state =
-                if sha256 == asset.sha256 && binary_sha256 == asset.binary_sha256 && tree_same {
-                    "same"
-                } else {
-                    "changed"
-                };
-            writeln!(
-                out,
-                "{state:<8} {} {} {target}: {}",
-                tool.name,
-                tool.version,
-                sources.join("; ")
-            )?;
-            set_pin(&mut document, &tool.name, target, "sha256", &sha256)?;
-            set_pin(
-                &mut document,
-                &tool.name,
-                target,
-                "binary-sha256",
-                &binary_sha256,
-            )?;
-            if tool.tree {
-                set_pin(
-                    &mut document,
-                    &tool.name,
-                    target,
-                    "tree-sha256",
-                    &Tree::of_archive(&archive)?.sha256(),
-                )?;
-            }
-            if let Some(member) = tool.library_member(asset) {
-                let library_sha256 = sha256_hex(&extract(&archive, &member)?);
-                set_pin(
-                    &mut document,
-                    &tool.name,
-                    target,
-                    "library-sha256",
-                    &library_sha256,
-                )?;
+            Err(error) => {
+                writeln!(out, "failed   {} {}: {error:#}", tool.name, tool.version)?;
+                failed.push((format!("{} {}", tool.name, tool.version), error));
             }
         }
     }
-    Ok(document.to_string())
+    Ok(Pinned {
+        text: document.to_string(),
+        failed,
+    })
+}
+
+/// One pin [`pins_of`] computed.
+enum Pin {
+    /// A crate's `sha256`.
+    Crate(String),
+    /// A target's `key` (`sha256`, `binary-sha256`, `tree-sha256` or `library-sha256`).
+    Target {
+        target: Target,
+        key: &'static str,
+        sha256: String,
+    },
+}
+
+/// Every pin of `tool`, from downloads by `fetch`, each checked against what its publisher
+/// vouches for; what it found goes to `lines`, to print once the whole tool is pinned.
+fn pins_of(
+    tool: &Tool,
+    lines: &mut Vec<String>,
+    published: &mut BTreeMap<String, String>,
+    fetch: &mut impl FnMut(&str) -> anyhow::Result<Vec<u8>>,
+) -> anyhow::Result<Vec<Pin>> {
+    if let Source::Crate {
+        name,
+        sha256: pinned,
+    } = tool.source()?
+    {
+        let sha256 = sha256_hex(&fetch(&tool.download_url(Target::MacArm64)?)?);
+        check_indexed(name, &tool.version, &sha256, fetch)
+            .with_context(|| format!("{} {}", tool.name, tool.version))?;
+        let state = if sha256 == pinned { "same" } else { "changed" };
+        lines.push(format!(
+            "{state:<8} {} {}: matches the crates.io index",
+            tool.name, tool.version
+        ));
+        return Ok(vec![Pin::Crate(sha256)]);
+    }
+    let mut pins = Vec::new();
+    for target in Target::ALL {
+        let asset = tool.asset(target)?;
+        let url = tool.download_url(target)?;
+        let archive = fetch(&url)?;
+        let sha256 = sha256_hex(&archive);
+        let mut sources = Vec::new();
+        if let Some(template) = &tool.checksums {
+            let checksums_url = tool.render(template, asset);
+            check_published(&checksums_url, &url, &sha256, published, fetch)
+                .with_context(|| format!("{} {} on {target}", tool.name, tool.version))?;
+            sources.push("matches the published checksum".to_owned());
+        }
+        if let Some(repository) = &tool.attestations {
+            check_attested(repository, &sha256, fetch)
+                .with_context(|| format!("{} {} on {target}", tool.name, tool.version))?;
+            sources.push(format!("attested on GitHub by {repository}"));
+        }
+        if let Some(template) = &tool.release_digests {
+            let release_url = tool.render(template, asset);
+            check_release_digest(&release_url, &url, &sha256, published, fetch)
+                .with_context(|| format!("{} {} on {target}", tool.name, tool.version))?;
+            sources.push("matches the digest GitHub recorded on upload".to_owned());
+        }
+        let binary_sha256 = sha256_hex(&tool.executable_in(&archive, asset)?);
+        let tree_sha256 = if tool.tree {
+            Some(Tree::of_archive(&archive)?.sha256())
+        } else {
+            None
+        };
+        let state = if sha256 == asset.sha256
+            && binary_sha256 == asset.binary_sha256
+            && tree_sha256.as_deref() == asset.tree_sha256.as_deref().filter(|_| tool.tree)
+        {
+            "same"
+        } else {
+            "changed"
+        };
+        lines.push(format!(
+            "{state:<8} {} {} {target}: {}",
+            tool.name,
+            tool.version,
+            sources.join("; ")
+        ));
+        pins.push(Pin::Target {
+            target,
+            key: "sha256",
+            sha256,
+        });
+        pins.push(Pin::Target {
+            target,
+            key: "binary-sha256",
+            sha256: binary_sha256,
+        });
+        if let Some(tree) = tree_sha256 {
+            pins.push(Pin::Target {
+                target,
+                key: "tree-sha256",
+                sha256: tree,
+            });
+        }
+        if let Some(member) = tool.library_member(asset) {
+            pins.push(Pin::Target {
+                target,
+                key: "library-sha256",
+                sha256: sha256_hex(&extract(&archive, &member)?),
+            });
+        }
+    }
+    Ok(pins)
 }
 
 /// Requires the checksums file at `checksums_url`, fetched once into `published`, to list
@@ -1108,17 +1190,16 @@ pub(crate) fn feed(child: &mut Child, input: &mut dyn Read) -> std::io::Result<b
     }
 }
 
-/// Downloads `url`, up to [`MAX_ARCHIVE_BYTES`].
+/// Downloads `url`, up to [`MAX_ARCHIVE_BYTES`], with timeouts, stall detection and resuming
+/// retries ([`crate::download`]), saying each retry on stderr.
 pub(crate) fn download(url: &str) -> anyhow::Result<Vec<u8>> {
-    let mut response = ureq::get(url)
-        .call()
-        .with_context(|| format!("could not download {url}"))?;
-    response
-        .body_mut()
-        .with_config()
-        .limit(MAX_ARCHIVE_BYTES)
-        .read_to_vec()
-        .with_context(|| format!("could not read {url}"))
+    crate::download::fetch(
+        url,
+        MAX_ARCHIVE_BYTES,
+        &crate::download::patience(),
+        &mut std::thread::sleep,
+        &mut std::io::stderr(),
+    )
 }
 
 /// The sha256 a published checksums file gives for `file_name`. The file either lists
@@ -1641,7 +1722,7 @@ mod tests {
     use flate2::write::GzEncoder;
 
     use super::{
-        Manifest, Status, Target, Tool, Tree, doctor, extract, install, install_unready, pin_text,
+        Manifest, Status, Target, Tool, Tree, doctor, extract, install, install_unready, pin_each,
         published_sha256, remove_other_versions, report, reports_version, set_pin, setup,
         sha256_hex,
     };
@@ -2315,6 +2396,60 @@ targets.aarch64-unknown-linux-gnu = {{ platform = "linux-arm64", sha256 = "{sha2
                 "{why}"
             );
         }
+    }
+
+    /// The tool list `text` repinned from `fetch`, or why a tool could not be.
+    fn pin_text(
+        text: &str,
+        out: &mut impl std::io::Write,
+        fetch: &mut impl FnMut(&str) -> anyhow::Result<Vec<u8>>,
+    ) -> anyhow::Result<String> {
+        let pinned = pin_each(text, out, fetch)?;
+        pinned.result()?;
+        Ok(pinned.text)
+    }
+
+    /// A VM's network reset one download, and `pin` wrote nothing: every pin computed was lost.
+    /// Now a tool that fails keeps its old pins and the others get their new ones.
+    #[test]
+    fn a_tool_that_fails_to_download_costs_the_others_nothing() {
+        let archive = tarball(&[("fake-1.2.3/fake", SCRIPT, 0o755)]);
+        let one = manifest_text(SHA_A, SHA_B);
+        let other = one
+            .replace("# The tools.\n", "")
+            .replace("name = \"fake\"", "name = \"other\"")
+            .replace("example.com/fake-", "example.com/other/fake-");
+        let text = format!("{one}\n{other}");
+        let mut serve = serving(&archive);
+        let mut fetch = |url: &str| {
+            if url.contains("/other/") && url.contains("linux-arm64") {
+                anyhow::bail!("the connection was reset")
+            }
+            serve(url)
+        };
+        let mut out = Vec::new();
+        let pinned = pin_each(&text, &mut out, &mut fetch).unwrap();
+        let (fake, rest) = pinned.text.split_once("name = \"other\"").unwrap();
+        assert!(
+            fake.contains(&sha256_hex(&archive)) && !fake.contains(SHA_A),
+            "fake is pinned: {fake}"
+        );
+        assert!(
+            rest.contains(SHA_A) && !rest.contains(&sha256_hex(&archive)),
+            "other is pinned whole or not at all, so it keeps every old pin: {rest}"
+        );
+        let error = format!("{:#}", pinned.result().unwrap_err());
+        assert!(
+            error.contains("could not pin 1 of the tools")
+                && error.contains("other 1.2.3: the connection was reset"),
+            "{error}"
+        );
+        let out = String::from_utf8(out).unwrap();
+        assert!(
+            out.contains("failed   other 1.2.3: the connection was reset"),
+            "{out}"
+        );
+        assert!(!out.contains("other 1.2.3 aarch64-apple-darwin"), "{out}");
     }
 
     #[test]

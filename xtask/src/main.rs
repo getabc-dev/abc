@@ -5,6 +5,7 @@ mod app;
 mod broker;
 mod check;
 mod coverage;
+mod download;
 mod e2e;
 mod fuzz;
 mod gate;
