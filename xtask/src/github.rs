@@ -267,7 +267,7 @@ fn push(item: &Value, what: &str) -> anyhow::Result<Push> {
 /// did. A revocation that fails is reported, not fatal: the token expires within the hour.
 pub(crate) fn with_token<T>(
     mint: impl FnOnce() -> anyhow::Result<String>,
-    revoke: impl FnOnce(&str) -> anyhow::Result<()>,
+    revoke: impl FnOnce(&str) -> anyhow::Result<crate::app::Revoked>,
     report: &mut impl std::io::Write,
     work: impl FnOnce(&str) -> anyhow::Result<T>,
 ) -> anyhow::Result<T> {
