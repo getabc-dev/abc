@@ -18,8 +18,9 @@ running() {
 }
 
 # start NAME: runs state/NAME.args (one word a line) in the background with only state/NAME.env
-# (NAME=VALUE lines) and a PATH in its environment, as a service manager does, its output in
-# state/NAME.log.
+# (NAME=VALUE lines) and a PATH in its environment, as a service manager does, from state/
+# rather than the caller's directory (so nothing it writes there lands in the repository), its
+# output in state/NAME.log.
 start() {
 	if running "$1"; then
 		return 0
@@ -33,6 +34,7 @@ start() {
 		while IFS= read -r word; do
 			set -- "$@" "$word"
 		done <"$STATE/$service.args"
+		cd "$STATE" || exit 1
 		exec env -i PATH=/usr/bin:/bin "$@"
 	) </dev/null >>"$STATE/$service.log" 2>&1 &
 	echo "$!" >"$STATE/$1.pid"

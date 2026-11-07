@@ -177,7 +177,11 @@ describe("ThemeMenu", () => {
     expect(document.activeElement).toBe(screen.getByRole("button", { name: "Theme: Dark" }));
 
     await userEvent.keyboard("{Enter}");
-    await screen.findByRole("menu");
+    const reopened = await screen.findByRole("menu");
+    // The menu takes focus a moment after it opens; keys pressed before then go nowhere.
+    await waitFor(() => {
+      expect(reopened.contains(document.activeElement)).toBe(true);
+    });
     await userEvent.keyboard("{End}{Enter}");
     expect(document.documentElement.classList.contains("dark")).toBe(false);
     expect(window.localStorage.getItem("abc-theme")).toBeNull();
