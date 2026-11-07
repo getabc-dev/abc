@@ -635,6 +635,7 @@ mod tests {
         fs::write(repo.join("small.rs"), "fn a() {}\n").unwrap();
         fs::write(repo.join("run.sh"), "#!/bin/sh\n").unwrap();
         fs::write(repo.join("large.txt"), "x".repeat(65)).unwrap();
+        fs::write(repo.join("limit.txt"), "x".repeat(64)).unwrap();
         fs::write(repo.join("image.png"), [0xff, 0xfe, 0x00]).unwrap();
         std::os::unix::fs::symlink("/etc/hostname", repo.join("link")).unwrap();
         git(&repo, &["add", "--all"]);
@@ -655,6 +656,7 @@ mod tests {
         let paths: Vec<String> = [
             "small.rs",
             "run.sh",
+            "limit.txt",
             "large.txt",
             "image.png",
             "link",
@@ -668,6 +670,7 @@ mod tests {
             [
                 ("small.rs".to_owned(), Blob::Text("fn a() {}\n".to_owned())),
                 ("run.sh".to_owned(), Blob::Text("#!/bin/sh\n".to_owned())),
+                ("limit.txt".to_owned(), Blob::Text("x".repeat(64))),
                 ("large.txt".to_owned(), Blob::TooLarge(65)),
                 ("image.png".to_owned(), Blob::NotText),
                 ("link".to_owned(), Blob::NotText),

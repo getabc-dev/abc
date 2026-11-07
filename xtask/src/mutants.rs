@@ -1193,6 +1193,29 @@ mod tests {
         );
     }
 
+    /// A scratch directory that cannot be removed is an error when the run ends, never passed
+    /// over, so a full disk is said rather than met later.
+    #[test]
+    fn a_scratch_directory_that_cannot_go_is_an_error() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let temp = tempfile::tempdir().unwrap();
+        let parent = temp.path().join("target");
+        let scratch = super::Scratch::create(parent.join("mutants-tmp")).unwrap();
+        fs::write(scratch.path().join("left.txt"), "x").unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o555)).unwrap();
+        let error = scratch.remove();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o755)).unwrap();
+        let error = error.unwrap_err();
+        assert!(
+            error.to_string().starts_with("could not remove "),
+            "{error:#}"
+        );
+        assert!(parent.join("mutants-tmp").exists());
+        super::remove(&parent.join("mutants-tmp")).unwrap();
+        assert!(!parent.join("mutants-tmp").exists());
+        super::remove(&parent.join("mutants-tmp")).unwrap();
+    }
+
     /// Every regular file under `dir` with its bytes, `target/` and `.git/` left out.
     fn snapshot(dir: &Path) -> Vec<(std::path::PathBuf, String)> {
         let mut files = Vec::new();

@@ -289,6 +289,97 @@ pub(crate) fn http<'a>(
 mod tests {
     use serde_json::json;
 
+    /// A full page of the timeline is followed by the next; a shorter one is the last.
+    #[test]
+    fn reads_the_timeline_page_by_page() {
+        let mut asked = Vec::new();
+        let items = super::timeline(7, &mut |path: &str| {
+            asked.push(path.to_owned());
+            let count = if path.ends_with("&page=1") { 100 } else { 1 };
+            Ok(serde_json::Value::Array(vec![
+                json!({"event": "labeled"});
+                count
+            ]))
+        })
+        .unwrap();
+        assert_eq!(items.len(), 101);
+        assert_eq!(
+            asked,
+            [
+                "issues/7/timeline?per_page=100&page=1",
+                "issues/7/timeline?per_page=100&page=2"
+            ]
+        );
+    }
+
+    /// A force push names the head it made: one to this head records its push though no run
+    /// started; one to another commit does not.
+    #[test]
+    fn a_force_push_records_only_the_head_it_made() {
+        let forced = |commit: &str| {
+            [json!({
+                "event": "head_ref_force_pushed",
+                "commit_id": commit,
+                "actor": {"login": "snehilvj"},
+                "created_at": "2026-11-05T10:00:00Z",
+            })]
+        };
+        let head = super::Head {
+            sha: "abc",
+            repository: "o/r",
+            branch: "x",
+        };
+        let mut no_runs = |_: &str| Ok(json!({"workflow_runs": []}));
+        assert_eq!(
+            super::push_of(head, &forced("abc"), &mut no_runs).unwrap(),
+            Some(super::Push {
+                pusher: "snehilvj".to_owned(),
+                at: "2026-11-05T10:00:00Z".to_owned(),
+            })
+        );
+        assert_eq!(
+            super::push_of(head, &forced("def"), &mut no_runs).unwrap(),
+            None,
+            "a force push to another commit is no push of this head"
+        );
+    }
+
+    /// A pull request reopened after its head's run, with a branch pushed while it was closed,
+    /// counts the reopening as its latest push.
+    #[test]
+    fn a_reopening_after_the_run_is_the_latest_push() {
+        let run = json!({
+            "head_sha": "abc",
+            "head_branch": "x",
+            "head_repository": {"full_name": "o/r"},
+            "actor": {"login": "getabc-dev-agent[bot]"},
+            "created_at": "2026-11-05T09:00:00Z",
+        });
+        let timeline = [json!({
+            "event": "reopened",
+            "actor": {"login": "snehilvj"},
+            "created_at": "2026-11-05T10:00:00Z",
+        })];
+        let push = super::push_of(
+            super::Head {
+                sha: "abc",
+                repository: "o/r",
+                branch: "x",
+            },
+            &timeline,
+            &mut |_: &str| Ok(json!({"workflow_runs": [run.clone()]})),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            push,
+            super::Push {
+                pusher: "snehilvj".to_owned(),
+                at: "2026-11-05T10:00:00Z".to_owned(),
+            }
+        );
+    }
+
     /// [`push_of`] reads pushes from [`PUSH_WORKFLOW`]'s runs, so nothing but a push or a
     /// reopen may start one: GitHub's default `pull_request` activity types.
     #[test]

@@ -104,6 +104,11 @@ impl Request {
             .saturating_add(generated(&self.generated).len())
     }
 
+    /// Whether the prompt, before whole files, fits [`MAX_PROMPT_BYTES`].
+    fn fits_the_prompt(&self) -> bool {
+        self.prompt_bytes() <= MAX_PROMPT_BYTES
+    }
+
     /// Adds the changed files `blobs` read: each small text file whole, smallest first, while the
     /// prompt stays within [`MAX_PROMPT_BYTES`] with the sections' headings and a line for each
     /// file left out; a larger file, or one past that limit, goes to `left_out`. A symlink, a
@@ -759,7 +764,7 @@ fn review_changes(
         files: Vec::new(),
         left_out: Vec::new(),
     };
-    if request.prompt_bytes() > MAX_PROMPT_BYTES {
+    if !request.fits_the_prompt() {
         say(
             progress,
             &format!(
@@ -1165,6 +1170,13 @@ mod tests {
             "without its function: {} bytes",
             sent.len()
         );
+    }
+
+    #[test]
+    fn the_prompt_holds_up_to_its_limit() {
+        let overhead = request("").prompt_bytes();
+        assert!(request(&"+".repeat(MAX_PROMPT_BYTES - overhead)).fits_the_prompt());
+        assert!(!request(&"+".repeat(MAX_PROMPT_BYTES - overhead + 1)).fits_the_prompt());
     }
 
     /// A caller the review was not shown can break when a changed function's contract changes.
