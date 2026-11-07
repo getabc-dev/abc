@@ -737,6 +737,7 @@ fn run_pr(
                 root,
                 &repo,
                 &mut github::http(app::GITHUB_API, token),
+                &mut tools::download,
                 &mut done,
             )
         },

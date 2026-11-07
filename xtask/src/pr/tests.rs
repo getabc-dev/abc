@@ -170,7 +170,17 @@ fn opens_through_the_rest_api() {
         branch: "agent/x".to_owned(),
         base: "main".to_owned(),
     };
-    assert!(send(plan, temp.path(), &repo(), &mut reply, &mut out).unwrap());
+    assert!(
+        send(
+            plan,
+            temp.path(),
+            &repo(),
+            &mut reply,
+            &mut no_downloads,
+            &mut out
+        )
+        .unwrap()
+    );
     assert_eq!(out, "pr: opened #31 https://github.com/o/r/pull/31\n");
     assert_eq!(
         sent,
@@ -261,7 +271,7 @@ fn update(
         Ok(answer(request))
     };
     let mut out = String::new();
-    let result = send(plan, work, &repo(), &mut reply, &mut out);
+    let result = send(plan, work, &repo(), &mut reply, &mut no_downloads, &mut out);
     (result, out, sent)
 }
 
@@ -699,5 +709,10 @@ fn send_plan(
     out: &mut String,
 ) -> bool {
     let temp = tempfile::tempdir().unwrap();
-    super::send(plan, temp.path(), &repo(), send, out).unwrap()
+    super::send(plan, temp.path(), &repo(), send, &mut no_downloads, out).unwrap()
+}
+
+/// A download where none is expected.
+fn no_downloads(url: &str) -> anyhow::Result<Vec<u8>> {
+    anyhow::bail!("no download expected: {url}")
 }

@@ -10,6 +10,7 @@
 //! token; [`send`] then makes its calls with one App token ([`crate::github`]).
 
 mod checks;
+mod renovate;
 
 use std::path::{Path, PathBuf};
 
@@ -50,12 +51,17 @@ pub(crate) enum Action {
     /// Print a "## Test changes" section naming every test integrity flags; only the reasons
     /// are left to write.
     TestChanges,
+    /// Replace Renovate's pull request NUMBER, a tool bump in xtask/tools.toml, with one that
+    /// pins it: the bump on the default branch, pinned with `cargo xtask pin`, on branch
+    /// agent/renovate-NUMBER; then close Renovate's with a link. The checkout is not touched.
+    Renovate { number: u64 },
 }
 
 /// What [`send`] does once [`prepare`] has checked it.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Plan {
     Checks(u64),
+    Renovate(u64),
     Open {
         title: String,
         body: String,
@@ -80,6 +86,7 @@ pub(crate) fn prepare(
 ) -> anyhow::Result<Option<Plan>> {
     match action {
         Action::Checks { number } => Ok(Some(Plan::Checks(number))),
+        Action::Renovate { number } => Ok(Some(Plan::Renovate(number))),
         Action::TestChanges => {
             let commit = git::merge_base(root, &git::default_branch(root)?)?;
             out.push_str(&Review::of(root, &commit, None)?.skeleton());
@@ -201,16 +208,18 @@ fn preflight(root: &Path, body: &str, out: &mut String) -> anyhow::Result<Checke
     Ok(Checked { branch, base, diff })
 }
 
-/// Carries out `plan` for the repository `repo` through `send`, writing what happened to `out`;
-/// whether all is well (for `checks`, whether every check passed).
+/// Carries out `plan` for the repository `repo` through `send`, with downloads from `fetch`,
+/// writing what happened to `out`; whether all is well (for `checks`, whether every check passed).
 pub(crate) fn send(
     plan: Plan,
     root: &Path,
     repo: &Repo,
     send: &mut Send<'_>,
+    fetch: &mut dyn FnMut(&str) -> anyhow::Result<Vec<u8>>,
     out: &mut String,
 ) -> anyhow::Result<bool> {
     match plan {
+        Plan::Renovate(number) => renovate::run(number, root, repo, send, fetch, out),
         Plan::Checks(number) => {
             stale(repo, number, send, out)?;
             checks::run(repo, number, send, out)

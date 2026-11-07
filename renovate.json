@@ -113,7 +113,7 @@
         "xtask/tools.toml"
       ],
       "prBodyNotes": [
-        "Run `cargo xtask pin` on this branch and commit `xtask/tools.toml`: `cargo xtask setup` refuses archives whose sha256 is not pinned."
+        "Renovate cannot pin, and `cargo xtask setup` refuses archives whose sha256 is not pinned, so this pull request is not merged: an agent runs `cargo xtask pr renovate <number>`, which opens a replacement with the bump pinned and closes this one with a link to it."
       ]
     }
   ],

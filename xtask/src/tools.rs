@@ -18,7 +18,7 @@ use sha2::{Digest, Sha256};
 use toml_edit::DocumentMut;
 
 /// The tool list, relative to the repository root.
-const MANIFEST: &str = "xtask/tools.toml";
+pub(crate) const MANIFEST: &str = "xtask/tools.toml";
 
 /// Where tools are installed, relative to the repository root.
 const TOOLS_DIR: &str = ".tools";
@@ -903,6 +903,92 @@ fn pin_each(
         text: document.to_string(),
         failed,
     })
+}
+
+/// One tool's version moving, as a tool-list change makes it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Bump {
+    pub(crate) tool: String,
+    pub(crate) from: String,
+    pub(crate) to: String,
+}
+
+impl fmt::Display for Bump {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} {} -> {}", self.tool, self.from, self.to)
+    }
+}
+
+/// The versions that moved from the tool list `before` to `after`. Fails when `after` adds or
+/// removes a tool: only a version moves in a bump.
+pub(crate) fn bumps(before: &str, after: &str) -> anyhow::Result<Vec<Bump>> {
+    let before =
+        Manifest::parse(before).with_context(|| format!("{MANIFEST} before is invalid"))?;
+    let after = Manifest::parse(after).with_context(|| format!("{MANIFEST} after is invalid"))?;
+    let names = |manifest: &Manifest| -> BTreeSet<String> {
+        manifest
+            .tools
+            .iter()
+            .map(|tool| tool.name.clone())
+            .collect()
+    };
+    ensure!(
+        names(&before) == names(&after),
+        "the change adds or removes a tool; only a version bump is taken"
+    );
+    Ok(after
+        .tools
+        .iter()
+        .filter_map(|tool| {
+            let old = before.tool(&tool.name).ok()?;
+            (old.version != tool.version).then(|| Bump {
+                tool: tool.name.clone(),
+                from: old.version.clone(),
+                to: tool.version.clone(),
+            })
+        })
+        .collect())
+}
+
+/// The tool list `text` with each of `bumps` applied, keeping its layout. Fails when a tool is
+/// not at the version a bump moves it from.
+pub(crate) fn bumped(text: &str, bumps: &[Bump]) -> anyhow::Result<String> {
+    let manifest = Manifest::parse(text).with_context(|| format!("{MANIFEST} is invalid"))?;
+    let mut document: DocumentMut = text.parse()?;
+    for bump in bumps {
+        let current = &manifest.tool(&bump.tool)?.version;
+        ensure!(
+            *current == bump.from,
+            "{} is at {current} here, not {}, which the bump moves from",
+            bump.tool,
+            bump.from
+        );
+        let value = document
+            .get_mut("tool")
+            .and_then(toml_edit::Item::as_array_of_tables_mut)
+            .context("the tool list has no [[tool]] tables")?
+            .iter_mut()
+            .find(|tool| tool.get("name").and_then(toml_edit::Item::as_str) == Some(&bump.tool))
+            .and_then(|tool| tool.get_mut("version"))
+            .and_then(toml_edit::Item::as_value_mut)
+            .with_context(|| format!("the tool list has no version for {}", bump.tool))?;
+        let decor = value.decor().clone();
+        *value = bump.to.as_str().into();
+        *value.decor_mut() = decor;
+    }
+    Ok(document.to_string())
+}
+
+/// The tool list `text` with every pin recomputed from downloads by `fetch`, as `cargo xtask pin`
+/// does; fails unless every tool was pinned.
+pub(crate) fn repin(
+    text: &str,
+    out: &mut impl Write,
+    fetch: &mut impl FnMut(&str) -> anyhow::Result<Vec<u8>>,
+) -> anyhow::Result<String> {
+    let pinned = pin_each(text, out, fetch)?;
+    pinned.result()?;
+    Ok(pinned.text)
 }
 
 /// One pin [`pins_of`] computed.
@@ -2404,9 +2490,39 @@ targets.aarch64-unknown-linux-gnu = {{ platform = "linux-arm64", sha256 = "{sha2
         out: &mut impl std::io::Write,
         fetch: &mut impl FnMut(&str) -> anyhow::Result<Vec<u8>>,
     ) -> anyhow::Result<String> {
-        let pinned = pin_each(text, out, fetch)?;
-        pinned.result()?;
-        Ok(pinned.text)
+        super::repin(text, out, fetch)
+    }
+
+    /// Renovate moves a version in the tool list; `pr renovate` reads which ones moved and moves
+    /// them the same way in main's tool list, keeping its layout.
+    #[test]
+    fn reads_and_applies_version_bumps() {
+        let before = manifest_text(SHA_A, SHA_B);
+        let after = before.replace("version = \"1.2.3\"", "version = \"1.3.0\"");
+        let moved = super::bumps(&before, &after).unwrap();
+        assert_eq!(
+            moved,
+            [super::Bump {
+                tool: "fake".to_owned(),
+                from: "1.2.3".to_owned(),
+                to: "1.3.0".to_owned()
+            }]
+        );
+        assert_eq!(moved[0].to_string(), "fake 1.2.3 -> 1.3.0");
+        assert_eq!(
+            super::bumped(&before, &moved).unwrap(),
+            after,
+            "only the version moves"
+        );
+        assert_eq!(super::bumps(&before, &before).unwrap(), [], "nothing moved");
+        let stale = format!("{:#}", super::bumped(&after, &moved).unwrap_err());
+        assert!(
+            stale.contains("fake is at 1.3.0 here, not 1.2.3"),
+            "{stale}"
+        );
+        let renamed = before.replace("name = \"fake\"", "name = \"other\"");
+        let added = format!("{:#}", super::bumps(&before, &renamed).unwrap_err());
+        assert!(added.contains("adds or removes a tool"), "{added}");
     }
 
     /// A VM's network reset one download, and `pin` wrote nothing: every pin computed was lost.
