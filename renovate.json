@@ -35,6 +35,16 @@
       "groupName": "axum and tokio-tungstenite"
     },
     {
+      "description": "Hold tokio-tungstenite at the version axum's ws feature depends on (0.29 for axum 0.8.9 in Cargo.lock). The group above still opened a pull request for tokio-tungstenite alone (#26) whenever it had a release axum did not take yet, and cargo-deny refuses the two versions that makes. When an axum update needs a newer tokio-tungstenite, its pull request fails cargo-deny's duplicate check: raise this bound to that version's successor in the same pull request, and bump the workspace's tokio-tungstenite with it.",
+      "matchDatasources": [
+        "crate"
+      ],
+      "matchPackageNames": [
+        "tokio-tungstenite"
+      ],
+      "allowedVersions": "<0.30"
+    },
+    {
       "description": "The web app's npm packages (web/package.json, locked in web/pnpm-lock.yaml): exact versions, which pnpm-workspace.yaml's savePrefix keeps, past the same 3-day minimum release age that pnpm's minimumReleaseAge enforces at install.",
       "matchManagers": [
         "npm"
