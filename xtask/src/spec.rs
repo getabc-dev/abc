@@ -53,9 +53,11 @@ const SERVER_START_CHECKS: u32 = 600;
 /// `QUINT_HOME` where Quint finds the pinned Apalache.
 const APALACHE_VERSION: &str = "pinned";
 
-/// The JVM heap TLC may take: half the machine's memory, where Quint's default of 8 GiB is more
-/// than many machines have.
-const TLC_CONFIG: &str = r#"{"maxHeap": "-XX:MaxRAMPercentage=50"}"#;
+/// The JVM memory TLC may take: a 1 GiB heap, where Quint's default of 8 GiB is more than many
+/// machines have, and 16 MiB stacks for its threads rather than Quint's 515 MiB, so that it starts
+/// within the 2 GiB a test may make writable under `cargo xtask mutants`. The gate's models need
+/// far less.
+const TLC_CONFIG: &str = r#"{"maxHeap": "-Xmx1g", "stackSize": "-Xss16m"}"#;
 
 /// What the gate checks, by file, relative to the repository root.
 #[derive(Debug, Clone, Copy)]
@@ -337,7 +339,7 @@ impl Drop for Server {
 fn server_args(apalache: &Path, port: u16) -> Vec<String> {
     vec![
         "--sun-misc-unsafe-memory-access=allow".to_owned(),
-        "-Xmx2g".to_owned(),
+        "-Xmx1g".to_owned(),
         "-jar".to_owned(),
         apalache
             .join("lib")
@@ -1071,7 +1073,7 @@ module tests {
             server_args(Path::new("/a"), 4321),
             [
                 "--sun-misc-unsafe-memory-access=allow",
-                "-Xmx2g",
+                "-Xmx1g",
                 "-jar",
                 "/a/lib/apalache.jar",
                 "server",
