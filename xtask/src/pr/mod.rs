@@ -140,6 +140,24 @@ pub(crate) fn prepare(
     }
 }
 
+/// Whether `body` has a `## Review findings` section with something in it besides comments: what
+/// `/code-review` and `/security-review` found on the branch, or "None". #33 opened before they
+/// ran, and they then found a data-loss bug and 8 more issues that every gate had passed.
+fn reviewed(body: &str) -> bool {
+    let Some((_, rest)) = body.split_once("## Review findings\n") else {
+        return false;
+    };
+    let section = rest.split("\n## ").next().unwrap_or_default();
+    let mut text = section;
+    let mut kept = String::new();
+    while let Some((before, after)) = text.split_once("<!--") {
+        kept.push_str(before);
+        text = after.split_once("-->").map_or("", |(_, after)| after);
+    }
+    kept.push_str(text);
+    !kept.trim().is_empty()
+}
+
 /// The review size check, as `review` makes it.
 fn check_size(bytes: usize) -> anyhow::Result<()> {
     crate::review::check_size("the diff with the title and description", bytes)
@@ -194,6 +212,12 @@ fn preflight(root: &Path, body: &str, out: &mut String) -> anyhow::Result<Checke
             String::from_utf8_lossy(&why)
         );
     }
+    ensure!(
+        reviewed(body),
+        "the description has no `## Review findings` section saying what the B1 reviews found: \
+         run `/code-review high` and `/security-review` on the branch before it opens, fix what \
+         they confirm, and list each finding with what was done, or \"None\""
+    );
     let workflows = git::changes(root, &commit)?.into_iter().any(|change| {
         change
             .old

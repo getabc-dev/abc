@@ -28,8 +28,9 @@ fn checkout(temp: &Path) -> PathBuf {
     work
 }
 
-const REASONED: &str =
-    "Drops t.\n\n## Test changes\n\n- `src/t.rs`: the parser it covered is gone.\n";
+const REASONED: &str = "Drops t.\n\n## Test changes\n\n- `src/t.rs`: the parser it covered is \
+                        gone.\n\n## Review findings\n\nNone: `/code-review high` and \
+                        `/security-review` found nothing.\n";
 
 /// The description `text`, in a file under `dir`.
 fn body(dir: &Path, text: &str) -> PathBuf {
@@ -86,7 +87,11 @@ fn opens_only_what_integrity_the_review_and_the_rulesets_would_pass() {
             "t",
             body(
                 temp.path(),
-                &format!("{REASONED}- `src/u.rs::tests::gone`: from an earlier push.\n"),
+                &REASONED.replacen(
+                    "gone.\n",
+                    "gone.\n- `src/u.rs::tests::gone`: from an earlier push.\n",
+                    1,
+                ),
             ),
         ),
         &work,
@@ -95,6 +100,29 @@ fn opens_only_what_integrity_the_review_and_the_rulesets_would_pass() {
         stale.contains("names `src/u.rs::tests::gone`, which has no flagged change"),
         "#25 kept three stale entries: {stale}"
     );
+    // #33: the B1 reviews found a data-loss bug and 8 more issues every gate passed. They run
+    // before the pull request opens, and its description says what they found.
+    let unreviewed_text = REASONED.split("## Review findings").next().unwrap();
+    let unreviewed = refusal(open("t", body(temp.path(), unreviewed_text)), &work);
+    assert!(
+        unreviewed.contains("## Review findings")
+            && unreviewed.contains("/code-review high")
+            && unreviewed.contains("/security-review"),
+        "{unreviewed}"
+    );
+    let blank = refusal(
+        open(
+            "t",
+            body(
+                temp.path(),
+                &format!(
+                    "{unreviewed_text}## Review findings\n\n<!-- what they found -->\n\n## After\n\nx\n"
+                ),
+            ),
+        ),
+        &work,
+    );
+    assert!(blank.contains("## Review findings"), "{blank}");
     let empty = refusal(open("t", body(temp.path(), "\n")), &work);
     assert!(
         empty.ends_with("is empty; a pull request needs a description"),
