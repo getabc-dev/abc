@@ -182,27 +182,68 @@ fn opens_through_the_rest_api() {
     );
 }
 
-/// GitHub's recorded replies to `pr update`: the pull request at `head`, the latest CI run for
-/// it, pushed by `pusher` (no run when empty), and the edited pull request.
-fn replies(head: &str, pusher: &str) -> std::vec::IntoIter<Value> {
-    let runs = if pusher.is_empty() {
-        json!({"total_count": 0, "workflow_runs": []})
-    } else {
-        json!({"workflow_runs": [{"actor": {"login": pusher}, "triggering_actor": {"login": "someone"}}]})
-    };
-    vec![
-        json!({"title": "feat: drop t", "head": {"ref": "agent/x", "sha": head}}),
-        runs,
-        json!({"number": 7}),
-    ]
-    .into_iter()
+/// A `ci.yml` run for `head` on this repository's `agent/x`, started by `actor` at `at`, as
+/// GitHub records it.
+fn ci_run(head: &str, actor: &str, at: &str) -> Value {
+    run_from(head, "o/r", "agent/x", actor, at)
 }
 
-/// Runs `pr update 7` on `work` against `answers`; its result, output and requests.
+/// A `ci.yml` run for `head` on `repository`'s `branch`, started by `actor` at `at`.
+fn run_from(head: &str, repository: &str, branch: &str, actor: &str, at: &str) -> Value {
+    json!({
+        "path": ".github/workflows/ci.yml",
+        "event": "pull_request",
+        "head_sha": head,
+        "head_branch": branch,
+        "head_repository": {"full_name": repository},
+        "pull_requests": [],
+        "actor": {"login": actor},
+        "triggering_actor": {"login": "someone"},
+        "created_at": at,
+    })
+}
+
+/// GitHub's recorded replies to `pr update` of #7, by path: the pull request at `head` from
+/// `agent/x`, `runs` as its `ci.yml` runs (and, for the first version's query, all its runs),
+/// the timeline `events`, and the edited pull request.
+fn github(head: &str, runs: &[Value], events: &[Value]) -> impl FnMut(&Request) -> Value + use<> {
+    let head = head.to_owned();
+    let runs = runs.to_vec();
+    let events = events.to_vec();
+    move |request| {
+        let path = request.path.as_str();
+        if request.method == "PATCH" {
+            json!({"number": 7})
+        } else if path == "/repos/o/r/pulls/7" {
+            json!({"title": "feat: drop t", "head": {"ref": "agent/x", "sha": head, "repo": {"full_name": "o/r"}}})
+        } else if path.starts_with("/repos/o/r/actions/") && path.ends_with("&page=1") {
+            json!({"total_count": runs.len(), "workflow_runs": runs})
+        } else if path.starts_with("/repos/o/r/actions/") {
+            json!({"workflow_runs": []})
+        } else if path == "/repos/o/r/issues/7/timeline?per_page=100&page=1" {
+            Value::Array(events.clone())
+        } else {
+            json!([])
+        }
+    }
+}
+
+/// GitHub's recorded replies to `pr update`: the pull request at `head`, the CI run of its push
+/// by `pusher` (no run when empty), and the edited pull request.
+fn replies(head: &str, pusher: &str) -> impl FnMut(&Request) -> Value + use<> {
+    let runs = if pusher.is_empty() {
+        Vec::new()
+    } else {
+        vec![ci_run(head, pusher, "2026-11-05T10:00:00Z")]
+    };
+    github(head, &runs, &[])
+}
+
+/// Runs `pr update 7` on `work` against `answer`; its result, output and requests.
 fn update(
     work: &Path,
     text: &str,
-    answers: std::vec::IntoIter<Value>,
+    mut answer: impl FnMut(&Request) -> Value,
 ) -> (anyhow::Result<bool>, String, Vec<Request>) {
     let plan = prepare(
         Action::Update {
@@ -214,11 +255,10 @@ fn update(
     )
     .unwrap()
     .unwrap();
-    let mut answers = answers;
     let mut sent = Vec::new();
     let mut reply = |request: &Request| {
         sent.push(request.clone());
-        Ok(answers.next().unwrap())
+        Ok(answer(request))
     };
     let mut out = String::new();
     let result = send(plan, work, &repo(), &mut reply, &mut out);
@@ -240,10 +280,16 @@ fn updates_the_description_when_the_app_pushed_last() {
     assert_eq!(sent[0].path, "/repos/o/r/pulls/7");
     assert_eq!(
         sent[1].path,
-        format!("/repos/o/r/actions/runs?head_sha={head}&event=pull_request&per_page=1")
+        "/repos/o/r/issues/7/timeline?per_page=100&page=1"
     );
     assert_eq!(
-        sent[2],
+        sent[2].path,
+        format!(
+            "/repos/o/r/actions/workflows/ci.yml/runs?event=pull_request&head_sha={head}&per_page=100&page=1"
+        )
+    );
+    assert_eq!(
+        sent[3],
         Request {
             method: "PATCH",
             path: "/repos/o/r/pulls/7".to_owned(),
@@ -251,7 +297,7 @@ fn updates_the_description_when_the_app_pushed_last() {
         },
         "through the REST API, never gh pr edit"
     );
-    assert_eq!(sent.len(), 3);
+    assert_eq!(sent.len(), 4);
 }
 
 #[test]
@@ -262,7 +308,7 @@ fn after_the_maintainers_push_only_a_push_that_changes_the_diff_hands_over() {
     let (same, _, refused) = update(&work, REASONED, replies(&theirs, "snehilvj"));
     let same = format!("{:#}", same.unwrap_err());
     assert!(same.contains("HEAD changes nothing in it"), "{same}");
-    assert_eq!(refused.len(), 2, "refused before the description was sent");
+    assert_eq!(refused.len(), 3, "refused before the description was sent");
 
     // #25 lost a round this way: an empty commit is a new commit but no reviewable push.
     git(
@@ -291,7 +337,7 @@ fn after_the_maintainers_push_only_a_push_that_changes_the_diff_hands_over() {
         ),
         "{out}"
     );
-    assert_eq!(sent.len(), 3, "the description is sent");
+    assert_eq!(sent.len(), 4, "the description is sent");
 
     let unknown = "0123456789012345678901234567890123456789";
     let (missing, _, _) = update(&work, REASONED, replies(unknown, "snehilvj"));
@@ -311,18 +357,282 @@ fn an_update_refuses_what_it_cannot_judge() {
         format!("{:#}", no_run.unwrap_err()).contains("so who pushed it is unknown"),
         "no CI run, no pusher"
     );
-    let other = vec![json!({"title": "t", "head": {"ref": "agent/y", "sha": head}})].into_iter();
-    let (elsewhere, _, _) = update(&work, REASONED, other);
+    let (elsewhere, _, _) = update(
+        &work,
+        REASONED,
+        |_: &Request| json!({"title": "t", "head": {"ref": "agent/y", "sha": head}}),
+    );
     assert_eq!(
         format!("{:#}", elsewhere.unwrap_err()),
         "#7 comes from agent/y, but HEAD is on agent/x"
     );
     let long = "x".repeat(MAX_DIFF_BYTES);
-    let titled = vec![json!({"title": long, "head": {"ref": "agent/x", "sha": head}})].into_iter();
-    let (oversized, _, _) = update(&work, REASONED, titled);
+    let (oversized, _, _) = update(
+        &work,
+        REASONED,
+        |_: &Request| json!({"title": long, "head": {"ref": "agent/x", "sha": head}}),
+    );
     assert!(
         format!("{:#}", oversized.unwrap_err())
             .starts_with("the diff with the title and description is "),
         "the pull request's title counts"
     );
+}
+
+/// #32: the maintainer's `integrity-approved` label started new runs for the same head, newest
+/// first in GitHub's list, so `pr update` read their actor and named the maintainer as the
+/// pusher of the App's push. Only `ci.yml`'s runs count, which no label starts, across pages.
+#[test]
+fn a_label_re_run_does_not_hide_who_pushed() {
+    let temp = tempfile::tempdir().unwrap();
+    let work = checkout(temp.path());
+    let head = git(&work, &["rev-parse", "HEAD"]).trim().to_owned();
+    // A full first page of runs for the same commit from other branches, then the push.
+    let elsewhere: Vec<Value> = (0..100)
+        .map(|minute| {
+            run_from(
+                &head,
+                "o/r",
+                "agent/y",
+                "snehilvj",
+                &format!("2026-11-05T12:{:02}:00Z", 59 - minute % 60),
+            )
+        })
+        .collect();
+    let mut answer = github(&head, &elsewhere, &[]);
+    let runs = format!(
+        "/repos/o/r/actions/workflows/ci.yml/runs?event=pull_request&head_sha={head}&per_page=100&page=2"
+    );
+    let push = ci_run(&head, APP_LOGIN, "2026-11-05T10:00:00Z");
+    let (result, out, sent) = update(&work, REASONED, move |request: &Request| {
+        if request.path == runs {
+            json!({"workflow_runs": [push.clone()]})
+        } else {
+            answer(request)
+        }
+    });
+    assert!(result.unwrap(), "the App pushed the head: {out}");
+    assert!(out.contains("is the agent App's"), "{out}");
+    assert!(
+        sent.iter().any(|request| request.path.ends_with("&page=2")),
+        "{sent:?}"
+    );
+}
+
+/// The earliest run for a head was taken as its push, but the same commit can head another pull
+/// request, from a fork: its earlier run named that fork's author as this one's pusher.
+#[test]
+fn a_run_for_the_same_commit_elsewhere_is_not_this_pull_requests_push() {
+    let temp = tempfile::tempdir().unwrap();
+    let work = checkout(temp.path());
+    let head = git(&work, &["rev-parse", "HEAD"]).trim().to_owned();
+    let runs = [
+        ci_run(&head, APP_LOGIN, "2026-11-05T10:00:00Z"),
+        run_from(
+            &head,
+            "someone/abc",
+            "agent/x",
+            "someone",
+            "2026-11-05T09:00:00Z",
+        ),
+    ];
+    let (result, out, _) = update(&work, REASONED, github(&head, &runs, &[]));
+    assert!(
+        result.unwrap(),
+        "the App pushed this pull request's head: {out}"
+    );
+}
+
+/// A push that started no CI run left only the runs a label started for its head, and the first
+/// of them was taken as the push, naming the labeller as the pusher.
+#[test]
+fn a_push_that_started_no_run_is_unknown() {
+    let temp = tempfile::tempdir().unwrap();
+    let work = checkout(temp.path());
+    let head = git(&work, &["rev-parse", "HEAD"]).trim().to_owned();
+    let label_run = json!({
+        "path": ".github/workflows/integrity.yml",
+        "event": "pull_request",
+        "head_sha": head,
+        "head_branch": "agent/x",
+        "head_repository": {"full_name": "o/r"},
+        "actor": {"login": "snehilvj"},
+        "created_at": "2026-11-05T11:00:00Z",
+    });
+    let mut answer = github(&head, &[], &[]);
+    let (result, _, _) = update(&work, REASONED, move |request: &Request| {
+        if request.path.starts_with("/repos/o/r/actions/runs?") {
+            json!({"workflow_runs": [label_run.clone()]})
+        } else {
+            answer(request)
+        }
+    });
+    assert!(
+        format!("{:#}", result.unwrap_err()).contains("so who pushed it is unknown"),
+        "a label's run is no push"
+    );
+}
+
+/// A force push that brings back an earlier commit is its latest push, though the commit's first
+/// run is older.
+#[test]
+fn a_force_push_back_is_the_latest_push() {
+    let temp = tempfile::tempdir().unwrap();
+    let work = checkout(temp.path());
+    let head = git(&work, &["rev-parse", "HEAD"]).trim().to_owned();
+    let runs = [ci_run(&head, APP_LOGIN, "2026-11-05T09:00:00Z")];
+    let events = [json!({
+        "event": "head_ref_force_pushed",
+        "commit_id": head,
+        "actor": {"login": "snehilvj"},
+        "created_at": "2026-11-05T10:30:00Z",
+    })];
+    let (result, _, _) = update(&work, REASONED, github(&head, &runs, &events));
+    assert!(
+        format!("{:#}", result.unwrap_err()).contains("snehilvj pushed #7's head last"),
+        "the maintainer's force push is the latest"
+    );
+}
+
+/// #33 and #38 were built at once; #33 broke on its merge with main once #38 merged. `pr open`
+/// and `pr update` fetch main and warn when it moved on files the branch changes too.
+#[test]
+fn warns_when_main_moved_on_the_branchs_files() {
+    let temp = tempfile::tempdir().unwrap();
+    let work = checkout(temp.path());
+    let prepared = |action: Action| {
+        let mut out = String::new();
+        prepare(action, &work, &mut out).unwrap().unwrap();
+        out
+    };
+    assert_eq!(
+        prepared(open("feat: x", body(temp.path(), REASONED))),
+        "",
+        "main has not moved"
+    );
+    // Another branch merges into main: it changes src/t.rs, which agent/x deletes, and a file
+    // agent/x leaves alone. This checkout has not fetched it.
+    let other = temp.path().join("other");
+    git(
+        temp.path(),
+        &[
+            "clone",
+            "--quiet",
+            temp.path().join("origin.git").to_str().unwrap(),
+            other.to_str().unwrap(),
+        ],
+    );
+    fs::write(
+        other.join("src/t.rs"),
+        "#[test]\nfn kept() { assert!(true); }\n",
+    )
+    .unwrap();
+    fs::write(other.join("README.md"), "moved\n").unwrap();
+    git(&other, &["add", "--all"]);
+    git(
+        &other,
+        &[
+            "-c",
+            "user.name=other",
+            "-c",
+            "user.email=other@example.com",
+            "commit",
+            "--quiet",
+            "-m",
+            "#38",
+        ],
+    );
+    git(&other, &["push", "--quiet", "origin", "HEAD:main"]);
+    let warned = "pr: warning: origin/main moved on since this branch left it, changing 1 \
+                  file(s) this branch changes too:\n  src/t.rs\npr: merge it (`git merge \
+                  origin/main`), check again and push; never rebase a pushed branch\n";
+    assert_eq!(
+        prepared(open("feat: x", body(temp.path(), REASONED))),
+        warned
+    );
+    assert_eq!(
+        prepared(Action::Update {
+            number: 7,
+            body: body(temp.path(), REASONED),
+        }),
+        warned
+    );
+    git(&work, &["remote", "set-url", "origin", "/no/such/remote"]);
+    let offline = prepared(Action::Update {
+        number: 7,
+        body: body(temp.path(), REASONED),
+    });
+    assert!(
+        offline.starts_with("pr: could not fetch origin/main, so it is compared as last fetched")
+            && offline.ends_with(warned),
+        "{offline}"
+    );
+}
+
+/// `pr open` and `pr update` fetch the default branch. On an HTTPS remote with no credential
+/// helper, git asked for a username on the terminal and waited; it now fails at once, and the
+/// branch is compared as last fetched.
+#[test]
+fn a_remote_that_asks_for_credentials_never_waits() {
+    let temp = tempfile::tempdir().unwrap();
+    let work = checkout(temp.path());
+    let asked = temp.path().join("asked");
+    crate::testing::script(
+        &temp.path().join("askpass"),
+        &format!("touch {}\necho secret\n", asked.display()),
+    );
+    git(
+        &work,
+        &[
+            "config",
+            "core.askPass",
+            temp.path().join("askpass").to_str().unwrap(),
+        ],
+    );
+    let (url, server) = crate::testing::serve(vec![("401 Unauthorized", "")]);
+    git(
+        &work,
+        &["remote", "set-url", "origin", &format!("{url}/abc.git")],
+    );
+    let mut out = String::new();
+    prepare(
+        Action::Update {
+            number: 7,
+            body: body(temp.path(), REASONED),
+        },
+        &work,
+        &mut out,
+    )
+    .unwrap()
+    .unwrap();
+    assert!(
+        out.starts_with("pr: could not fetch origin/main, so it is compared as last fetched")
+            && out.contains("terminal prompts disabled"),
+        "{out}"
+    );
+    assert!(!asked.exists(), "nothing asked for credentials");
+    server.join().unwrap();
+}
+
+/// Two of the head's own runs in the same second: GitHub lists the newer first, and the first
+/// read stays.
+#[test]
+fn of_two_runs_in_one_second_the_first_listed_counts() {
+    let runs = [
+        ci_run("abc", APP_LOGIN, "2026-11-05T10:00:00Z"),
+        ci_run("abc", "snehilvj", "2026-11-05T10:00:00Z"),
+    ];
+    let mut answers = vec![json!({"workflow_runs": runs})].into_iter();
+    let push = crate::github::push_of(
+        crate::github::Head {
+            sha: "abc",
+            repository: "o/r",
+            branch: "agent/x",
+        },
+        &[],
+        &mut |_| Ok(answers.next().unwrap()),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(push.pusher, APP_LOGIN);
 }

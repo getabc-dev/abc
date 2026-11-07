@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuites name="nextest-run" tests="2" skipped="0" failures="1" errors="0" uuid="fcea6ad6-985a-46f3-8b36-e2c41482c229" timestamp="2026-11-06T18:46:22.214+00:00" time="0.002">
+    <testsuite name="xtask::bin/xtask" tests="2" skipped="0" errors="0" failures="1">
+        <testcase name="broker::tests::serves_one_client" classname="xtask::bin/xtask" timestamp="2026-11-06T18:46:22.214+00:00" time="0.001"/>
+        <testcase name="broker::tests::a_client_has_its_patience_in_all_not_per_read" classname="xtask::bin/xtask" timestamp="2026-11-06T18:46:22.214+00:00" time="0.001">
+            <failure message="thread &apos;broker::tests::a_client_has_its_patience_in_all_not_per_read&apos; (31265) panicked at src/broker.rs:6:9" type="test failure with exit code 101">thread &apos;broker::tests::a_client_has_its_patience_in_all_not_per_read&apos; (31265) panicked at src/broker.rs:6:9:
+a client that sends a byte at a time is cut off at 2 s in all, not per read: it was served for 3s
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace</failure>
+            <system-out>
+running 1 test
+test broker::tests::a_client_has_its_patience_in_all_not_per_read ... FAILED
+
+failures:
+
+failures:
+    broker::tests::a_client_has_its_patience_in_all_not_per_read
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+</system-out>
+            <system-err>
+thread &apos;broker::tests::a_client_has_its_patience_in_all_not_per_read&apos; (31265) panicked at src/broker.rs:6:9:
+a client that sends a byte at a time is cut off at 2 s in all, not per read: it was served for 3s
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+</system-err>
+        </testcase>
+    </testsuite>
+</testsuites>

@@ -34,6 +34,21 @@ mod tests {
         child.wait_with_output().unwrap()
     }
 
+    /// The checkout these tests read: the one around xtask's own directory, or, when they run in
+    /// a copy of `xtask/` alone (`cargo xtask mutants`), the one it names at run time in
+    /// `XTASK_TEST_REPOSITORY`.
+    fn checkout() -> std::path::PathBuf {
+        std::env::var_os("XTASK_TEST_REPOSITORY").map_or_else(
+            || {
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .parent()
+                    .unwrap()
+                    .to_path_buf()
+            },
+            std::path::PathBuf::from,
+        )
+    }
+
     fn stderr(output: &Output) -> String {
         String::from_utf8_lossy(&output.stderr).into_owned()
     }
@@ -94,7 +109,9 @@ mod tests {
 
     #[test]
     fn runs_a_gate_on_the_tree_at_root() {
-        let checked = xtask(&["rulesets", "check"], "", &[]);
+        let checkout = checkout();
+        let root = checkout.to_str().unwrap();
+        let checked = xtask(&["--root", root, "rulesets", "check"], "", &[]);
         assert!(checked.status.success(), "{}", stderr(&checked));
         assert!(
             stderr(&checked).contains("matches CI"),
@@ -143,13 +160,41 @@ mod tests {
         );
     }
 
+    /// The binary runs the pinned tools of the checkout it was built from, the directory around
+    /// xtask's own, and nothing in the environment points it elsewhere: #33's mutants named the
+    /// checkout in `XTASK_REPOSITORY` when xtask was compiled, so any build with it set ran
+    /// another checkout's tools. Run in a copy of `xtask/` alone, the checkout it was built from
+    /// has no tools, and it says so, naming that directory.
     #[test]
     fn runs_the_pinned_tools_of_its_own_checkout() {
-        let version = xtask(&["tool", "cargo-nextest", "--version"], "", &[]);
-        assert!(version.status.success(), "{}", stderr(&version));
+        let elsewhere = Path::new("/no/such/checkout");
+        let version = xtask(
+            &["tool", "cargo-nextest", "--version"],
+            "",
+            &[
+                ("XTASK_REPOSITORY", elsewhere),
+                ("XTASK_TEST_REPOSITORY", elsewhere),
+            ],
+        );
+        let own = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        if own.join("xtask/tools.toml").is_file() {
+            assert!(version.status.success(), "{}", stderr(&version));
+            assert!(
+                String::from_utf8_lossy(&version.stdout).contains("cargo-nextest"),
+                "the pinned cargo-nextest ran"
+            );
+        } else {
+            assert!(!version.status.success());
+            assert!(
+                stderr(&version).contains(&own.display().to_string()),
+                "{}",
+                stderr(&version)
+            );
+        }
         assert!(
-            String::from_utf8_lossy(&version.stdout).contains("cargo-nextest"),
-            "the pinned cargo-nextest ran"
+            !stderr(&version).contains("/no/such/checkout"),
+            "{}",
+            stderr(&version)
         );
     }
 
@@ -249,6 +294,10 @@ mod tests {
             .env("XTASK_HOOK_GATE_WAIT", "2")
             .env_remove("ABC_VM")
             .env_remove("CARGO_TARGET_DIR")
+            // The launcher builds and runs the xtask of `project`, which finds its own checkout
+            // whatever these say: #33 read `XTASK_REPOSITORY` when xtask compiled.
+            .env("XTASK_REPOSITORY", "/no/such/checkout")
+            .env("XTASK_TEST_REPOSITORY", "/no/such/checkout")
             .env_remove("RUSTUP_TOOLCHAIN")
             .env_remove("CARGO")
             .stdin(Stdio::piped())
@@ -275,7 +324,8 @@ mod tests {
     /// by every test process on this machine, as when a main agent's and a subagent's stop hooks
     /// check at once, so it comes with an exclusive lock that the caller holds until it is done.
     fn copy_of_the_repository() -> (std::path::PathBuf, std::fs::File) {
-        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let checkout = checkout();
+        let repo = checkout.as_path();
         let tmp = Path::new(env!("CARGO_TARGET_TMPDIR"));
         let copy = tmp.join("broken-workspace");
         std::fs::create_dir_all(&copy).unwrap();

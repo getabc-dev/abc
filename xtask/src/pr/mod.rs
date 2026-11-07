@@ -86,7 +86,7 @@ pub(crate) fn prepare(
         }
         Action::Open { title, body } => {
             let body = read_body(&body)?;
-            let checked = preflight(root, &body)?;
+            let checked = preflight(root, &body, out)?;
             let head = git::git(root, &["rev-parse", "HEAD"])?;
             let pushed = git::git(
                 root,
@@ -121,7 +121,7 @@ pub(crate) fn prepare(
         }
         Action::Update { number, body } => {
             let body = read_body(&body)?;
-            let checked = preflight(root, &body)?;
+            let checked = preflight(root, &body, out)?;
             Ok(Some(Plan::Update {
                 number,
                 body,
@@ -161,8 +161,8 @@ struct Checked {
 
 /// The checks every description goes through before it is sent: a clean tree on a branch, a
 /// `## Test changes` section integrity accepts, and rulesets that match CI when `.github/`
-/// changed.
-fn preflight(root: &Path, body: &str) -> anyhow::Result<Checked> {
+/// changed. It warns in `out` when the default branch moved on files the branch changes.
+fn preflight(root: &Path, body: &str, out: &mut String) -> anyhow::Result<Checked> {
     let branch = git::git(root, &["symbolic-ref", "--quiet", "--short", "HEAD"])
         .context("HEAD is on no branch; a pull request comes from a branch")?
         .trim()
@@ -174,6 +174,7 @@ fn preflight(root: &Path, body: &str) -> anyhow::Result<Checked> {
          commit them first:\n{status}"
     );
     let base = git::default_branch(root)?;
+    behind(root, &base, out)?;
     let commit = git::merge_base(root, &base)?;
     let review = Review::of(root, &commit, Some(body))?;
     if !review.explained() {
@@ -195,7 +196,7 @@ fn preflight(root: &Path, body: &str) -> anyhow::Result<Checked> {
     if workflows {
         crate::rulesets::check(root).context(".github/ changed and `rulesets check` fails")?;
     }
-    let (diff, _) = git::reviewable_diff(root, &commit, 3)?;
+    let (diff, _) = git::reviewable_diff(root, &commit, git::To::WorkingTree)?;
     Ok(Checked { branch, base, diff })
 }
 
@@ -278,22 +279,24 @@ fn update(
             .saturating_add(body.len()),
     )?;
     let head = text(&pull, "/head/sha").to_owned();
-    let runs = github::get(
-        send,
-        repo.path(&format!(
-            "actions/runs?head_sha={head}&event=pull_request&per_page=1"
-        )),
-    )?;
-    let pusher = runs
-        .pointer("/workflow_runs/0/actor/login")
-        .and_then(Value::as_str)
-        .with_context(|| {
-            format!(
-                "no CI run for #{number}'s head {head} yet, so who pushed it is unknown; run this \
-                 again once CI has started"
-            )
-        })?
-        .to_owned();
+    let mut page = |path: &str| github::get(send, repo.path(path));
+    let timeline = github::timeline(number, &mut page)?;
+    let pusher = github::push_of(
+        github::Head {
+            sha: &head,
+            repository: text(&pull, "/head/repo/full_name"),
+            branch: head_ref,
+        },
+        &timeline,
+        &mut page,
+    )?
+    .with_context(|| {
+        format!(
+            "no CI run for #{number}'s head {head} yet, so who pushed it is unknown; run this \
+             again once CI has started"
+        )
+    })?
+    .pusher;
     let handover = if pusher == APP_LOGIN {
         format!("pr: the latest push to #{number} is the agent App's; the hand-over is done")
     } else {
@@ -336,6 +339,69 @@ fn handover(root: &Path, head: &str, pusher: &str, number: u64) -> anyhow::Resul
         ),
         _ => bail!("git diff {head} HEAD failed"),
     }
+}
+
+/// Fetches the default branch `base` (a remote-tracking ref) and warns in `out` when it changed,
+/// since HEAD left it, files that HEAD changes too. #33 and #38 were built at once, and #33
+/// broke on its merge with main once #38 merged: the fix is to merge the default branch and
+/// check again, never to rebase a pushed branch. A fetch that fails is said, and the last
+/// fetched branch compared.
+fn behind(root: &Path, base: &str, out: &mut String) -> anyhow::Result<()> {
+    let short = base.strip_prefix("refs/remotes/").unwrap_or(base);
+    if let Some((remote, branch)) = short.split_once('/')
+        && let Err(error) = git::fetch(root, remote, branch, git::FETCH_TIMEOUT)
+    {
+        say(
+            out,
+            &format!("pr: could not fetch {short}, so it is compared as last fetched: {error:#}"),
+        );
+    }
+    let commit = git::merge_base(root, base)?;
+    let names = |to: &str| -> anyhow::Result<std::collections::BTreeSet<String>> {
+        Ok(git::git(
+            root,
+            &[
+                "-c",
+                "core.quotePath=false",
+                "diff",
+                "--no-renames",
+                "--name-only",
+                &commit,
+                to,
+                "--",
+            ],
+        )?
+        .lines()
+        .map(str::to_owned)
+        .collect())
+    };
+    let moved = names(base)?;
+    if moved.is_empty() {
+        return Ok(());
+    }
+    let both: Vec<String> = names("HEAD")?.intersection(&moved).cloned().collect();
+    if both.is_empty() {
+        return Ok(());
+    }
+    say(
+        out,
+        &format!(
+            "pr: warning: {short} moved on since this branch left it, changing {} file(s) this \
+             branch changes too:",
+            both.len()
+        ),
+    );
+    for path in &both {
+        say(out, &format!("  {path}"));
+    }
+    say(
+        out,
+        &format!(
+            "pr: merge it (`git merge {short}`), check again and push; never rebase a pushed \
+             branch"
+        ),
+    );
+    Ok(())
 }
 
 #[cfg(test)]

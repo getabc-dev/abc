@@ -333,7 +333,7 @@ mod tests {
 
     #[test]
     fn reads_every_test_of_the_web_app() {
-        let root = crate::repo_root().unwrap();
+        let root = crate::testing::checkout();
         let mut pending = vec![root.join("web/src"), root.join("web/e2e")];
         let mut files = 0;
         while let Some(dir) = pending.pop() {

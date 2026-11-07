@@ -51,7 +51,7 @@ mod tests {
 
     #[test]
     fn the_checked_in_list_is_valid() {
-        let text = std::fs::read_to_string(crate::repo_root().unwrap().join(super::FILE)).unwrap();
+        let text = std::fs::read_to_string(crate::testing::checkout().join(super::FILE)).unwrap();
         let hosts = parse(&text).unwrap();
         for needed in [
             "github.com",

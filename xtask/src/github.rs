@@ -96,6 +96,173 @@ pub(crate) fn graphql(
         .context("GitHub's GraphQL API answered without data")
 }
 
+/// The push that made a commit a pull request's head: who pushed it and when.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Push {
+    pub(crate) pusher: String,
+    /// GitHub's UTC ISO 8601 time, which sorts as text.
+    pub(crate) at: String,
+}
+
+/// A pull request's head, whose push [`push_of`] reads.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Head<'a> {
+    pub(crate) sha: &'a str,
+    /// The repository the head branch is in, `owner/name`: a fork's for a fork's pull request.
+    pub(crate) repository: &'a str,
+    pub(crate) branch: &'a str,
+}
+
+/// How many items GitHub lists per page at most, as these reads ask for.
+const PER_PAGE: usize = 100;
+
+/// The workflow whose runs are the pull request's pushes: it runs on `pull_request` with
+/// GitHub's default activity types alone (opened, synchronize, reopened), so a label, a
+/// description edit or a review never starts one. A test keeps `.github/workflows/ci.yml` so.
+pub(crate) const PUSH_WORKFLOW: &str = "ci.yml";
+
+/// How many pages of a pull request's timeline [`timeline`] reads at most: 5,000 items. GitHub
+/// sets no limit of its own, and a timeline read in part would miss its latest events, so a longer
+/// one fails instead of being read without end.
+const TIMELINE_PAGES: usize = 50;
+
+/// How many pages of runs [`push_of`] reads at most: GitHub lists no more than 1,000 runs for a
+/// query filtered by `event` or `head_sha`, so a full tenth page is the last there is.
+const RUN_PAGES: usize = 10;
+
+/// Reads pages 1 to `limit` of a list, page `index` being at `path(index)`, through `page`, and
+/// gives each answer, with its path, to `each`, which returns how many items it held. It stops
+/// after the first page with fewer than [`PER_PAGE`] items and returns whether one came: `false`
+/// when page `limit` was full too. Every list is read to a bound, so a page that is always full
+/// never makes a read without end.
+fn read_pages(
+    limit: usize,
+    path: impl Fn(usize) -> String,
+    page: &mut impl FnMut(&str) -> anyhow::Result<Value>,
+    mut each: impl FnMut(&str, &Value) -> anyhow::Result<usize>,
+) -> anyhow::Result<bool> {
+    for index in 1..=limit {
+        let path = path(index);
+        let answer = page(&path)?;
+        if each(&path, &answer)? < PER_PAGE {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Every item of the pull request `number`'s timeline, oldest first, read through `page` (a path
+/// under the repository answered with its JSON). Fails on a timeline longer than
+/// [`TIMELINE_PAGES`] pages.
+pub(crate) fn timeline(
+    number: u64,
+    page: &mut impl FnMut(&str) -> anyhow::Result<Value>,
+) -> anyhow::Result<Vec<Value>> {
+    let mut items = Vec::new();
+    let complete = read_pages(
+        TIMELINE_PAGES,
+        |index| format!("issues/{number}/timeline?per_page={PER_PAGE}&page={index}"),
+        page,
+        |path, answer| {
+            let batch = answer
+                .as_array()
+                .with_context(|| format!("GitHub answered {path} with no list"))?;
+            items.extend(batch.iter().cloned());
+            Ok(batch.len())
+        },
+    )?;
+    anyhow::ensure!(
+        complete,
+        "the timeline of pull request #{number} has more than {} items, more than xtask reads",
+        TIMELINE_PAGES * PER_PAGE
+    );
+    Ok(items)
+}
+
+/// The latest push that made `head` the pull request's head, from the pull request's own
+/// records: the [`PUSH_WORKFLOW`] runs for `head` on its head branch, its `head_ref_force_pushed`
+/// events and its `reopened` events in `timeline`, whichever came last; `page` answers a path
+/// under the repository with its JSON, and every page is read. Nothing when none of them records
+/// `head` itself, as when no run has started yet: the push is then unknown.
+///
+/// The timeline cannot give it alone: its `committed` items carry only the commit's own dates,
+/// which its author sets, and no pusher. Any run cannot either: #32's `integrity-approved` label
+/// started runs that named the maintainer, and the earliest run for a head can belong to another
+/// pull request with the same head, or be older than a force push that brought the head back
+/// after an approval.
+pub(crate) fn push_of(
+    head: Head<'_>,
+    timeline: &[Value],
+    page: &mut impl FnMut(&str) -> anyhow::Result<Value>,
+) -> anyhow::Result<Option<Push>> {
+    let mut latest: Option<Push> = None;
+    let mut keep = |push: Push| {
+        // Of two in the same second, the first read stays: GitHub lists runs newest first.
+        if latest.as_ref().is_none_or(|last| push.at > last.at) {
+            latest = Some(push);
+        }
+    };
+    let mut recorded = false;
+    // A full last page ends the list too: GitHub lists no run past it.
+    read_pages(
+        RUN_PAGES,
+        |index| {
+            format!(
+                "actions/workflows/{PUSH_WORKFLOW}/runs?event=pull_request&head_sha={}&per_page={PER_PAGE}&page={index}",
+                head.sha
+            )
+        },
+        page,
+        |path, answer| {
+            let runs = answer
+                .get("workflow_runs")
+                .and_then(Value::as_array)
+                .with_context(|| format!("GitHub answered {path} without workflow_runs"))?;
+            for run in runs {
+                let text = |pointer: &str| run.pointer(pointer).and_then(Value::as_str);
+                // The same commit can head another pull request, from a fork or another branch.
+                if text("/head_repository/full_name") != Some(head.repository)
+                    || text("/head_branch") != Some(head.branch)
+                    || text("/head_sha") != Some(head.sha)
+                {
+                    continue;
+                }
+                recorded = true;
+                keep(push(run, "a workflow run")?);
+            }
+            Ok(runs.len())
+        },
+    )?;
+    for item in timeline {
+        match item.get("event").and_then(Value::as_str) {
+            Some("head_ref_force_pushed") => {
+                // A force push of another commit made another head, not this one.
+                if item.get("commit_id").and_then(Value::as_str) == Some(head.sha) {
+                    recorded = true;
+                    keep(push(item, "a head_ref_force_pushed event")?);
+                }
+            }
+            Some("reopened") => keep(push(item, "a reopened event")?),
+            _ => {}
+        }
+    }
+    Ok(latest.filter(|_| recorded))
+}
+
+/// The push `item` (a run or a timeline event, `what`) records: its actor and creation time.
+fn push(item: &Value, what: &str) -> anyhow::Result<Push> {
+    let field = |pointer: &str| {
+        item.pointer(pointer)
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .with_context(|| format!("{what} has no {pointer}"))
+    };
+    Ok(Push {
+        pusher: field("/actor/login")?,
+        at: field("/created_at")?,
+    })
+}
+
 /// Runs `work` with a token from `mint`, then revokes the token with `revoke`, whatever `work`
 /// did. A revocation that fails is reported, not fatal: the token expires within the hour.
 pub(crate) fn with_token<T>(
@@ -165,6 +332,207 @@ pub(crate) fn http<'a>(
 #[cfg(test)]
 mod tests {
     use serde_json::json;
+
+    /// A full page of the timeline is followed by the next; a shorter one is the last.
+    #[test]
+    fn reads_the_timeline_page_by_page() {
+        let mut asked = Vec::new();
+        let items = super::timeline(7, &mut |path: &str| {
+            asked.push(path.to_owned());
+            let count = match path.rsplit_once("&page=") {
+                Some((_, "1")) => 100,
+                Some((_, "2")) => 1,
+                _ => anyhow::bail!("no page {path}"),
+            };
+            Ok(serde_json::Value::Array(vec![
+                json!({"event": "labeled"});
+                count
+            ]))
+        })
+        .unwrap();
+        assert_eq!(items.len(), 101);
+        assert_eq!(
+            asked,
+            [
+                "issues/7/timeline?per_page=100&page=1",
+                "issues/7/timeline?per_page=100&page=2"
+            ]
+        );
+    }
+
+    /// A timeline whose pages are all full is read to [`super::TIMELINE_PAGES`] pages and no
+    /// further, and fails: read in part, it would miss its latest events.
+    #[test]
+    fn a_timeline_longer_than_xtask_reads_fails() {
+        let mut asked = 0_usize;
+        let error = super::timeline(7, &mut |_: &str| {
+            asked += 1;
+            Ok(serde_json::Value::Array(vec![json!({}); super::PER_PAGE]))
+        })
+        .unwrap_err();
+        assert_eq!(asked, super::TIMELINE_PAGES);
+        assert_eq!(
+            error.to_string(),
+            "the timeline of pull request #7 has more than 5000 items, more than xtask reads"
+        );
+    }
+
+    /// Runs are read page by page to GitHub's last, [`super::RUN_PAGES`], however full it is.
+    #[test]
+    fn runs_are_read_to_the_last_page_github_lists() {
+        let head = super::Head {
+            sha: "abc",
+            repository: "o/r",
+            branch: "x",
+        };
+        let other = json!({
+            "head_sha": "def",
+            "head_branch": "x",
+            "head_repository": {"full_name": "o/r"},
+            "actor": {"login": "snehilvj"},
+            "created_at": "2026-11-05T09:00:00Z",
+        });
+        let mut asked = Vec::new();
+        let push = super::push_of(head, &[], &mut |path: &str| {
+            asked.push(path.to_owned());
+            Ok(json!({"workflow_runs": vec![other.clone(); super::PER_PAGE]}))
+        })
+        .unwrap();
+        assert_eq!(push, None, "no run is of this head");
+        assert_eq!(asked.len(), super::RUN_PAGES);
+        assert!(
+            asked.last().unwrap().ends_with("&per_page=100&page=10"),
+            "{asked:?}"
+        );
+    }
+
+    /// A force push names the head it made: one to this head records its push though no run
+    /// started; one to another commit does not.
+    #[test]
+    fn a_force_push_records_only_the_head_it_made() {
+        let forced = |commit: &str| {
+            [json!({
+                "event": "head_ref_force_pushed",
+                "commit_id": commit,
+                "actor": {"login": "snehilvj"},
+                "created_at": "2026-11-05T10:00:00Z",
+            })]
+        };
+        let head = super::Head {
+            sha: "abc",
+            repository: "o/r",
+            branch: "x",
+        };
+        let mut no_runs = |_: &str| Ok(json!({"workflow_runs": []}));
+        assert_eq!(
+            super::push_of(head, &forced("abc"), &mut no_runs).unwrap(),
+            Some(super::Push {
+                pusher: "snehilvj".to_owned(),
+                at: "2026-11-05T10:00:00Z".to_owned(),
+            })
+        );
+        assert_eq!(
+            super::push_of(head, &forced("def"), &mut no_runs).unwrap(),
+            None,
+            "a force push to another commit is no push of this head"
+        );
+    }
+
+    /// A newer force push of another commit is not the head's push: the head's own, earlier one
+    /// stays the latest.
+    #[test]
+    fn a_newer_force_push_of_another_commit_is_not_the_latest_push() {
+        let timeline = [
+            json!({
+                "event": "head_ref_force_pushed",
+                "commit_id": "abc",
+                "actor": {"login": "alice"},
+                "created_at": "2026-11-05T09:00:00Z",
+            }),
+            json!({
+                "event": "head_ref_force_pushed",
+                "commit_id": "def",
+                "actor": {"login": "bob"},
+                "created_at": "2026-11-05T10:00:00Z",
+            }),
+        ];
+        let push = super::push_of(
+            super::Head {
+                sha: "abc",
+                repository: "o/r",
+                branch: "x",
+            },
+            &timeline,
+            &mut |_: &str| Ok(json!({"workflow_runs": []})),
+        )
+        .unwrap();
+        assert_eq!(
+            push,
+            Some(super::Push {
+                pusher: "alice".to_owned(),
+                at: "2026-11-05T09:00:00Z".to_owned(),
+            })
+        );
+    }
+
+    /// A pull request reopened after its head's run, with a branch pushed while it was closed,
+    /// counts the reopening as its latest push.
+    #[test]
+    fn a_reopening_after_the_run_is_the_latest_push() {
+        let run = json!({
+            "head_sha": "abc",
+            "head_branch": "x",
+            "head_repository": {"full_name": "o/r"},
+            "actor": {"login": "getabc-dev-agent[bot]"},
+            "created_at": "2026-11-05T09:00:00Z",
+        });
+        let timeline = [json!({
+            "event": "reopened",
+            "actor": {"login": "snehilvj"},
+            "created_at": "2026-11-05T10:00:00Z",
+        })];
+        let push = super::push_of(
+            super::Head {
+                sha: "abc",
+                repository: "o/r",
+                branch: "x",
+            },
+            &timeline,
+            &mut |_: &str| Ok(json!({"workflow_runs": [run.clone()]})),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            push,
+            super::Push {
+                pusher: "snehilvj".to_owned(),
+                at: "2026-11-05T10:00:00Z".to_owned(),
+            }
+        );
+    }
+
+    /// [`push_of`] reads pushes from [`PUSH_WORKFLOW`]'s runs, so nothing but a push or a
+    /// reopen may start one: GitHub's default `pull_request` activity types.
+    #[test]
+    fn the_push_workflow_runs_on_pushes_alone() {
+        let text = crate::testing::read_in_repository(&format!(
+            ".github/workflows/{}",
+            super::PUSH_WORKFLOW
+        ));
+        let workflow = &yaml_rust2::YamlLoader::load_from_str(&text).unwrap()[0];
+        let trigger = &workflow["on"]["pull_request"];
+        assert!(
+            !trigger.is_badvalue(),
+            "{} runs on pull_request",
+            super::PUSH_WORKFLOW
+        );
+        assert!(
+            trigger["types"].is_badvalue(),
+            "{} keeps the default types (opened, synchronize, reopened); a label or edit that \
+             started it would read as a push: {trigger:?}",
+            super::PUSH_WORKFLOW
+        );
+    }
 
     use super::{Repo, Request, get, graphql, http, with_token};
     use crate::testing::serve;

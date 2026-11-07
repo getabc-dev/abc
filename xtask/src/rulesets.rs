@@ -700,7 +700,7 @@ mod tests {
             ruleset(&["Checks", "lint"]),
         )
         .unwrap();
-        let checked_in = crate::repo_root().unwrap();
+        let checked_in = crate::testing::checkout();
         for file in [BRANCHES, TAGS] {
             fs::copy(checked_in.join(file), root.join(file)).unwrap();
         }
@@ -753,7 +753,7 @@ mod tests {
 
     #[test]
     fn the_checked_in_ruleset_matches_the_workflows() {
-        check(&crate::repo_root().unwrap()).unwrap();
+        check(&crate::testing::checkout()).unwrap();
     }
 
     #[test]
@@ -841,7 +841,7 @@ mod tests {
             ruleset(&["Checks", "lint"]),
         )
         .unwrap();
-        let checked_in = crate::repo_root().unwrap();
+        let checked_in = crate::testing::checkout();
         for file in [BRANCHES, TAGS] {
             fs::copy(checked_in.join(file), repo.join(file)).unwrap();
         }
@@ -938,7 +938,7 @@ case \"$*\" in 'api repos/getabc-dev/abc/rulesets') echo '[]' ;; *) \
 
     #[test]
     fn the_branch_and_tag_rulesets_keep_their_shape() {
-        let root = crate::repo_root().unwrap();
+        let root = crate::testing::checkout();
         let branches = fs::read_to_string(root.join(BRANCHES)).unwrap();
         let tags = fs::read_to_string(root.join(TAGS)).unwrap();
         check_refs(&branches, Refs::Branches).unwrap();
@@ -1000,8 +1000,10 @@ case \"$*\" in 'api repos/getabc-dev/abc/rulesets') echo '[]' ;; *) \
 
     #[test]
     fn the_branch_exclusions_free_the_merge_queue_and_agents_and_nothing_else() {
-        let ruleset: serde_json::Value =
-            serde_json::from_str(include_str!("../../.github/rulesets/branches.json")).unwrap();
+        let ruleset: serde_json::Value = serde_json::from_str(&crate::testing::read_in_repository(
+            ".github/rulesets/branches.json",
+        ))
+        .unwrap();
         let excluded: Vec<String> = ruleset["conditions"]["ref_name"]["exclude"]
             .as_array()
             .unwrap()

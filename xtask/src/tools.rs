@@ -1748,7 +1748,7 @@ targets.aarch64-unknown-linux-gnu = {{ platform = "linux-arm64", sha256 = "{sha2
 
     #[test]
     fn no_checked_in_pin_is_all_zeros() {
-        let manifest = Manifest::load(&crate::repo_root().unwrap()).unwrap();
+        let manifest = Manifest::load(&crate::testing::checkout()).unwrap();
         let zeros = "0".repeat(64);
         for tool in &manifest.tools {
             let mut pins: Vec<(String, &str)> = Vec::new();
@@ -1773,7 +1773,7 @@ targets.aarch64-unknown-linux-gnu = {{ platform = "linux-arm64", sha256 = "{sha2
 
     #[test]
     fn checked_in_tool_list_is_valid() {
-        let root = crate::repo_root().unwrap();
+        let root = crate::testing::checkout();
         let manifest = Manifest::load(&root).unwrap();
         for name in [
             "cargo-nextest",
@@ -2760,7 +2760,7 @@ targets.aarch64-unknown-linux-gnu = {{ platform = "linux-arm64", sha256 = "{sha2
 
     #[test]
     fn setup_and_doctor_can_select_tools() {
-        let root = crate::repo_root().unwrap();
+        let root = crate::testing::checkout();
         let unknown = ["no-such-tool".to_owned()];
         assert!(
             setup(&root, &unknown, false, &mut Vec::new()).is_err(),
@@ -2789,7 +2789,7 @@ targets.aarch64-unknown-linux-gnu = {{ platform = "linux-arm64", sha256 = "{sha2
     fn for_tests_selects_exactly_the_tools_the_tests_run() {
         let names = |only: &[&str], for_tests: bool| -> Vec<String> {
             let only: Vec<String> = only.iter().map(|&name| name.to_owned()).collect();
-            Manifest::load(&crate::repo_root().unwrap())
+            Manifest::load(&crate::testing::checkout())
                 .unwrap()
                 .select(&only, for_tests)
                 .unwrap()
