@@ -351,12 +351,17 @@ impl Session {
 
     /// Puts the session repository's config back to the host's, empties its hooks and drops its
     /// alternates and any per-worktree config, so nothing the VM wrote there runs on the host.
+    /// Its origin is always the HTTPS URL of the main clone's GitHub repository, whatever URL the
+    /// host uses: the VM has no SSH key, reaches the network only over HTTPS, and its credential
+    /// helper answers only for `https://github.com`.
     fn seal(&self, repo: &Path) -> anyhow::Result<()> {
-        let origin = git_main(&self.common, &["config", "remote.origin.url"]).unwrap_or_default();
+        let origin = git_main(&self.common, &["config", "remote.origin.url"])
+            .context("the main clone has no origin")?;
+        let origin = crate::github::Repo::parse(origin.trim())?.https_url();
         let mut config = format!(
             "[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n\tbare = true\n\
              [remote \"origin\"]\n\turl = {}\n\tfetch = +refs/heads/*:refs/remotes/origin/*\n",
-            quoted(origin.trim())
+            quoted(&origin)
         );
         let identity: Vec<(&str, String)> = ["name", "email"]
             .into_iter()

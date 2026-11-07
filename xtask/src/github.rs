@@ -54,6 +54,11 @@ impl Repo {
         Self::parse(crate::git::git(root, &["remote", "get-url", "origin"])?.trim())
     }
 
+    /// Its HTTPS URL, as git clones it.
+    pub(crate) fn https_url(&self) -> String {
+        format!("https://github.com/{}/{}.git", self.owner, self.name)
+    }
+
     /// A REST path under this repository, such as `pulls/7`.
     pub(crate) fn path(&self, rest: &str) -> String {
         format!("/repos/{}/{}/{rest}", self.owner, self.name)
