@@ -391,14 +391,16 @@ mod tests {
     fn the_server_needs_its_socket_named() {
         let output = bare(&["server"], &[]).status.code();
         assert_eq!(output, Some(2), "a configuration error");
-        let mut command = Command::new(env!("CARGO_BIN_EXE_abc"));
-        let named = command
-            .arg("server")
-            .env_clear()
-            .env("ABC_PUBLIC_URL", "https://abc.example.ts.net")
-            .env("ABC_DATABASE_URL", "postgres://abc@127.0.0.1:1/abc")
-            .output()
-            .unwrap();
+        let named = bare(
+            &["server"],
+            &[
+                ("ABC_PUBLIC_URL", Path::new("https://abc.example.ts.net")),
+                (
+                    "ABC_DATABASE_URL",
+                    Path::new("postgres://abc@127.0.0.1:1/abc"),
+                ),
+            ],
+        );
         assert_eq!(named.status.code(), Some(2), "{}", text(&named.stderr));
         assert!(
             text(&named.stderr).contains("ABC_SIDECAR_SOCKET is required to run the server"),
