@@ -3575,6 +3575,197 @@ targets.aarch64-unknown-linux-gnu = {{ platform = "linux-arm64", sha256 = "{sha2
     }
 
     #[test]
+    fn a_target_may_keep_its_executable_elsewhere_in_its_archive() {
+        let root = tempfile::tempdir().unwrap();
+        let archive = tarball(&[
+            ("fake-1.2.3/fake", SCRIPT, 0o755),
+            ("fake-1.2.3/Contents/Home/fake", SCRIPT, 0o755),
+        ]);
+        let tree = Tree::of_archive(&archive).unwrap().sha256();
+        let text = manifest_text(&sha256_hex(&archive), &sha256_hex(SCRIPT))
+            .replace(
+                "binary = \"fake-{version}/fake\"\n",
+                "binary = \"fake-{version}/fake\"\ntree = true\n",
+            )
+            .replace(" }\n", &format!(", tree-sha256 = \"{tree}\" }}\n"))
+            .replace(
+                "platform = \"mac\",",
+                "platform = \"mac\", binary = \"fake-{version}/Contents/Home/fake\",",
+            );
+        let manifest = Manifest::parse(&text).unwrap();
+        let tool = only_tool(&manifest);
+        assert_eq!(
+            tool.executable(root.path(), Target::MacArm64).unwrap(),
+            root.path()
+                .join(".tools/fake/1.2.3/fake-1.2.3/Contents/Home/fake"),
+            "the target's own path"
+        );
+        assert_eq!(
+            tool.executable(root.path(), Target::LinuxX64).unwrap(),
+            root.path().join(".tools/fake/1.2.3/fake-1.2.3/fake"),
+            "the tool's path elsewhere"
+        );
+        install(root.path(), tool, None, Target::MacArm64, &archive).unwrap();
+        assert_eq!(
+            tool.status(root.path(), Target::MacArm64, None).unwrap(),
+            Status::Ready
+        );
+
+        let without_binary = manifest_text(SHA_A, SHA_B)
+            .replace("binary = \"fake-{version}/fake\"\n", "")
+            .replace(
+                "platform = \"mac\",",
+                "platform = \"mac\", binary = \"fake\",",
+            );
+        let unpaired = format!("{:#}", Manifest::parse(&without_binary).unwrap_err());
+        assert!(
+            unpaired.contains("a target's binary replaces the tool's `binary`, which it needs"),
+            "{unpaired}"
+        );
+        let escaping = text.replace("fake-{version}/Contents/Home/fake", "../fake");
+        let outside = format!("{:#}", Manifest::parse(&escaping).unwrap_err());
+        assert!(
+            outside.contains("aarch64-apple-darwin: binary \"../fake\" must be a relative path"),
+            "{outside}"
+        );
+    }
+
+    /// A tool list of `rt`, an executable asset, then `fake`, which runs on it.
+    fn with_runtime(runtime: &[u8], archive: &[u8]) -> String {
+        let rt = sha256_hex(runtime);
+        format!(
+            r#"[[tool]]
+name = "rt"
+version = "9.9.9"
+url = "https://example.com/rt-{{platform}}"
+attestations = "example/rt"
+targets.aarch64-apple-darwin = {{ platform = "mac", sha256 = "{rt}", binary-sha256 = "{rt}" }}
+targets.x86_64-unknown-linux-gnu = {{ platform = "linux-x64", sha256 = "{rt}", binary-sha256 = "{rt}" }}
+targets.aarch64-unknown-linux-gnu = {{ platform = "linux-arm64", sha256 = "{rt}", binary-sha256 = "{rt}" }}
+
+{}"#,
+            manifest_text(&sha256_hex(archive), &sha256_hex(RUNS_ON_RT))
+                .replace("# The tools.\n", "")
+                .replace("[[tool]]\n", "[[tool]]\nruntime = \"rt\"\n")
+        )
+    }
+
+    /// An executable that reports its version only when `rt` is first on `PATH`.
+    const RUNS_ON_RT: &[u8] = b"#!/bin/sh\nrt && echo 'fake 1.2.3'\n";
+
+    #[test]
+    fn a_runtime_comes_first_on_path_whenever_its_tool_runs() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime: &[u8] = b"#!/bin/sh\n[ \"$1\" = --version ] && echo 'rt 9.9.9'\nexit 0\n";
+        let archive = tarball(&[("fake-1.2.3/fake", RUNS_ON_RT, 0o755)]);
+        let manifest = Manifest::parse(&with_runtime(runtime, &archive)).unwrap();
+        let mut downloads = Vec::new();
+        install_unready(
+            root.path(),
+            &manifest,
+            Target::MacArm64,
+            &mut Vec::new(),
+            &mut |url: &str| {
+                downloads.push(url.to_owned());
+                Ok(if url.contains("/rt-") {
+                    runtime.to_vec()
+                } else {
+                    archive.clone()
+                })
+            },
+        )
+        .unwrap();
+        assert_eq!(downloads.len(), 2, "{downloads:?}");
+        let fake = only_tool(&manifest);
+        assert!(
+            matches!(
+                fake.status(root.path(), Target::MacArm64, None).unwrap(),
+                Status::Drift { said } if said.contains("rt")
+            ),
+            "without its runtime it cannot run"
+        );
+        let mut out = Vec::new();
+        assert_eq!(
+            report(root.path(), &manifest, Target::MacArm64, &mut out).unwrap(),
+            ExitCode::SUCCESS,
+            "{}",
+            String::from_utf8_lossy(&out)
+        );
+
+        let selected = Manifest::parse(&with_runtime(runtime, &archive))
+            .unwrap()
+            .select(&["fake".to_owned()], false)
+            .unwrap();
+        let names: Vec<&str> = selected
+            .tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            ["rt", "fake"],
+            "selecting a tool selects its runtime"
+        );
+    }
+
+    #[test]
+    fn a_tool_run_by_hand_has_its_runtime_first_on_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = dir.path().join("rt-home/bin/rt");
+        write_executable(&runtime, b"#!/bin/sh\nexit 0\n");
+        let tool = dir.path().join("tool");
+        write_executable(&tool, b"#!/bin/sh\nrt || exit 7\nexit 4\n");
+        assert_eq!(
+            super::run(&tool, Some(&runtime), dir.path(), &[]).unwrap(),
+            ExitCode::from(4),
+            "the runtime is found"
+        );
+        assert_eq!(
+            super::run(&tool, None, dir.path(), &[]).unwrap(),
+            ExitCode::from(7),
+            "without it, it is not"
+        );
+        let checkout = crate::testing::checkout();
+        assert_eq!(
+            super::runtime(&checkout, "apalache").unwrap(),
+            Some(crate::testing::pinned_for_tests("jre")),
+            "Apalache runs on the pinned JRE"
+        );
+        assert_eq!(super::runtime(&checkout, "quint").unwrap(), None);
+    }
+
+    #[test]
+    fn a_runtime_is_a_tool_listed_before_that_needs_none() {
+        let valid = with_runtime(b"rt", b"fake");
+        let (rt, fake) = valid.split_at(valid.find("\n[[tool]]\nruntime").unwrap());
+        for (text, problem) in [
+            (
+                format!("{fake}\n{rt}"),
+                "tool \"fake\": its runtime \"rt\" must be a tool listed before it",
+            ),
+            (
+                valid.replace("runtime = \"rt\"", "runtime = \"fake\""),
+                "tool \"fake\": its runtime \"fake\" must be a tool listed before it",
+            ),
+            (
+                valid.replace("runtime = \"rt\"", "runtime = \"jre\""),
+                "tool \"fake\": its runtime \"jre\" must be a tool listed before it",
+            ),
+            (
+                format!(
+                    "{}\n{}",
+                    rt.replace("name = \"rt\"", "name = \"rt0\""),
+                    valid.replacen("name = \"rt\"", "name = \"rt\"\nruntime = \"rt0\"", 1)
+                ),
+                "must not need a runtime itself",
+            ),
+        ] {
+            let error = format!("{:#}", Manifest::parse(&text).unwrap_err());
+            assert!(error.contains(problem), "{problem}: {error}");
+        }
+    }
+
+    #[test]
     fn a_tree_needs_its_pin_and_an_archive() {
         let base = manifest_text(SHA_A, SHA_B);
         let tree = |text: &str| {
