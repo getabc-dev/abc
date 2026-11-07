@@ -114,9 +114,7 @@ pub(crate) fn run(
     root: &Path,
     base: &str,
     options: &Options,
-    mutants: &Path,
-    nextest: &Path,
-    web: &crate::web::Toolchain,
+    tools: &Tools,
     out: &mut impl Write,
 ) -> anyhow::Result<bool> {
     let commit = git::merge_base(root, base)?;
@@ -132,7 +130,7 @@ pub(crate) fn run(
         mutated = true;
         // The main workspace's abc crate embeds the built web app, which the copies of the tree
         // take along.
-        if workspace == check::MAIN && !crate::web::build_here(root, web, out)? {
+        if workspace == check::MAIN && !crate::web::build_here(root, &tools.web, out)? {
             passed = false;
             continue;
         }
@@ -140,8 +138,7 @@ pub(crate) fn run(
             root,
             workspace,
             options,
-            mutants,
-            nextest,
+            tools,
         };
         let result = run.mutate(&diff, &mut step, out);
         if result.is_err() {
@@ -194,8 +191,30 @@ struct Run<'a> {
     root: &'a Path,
     workspace: Workspace,
     options: &'a Options,
-    mutants: &'a Path,
-    nextest: &'a Path,
+    tools: &'a Tools,
+}
+
+/// The pinned tools a mutants run uses.
+#[derive(Debug)]
+pub(crate) struct Tools {
+    mutants: PathBuf,
+    nextest: PathBuf,
+    /// Postgres 18's bin directory, which the tests get as [`check::POSTGRES_BIN`].
+    postgres: PathBuf,
+    /// node and pnpm, which build the web app the abc crate embeds.
+    web: crate::web::Toolchain,
+}
+
+impl Tools {
+    /// The pinned ones, found with `tool`.
+    pub(crate) fn pinned(tool: &dyn Fn(&str) -> anyhow::Result<PathBuf>) -> anyhow::Result<Self> {
+        Ok(Self {
+            mutants: tool("cargo-mutants")?,
+            nextest: tool("cargo-nextest")?,
+            postgres: check::postgres_bin(tool)?,
+            web: crate::web::Toolchain::pinned(tool)?,
+        })
+    }
 }
 
 impl Run<'_> {
@@ -249,7 +268,7 @@ impl Run<'_> {
         // name, or it would run without its timeouts and write no report.
         let mut nextest_config = OsString::from("--cargo-test-arg=--config-file=");
         nextest_config.push(root.join(check::NEXTEST_CONFIG));
-        let mut command = Command::new(self.mutants);
+        let mut command = Command::new(&self.tools.mutants);
         command
             .arg("mutants")
             .arg("--in-diff")
@@ -291,9 +310,10 @@ impl Run<'_> {
             )
             .arg("--output")
             .arg(&output)
-            .env("PATH", tools::path_with(self.nextest)?)
+            .env("PATH", tools::path_with(&self.tools.nextest)?)
             .env("PROPTEST_RNG_SEED", PROPTEST_RNG_SEED)
             .env(TEST_REPOSITORY, root)
+            .env(check::POSTGRES_BIN, &self.tools.postgres)
             .env("TMPDIR", scratch.path())
             // Each copy builds into its own target/: a copy of xtask/ alone has no .cargo/, and
             // cargo, looking up from it, would read the checkout's and build every mutant into the
@@ -599,6 +619,16 @@ mod tests {
         crate::web::Toolchain::pinned(&|name| Ok(Path::new("unused").join(name))).unwrap()
     }
 
+    /// The tools a test run uses: `mutants` and `nextest` fakes, and `web`.
+    fn tools(mutants: &Path, nextest: &Path, web: &crate::web::Toolchain) -> super::Tools {
+        super::Tools {
+            mutants: mutants.to_path_buf(),
+            nextest: nextest.to_path_buf(),
+            postgres: Path::new("/pinned/postgresql/bin").to_path_buf(),
+            web: web.clone(),
+        }
+    }
+
     #[test]
     fn reads_cargo_mutants_exit_codes() {
         assert_eq!(outcome(Some(0)).unwrap(), Outcome::AllCaught, "success");
@@ -745,7 +775,14 @@ mod tests {
             "[ \"$1\" = mutants ] || exit 7\nwhile [ $# -gt 0 ]; do case \"$1\" in --output) out=$2 ;; --in-diff) diff=$2 ;; --timeout-multiplier) multiplier=$2 ;; esac; shift; done\ngrep -q 'src/a.rs' \"$diff\" || exit 8\n[ \"$multiplier\" = 6 ] || exit 9\nmkdir -p \"$out/mutants.out\"\necho 'src/a.rs:1:18: replace a -> bool with false' > \"$out/mutants.out/missed.txt\"\nexit 2\n",
         );
         let mut out = Vec::new();
-        let passed = run(&repo, "base", &TWO, &missing, &nextest, &web, &mut out).unwrap();
+        let passed = run(
+            &repo,
+            "base",
+            &TWO,
+            &tools(&missing, &nextest, &web),
+            &mut out,
+        )
+        .unwrap();
         let text = String::from_utf8(out).unwrap();
         assert!(!passed, "a missed mutant fails: {text}");
         assert!(
@@ -764,7 +801,14 @@ mod tests {
         );
         let mut both = Vec::new();
         assert!(
-            !run(&repo, "base", &TWO, &mixed, &nextest, &web, &mut both).unwrap(),
+            !run(
+                &repo,
+                "base",
+                &TWO,
+                &tools(&mixed, &nextest, &web),
+                &mut both
+            )
+            .unwrap(),
             "a missed mutant fails even when another timed out"
         );
         assert!(
@@ -776,7 +820,7 @@ mod tests {
         script(
             &caught,
             &format!(
-                "while [ $# -gt 0 ]; do case \"$1\" in --shard) shard=$2 ;; --cargo-arg=--config=*) config=${{1#--cargo-arg=--config=}} ;; esac; shift; done\n[ \"$shard\" = 1/4 ] || exit 9\nmkdir \"$TMPDIR/cargo-mutants-copy\"\necho \"$TMPDIR\" > {}\ncp \"$config\" {}\n",
+                "while [ $# -gt 0 ]; do case \"$1\" in --shard) shard=$2 ;; --cargo-arg=--config=*) config=${{1#--cargo-arg=--config=}} ;; esac; shift; done\n[ \"$shard\" = 1/4 ] || exit 9\n[ \"$ABC_TEST_POSTGRES_BIN\" = /pinned/postgresql/bin ] || exit 10\nmkdir \"$TMPDIR/cargo-mutants-copy\"\necho \"$TMPDIR\" > {}\ncp \"$config\" {}\n",
                 temp.path().join("tmpdir").display(),
                 temp.path().join("config.toml").display()
             ),
@@ -791,13 +835,11 @@ mod tests {
                 &repo,
                 "base",
                 &sharded,
-                &caught,
-                &nextest,
-                &web,
-                &mut Vec::new()
+                &tools(&caught, &nextest, &web),
+                &mut Vec::new(),
             )
             .unwrap(),
-            "all caught, in the shard asked for"
+            "all caught, in the shard asked for, with the pinned Postgres for the tests"
         );
         let tmpdir = fs::read_to_string(temp.path().join("tmpdir")).unwrap();
         assert_eq!(
@@ -818,13 +860,26 @@ mod tests {
             std::env::temp_dir().to_str(),
             "while the tests get this process's temporary directory: {config}"
         );
+    }
 
+    #[test]
+    fn a_change_without_rust_runs_nothing() {
+        let temp = tempfile::tempdir().unwrap();
+        let web = no_web();
+        let nextest = temp.path().join("cargo-nextest");
         let docs = repository_with_change(&temp.path().join("docs"), &[("README.md", "# x\n")]);
         let never = temp.path().join("never");
         script(&never, "exit 99\n");
         let mut skipped = Vec::new();
         assert!(
-            run(&docs, "base", &TWO, &never, &nextest, &web, &mut skipped).unwrap(),
+            run(
+                &docs,
+                "base",
+                &TWO,
+                &tools(&never, &nextest, &web),
+                &mut skipped
+            )
+            .unwrap(),
             "nothing to mutate"
         );
         assert!(
@@ -853,9 +908,11 @@ mod tests {
             &repo,
             "base",
             &TWO,
-            &never,
-            &temp.path().join("cargo-nextest"),
-            &crate::testing::fake_web(&web, "build"),
+            &tools(
+                &never,
+                &temp.path().join("cargo-nextest"),
+                &crate::testing::fake_web(&web, "build"),
+            ),
             &mut out,
         )
         .unwrap();
@@ -899,9 +956,7 @@ mod tests {
             &repo,
             "base",
             &actions,
-            &mutants,
-            &nextest,
-            &no_web(),
+            &tools(&mutants, &nextest, &no_web()),
             &mut out,
         )
         .unwrap();
@@ -974,9 +1029,7 @@ mod tests {
             &repo,
             "base",
             &actions,
-            &mutants,
-            &temp.path().join("cargo-nextest"),
-            &no_web(),
+            &tools(&mutants, &temp.path().join("cargo-nextest"), &no_web()),
             &mut out,
         )
         .unwrap_err();
@@ -1048,9 +1101,11 @@ mod tests {
             &repo,
             "base",
             &actions,
-            &mutants,
-            &crate::testing::pinned_for_tests("cargo-nextest"),
-            &no_web(),
+            &tools(
+                &mutants,
+                &crate::testing::pinned_for_tests("cargo-nextest"),
+                &no_web(),
+            ),
             &mut out,
         )
         .unwrap_err();
@@ -1100,9 +1155,7 @@ mod tests {
             &repo,
             "base",
             &actions,
-            &mutants,
-            &temp.path().join("cargo-nextest"),
-            &no_web(),
+            &tools(&mutants, &temp.path().join("cargo-nextest"), &no_web()),
             &mut out,
         )
         .unwrap_err();
@@ -1146,9 +1199,7 @@ mod tests {
             &repo,
             "base",
             &actions,
-            &unreadable,
-            &temp.path().join("cargo-nextest"),
-            &no_web(),
+            &tools(&unreadable, &temp.path().join("cargo-nextest"), &no_web()),
             &mut out,
         )
         .unwrap_err();
@@ -1172,9 +1223,7 @@ mod tests {
             &repo,
             "base",
             &TWO,
-            &crashing,
-            &temp.path().join("cargo-nextest"),
-            &no_web(),
+            &tools(&crashing, &temp.path().join("cargo-nextest"), &no_web()),
             &mut Vec::new(),
         )
         .unwrap_err();
@@ -1191,9 +1240,11 @@ mod tests {
             &repo,
             "base",
             &TWO,
-            &temp.path().join("absent"),
-            &temp.path().join("cargo-nextest"),
-            &no_web(),
+            &tools(
+                &temp.path().join("absent"),
+                &temp.path().join("cargo-nextest"),
+                &no_web(),
+            ),
             &mut Vec::new(),
         )
         .unwrap_err();
@@ -1234,9 +1285,7 @@ mod tests {
                 &repo,
                 "base",
                 &actions,
-                &mutants,
-                &temp.path().join("cargo-nextest"),
-                &no_web(),
+                &tools(&mutants, &temp.path().join("cargo-nextest"), &no_web()),
                 &mut out,
             )
             .unwrap()
@@ -1346,9 +1395,7 @@ mod tests {
                 &repo,
                 "base",
                 &TWO,
-                &mutants,
-                &temp.path().join("cargo-nextest"),
-                &no_web(),
+                &tools(&mutants, &temp.path().join("cargo-nextest"), &no_web()),
                 &mut out,
             )
             .unwrap(),

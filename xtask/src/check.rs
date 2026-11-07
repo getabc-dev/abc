@@ -222,6 +222,8 @@ impl Failure {
 pub(crate) struct Tools<'a> {
     pub(crate) nextest: PathBuf,
     pub(crate) shellcheck: PathBuf,
+    /// Postgres 18's bin directory, for the tests that run Postgres's own programs.
+    pub(crate) postgres: PathBuf,
     /// node and pnpm, for a tree with the web app.
     pub(crate) web: Option<crate::web::Toolchain>,
     /// Finds Quint, Apalache and the JRE, for a tree with formal specs: only when the specs' gate
@@ -658,12 +660,7 @@ impl<W: Write> Run<'_, W> {
     fn tests(&mut self, workspace: Workspace, scope: &Scope) -> anyhow::Result<()> {
         let report = self.root.join(workspace.dir()).join(crate::junit::REPORT);
         crate::junit::clear(&report)?;
-        if !self.step(&mut test_command(
-            &self.tools.nextest,
-            self.root,
-            workspace,
-            scope,
-        ))? {
+        if !self.step(&mut test_command(self.tools, self.root, workspace, scope))? {
             self.failures.push(Failure::new(
                 "tests",
                 workspace,
@@ -736,17 +733,35 @@ pub(crate) fn tee(
 }
 
 /// The nextest run for `scope` of `workspace` in the repository at `root`, with its nextest
-/// configuration and property tests seeded by [`PROPTEST_RNG_SEED`].
-fn test_command(nextest: &Path, root: &Path, workspace: Workspace, scope: &Scope) -> Command {
-    let mut command = Command::new(nextest);
+/// configuration, property tests seeded by [`PROPTEST_RNG_SEED`] and Postgres's programs at
+/// [`POSTGRES_BIN`].
+fn test_command(tools: &Tools<'_>, root: &Path, workspace: Workspace, scope: &Scope) -> Command {
+    let mut command = Command::new(&tools.nextest);
     command
         .args(["nextest", "run"])
         .args(Workspace::nextest_config_args(root))
         .args(workspace.manifest_args())
         .args(scope.cargo_args())
         .arg("--locked")
-        .env("PROPTEST_RNG_SEED", PROPTEST_RNG_SEED);
+        .env("PROPTEST_RNG_SEED", PROPTEST_RNG_SEED)
+        .env(POSTGRES_BIN, &tools.postgres);
     command
+}
+
+/// The variable naming Postgres 18's bin directory for the tests: `abc server setup`'s end-to-end
+/// test runs a private Postgres with these programs, never ones from `PATH`.
+pub(crate) const POSTGRES_BIN: &str = "ABC_TEST_POSTGRES_BIN";
+
+/// Postgres 18's bin directory: where the pinned `postgresql` tool's `postgres` is, found with
+/// `tool`, which resolves and verifies a pinned tool.
+pub(crate) fn postgres_bin(
+    tool: &dyn Fn(&str) -> anyhow::Result<PathBuf>,
+) -> anyhow::Result<PathBuf> {
+    let postgres = tool("postgresql")?;
+    postgres
+        .parent()
+        .map(Path::to_path_buf)
+        .with_context(|| format!("{} has no directory", postgres.display()))
 }
 
 /// Cargo as chosen by `cargo xtask`, so every step uses the pinned toolchain.
@@ -910,8 +925,8 @@ mod tests {
     use std::collections::BTreeSet;
 
     use super::{
-        MAIN, Options, PROPTEST_RNG_SEED, Package, Scope, Tools, Tree, XTASK, affected,
-        changed_since, review_size, run, test_command,
+        MAIN, Options, POSTGRES_BIN, PROPTEST_RNG_SEED, Package, Scope, Tools, Tree, XTASK,
+        affected, changed_since, postgres_bin, review_size, run, test_command,
     };
     use crate::annotation::Mode;
     use crate::git::default_branch;
@@ -1420,6 +1435,7 @@ mod tests {
         let tools = Tools {
             nextest,
             shellcheck: crate::testing::pinned_for_tests("shellcheck"),
+            postgres: PathBuf::from("unused"),
             web: None,
             spec: None,
         };
@@ -1503,6 +1519,7 @@ mod tests {
         let tools = Tools {
             nextest: PathBuf::from("unused"),
             shellcheck: crate::testing::pinned_for_tests("shellcheck"),
+            postgres: PathBuf::from("unused"),
             web: None,
             spec: None,
         };
@@ -1531,6 +1548,7 @@ mod tests {
         let tools = Tools {
             nextest: PathBuf::from("unused"),
             shellcheck: PathBuf::from("unused"),
+            postgres: PathBuf::from("unused"),
             web,
             spec: None,
         };
@@ -1609,6 +1627,7 @@ mod tests {
         let tools = Tools {
             nextest: crate::testing::pinned_for_tests("cargo-nextest"),
             shellcheck: PathBuf::from("unused"),
+            postgres: PathBuf::from("unused"),
             web: Some(crate::testing::fake_web(&tools_dir, "")),
             spec: None,
         };
@@ -1706,6 +1725,7 @@ mod tests {
         let tools = Tools {
             nextest: PathBuf::from("unused"),
             shellcheck: PathBuf::from("unused"),
+            postgres: PathBuf::from("unused"),
             web: None,
             spec,
         };
@@ -1869,7 +1889,7 @@ mod tests {
             "the main workspace is the root's"
         );
         let command = test_command(
-            Path::new("cargo-nextest"),
+            &command_tools(),
             Path::new("/work/abc"),
             XTASK,
             &Scope::Workspace,
@@ -2001,10 +2021,57 @@ mod tests {
         );
     }
 
+    /// Tools that only name their programs, for building commands.
+    fn command_tools() -> Tools<'static> {
+        Tools {
+            nextest: PathBuf::from("cargo-nextest"),
+            shellcheck: PathBuf::from("shellcheck"),
+            postgres: PathBuf::from("/pinned/postgresql/bin"),
+            web: None,
+            spec: None,
+        }
+    }
+
+    #[test]
+    fn the_tests_get_postgres_from_the_pinned_tool() {
+        let command = test_command(
+            &command_tools(),
+            Path::new("/work/abc"),
+            MAIN,
+            &Scope::Workspace,
+        );
+        let bin = command
+            .get_envs()
+            .find(|(name, _)| *name == POSTGRES_BIN)
+            .and_then(|(_, value)| value);
+        assert_eq!(
+            bin,
+            Some(OsStr::new("/pinned/postgresql/bin")),
+            "abc server setup's test runs the pinned Postgres"
+        );
+        assert_eq!(
+            postgres_bin(&|name| Ok(Path::new("/tools").join(name).join("bin/postgres"))).unwrap(),
+            Path::new("/tools/postgresql/bin"),
+            "the directory of the pinned postgresql tool's postgres"
+        );
+        assert!(
+            postgres_bin(&|name| anyhow::bail!("{name} is not installed")).is_err(),
+            "a missing tool is an error"
+        );
+        assert!(
+            crate::testing::pinned_for_tests("postgresql")
+                .parent()
+                .unwrap()
+                .join("initdb")
+                .is_file(),
+            "the pinned tool holds initdb beside postgres"
+        );
+    }
+
     #[test]
     fn property_tests_run_with_a_fixed_seed() {
         let command = test_command(
-            Path::new("cargo-nextest"),
+            &command_tools(),
             Path::new("/work/abc"),
             MAIN,
             &Scope::Workspace,

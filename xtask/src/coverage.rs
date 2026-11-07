@@ -37,8 +37,22 @@ type Hits = BTreeMap<String, BTreeMap<u32, u64>>;
 pub(crate) struct Tools {
     pub(crate) llvm_cov: PathBuf,
     pub(crate) nextest: PathBuf,
+    /// Postgres 18's bin directory, which the tests get as [`check::POSTGRES_BIN`].
+    pub(crate) postgres: PathBuf,
     /// node and pnpm, for the web app's tests.
     pub(crate) web: web::Toolchain,
+}
+
+impl Tools {
+    /// The pinned ones, found with `tool`.
+    pub(crate) fn pinned(tool: &dyn Fn(&str) -> anyhow::Result<PathBuf>) -> anyhow::Result<Self> {
+        Ok(Self {
+            llvm_cov: tool("cargo-llvm-cov")?,
+            nextest: tool("cargo-nextest")?,
+            postgres: check::postgres_bin(tool)?,
+            web: web::Toolchain::pinned(tool)?,
+        })
+    }
 }
 
 /// Runs the tests of every workspace and of the web app under coverage, with the tools given,
@@ -88,6 +102,7 @@ pub(crate) fn run(
             .arg(&lcov)
             .env("PATH", tools::path_with(nextest)?)
             .env("PROPTEST_RNG_SEED", PROPTEST_RNG_SEED)
+            .env(check::POSTGRES_BIN, &tools.postgres)
             .current_dir(root)
             .status()
             .context("could not run cargo-llvm-cov")?;
@@ -372,7 +387,7 @@ fn ranges(lines: &BTreeSet<u32>) -> String {
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
     use super::{
         Measured, Tools, absolute_sources, measure, parse_lcov, ranges, run, without_tests,
@@ -392,6 +407,7 @@ mod tests {
         Tools {
             llvm_cov: llvm_cov.to_path_buf(),
             nextest: nextest.to_path_buf(),
+            postgres: PathBuf::from("unused"),
             web: crate::web::Toolchain::pinned(&|name| Ok(Path::new("unused").join(name))).unwrap(),
         }
     }
@@ -498,7 +514,7 @@ mod tests {
 
     /// A fake cargo-llvm-cov that writes an lcov report covering line 1 of `src/a.rs` and, when
     /// `both` is set, line 2 too.
-    fn fake_llvm_cov(dir: &Path, both: bool) -> std::path::PathBuf {
+    fn fake_llvm_cov(dir: &Path, both: bool) -> PathBuf {
         let path = dir.join("cargo-llvm-cov");
         let second = u8::from(both);
         script(
@@ -691,6 +707,7 @@ mod tests {
         let tools = Tools {
             llvm_cov: empty.clone(),
             nextest: nextest.clone(),
+            postgres: PathBuf::from("unused"),
             web: crate::testing::fake_web(&web, ""),
         };
         let mut out = Vec::new();
@@ -706,6 +723,7 @@ mod tests {
         let failing = Tools {
             llvm_cov: empty,
             nextest,
+            postgres: PathBuf::from("unused"),
             web: crate::testing::fake_web(&temp.path().join("failing"), "coverage"),
         };
         let error = run(&repo, "base", &failing, Mode::Plain, &mut Vec::new())
@@ -718,6 +736,7 @@ mod tests {
         let unbuilt = Tools {
             llvm_cov: temp.path().join("unused"),
             nextest: temp.path().join("unused"),
+            postgres: PathBuf::from("unused"),
             web: crate::testing::fake_web(&temp.path().join("unbuilt"), "build"),
         };
         let unbuilt_error = run(&repo, "base", &unbuilt, Mode::Plain, &mut Vec::new())

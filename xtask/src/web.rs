@@ -23,7 +23,7 @@ pub(crate) const BUILT: &str = "web/dist/index.html";
 pub(crate) const LCOV: &str = "coverage/lcov.info";
 
 /// The pinned node and pnpm.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct Toolchain {
     node: PathBuf,
     pnpm: PathBuf,

@@ -110,6 +110,11 @@ pub(crate) struct Tool {
     /// expect their own name first. `--version` when absent.
     #[serde(rename = "version-args")]
     version_args: Option<Vec<String>>,
+    /// The version the executable reports, when the release's own number adds a build revision
+    /// as its last part, which the executable does not report (theseus-rs's `18.6.1` builds
+    /// Postgres `18.6`). `version` when absent.
+    #[serde(rename = "reported-version")]
+    reported_version: Option<String>,
     /// Whether the tests run the tool, so every CI job that runs tests installs it with
     /// `cargo xtask setup --for-tests`.
     #[serde(rename = "for-tests", default)]
@@ -284,6 +289,16 @@ impl Tool {
             "version {:?} must be ASCII letters, digits, '.', '+' or '-'",
             self.version
         );
+        if let Some(reported) = &self.reported_version {
+            ensure!(
+                self.version
+                    .rsplit_once('.')
+                    .is_some_and(|(release, _revision)| release == reported),
+                "reported-version {reported:?} must be version {:?} without its build revision; \
+                 update it with the version",
+                self.version
+            );
+        }
         if let Source::Crate { name, sha256 } = self.source()? {
             ensure!(
                 name.split('-').all(is_safe_name),
@@ -678,8 +693,8 @@ impl Tool {
             .with_context(|| format!("could not run {} --version", executable.display()))?;
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
-        if output.status.success() && reports_version(&format!("{stdout}\n{stderr}"), &self.version)
-        {
+        let reported = self.reported_version.as_deref().unwrap_or(&self.version);
+        if output.status.success() && reports_version(&format!("{stdout}\n{stderr}"), reported) {
             Ok(Status::Ready)
         } else {
             Ok(Status::Drift {
@@ -1581,40 +1596,21 @@ fn place_files(
     Ok(())
 }
 
-/// The files of a tool installed as a directory: each path relative to the directory, with what
-/// it holds. Directories are implied by the entries in them. A symbolic link must lead, within
-/// the directory, to one of its files; anything else, such as a link out of it or a device, is
-/// refused, so the manifest covers everything the tool can load.
+/// The files of a tool installed as a directory: each path relative to the directory, with its
+/// sha256 and whether it is executable. Directories are implied by the files in them. A link, hard
+/// or symbolic, holds what the file it reaches holds: a symbolic link must reach a file of the
+/// tree without leaving it, as a library's soname link does (`libpq.so.5 -> libpq.so.5.18`), and
+/// has its file's mode. Anything else is refused, so the manifest covers everything the tool can
+/// load, and a link repointed after installation changes it.
 #[derive(Debug, PartialEq, Eq)]
-struct Tree(BTreeMap<String, Entry>);
-
-/// What one path of a [`Tree`] holds.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum Entry {
-    /// A regular file: its sha256 and whether it is executable.
-    File { sha256: String, executable: bool },
-    /// A symbolic link, and the path it holds, as written.
-    Link { target: String },
-}
+struct Tree(BTreeMap<String, (String, bool)>);
 
 impl Tree {
-    /// The tree of `entries`, once every link in it leads to one of its files.
-    fn new(entries: BTreeMap<String, Entry>) -> anyhow::Result<Self> {
-        for (path, entry) in &entries {
-            if let Entry::Link { target } = entry {
-                let resolved = link_destination(path, target)?;
-                ensure!(
-                    matches!(entries.get(&resolved), Some(Entry::File { .. })),
-                    "{path} links to {target}, which is not a file of the tool's directory"
-                );
-            }
-        }
-        Ok(Self(entries))
-    }
-
-    /// The files of a gzipped tarball as it unpacks: a hard link holds what its target holds.
+    /// The files of a gzipped tarball as it unpacks: a hard link holds what its target holds, and
+    /// a symbolic link what the file it resolves to holds.
     fn of_archive(archive: &[u8]) -> anyhow::Result<Self> {
-        let mut entries = BTreeMap::new();
+        let mut files = BTreeMap::new();
+        let mut symlinks = BTreeMap::new();
         let mut tarball = tar::Archive::new(GzDecoder::new(archive));
         for entry in tarball
             .entries()
@@ -1629,51 +1625,51 @@ impl Tree {
                 entry
                     .read_to_end(&mut bytes)
                     .with_context(|| format!("could not read {path} from the archive"))?;
-                entries.insert(
-                    path,
-                    Entry::File {
-                        sha256: sha256_hex(&bytes),
-                        executable: mode & 0o100 != 0,
-                    },
-                );
+                files.insert(path, (sha256_hex(&bytes), mode & 0o100 != 0));
             } else if kind.is_hard_link() {
                 let target = entry
                     .link_name()
                     .context("a hard link has an unreadable target")?
                     .with_context(|| format!("the hard link {path} has no target"))?;
                 let target = tree_path(&target)?;
-                let Some(Entry::File { sha256, .. }) = entries.get(&target) else {
-                    bail!("{path} links to {target}, which is not a file before it");
-                };
-                let sha256 = sha256.clone();
-                entries.insert(
-                    path,
-                    Entry::File {
-                        sha256,
-                        executable: mode & 0o100 != 0,
-                    },
-                );
+                let (sha256, _) = files
+                    .get(&target)
+                    .with_context(|| format!("{path} links to {target}, which comes after it"))?
+                    .clone();
+                files.insert(path, (sha256, mode & 0o100 != 0));
             } else if kind.is_symlink() {
                 let target = entry
                     .link_name()
                     .context("a symbolic link has an unreadable target")?
                     .with_context(|| format!("the symbolic link {path} has no target"))?;
-                entries.insert(
-                    path,
-                    Entry::Link {
-                        target: link_text(&target)?,
-                    },
-                );
+                let resolved = resolve_link(&path, &target)?;
+                symlinks.insert(path, resolved);
             } else if !kind.is_dir() {
                 bail!("{path} in the archive is neither a file, a link nor a directory");
             }
         }
-        Self::new(entries)
+        for (path, first) in &symlinks {
+            let mut reached = first;
+            for _hop in 0..MAX_LINK_HOPS {
+                let Some(next) = symlinks.get(reached) else {
+                    break;
+                };
+                reached = next;
+            }
+            let held = files
+                .get(reached)
+                .with_context(|| {
+                    format!("{path} links to {reached}, which is no file the archive holds")
+                })?
+                .clone();
+            files.insert(path.clone(), held);
+        }
+        Ok(Self(files))
     }
 
     /// The files under `dir`, as installed.
     fn of_dir(dir: &Path) -> anyhow::Result<Self> {
-        let mut entries = BTreeMap::new();
+        let mut files = BTreeMap::new();
         let mut pending = vec![dir.to_path_buf()];
         while let Some(current) = pending.pop() {
             for entry in fs::read_dir(&current)
@@ -1684,28 +1680,29 @@ impl Tree {
                     .with_context(|| format!("could not inspect {}", path.display()))?;
                 if metadata.is_dir() {
                     pending.push(path);
-                    continue;
-                }
-                let relative = tree_path(
-                    path.strip_prefix(dir)
-                        .context("a listed file lies outside its directory")?,
-                )?;
-                if metadata.is_file() {
-                    entries.insert(
+                } else if metadata.is_file() || metadata.is_symlink() {
+                    let relative = tree_path(
+                        path.strip_prefix(dir)
+                            .context("a listed file lies outside its directory")?,
+                    )?;
+                    let file = if metadata.is_symlink() {
+                        let target = fs::read_link(&path).with_context(|| {
+                            format!("could not read the link {}", path.display())
+                        })?;
+                        dir.join(resolve_link(&relative, &target)?)
+                    } else {
+                        path.clone()
+                    };
+                    // A link to a link is followed by the system; each link is checked itself.
+                    let reached = fs::metadata(&file)
+                        .with_context(|| format!("{} reaches no file", path.display()))?;
+                    ensure!(reached.is_file(), "{} reaches no file", path.display());
+                    files.insert(
                         relative,
-                        Entry::File {
-                            sha256: file_sha256(&path)?,
-                            executable: metadata.permissions().mode() & 0o100 != 0,
-                        },
-                    );
-                } else if metadata.is_symlink() {
-                    let target = fs::read_link(&path)
-                        .with_context(|| format!("could not read the link {}", path.display()))?;
-                    entries.insert(
-                        relative,
-                        Entry::Link {
-                            target: link_text(&target)?,
-                        },
+                        (
+                            file_sha256(&file)?,
+                            reached.permissions().mode() & 0o100 != 0,
+                        ),
                     );
                 } else {
                     bail!(
@@ -1715,25 +1712,14 @@ impl Tree {
                 }
             }
         }
-        Self::new(entries)
+        Ok(Self(files))
     }
 
-    /// The manifest: a line per entry, in path order. A file's line is `<sha256> <x or -> <path>`;
-    /// a link's is `<sha256 of the path it holds> l <path>`.
+    /// The manifest: a line per file, `<sha256> <x or -> <path>`, in path order.
     fn manifest(&self) -> String {
         let mut manifest = String::new();
-        for (path, entry) in &self.0 {
-            let (sha256, mode) = match entry {
-                Entry::File {
-                    sha256,
-                    executable: true,
-                } => (sha256.clone(), 'x'),
-                Entry::File {
-                    sha256,
-                    executable: false,
-                } => (sha256.clone(), '-'),
-                Entry::Link { target } => (sha256_hex(target.as_bytes()), 'l'),
-            };
+        for (path, (sha256, executable)) in &self.0 {
+            let mode = if *executable { 'x' } else { '-' };
             // Writing to a String cannot fail.
             if writeln!(manifest, "{sha256} {mode} {path}").is_err() {
                 break;
@@ -1748,35 +1734,34 @@ impl Tree {
     }
 }
 
-/// A link's target as UTF-8 text.
-fn link_text(target: &Path) -> anyhow::Result<String> {
-    target
-        .to_str()
-        .map(str::to_owned)
-        .with_context(|| format!("the link target {} is not UTF-8", target.display()))
-}
+/// The most symbolic links a link may pass through before it reaches a file.
+const MAX_LINK_HOPS: usize = 8;
 
-/// The path in the tool's directory that the link at `path` (as [`tree_path`] names it) leads to
-/// through `target`: relative to the link's directory, never above the tool's directory.
-fn link_destination(path: &str, target: &str) -> anyhow::Result<String> {
-    ensure!(
-        !target.starts_with('/'),
-        "{path} links to {target}, outside the tool's directory"
-    );
+/// Where the symbolic link at `path` (a manifest path) to `target` leads, as a manifest path: its
+/// target taken from the link's directory, which must stay in the tool's directory.
+fn resolve_link(path: &str, target: &Path) -> anyhow::Result<String> {
     let mut parts: Vec<&str> = path.split('/').collect();
     parts.pop();
-    for part in target.split('/') {
-        match part {
-            "" | "." => {}
-            ".." => {
+    for component in target.components() {
+        match component {
+            Component::CurDir => {}
+            Component::Normal(part) => parts.push(part.to_str().with_context(|| {
+                format!("{path} links to {}, which is not UTF-8", target.display())
+            })?),
+            Component::ParentDir => {
                 ensure!(
                     parts.pop().is_some(),
-                    "{path} links to {target}, outside the tool's directory"
+                    "{path} links to {}, which leaves the tool's directory",
+                    target.display()
                 );
             }
-            part => parts.push(part),
+            Component::RootDir | Component::Prefix(_) => bail!(
+                "{path} links to {}, which leaves the tool's directory",
+                target.display()
+            ),
         }
     }
+    ensure!(!parts.is_empty(), "{path} links to its tool's directory");
     Ok(parts.join("/"))
 }
 
@@ -2677,6 +2662,47 @@ targets.aarch64-unknown-linux-gnu = {{ platform = "linux-arm64", sha256 = "{sha2
     }
 
     #[test]
+    fn a_reported_version_stands_for_a_release_with_a_build_revision() {
+        let root = tempfile::tempdir().unwrap();
+        let short: &[u8] = b"#!/bin/sh\necho 'fake (Fake) 1.2'\n";
+        let text = manifest_text(SHA_A, &sha256_hex(short)).replace(
+            "version = \"1.2.3\"\n",
+            "version = \"1.2.3\"\nreported-version = \"1.2\"\n",
+        );
+        let manifest = Manifest::parse(&text).unwrap();
+        write_executable(&root.path().join(".tools/fake/1.2.3/fake"), short);
+        assert_eq!(
+            only_tool(&manifest)
+                .status(root.path(), Target::MacArm64, None)
+                .unwrap(),
+            Status::Ready,
+            "1.2 is what release 1.2.3 reports"
+        );
+        let plain = Manifest::parse(&manifest_text(SHA_A, &sha256_hex(short))).unwrap();
+        assert!(
+            matches!(
+                only_tool(&plain)
+                    .status(root.path(), Target::MacArm64, None)
+                    .unwrap(),
+                Status::Drift { .. }
+            ),
+            "without it, 1.2 is not 1.2.3"
+        );
+        for stale in ["1.1", "1.2.3", "1", "", "2"] {
+            let error = Manifest::parse(&text.replace(
+                "reported-version = \"1.2\"",
+                &format!("reported-version = {stale:?}"),
+            ))
+            .unwrap_err();
+            assert!(
+                format!("{error:#}")
+                    .contains("must be version \"1.2.3\" without its build revision"),
+                "{stale:?}: {error:#}"
+            );
+        }
+    }
+
+    #[test]
     fn a_version_run_that_fails_says_how_and_why() {
         let broken: &[u8] =
             b"#!/bin/sh\necho 'fake: /lib64/libc.so.6: version GLIBC_2.34 not found' >&2\nexit 1\n";
@@ -3199,7 +3225,8 @@ targets.aarch64-unknown-linux-gnu = {{ platform = "linux-arm64", sha256 = "{sha2
         };
         // #25's Coverage and Mutants jobs installed only cargo-nextest, and xtask's tests failed
         // there for want of shellcheck. node and pnpm build the web app the abc binary embeds,
-        // and run its tests. The JRE, Apalache and Quint check the specs.
+        // and run its tests; the JRE, Apalache and Quint check the specs; postgresql is the
+        // Postgres abc server setup's test runs.
         assert_eq!(
             names(&[], true),
             [
@@ -3209,7 +3236,8 @@ targets.aarch64-unknown-linux-gnu = {{ platform = "linux-arm64", sha256 = "{sha2
                 "pnpm",
                 "jre",
                 "apalache",
-                "quint"
+                "quint",
+                "postgresql"
             ]
         );
         assert_eq!(
@@ -3222,7 +3250,8 @@ targets.aarch64-unknown-linux-gnu = {{ platform = "linux-arm64", sha256 = "{sha2
                 "pnpm",
                 "jre",
                 "apalache",
-                "quint"
+                "quint",
+                "postgresql"
             ],
             "named tools join them"
         );
@@ -3418,7 +3447,7 @@ targets.aarch64-unknown-linux-gnu = {{ platform = "linux-arm64", sha256 = "{sha2
     }
 
     #[test]
-    fn a_tree_holds_files_and_links_to_its_own_files_only() {
+    fn a_tree_holds_files_and_links_that_stay_inside_it() {
         let linked = Tree::of_archive(&tarball_with_link(
             tar::EntryType::Link,
             "fake-1.2.3/pnpm",
@@ -3435,72 +3464,48 @@ targets.aarch64-unknown-linux-gnu = {{ platform = "linux-arm64", sha256 = "{sha2
         );
         let symlinked = Tree::of_archive(&tarball_with_link(
             tar::EntryType::Symlink,
-            "fake-1.2.3/legal/fake",
-            "../fake",
+            "fake-1.2.3/pnpm",
+            "fake",
         ))
         .unwrap();
         assert_eq!(
             symlinked.manifest(),
             format!(
-                "{} x fake-1.2.3/fake\n{} l fake-1.2.3/legal/fake\n",
-                sha256_hex(SCRIPT),
-                sha256_hex(b"../fake")
+                "{0} x fake-1.2.3/fake\n{0} x fake-1.2.3/pnpm\n",
+                sha256_hex(SCRIPT)
             ),
-            "a symbolic link is pinned by the path it holds"
-        );
-        assert_ne!(
-            symlinked.sha256(),
-            Tree::of_archive(&tarball_with_link(
-                tar::EntryType::Symlink,
-                "fake-1.2.3/legal/fake",
-                "./../fake",
-            ))
-            .unwrap()
-            .sha256(),
-            "a link that holds another path is another tree"
+            "a symbolic link holds what the file it reaches holds, with that file's mode"
         );
         for (kind, path, link, problem) in [
             (
                 tar::EntryType::Symlink,
                 "fake-1.2.3/pnpm",
                 "../../outside",
-                "fake-1.2.3/pnpm links to ../../outside, outside the tool's directory",
+                "fake-1.2.3/pnpm links to ../../outside, which leaves the tool's directory",
             ),
             (
                 tar::EntryType::Symlink,
                 "fake-1.2.3/pnpm",
-                "/usr/bin/env",
-                "fake-1.2.3/pnpm links to /usr/bin/env, outside the tool's directory",
+                "/etc/passwd",
+                "fake-1.2.3/pnpm links to /etc/passwd, which leaves the tool's directory",
             ),
             (
                 tar::EntryType::Symlink,
                 "fake-1.2.3/pnpm",
                 "missing",
-                "fake-1.2.3/pnpm links to missing, which is not a file of the tool's directory",
-            ),
-            (
-                tar::EntryType::Symlink,
-                "fake-1.2.3/pnpm",
-                ".",
-                "fake-1.2.3/pnpm links to ., which is not a file of the tool's directory",
+                "fake-1.2.3/pnpm links to fake-1.2.3/missing, which is no file the archive holds",
             ),
             (
                 tar::EntryType::Link,
                 "fake-1.2.3/pnpm",
                 "fake-1.2.3/later",
-                "fake-1.2.3/pnpm links to fake-1.2.3/later, which is not a file before it",
+                "fake-1.2.3/pnpm links to fake-1.2.3/later, which comes after it",
             ),
             (
                 tar::EntryType::Link,
                 "fake-1.2.3/pnpm",
                 "../outside",
                 "../outside leaves the tool's directory",
-            ),
-            (
-                tar::EntryType::Fifo,
-                "fake-1.2.3/pnpm",
-                "fake",
-                "fake-1.2.3/pnpm in the archive is neither a file, a link nor a directory",
             ),
         ] {
             let error = format!(
@@ -3509,244 +3514,64 @@ targets.aarch64-unknown-linux-gnu = {{ platform = "linux-arm64", sha256 = "{sha2
             );
             assert!(error.contains(problem), "{problem}: {error}");
         }
-    }
-
-    #[test]
-    fn an_installed_tree_reads_its_links_without_following_them() {
-        let dir = tempfile::tempdir().unwrap();
-        fs::create_dir(dir.path().join("legal")).unwrap();
-        fs::write(dir.path().join("file"), b"x").unwrap();
-        std::os::unix::fs::symlink("../file", dir.path().join("legal/link")).unwrap();
-        assert_eq!(
-            Tree::of_dir(dir.path()).unwrap().manifest(),
-            format!(
-                "{} - file\n{} l legal/link\n",
-                sha256_hex(b"x"),
-                sha256_hex(b"../file")
-            ),
-            "an installed link is read, not followed"
+        let mut builder = tar::Builder::new(GzEncoder::new(Vec::new(), Compression::fast()));
+        let mut fifo = tar::Header::new_gnu();
+        fifo.set_entry_type(tar::EntryType::Fifo);
+        fifo.set_size(0);
+        fifo.set_mode(0o644);
+        builder
+            .append_data(&mut fifo, "fake-1.2.3/pipe", std::io::empty())
+            .unwrap();
+        let error = format!(
+            "{:#}",
+            Tree::of_archive(&builder.into_inner().unwrap().finish().unwrap()).unwrap_err()
         );
-        std::os::unix::fs::symlink("/etc/hosts", dir.path().join("out")).unwrap();
-        let error = format!("{:#}", Tree::of_dir(dir.path()).unwrap_err());
         assert!(
-            error.contains("out links to /etc/hosts, outside the tool's directory"),
+            error.contains(
+                "fake-1.2.3/pipe in the archive is neither a file, a link nor a directory"
+            ),
             "{error}"
         );
     }
 
     #[test]
-    fn installs_a_tree_with_its_links_and_checks_them() {
-        let root = tempfile::tempdir().unwrap();
-        let archive = tarball_with_link(tar::EntryType::Symlink, "fake-1.2.3/again", "fake");
-        let tree = Tree::of_archive(&archive).unwrap();
-        let manifest = pinned_tree(&archive, SCRIPT, &tree.sha256());
-        let tool = only_tool(&manifest);
-        install(root.path(), tool, None, Target::MacArm64, &archive).unwrap();
-        let dir = root.path().join(".tools/fake/1.2.3");
-        assert_eq!(Tree::of_dir(&dir).unwrap(), tree, "installed as it unpacks");
-        let link = dir.join("fake-1.2.3/again");
-        assert_eq!(fs::read_link(&link).unwrap(), Path::new("fake"));
-        fs::remove_file(&link).unwrap();
-        fs::write(&link, SCRIPT).unwrap();
-        fs::set_permissions(&link, fs::Permissions::from_mode(0o755)).unwrap();
-        assert!(
-            matches!(
-                tool.status(root.path(), Target::MacArm64, None).unwrap(),
-                Status::TreeModified { .. }
-            ),
-            "a link replaced by a copy of its file is another tree"
-        );
-    }
-
-    #[test]
-    fn a_target_may_keep_its_executable_elsewhere_in_its_archive() {
-        let root = tempfile::tempdir().unwrap();
-        let archive = tarball(&[
-            ("fake-1.2.3/fake", SCRIPT, 0o755),
-            ("fake-1.2.3/Contents/Home/fake", SCRIPT, 0o755),
-        ]);
-        let tree = Tree::of_archive(&archive).unwrap().sha256();
-        let text = manifest_text(&sha256_hex(&archive), &sha256_hex(SCRIPT))
-            .replace(
-                "binary = \"fake-{version}/fake\"\n",
-                "binary = \"fake-{version}/fake\"\ntree = true\n",
-            )
-            .replace(" }\n", &format!(", tree-sha256 = \"{tree}\" }}\n"))
-            .replace(
-                "platform = \"mac\",",
-                "platform = \"mac\", binary = \"fake-{version}/Contents/Home/fake\",",
-            );
-        let manifest = Manifest::parse(&text).unwrap();
-        let tool = only_tool(&manifest);
-        assert_eq!(
-            tool.executable(root.path(), Target::MacArm64).unwrap(),
-            root.path()
-                .join(".tools/fake/1.2.3/fake-1.2.3/Contents/Home/fake"),
-            "the target's own path"
-        );
-        assert_eq!(
-            tool.executable(root.path(), Target::LinuxX64).unwrap(),
-            root.path().join(".tools/fake/1.2.3/fake-1.2.3/fake"),
-            "the tool's path elsewhere"
-        );
-        install(root.path(), tool, None, Target::MacArm64, &archive).unwrap();
-        assert_eq!(
-            tool.status(root.path(), Target::MacArm64, None).unwrap(),
-            Status::Ready
-        );
-
-        let without_binary = manifest_text(SHA_A, SHA_B)
-            .replace("binary = \"fake-{version}/fake\"\n", "")
-            .replace(
-                "platform = \"mac\",",
-                "platform = \"mac\", binary = \"fake\",",
-            );
-        let unpaired = format!("{:#}", Manifest::parse(&without_binary).unwrap_err());
-        assert!(
-            unpaired.contains("a target's binary replaces the tool's `binary`, which it needs"),
-            "{unpaired}"
-        );
-        let escaping = text.replace("fake-{version}/Contents/Home/fake", "../fake");
-        let outside = format!("{:#}", Manifest::parse(&escaping).unwrap_err());
-        assert!(
-            outside.contains("aarch64-apple-darwin: binary \"../fake\" must be a relative path"),
-            "{outside}"
-        );
-    }
-
-    /// A tool list of `rt`, an executable asset, then `fake`, which runs on it.
-    fn with_runtime(runtime: &[u8], archive: &[u8]) -> String {
-        let rt = sha256_hex(runtime);
-        format!(
-            r#"[[tool]]
-name = "rt"
-version = "9.9.9"
-url = "https://example.com/rt-{{platform}}"
-attestations = "example/rt"
-targets.aarch64-apple-darwin = {{ platform = "mac", sha256 = "{rt}", binary-sha256 = "{rt}" }}
-targets.x86_64-unknown-linux-gnu = {{ platform = "linux-x64", sha256 = "{rt}", binary-sha256 = "{rt}" }}
-targets.aarch64-unknown-linux-gnu = {{ platform = "linux-arm64", sha256 = "{rt}", binary-sha256 = "{rt}" }}
-
-{}"#,
-            manifest_text(&sha256_hex(archive), &sha256_hex(RUNS_ON_RT))
-                .replace("# The tools.\n", "")
-                .replace("[[tool]]\n", "[[tool]]\nruntime = \"rt\"\n")
-        )
-    }
-
-    /// An executable that reports its version only when `rt` is first on `PATH`.
-    const RUNS_ON_RT: &[u8] = b"#!/bin/sh\nrt && echo 'fake 1.2.3'\n";
-
-    #[test]
-    fn a_runtime_comes_first_on_path_whenever_its_tool_runs() {
-        let root = tempfile::tempdir().unwrap();
-        let runtime: &[u8] = b"#!/bin/sh\n[ \"$1\" = --version ] && echo 'rt 9.9.9'\nexit 0\n";
-        let archive = tarball(&[("fake-1.2.3/fake", RUNS_ON_RT, 0o755)]);
-        let manifest = Manifest::parse(&with_runtime(runtime, &archive)).unwrap();
-        let mut downloads = Vec::new();
-        install_unready(
-            root.path(),
-            &manifest,
-            Target::MacArm64,
-            &mut Vec::new(),
-            &mut |url: &str| {
-                downloads.push(url.to_owned());
-                Ok(if url.contains("/rt-") {
-                    runtime.to_vec()
-                } else {
-                    archive.clone()
-                })
-            },
-        )
-        .unwrap();
-        assert_eq!(downloads.len(), 2, "{downloads:?}");
-        let fake = only_tool(&manifest);
-        assert!(
-            matches!(
-                fake.status(root.path(), Target::MacArm64, None).unwrap(),
-                Status::Drift { said } if said.contains("rt")
-            ),
-            "without its runtime it cannot run"
-        );
-        let mut out = Vec::new();
-        assert_eq!(
-            report(root.path(), &manifest, Target::MacArm64, &mut out).unwrap(),
-            ExitCode::SUCCESS,
-            "{}",
-            String::from_utf8_lossy(&out)
-        );
-
-        let selected = Manifest::parse(&with_runtime(runtime, &archive))
-            .unwrap()
-            .select(&["fake".to_owned()], false)
-            .unwrap();
-        let names: Vec<&str> = selected
-            .tools
-            .iter()
-            .map(|tool| tool.name.as_str())
-            .collect();
-        assert_eq!(
-            names,
-            ["rt", "fake"],
-            "selecting a tool selects its runtime"
-        );
-    }
-
-    #[test]
-    fn a_tool_run_by_hand_has_its_runtime_first_on_path() {
+    fn an_installed_link_reads_as_its_file_and_must_stay_in_the_tree() {
         let dir = tempfile::tempdir().unwrap();
-        let runtime = dir.path().join("rt-home/bin/rt");
-        write_executable(&runtime, b"#!/bin/sh\nexit 0\n");
-        let tool = dir.path().join("tool");
-        write_executable(&tool, b"#!/bin/sh\nrt || exit 7\nexit 4\n");
+        fs::create_dir(dir.path().join("lib")).unwrap();
+        fs::write(dir.path().join("lib/libpq.so.5.18"), b"x").unwrap();
+        std::os::unix::fs::symlink("libpq.so.5.18", dir.path().join("lib/libpq.so.5")).unwrap();
         assert_eq!(
-            super::run(&tool, Some(&runtime), dir.path(), &[]).unwrap(),
-            ExitCode::from(4),
-            "the runtime is found"
+            Tree::of_dir(dir.path()).unwrap().manifest(),
+            format!(
+                "{0} - lib/libpq.so.5\n{0} - lib/libpq.so.5.18\n",
+                sha256_hex(b"x")
+            ),
+            "an installed link reads as the file it reaches"
         );
-        assert_eq!(
-            super::run(&tool, None, dir.path(), &[]).unwrap(),
-            ExitCode::from(7),
-            "without it, it is not"
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(outside.path().join("file"), b"x").unwrap();
+        std::os::unix::fs::symlink(outside.path().join("file"), dir.path().join("lib/escape"))
+            .unwrap();
+        let escape = format!("{:#}", Tree::of_dir(dir.path()).unwrap_err());
+        assert!(
+            escape.contains("lib/escape links to")
+                && escape.contains("leaves the tool's directory"),
+            "{escape}"
         );
-        let checkout = crate::testing::checkout();
-        assert_eq!(
-            super::runtime(&checkout, "apalache").unwrap(),
-            Some(crate::testing::pinned_for_tests("jre")),
-            "Apalache runs on the pinned JRE"
+        fs::remove_file(dir.path().join("lib/escape")).unwrap();
+        std::os::unix::fs::symlink("gone", dir.path().join("lib/dangling")).unwrap();
+        let dangling = format!("{:#}", Tree::of_dir(dir.path()).unwrap_err());
+        assert!(
+            dangling.contains("lib/dangling reaches no file"),
+            "{dangling}"
         );
-        assert_eq!(super::runtime(&checkout, "quint").unwrap(), None);
-    }
-
-    #[test]
-    fn a_runtime_is_a_tool_listed_before_that_needs_none() {
-        let valid = with_runtime(b"rt", b"fake");
-        let (rt, fake) = valid.split_at(valid.find("\n[[tool]]\nruntime").unwrap());
-        for (text, problem) in [
-            (
-                format!("{fake}\n{rt}"),
-                "tool \"fake\": its runtime \"rt\" must be a tool listed before it",
-            ),
-            (
-                valid.replace("runtime = \"rt\"", "runtime = \"fake\""),
-                "tool \"fake\": its runtime \"fake\" must be a tool listed before it",
-            ),
-            (
-                valid.replace("runtime = \"rt\"", "runtime = \"jre\""),
-                "tool \"fake\": its runtime \"jre\" must be a tool listed before it",
-            ),
-            (
-                format!(
-                    "{}\n{}",
-                    rt.replace("name = \"rt\"", "name = \"rt0\""),
-                    valid.replacen("name = \"rt\"", "name = \"rt\"\nruntime = \"rt0\"", 1)
-                ),
-                "must not need a runtime itself",
-            ),
-        ] {
-            let error = format!("{:#}", Manifest::parse(&text).unwrap_err());
-            assert!(error.contains(problem), "{problem}: {error}");
-        }
+        fs::remove_file(dir.path().join("lib/dangling")).unwrap();
+        std::os::unix::fs::symlink(".", dir.path().join("lib/self")).unwrap();
+        let to_a_directory = format!("{:#}", Tree::of_dir(dir.path()).unwrap_err());
+        assert!(
+            to_a_directory.contains("lib/self reaches no file"),
+            "{to_a_directory}"
+        );
     }
 
     #[test]

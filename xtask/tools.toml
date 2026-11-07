@@ -22,10 +22,10 @@
 # beside its executable at run time, as pnpm loads its dist/. `binary` is then the executable's
 # path in that directory, and a target's `tree-sha256` pins the directory: the sha256 of its
 # manifest, a line per file with the file's sha256, whether it is executable and its path.
-# A tree may also hold symbolic links, each to a file of the tree, as the Linux JRE links its legal
-# notices; the manifest pins the path a link holds. `cargo xtask setup` refuses an archive holding
-# anything else, or a link out of the tree, and xtask checks every installed file and link against
-# that pin whenever it runs the tool.
+# A symbolic link in a tree must reach a file of the tree, and the manifest lists it as that file
+# (xtask/src/tools.rs's `Tree`), as the Linux JRE links its legal notices to java.base's.
+# `cargo xtask setup` refuses an archive holding anything else, and xtask checks every installed
+# file against that pin whenever it runs the tool.
 # A target's `binary` replaces the tool's `binary` where its archive keeps the executable
 # elsewhere, as macOS's JRE does. `runtime` names a tool listed before this one whose executable's
 # directory goes first on PATH whenever xtask runs this one, its version check and `cargo xtask
@@ -39,6 +39,9 @@
 # sha256 beside it, which xtask checks whenever it runs the tool. `features`, when given, replaces
 # the crate's default features. Renovate bumps `version` from crates.io; keep `version` before
 # `crate`, with only comments between them.
+#
+# `reported-version` is what the executable's `--version` names, for a release whose number adds
+# a build revision as its last part; it must be `version` without that part.
 #
 # `for-tests = true` marks a tool the tests run. `cargo xtask setup --for-tests` installs exactly
 # those, and every CI job that runs tests uses it; `cargo xtask rulesets check` fails a job that
@@ -224,8 +227,8 @@ checksums = "https://github.com/adoptium/temurin25-binaries/releases/download/jd
 binary = "jdk-{version}+8-jre/bin/java"
 tree = true
 targets.aarch64-apple-darwin = { platform = "aarch64_mac", binary = "jdk-{version}+8-jre/Contents/Home/bin/java", sha256 = "72ebd76b502c849e88dea39afae51baf5f82f2b5b1b6389c28ea707b20451bce", binary-sha256 = "d6b5c8ffce485baa7e9aacfd9c652e2999c89053a5070104c598731636bd2249", tree-sha256 = "db4b59d759f474e38ceefb5f903f1965b0093c7d0084b6ce1bf9e136e56d4300" }
-targets.x86_64-unknown-linux-gnu = { platform = "x64_linux", sha256 = "6fac98f0c8202efc3135a9e9e42aa61963ec42d1c5cbb40caf231e7b14a24ef6", binary-sha256 = "2c6758fcd55b51cd3b8012ebe712504f722a8a0bbb6209b0fccff25960cd41e9", tree-sha256 = "3bac3b51972985b156982dab968d8543afcf68e07704adf15fb9c6197d694056" }
-targets.aarch64-unknown-linux-gnu = { platform = "aarch64_linux", sha256 = "963931723891302ebb2687178532c3d793d71e2577cd058061c7efb396140a86", binary-sha256 = "9773d145ea1adce8da70e0f9e87ecddad5446f7e5ac05b44a95cecf902b42cb9", tree-sha256 = "06f62aa36ab618b9249e66927674d81ce985077202a8eb771904b5771071e1a7" }
+targets.x86_64-unknown-linux-gnu = { platform = "x64_linux", sha256 = "6fac98f0c8202efc3135a9e9e42aa61963ec42d1c5cbb40caf231e7b14a24ef6", binary-sha256 = "2c6758fcd55b51cd3b8012ebe712504f722a8a0bbb6209b0fccff25960cd41e9", tree-sha256 = "37569ad4d2e3775adafd3100f74ab85c412d1c6db60b694eca077db4af93a57d" }
+targets.aarch64-unknown-linux-gnu = { platform = "aarch64_linux", sha256 = "963931723891302ebb2687178532c3d793d71e2577cd058061c7efb396140a86", binary-sha256 = "9773d145ea1adce8da70e0f9e87ecddad5446f7e5ac05b44a95cecf902b42cb9", tree-sha256 = "cb0f581aff74c3e87beb22b76984b3a6074d348b255f061501e1bbeb847ddd66" }
 
 # Apalache's jar holds Quint's TLA+ transpiler and TLC. It runs on the JVM, so one archive serves
 # every target, and its launcher runs `java` from the pinned JRE (`runtime`). The Quint release
@@ -256,3 +259,23 @@ release-digests = "https://api.github.com/repos/quint-co/quint/releases/tags/v{v
 targets.aarch64-apple-darwin = { platform = "macos-arm64", sha256 = "8744447e5c641291a28d29848a4fd22e0d18237e9964934545e6270b78d2b8e3", binary-sha256 = "8744447e5c641291a28d29848a4fd22e0d18237e9964934545e6270b78d2b8e3" }
 targets.x86_64-unknown-linux-gnu = { platform = "linux-amd64", sha256 = "acd153075b7edc6fc8f889930c5ff3ebdf94ada381a45a26a2d41b18b9f10db7", binary-sha256 = "acd153075b7edc6fc8f889930c5ff3ebdf94ada381a45a26a2d41b18b9f10db7" }
 targets.aarch64-unknown-linux-gnu = { platform = "linux-arm64", sha256 = "ffc0549933db6787ffb932aa5c0e9a778018fe027e10d21ce4895c57502c11fc", binary-sha256 = "ffc0549933db6787ffb932aa5c0e9a778018fe027e10d21ce4895c57502c11fc" }
+
+# Postgres 18's server programs, which `abc server setup`'s end-to-end test runs for real
+# (crates/abc/tests/server_setup.rs); xtask gives the tests their bin directory as
+# ABC_TEST_POSTGRES_BIN. theseus-rs builds them from Postgres's source in GitHub Actions, publishes
+# each archive's sha256 and attests it (SLSA provenance from its release workflow), as the
+# postgresql_embedded crate relies on. The archive holds lib/ and share/ the programs load, so it
+# is installed whole (`tree`). The tests only: abc's users get Homebrew's postgresql@18.
+[[tool]]
+name = "postgresql"
+for-tests = true
+version = "18.6.1"
+url = "https://github.com/theseus-rs/postgresql-binaries/releases/download/{version}/postgresql-{version}-{platform}.tar.gz"
+reported-version = "18.6"
+checksums = "https://github.com/theseus-rs/postgresql-binaries/releases/download/{version}/postgresql-{version}-{platform}.tar.gz.sha256"
+attestations = "theseus-rs/postgresql-binaries"
+binary = "postgresql-{version}-{platform}/bin/postgres"
+tree = true
+targets.aarch64-apple-darwin = { platform = "aarch64-apple-darwin", sha256 = "89e91cc80650a43d22c018b95ca356a0c9e15838a1182fed2880bfb5d7d9c9a6", binary-sha256 = "d6688852af4db60285432f3bec9486e17b838c2f3f772b7484029abb0e4ff770", tree-sha256 = "c553407ea2a2303f61a392b129039820815a78d0154f4db246328c101a23b7c2" }
+targets.x86_64-unknown-linux-gnu = { platform = "x86_64-unknown-linux-gnu", sha256 = "e84b02dd8d0ce5879fb697330a789231c8b8f8d958dae3ad4d90fecc710b1315", binary-sha256 = "5bc8957ed11c87924a63120ac01cca1a33068702ab434b58ee892605224f93e0", tree-sha256 = "a2a6f833a6628e440ef452450432cec6617e72d5de3b68cb9c21c66cb29cf8a8" }
+targets.aarch64-unknown-linux-gnu = { platform = "aarch64-unknown-linux-gnu", sha256 = "1ab47fa2f06ff70454309ad02e5d89c46488300d43977231481fd6b160b9d556", binary-sha256 = "cf3017f283714e212b24d73fbe830d826db4d7b786d9fe1a3c13b835d4af8514", tree-sha256 = "b2dd8e761075d3323954d4de81649dd5d00f4db41b49f94c44220a2ec86e0e78" }
