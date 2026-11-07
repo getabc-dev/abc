@@ -448,5 +448,9 @@ mod tests {
             matches!(write_private(&dir, "x"), Err(HostError::Io { path: failed, .. }) if failed == dir),
             "what cannot be read is an error, never a new file"
         );
+        assert!(
+            !scratch.path().join("d.new").exists(),
+            "and nothing is written beside it"
+        );
     }
 }
