@@ -572,6 +572,26 @@ fn a_stop_while_another_gate_runs_is_sent_back_to_wait_for_it() {
     );
 }
 
+/// PR 2's run: the agent ran mutants in the background and kept stopping. Each stop waited 300 s
+/// and was sent back, and each counted toward the backstop, so a long gate could end the session
+/// without a handoff. The message says to wait inside the turn, never to stop while it runs.
+#[test]
+fn a_busy_gate_is_waited_for_inside_the_turn_not_by_stopping() {
+    let dir = tempfile::tempdir().unwrap();
+    let held = drive(dir.path(), MAIN, &mut Fake::new(Ok(CheckResult::GateBusy)));
+    let Answer::Block(reason) = held else {
+        panic!("sent back: {held:?}");
+    };
+    for words in [
+        "inside this turn",
+        "Do not stop",
+        "kill -0",
+        "counts toward the 5 blocked stops",
+    ] {
+        assert!(reason.contains(words), "{words:?} in {reason}");
+    }
+}
+
 #[test]
 fn the_backstop_lets_the_sixth_blocked_stop_through_and_records_it() {
     let dir = tempfile::tempdir().unwrap();
