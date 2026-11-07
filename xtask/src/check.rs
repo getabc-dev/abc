@@ -229,20 +229,6 @@ pub(crate) struct Tools<'a> {
     pub(crate) spec: Option<&'a dyn Fn() -> anyhow::Result<crate::spec::Tools>>,
 }
 
-impl std::fmt::Debug for Tools<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Tools")
-            .field("nextest", &self.nextest)
-            .field("shellcheck", &self.shellcheck)
-            .field("web", &self.web)
-            .field(
-                "spec",
-                &self.spec.map(|_| "found when the specs' gate runs"),
-            )
-            .finish()
-    }
-}
-
 /// How the check reaches Postgres.
 pub(crate) struct Postgres<'a> {
     /// Makes sure the database tests have a server (`crate::postgres::warm`).

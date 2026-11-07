@@ -1564,6 +1564,10 @@ mod tests {
             (here.tool)("no-such-tool").is_err(),
             "only pinned tools resolve"
         );
+        assert!(
+            (here.runtime)("no-such-tool").is_err(),
+            "and only their runtimes"
+        );
         let temp = tempfile::tempdir().unwrap();
         let elsewhere = Invocation::new(Some(temp.path().to_path_buf())).unwrap();
         assert_eq!(

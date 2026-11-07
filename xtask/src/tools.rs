@@ -2170,6 +2170,16 @@ targets.aarch64-unknown-linux-gnu = {{ platform = "linux-arm64", sha256 = "{sha2
         assert!(error.contains("404"), "{error}");
         assert!(pauses.is_empty(), "never tried again");
         assert_eq!(server.join().unwrap().len(), 1, "one connection");
+        let (whole, refusing) = scripted(vec![turn(
+            b"HTTP/1.1 416 Range Not Satisfiable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        )]);
+        let (refused, none) = fetch(&whole, 4);
+        assert!(
+            format!("{:#}", refused.unwrap_err()).contains("416"),
+            "a 416 to a request for the whole is final too"
+        );
+        assert!(none.is_empty(), "never tried again");
+        refusing.join().unwrap();
     }
 
     #[test]

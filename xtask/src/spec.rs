@@ -966,6 +966,105 @@ module tests {
     }
 
     #[test]
+    fn only_models_and_seeded_bugs_start_the_server() {
+        let root = tree(&[(FILE, COUNTER)]);
+        let bin = root.path().join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        script(&bin.join("java"), "exit 1\n");
+        let no_jvm = Tools {
+            java: bin.join("java"),
+            ..pinned()
+        };
+        let mut out = Vec::new();
+        let tests_alone = Checks {
+            tests: &[TESTS],
+            models: &[],
+            seeded: &[],
+        };
+        let passed = run(
+            root.path(),
+            &tests_alone,
+            &|| Ok(no_jvm.clone()),
+            Options { traces: None },
+            &mut out,
+        )
+        .unwrap();
+        assert!(passed, "{}", String::from_utf8_lossy(&out));
+        for checks in [
+            Checks {
+                tests: &[],
+                models: &[MODEL],
+                seeded: &[],
+            },
+            Checks {
+                tests: &[],
+                models: &[],
+                seeded: &[Seeded {
+                    model: SEEDED,
+                    property: "atMostThree",
+                }],
+            },
+        ] {
+            assert!(
+                run(
+                    root.path(),
+                    &checks,
+                    &|| Ok(no_jvm.clone()),
+                    Options { traces: None },
+                    &mut Vec::new(),
+                )
+                .is_err(),
+                "a model or a seeded bug needs the server: {checks:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_server_that_exits_is_tried_on_another_port_a_few_times() {
+        let root = tempfile::tempdir().unwrap();
+        let tools = pinned();
+        let workspace = Workspace::create(root.path(), &tools).unwrap();
+        let bin = root.path().join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let count = root.path().join("count");
+        let java = tools.java.display().to_string();
+        script(
+            &bin.join("flaky"),
+            &format!(
+                "echo x >> {count}\n[ \"$(wc -l < {count})\" -gt 1 ] && exec {java} \"$@\"\nexit 1\n",
+                count = count.display()
+            ),
+        );
+        let flaky = Tools {
+            java: bin.join("flaky"),
+            ..tools.clone()
+        };
+        let server = super::Server::start(&flaky, &workspace, super::SERVER_START_CHECKS).unwrap();
+        drop(server);
+        assert_eq!(
+            fs::read_to_string(&count).unwrap().lines().count(),
+            2,
+            "once more"
+        );
+
+        fs::remove_file(&count).unwrap();
+        script(
+            &bin.join("broken"),
+            &format!("echo x >> {}\nexit 1\n", count.display()),
+        );
+        let broken = Tools {
+            java: bin.join("broken"),
+            ..tools
+        };
+        assert!(super::Server::start(&broken, &workspace, 3).is_err());
+        assert_eq!(
+            fs::read_to_string(&count).unwrap().lines().count(),
+            usize::try_from(super::SERVER_PORTS).unwrap(),
+            "each of the ports"
+        );
+    }
+
+    #[test]
     fn the_tools_come_from_the_pins() {
         let tools =
             Tools::pinned(&|name| Ok(PathBuf::from(format!("/t/{name}/1/d/bin/{name}")))).unwrap();
