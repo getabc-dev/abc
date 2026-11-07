@@ -208,7 +208,7 @@ fn the_session_repository_holds_the_branch_and_origin_main_only() {
 
 /// The seal copied the host's `remote.origin.url` into the VM's repository. A maintainer whose
 /// origin is SSH gave the VM a remote it cannot use: no key there, egress is HTTPS only, and the
-/// App's credential helper answers only for https://github.com. The VM always gets the HTTPS URL.
+/// App's credential helper answers only for `https://github.com`. The VM always gets the HTTPS URL.
 #[test]
 fn the_vm_always_gets_the_https_remote() {
     let dir = tempfile::tempdir().unwrap();
