@@ -9,7 +9,6 @@
 
 use std::ffi::OsString;
 use std::fs;
-use std::io;
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -287,11 +286,7 @@ impl<'a> Services<'a> {
                     .run(&fix)?;
             }
         }
-        match fs::remove_file(&path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(source) => return Err(HostError::io(&path, source)),
-        }
+        fs::remove_file(&path).map_err(|source| HostError::io(&path, source))?;
         if self.host.os == Os::Linux {
             manager.arg("daemon-reload").run(&fix)?;
         }

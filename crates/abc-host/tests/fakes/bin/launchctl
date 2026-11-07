@@ -2,7 +2,8 @@
 # A stand-in for launchctl: bootstrap, bootout, print and kickstart of gui/<uid> agents. It runs
 # each agent's ProgramArguments with its EnvironmentVariables, as read from the plist, so a plist
 # abc writes wrong fails the test. With state/bootout-lingers, a booted-out agent is still
-# unloading when the next bootstrap of it comes, which then fails once, as launchd's does.
+# unloading when the next bootstrap of it comes, which then fails once, as launchd's does; with
+# state/bootstrap-refuses, every bootstrap fails.
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 # shellcheck source-path=SCRIPTDIR source=lib.sh
 . "$ROOT/bin/lib.sh"
@@ -35,6 +36,10 @@ label_of() {
 case "$1" in
 bootstrap)
 	label=$(basename "$3" .plist)
+	if [ -f "$STATE/bootstrap-refuses" ]; then
+		echo "Bootstrap failed: 125: Domain does not support specified action" >&2
+		exit 125
+	fi
 	if [ -f "$STATE/$label.unloading" ]; then
 		rm -f "$STATE/$label.unloading"
 		echo "Bootstrap failed: 5: Input/output error" >&2

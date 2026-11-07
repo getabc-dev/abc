@@ -278,6 +278,10 @@ mod tests {
             said.contains("Log abc's node in to your tailnet in the browser:\n  https://login.tailscale.com/a/fake"),
             "and printed: {said}"
         );
+        assert!(
+            !said.contains("approve `abc`"),
+            "no approval to ask for on a tailnet that needs none: {said}"
+        );
         root_was_asked_once(machine, &calls, said);
         assert!(
             calls.contains(&format!(
@@ -1237,5 +1241,19 @@ mod tests {
         host.home = ServerHome::at(machine.root().join("never-made"));
         abc_host::uninstall(&host, true, &mut Console::new(&mut said)).unwrap();
         assert!(!host.home.exists(), "still nothing");
+    }
+
+    #[test]
+    fn a_launchd_that_keeps_refusing_an_agent_is_given_up_on_with_its_message() {
+        let machine = Machine::new(Os::MacOs);
+        std::fs::write(machine.state("bootstrap-refuses"), "").unwrap();
+        let (error, _said) = setup_with(&machine, |timing| {
+            timing.service = Duration::from_millis(200);
+        });
+        assert!(
+            matches!(&error, HostError::Failed { command, output, .. }
+                if command.contains("bootstrap gui/501") && output.contains("Bootstrap failed: 125")),
+            "{error:?}"
+        );
     }
 }
