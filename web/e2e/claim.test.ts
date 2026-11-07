@@ -33,6 +33,18 @@ test("a wrong code is refused on the code field", async ({ page, server }) => {
   await capture(page, "claim-wrong-code-phone");
 });
 
+test("the claim link abc server setup opens fills the code in and leaves no trace of it", async ({
+  page,
+  server,
+}) => {
+  // It claims nothing: the next test claims this worker's server.
+  const code = await server.setupCode();
+  await page.goto(`/#code=${code}`);
+  await expect(page.getByRole("heading", { level: 1 })).toHaveText("Claim this server");
+  await expect(page.getByRole("textbox", { name: "Setup code" })).toHaveValue(code);
+  expect(new URL(page.url()).hash).toBe("");
+});
+
 test("the host's code claims the server and lands on home; a second tab learns it is taken", async ({
   page,
   context,
@@ -54,19 +66,4 @@ test("the host's code claims the server and lands on home; a second tab learns i
   await capture(late, "claim-already-claimed");
   await late.getByRole("button", { name: "Continue" }).click();
   await expect(late.getByRole("heading", { level: 1 })).toHaveText("Machines");
-});
-
-test("the claim link abc server setup opens fills the code in and leaves no trace of it", async ({
-  page,
-  server,
-}) => {
-  const code = await server.setupCode();
-  await page.goto(`/#code=${code}`);
-  await expect(page.getByRole("heading", { level: 1 })).toHaveText("Claim this server");
-  await expect(page.getByRole("textbox", { name: "Setup code" })).toHaveValue(code);
-  expect(new URL(page.url()).hash).toBe("");
-  await page.getByRole("textbox", { name: "Your name" }).fill("Ada Lovelace");
-  await page.getByRole("textbox", { name: "Workspace name" }).fill("Home lab");
-  await page.getByRole("button", { name: "Claim this server" }).click();
-  await expect(page.getByRole("heading", { level: 1 })).toHaveText("Machines");
 });
