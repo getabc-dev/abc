@@ -54,7 +54,35 @@ cargo xtask build    # web/dist with the pinned pnpm, then target/release/abc wi
 ```
 
 A plain `cargo build` of the `abc` crate without a web build fails and names `cargo xtask build`.
-`abc server` serves the app on its sidecar socket beside the API, behind the Tailscale sidecar.
+`abc server` serves the app on its sidecar socket beside the API, behind Tailscale Serve.
+
+### abc's server stack
+
+`abc server setup` (crate `abc-host`) runs the server the way a user's machine does: a private
+Postgres 18, abc's own unprivileged tailscaled as the tailnet node `abc`, and abc server, as
+launchd agents (`~/Library/LaunchAgents/dev.getabc.{postgres,tailscaled,server}.plist`) or
+systemd user units (`~/.config/systemd/user/abc-{postgres,tailscaled,server}.service`), all under
+one private home (`~/Library/Application Support/abc/server`, or `~/.local/share/abc/server`).
+[docs/server.md](docs/server.md) shows the layout and the commands. A build outside Homebrew has
+no `libexec/` beside it, so name the programs in the home's `config.toml` before the first
+`abc server setup`:
+
+```toml
+format = 1
+ops_addr = "127.0.0.1:7071"
+
+[programs]
+abc = "/path/to/abc/target/release/abc"
+tailscaled = "/path/to/tailscaled"
+tailscale = "/path/to/tailscale"
+postgres = "/opt/homebrew/opt/postgresql@18/bin"
+```
+
+Its tests run against fakes of launchctl, systemctl, loginctl, sudo, the browser, tailscaled and
+the tailscale CLI (`crates/abc-host/tests/fakes`), which record every call and run what each
+service definition says. `crates/abc/tests/server_setup.rs` runs the real abc server on a real
+Postgres 18 under them, so it needs Postgres 18's programs: `brew install postgresql@18` on macOS
+or `postgresql-18` on Debian and Ubuntu, or `ABC_TEST_POSTGRES_BIN` naming their directory.
 
 To work on the web app with Vite's dev server and its instant reloads:
 

@@ -1,0 +1,8 @@
+#!/bin/sh
+# A stand-in for abc's tailscaled: records how it was started and runs until stopped.
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
+# shellcheck source-path=SCRIPTDIR source=../bin/lib.sh
+. "$ROOT/bin/lib.sh"
+record tailscaled "$@"
+echo "$$" >"$STATE/tailscaled.daemon"
+exec sleep 86400

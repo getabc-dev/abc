@@ -1,0 +1,26 @@
+[package]
+name = "abc-host"
+description = "abc server's own stack on its host: a private Postgres, abc's own tailscaled, the services that run them, and the commands that set up and look after them."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# No sqlx, no axum and no async: this crate runs Postgres's, Tailscale's and the service manager's
+# own programs and reads what they print. The binary asks the store what only the store knows.
+[dependencies]
+abc-protocol = { path = "../abc-protocol" }
+rustix = { workspace = true, features = ["process"] }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+time.workspace = true
+toml_edit.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

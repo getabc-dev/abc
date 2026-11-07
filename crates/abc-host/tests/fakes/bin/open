@@ -1,0 +1,10 @@
+#!/bin/sh
+# A stand-in for the browser (open on macOS, xdg-open on Linux): records the URL, and a login
+# link logs abc's fake node in, as the person would.
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
+# shellcheck source-path=SCRIPTDIR source=lib.sh
+. "$ROOT/bin/lib.sh"
+record "$(basename "$0")" "$@"
+case "$1" in
+https://login.tailscale.com/*) touch "$STATE/logged-in" ;;
+esac

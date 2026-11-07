@@ -1,6 +1,6 @@
 [package]
 name = "abc"
-description = "The abc binary: `abc server`, `abc server setup-code`, `abc worker` and `abc worker enrol`."
+description = "The abc binary: `abc server`, its setup and day-2 commands, `abc server setup-code`, `abc worker` and `abc worker enrol`."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -15,6 +15,7 @@ path = "src/main.rs"
 # No sqlx and no axum: the binary parses configuration and hands it over.
 [dependencies]
 abc-core = { path = "../abc-core" }
+abc-host = { path = "../abc-host" }
 abc-platform = { path = "../abc-platform" }
 abc-protocol = { path = "../abc-protocol" }
 abc-server = { path = "../abc-server" }
@@ -24,6 +25,7 @@ clap = { workspace = true, features = ["env"] }
 # Echo off while the enrolment token is pasted into a terminal.
 rustix = { workspace = true, features = ["termios"] }
 semver.workspace = true
+time.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 zeroize.workspace = true

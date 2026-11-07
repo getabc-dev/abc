@@ -1,0 +1,22 @@
+#!/bin/sh
+# A stand-in for psql, knowing only the statements abc sends. A database is a file,
+# state/db-<name>, holding what was loaded into it.
+ROOT=$(cd "$(dirname "$0")/../.." && pwd)
+# shellcheck source-path=SCRIPTDIR source=../../bin/lib.sh
+. "$ROOT/bin/lib.sh"
+for sql; do :; done
+record psql "$sql"
+case "$sql" in
+"SELECT 1 FROM pg_database WHERE datname = 'abc'")
+	if [ -f "$STATE/db-abc" ]; then echo 1; fi
+	;;
+"CREATE DATABASE abc") echo "empty" >"$STATE/db-abc" ;;
+"CREATE DATABASE abc_restoring") : >"$STATE/db-abc_restoring" ;;
+"DROP DATABASE IF EXISTS abc_restoring"*) rm -f "$STATE/db-abc_restoring" ;;
+"DROP DATABASE IF EXISTS abc WITH (FORCE)") rm -f "$STATE/db-abc" ;;
+"ALTER DATABASE abc_restoring RENAME TO abc") mv "$STATE/db-abc_restoring" "$STATE/db-abc" ;;
+*)
+	echo "the fake psql does not know: $sql" >&2
+	exit 3
+	;;
+esac

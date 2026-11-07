@@ -1,0 +1,10 @@
+#!/bin/sh
+# A stand-in for abc server: records how it was started and runs until stopped. The test answers
+# its ops address while it runs.
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
+# shellcheck source-path=SCRIPTDIR source=../bin/lib.sh
+. "$ROOT/bin/lib.sh"
+record abc "$@"
+env | grep '^ABC_' | sort >"$STATE/abc.environment"
+echo "$$" >"$STATE/abc.daemon"
+exec sleep 86400

@@ -1,0 +1,81 @@
+#!/bin/sh
+# A stand-in for launchctl: bootstrap, bootout, print and kickstart of gui/<uid> agents. It runs
+# each agent's ProgramArguments with its EnvironmentVariables, as read from the plist, so a plist
+# abc writes wrong fails the test.
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
+# shellcheck source-path=SCRIPTDIR source=lib.sh
+. "$ROOT/bin/lib.sh"
+record launchctl "$@"
+
+# read_plist PLIST LABEL: the agent's arguments and environment into state/LABEL.args and .env.
+read_plist() {
+	awk -v args="$STATE/$2.args" -v env="$STATE/$2.env" '
+		function inner(line) { sub(/^[ \t]*<[a-z]+>/, "", line); sub(/<\/[a-z]+>[ \t]*$/, "", line); return line }
+		/<key>ProgramArguments<\/key>/ { mode = "args"; next }
+		/<key>EnvironmentVariables<\/key>/ { mode = "env"; next }
+		mode == "args" && /<\/array>/ { mode = ""; next }
+		mode == "env" && /<\/dict>/ { mode = ""; next }
+		mode == "args" && /<string>/ { print inner($0) > args }
+		mode == "env" && /<key>/ { key = inner($0) }
+		mode == "env" && /<string>/ { print key "=" inner($0) > env }
+	' "$1"
+	touch "$STATE/$2.env"
+	for file in "$STATE/$2.args" "$STATE/$2.env"; do
+		sed -e 's/&lt;/</g' -e 's/&gt;/>/g' -e 's/&quot;/"/g' -e "s/&apos;/'/g" -e 's/&amp;/\&/g' \
+			"$file" >"$file.new"
+		mv "$file.new" "$file"
+	done
+}
+
+label_of() {
+	printf '%s\n' "${1##*/}"
+}
+
+case "$1" in
+bootstrap)
+	label=$(basename "$3" .plist)
+	if [ -f "$STATE/$label.loaded" ]; then
+		echo "Bootstrap failed: 5: Input/output error" >&2
+		exit 5
+	fi
+	read_plist "$3" "$label"
+	touch "$STATE/$label.loaded"
+	start "$label"
+	;;
+bootout)
+	label=$(label_of "$2")
+	if [ ! -f "$STATE/$label.loaded" ]; then
+		echo "Boot-out failed: 3: No such process" >&2
+		exit 3
+	fi
+	stop "$label"
+	rm -f "$STATE/$label.loaded"
+	;;
+print)
+	label=$(label_of "$2")
+	if [ ! -f "$STATE/$label.loaded" ]; then
+		echo "Could not find service \"$label\" in domain for user gui" >&2
+		exit 113
+	fi
+	echo "state = running"
+	;;
+kickstart)
+	if [ "$2" = -k ]; then
+		label=$(label_of "$3")
+	else
+		label=$(label_of "$2")
+	fi
+	if [ ! -f "$STATE/$label.loaded" ]; then
+		echo "Could not find service \"$label\" in domain for user gui" >&2
+		exit 113
+	fi
+	if [ "$2" = -k ]; then
+		stop "$label"
+	fi
+	start "$label"
+	;;
+*)
+	echo "the fake launchctl does not know $1" >&2
+	exit 64
+	;;
+esac

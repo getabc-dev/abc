@@ -1,0 +1,13 @@
+#!/bin/sh
+# A stand-in for Postgres 18's server: says its version, or records how it was started and runs
+# until stopped.
+ROOT=$(cd "$(dirname "$0")/../.." && pwd)
+# shellcheck source-path=SCRIPTDIR source=../../bin/lib.sh
+. "$ROOT/bin/lib.sh"
+if [ "$1" = --version ]; then
+	echo "postgres (PostgreSQL) 18.1"
+	exit 0
+fi
+record postgres "$@"
+echo "$$" >"$STATE/postgres.daemon"
+exec sleep 86400

@@ -9,7 +9,12 @@ import { routeTree } from "./routeTree.gen";
 
 /** The router, on the browser's history unless `history` is given. */
 export function createAppRouter(
-  context: { readonly api: ApiClient; readonly queryClient: QueryClient; readonly origin: string },
+  context: {
+    readonly api: ApiClient;
+    readonly queryClient: QueryClient;
+    readonly origin: string;
+    readonly setupCode: string;
+  },
   history?: RouterHistory,
 ) {
   return createRouter({ routeTree, context, ...(history === undefined ? {} : { history }) });

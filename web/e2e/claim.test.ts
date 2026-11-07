@@ -1,6 +1,6 @@
-// Claiming the server end to end: the host prints a setup code, the person enters it in the
-// browser and becomes the owner. A wrong code is refused on its field, and a second tab that
-// claims after the first is told the server already has an owner.
+// Claiming the server end to end: the host prints a setup code, or `abc server setup` opens a link
+// carrying it, and the person becomes the owner in the browser. A wrong code is refused on its
+// field, and a second tab that claims after the first is told the server already has an owner.
 
 import type { Page } from "@playwright/test";
 
@@ -54,4 +54,19 @@ test("the host's code claims the server and lands on home; a second tab learns i
   await capture(late, "claim-already-claimed");
   await late.getByRole("button", { name: "Continue" }).click();
   await expect(late.getByRole("heading", { level: 1 })).toHaveText("Machines");
+});
+
+test("the claim link abc server setup opens fills the code in and leaves no trace of it", async ({
+  page,
+  server,
+}) => {
+  const code = await server.setupCode();
+  await page.goto(`/#code=${code}`);
+  await expect(page.getByRole("heading", { level: 1 })).toHaveText("Claim this server");
+  await expect(page.getByRole("textbox", { name: "Setup code" })).toHaveValue(code);
+  expect(new URL(page.url()).hash).toBe("");
+  await page.getByRole("textbox", { name: "Your name" }).fill("Ada Lovelace");
+  await page.getByRole("textbox", { name: "Workspace name" }).fill("Home lab");
+  await page.getByRole("button", { name: "Claim this server" }).click();
+  await expect(page.getByRole("heading", { level: 1 })).toHaveText("Machines");
 });

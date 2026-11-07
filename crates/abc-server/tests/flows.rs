@@ -896,7 +896,7 @@ mod tests {
             "a world-readable directory: {refused:?}"
         );
         assert!(
-            refused.to_string().contains("0750 or 0770"),
+            refused.to_string().contains("chmod 700 it"),
             "the message says what to do"
         );
         let dir = socket_dir();

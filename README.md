@@ -7,6 +7,22 @@ trust it without reading the code.
 **Status: in development. Nothing is installable yet.** There are no releases, and the parts below
 describe the design being built, not features you can use today.
 
+## Install
+
+abc has no release yet; the first one brings the Homebrew tap. From then on, a Mac or a Linux
+machine becomes abc's server with two commands:
+
+```sh
+brew install getabc-dev/tap/abc
+abc server setup
+```
+
+Setup runs a private Postgres and abc's own Tailscale node, asks for your password once (Tailscale
+lets only root point Serve at abc), installs the services that keep them running, and opens the
+claim page in your browser with a setup code filled in. It never touches the Tailscale you already
+run. [Running abc's server](docs/server.md) covers what it sets up, `abc server status`,
+upgrades, backups and uninstalling.
+
 ## How a change moves
 
 ```text
@@ -39,6 +55,7 @@ code follows.
 
 ## Links
 
+- [Running abc's server](docs/server.md)
 - [Contributing](CONTRIBUTING.md), including the AI policy
 - [Security policy](SECURITY.md) and the [threat model](docs/threat-model.md)
 - [Code of conduct](CODE_OF_CONDUCT.md)

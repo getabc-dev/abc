@@ -21,7 +21,7 @@ Report vulnerabilities as [SECURITY.md](../SECURITY.md) explains.
 ## System
 
 ```text
-Browser ──B1──▶ Tailscale sidecar ──▶ abc server ──▶ Postgres
+Browser ──B1──▶ abc's tailscaled ──▶ abc server ──▶ Postgres
                                        ▲  │  ▲
                                     B3 │  │  │ B2: webhooks, the only public path
                                        │  │  └──────────────── GitHub
@@ -50,7 +50,7 @@ leave the user's machines for GitHub and the model providers.
 | Installation tokens | Minted per use, handed to agents | Write access to code and PRs until revoked or for up to one hour. |
 | Webhook secret | The server (planned) | Lets anyone forge GitHub events to the public path. |
 | `GEMINI_API_KEY` | A GitHub Actions secret, given only to the Gemini review job | Billable model access, and the review gate itself. |
-| Tailscale identity | Node keys of the sidecar and each worker; the user's tailnet login | Reaching the server, and being taken for the user or a worker. |
+| Tailscale identity | Node keys of abc's own node (`tailscale/` in the server's home) and each worker; the user's tailnet login | Reaching the server, and being taken for the user or a worker. |
 | Event log and PR artifact | Postgres; the PR branch | The record people trust instead of reading code (I4, I6). |
 | The gates | CI, `cargo xtask`, the `main` ruleset | Weakened gates let any other attack merge. |
 
@@ -165,9 +165,11 @@ Open:
 
 ## Boundaries and threats
 
-### B1 · Browser to server, through the Tailscale sidecar
+### B1 · Browser to server, through abc's own tailscaled
 
-The server sits behind the official Tailscale sidecar. `tailscale serve` adds identity headers
+The server sits behind abc's own tailscaled, a node of its own named `abc`, which `abc server
+setup` runs unprivileged in userspace ([The server's host](#the-servers-host-one-root-call)).
+`tailscale serve` adds identity headers
 (`Tailscale-User-Login`, `Tailscale-User-Name`, `Tailscale-User-Profile-Pic`) to tailnet requests,
 and `Tailscale-App-Capabilities` when it is set to forward app capabilities. It strips copies of
 these headers sent by the client. It adds no user identity for tagged devices or for Funnel
@@ -185,6 +187,29 @@ node.
 | Information disclosure | A production secret shown in the web app. | Secrets never leave the vault for display, logs or PR artifacts. | I2 | Planned |
 | Denial of service | A tailnet device floods the server. | Request size and rate limits per identity. | P4 | Planned |
 | Elevation of privilege | A tailnet member reaches another workspace's data. | One permission check on every request; everything belongs to a workspace. | I4 | Planned |
+
+### The server's host: one root call
+
+`abc server setup` runs the stack as the user who runs it: a private Postgres 18, abc's own
+tailscaled and abc server, as launchd agents or systemd user units, all under the server's home
+(0700). Root is used once, because Tailscale lets only root point Serve at a Unix socket:
+`sudo <abc's tailscale> --socket=<abc's> serve --bg unix:<home>/run/abc.sock`, with
+`loginctl enable-linger <uid>` in the same `sudo` on Linux. Setup prints that command and why
+before `sudo` asks, and runs it only when Serve or lingering is missing. The Serve setting lives
+in abc's node's state, so no later run needs root.
+
+abc trusts the identity headers Serve sets because only abc's own node can reach the socket, and
+only this user controls that node: its state and its socket sit in the private home.
+
+| STRIDE | Threat | Mitigation | Rule | Status |
+| --- | --- | --- | --- | --- |
+| Elevation of privilege | Setup's root step does more than it says. | One `sudo` of one printed command, built from fixed words with every path an argument (never spliced into a shell script); nothing else runs as root, and a second run asks nothing. Tests check the exact command line. | I3 | Built |
+| Spoofing | Another user of the machine connects to `abc.sock` and sends forged identity headers. | The socket's directory is the home's `run/` (0700); abc server refuses a directory with any permission for others. | I4 | Built |
+| Spoofing | Another user of the machine connects to Postgres, which trusts its socket. | Postgres listens on no TCP address (`listen_addresses=''`, host connections rejected), and its socket is in the same 0700 directory with `unix_socket_permissions=0700`. | I4 | Built |
+| Tampering | Another user of the machine changes Serve or logs abc's node out through its tailscaled. | tailscaled's socket and state are in the private home; changing Serve to a socket needs root besides. | I4 | Built |
+| Tampering | abc changes the user's own Tailscale. | Every Tailscale call names abc's socket; abc runs the tailscale and tailscaled its install or `config.toml` names, never one on the `PATH`. Tests run a `PATH` tailscale that fails if called. | I3 | Built |
+| Information disclosure | The setup code leaks from the claim link. | The code rides in the URL's fragment, which the browser never sends, so no proxy or server log holds it; the app reads it once and takes it out of the address bar and history. The link is printed to the terminal and passed to `open` or `xdg-open`, where another user of the machine could see it in the process list for a moment; using it also needs a tailnet identity, and it expires in an hour. | I2 | Built |
+| Information disclosure | A backup is read by someone else. | `abc server backup` writes a new 0600 file and never overwrites one. | I2 | Built |
 
 ### B2 · GitHub to server, on the public webhook path
 

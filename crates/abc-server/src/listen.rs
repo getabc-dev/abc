@@ -10,9 +10,9 @@
 //!    distinction.)
 //! 2. **Only the sidecar can reach the socket.** [`SidecarSocket::bind`] refuses a parent directory
 //!    with any "other" permission bit, removes a stale socket file, binds, and sets the socket to
-//!    0660. In the compose file the directory is a volume mounted into exactly two containers: abc
-//!    and `tailscale/tailscale`, whose serve config proxies `https://<name>.<tailnet>.ts.net/` to
-//!    `unix:/run/abc-sidecar/abc.sock`.
+//!    0660. `abc server setup` puts it in `<home>/run/` (0700), where only the user reaches it: abc
+//!    server and abc's own tailscaled run as that user, and Serve proxies
+//!    `https://<name>.<tailnet>.ts.net/` to `unix:<home>/run/abc.sock` (abc-host's `root`).
 //! 3. **There is no TCP listener with identity**, so a stray `ports:` mapping or a `0.0.0.0` bind
 //!    exposes health checks at most, never forgeable identity.
 //! 4. **Defence in depth.** `TailnetCaller` is `FromRequestParts<SidecarState>` only, so identity
