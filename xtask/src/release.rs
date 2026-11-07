@@ -1756,7 +1756,7 @@ mod tests {
         );
         assert!(
             rendered.contains(
-                "libexec.install_symlink Formula[\"postgresql@18\"].opt_bin => \"postgresql\""
+                "libexec.install_symlink formula_opt_bin(\"postgresql@18\") => \"postgresql\""
             ) && rendered
                 .contains("assert_predicate libexec/\"postgresql/postgres\", :executable?"),
             "abc finds the keg-only Postgres 18 in its own libexec"

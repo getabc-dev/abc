@@ -61,7 +61,7 @@ class Abc < Formula
     resource("tailscaled").stage { libexec.install "tailscaled" }
     # postgresql@18 is keg-only, off the PATH. abc finds its programs through this link in its
     # own libexec, to the formula's opt directory, which stays put across Postgres 18 updates.
-    libexec.install_symlink Formula["postgresql@18"].opt_bin => "postgresql"
+    libexec.install_symlink formula_opt_bin("postgresql@18") => "postgresql"
   end
 
   test do
