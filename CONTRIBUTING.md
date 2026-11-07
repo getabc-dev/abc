@@ -252,8 +252,8 @@ hold only caches); each version keeps its state apart, so delete the old version
 ## Release abc (maintainers)
 
 A tag `v<version>` that a maintainer pushes releases abc: the Release workflow
-(`.github/workflows/release.yml`) builds abc and abc's private tailscaled for macOS and Linux on
-arm64 and x86_64, renders the Homebrew formula for them and installs, tests and lints it with
+(`.github/workflows/release.yml`) builds the web app once, then abc with it embedded and abc's
+private tailscaled for macOS and Linux on arm64 and x86_64, renders the Homebrew formula for them and installs, tests and lints it with
 Homebrew on each of the four platforms, each on a native runner (`macos-26` for Apple silicon,
 `macos-15-intel` for Intel Macs, `ubuntu-26.04` for x86_64 Linux and `ubuntu-24.04-arm` for
 arm64 Linux). Only then does it attest every archive and `SHA256SUMS`, publish the GitHub Release

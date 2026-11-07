@@ -67,8 +67,11 @@ enum ReleaseAction {
     /// Install the Go that packaging/tailscale.toml pins, for this machine, into target/go, once
     /// Tailscale's go.mod names it and go.dev's archive matches its pinned sha256.
     Go,
-    /// Build the web app, abc for TARGET with it embedded and tailscaled from target/tailscale,
-    /// and package each with its licence in target/dist.
+    /// Build the web app with the pinned node and pnpm and pack web/dist into
+    /// `target/web/web-<HEAD>.tar.gz`, the one web app every target's package embeds.
+    Web,
+    /// Build abc for TARGET with the web app `release web` packed for HEAD, and tailscaled from
+    /// target/tailscale, and package each with its licence in target/dist. It runs no node.
     Package {
         /// The Rust target triple, such as aarch64-apple-darwin.
         #[arg(long, value_parser = release::Target::parse)]
@@ -542,12 +545,19 @@ fn run_release(
         ReleaseAction::TailscaleSource => {
             release::tailscale_source(root, release::TAILSCALE_REPOSITORY, report)?;
         }
-        ReleaseAction::Package { target } => {
+        ReleaseAction::Web => {
             let toolchain = web::Toolchain::pinned(tool)?;
+            return Ok(verdict(release::pack_web(
+                root,
+                &toolchain,
+                &mut web::run_here,
+                report,
+            )?));
+        }
+        ReleaseAction::Package { target } => {
             return Ok(verdict(release::package(
                 root,
                 target,
-                &toolchain,
                 &mut web::run_here,
                 report,
             )?));
@@ -1000,6 +1010,14 @@ mod tests {
             dispatch(package(), &home, &root, &no_env).unwrap(),
             ExitCode::FAILURE,
             "no Tailscale source was fetched"
+        );
+        let web = Task::Release {
+            action: ReleaseAction::Web,
+        };
+        assert_eq!(
+            dispatch(web, &home, &root, &no_env).unwrap(),
+            ExitCode::FAILURE,
+            "a tree without the web app has none to build"
         );
     }
 

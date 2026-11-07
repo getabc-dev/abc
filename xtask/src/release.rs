@@ -40,6 +40,9 @@ pub(crate) const FORMULA_TEMPLATE: &str = "packaging/homebrew/abc.rb";
 /// Where `package` writes the archives, relative to the root.
 pub(crate) const DIST: &str = "target/dist";
 
+/// Where `web` writes the built web app's archive, relative to the root.
+pub(crate) const WEB: &str = "target/web";
+
 /// Where `tailscale-source` puts Tailscale's source, relative to the root.
 pub(crate) const TAILSCALE_SOURCE: &str = "target/tailscale";
 
@@ -524,12 +527,131 @@ fn tagged_commit(listed: &str, tag: &str) -> Option<String> {
 /// Runs a command and says whether it passed.
 pub(crate) type Runner<'run> = dyn FnMut(&mut Command) -> anyhow::Result<bool> + 'run;
 
-/// Builds abc and tailscaled for `target` and packages them in [`DIST`], running each command with
-/// `run`; reports whether every step passed, and says in `out` what failed and how to fix it.
+/// The archive [`pack_web`] packs the web app built at `commit` into, relative to the root.
+fn web_archive(commit: &str) -> String {
+    format!("{WEB}/web-{commit}.tar.gz")
+}
+
+/// The commit `root`'s HEAD names.
+fn head(root: &Path) -> anyhow::Result<String> {
+    Ok(git::git(root, &["rev-parse", "HEAD"])?.trim().to_owned())
+}
+
+/// Builds the web app at `root` with the pinned node and pnpm, running each step with `run`, and
+/// packs `web/dist` into [`web_archive`] for HEAD: the one web app every target's `package`
+/// embeds, built once on a machine node runs on. Reports whether it passed, and says in `out`
+/// what failed and how to fix it.
+pub(crate) fn pack_web(
+    root: &Path,
+    toolchain: &web::Toolchain,
+    run: &mut Runner<'_>,
+    out: &mut impl Write,
+) -> anyhow::Result<bool> {
+    if !web::present(root) {
+        writeln!(out, "xtask release: {}", web::MISSING)?;
+        return Ok(false);
+    }
+    if let Some(step) = web::build(root, toolchain, run)? {
+        writeln!(out, "xtask release: {} failed: {}", step.name, step.fix)?;
+        return Ok(false);
+    }
+    let dist = root.join("web/dist");
+    ensure!(
+        web::built(root),
+        "the web build left no {}",
+        root.join(web::BUILT).display()
+    );
+    let mut files = Vec::new();
+    web_files(&dist, &dist, &mut files)?;
+    files.sort();
+    let path = root.join(web_archive(&head(root)?));
+    let dir = root.join(WEB);
+    fs::create_dir_all(&dir).with_context(|| format!("could not create {}", dir.display()))?;
+    let entries: Vec<(&str, PathBuf, u32)> = files
+        .iter()
+        .map(|(name, file)| (name.as_str(), file.clone(), 0o644))
+        .collect();
+    archive(&path, "dist", &entries, commit_time(root)?)?;
+    writeln!(
+        out,
+        "xtask release: packed the web app into {}",
+        path.display()
+    )?;
+    Ok(true)
+}
+
+/// Adds every file under `dir` to `files`, as its path relative to `dist` and its full path.
+fn web_files(dist: &Path, dir: &Path, files: &mut Vec<(String, PathBuf)>) -> anyhow::Result<()> {
+    let entries = fs::read_dir(dir).with_context(|| format!("could not list {}", dir.display()))?;
+    for entry in entries {
+        let path = entry
+            .with_context(|| format!("could not list {}", dir.display()))?
+            .path();
+        let kind = fs::symlink_metadata(&path)
+            .with_context(|| format!("could not inspect {}", path.display()))?
+            .file_type();
+        if kind.is_dir() {
+            web_files(dist, &path, files)?;
+        } else {
+            ensure!(
+                kind.is_file(),
+                "{} is neither a file nor a directory",
+                path.display()
+            );
+            let relative = path
+                .strip_prefix(dist)
+                .context("a file outside web/dist")?
+                .to_str()
+                .with_context(|| format!("{} is not UTF-8", path.display()))?
+                .to_owned();
+            files.push((relative, path));
+        }
+    }
+    Ok(())
+}
+
+/// Puts the web app [`pack_web`] packed for HEAD in place as `web/dist`, replacing whatever was
+/// there, so the binary embeds exactly that build. Says in `out` how to make the archive when
+/// it is missing, and reports whether it was there.
+fn unpack_web(root: &Path, out: &mut impl Write) -> anyhow::Result<bool> {
+    let packed = root.join(web_archive(&head(root)?));
+    if !packed.is_file() {
+        writeln!(
+            out,
+            "xtask release: {} holds no web app built at HEAD: run `cargo xtask release web` \
+             first, on this commit (the release workflow's web job does, and every build \
+             downloads its archive)",
+            packed.display()
+        )?;
+        return Ok(false);
+    }
+    let unpacked = root.join(WEB).join("unpacked");
+    let dist = root.join("web/dist");
+    for dir in [&unpacked, &dist] {
+        if dir.exists() {
+            fs::remove_dir_all(dir)
+                .with_context(|| format!("could not clear {}", dir.display()))?;
+        }
+    }
+    let file =
+        fs::File::open(&packed).with_context(|| format!("could not read {}", packed.display()))?;
+    tar::Archive::new(flate2::read::GzDecoder::new(file))
+        .unpack(&unpacked)
+        .with_context(|| format!("could not unpack {}", packed.display()))?;
+    fs::rename(unpacked.join("dist"), &dist)
+        .with_context(|| format!("{} holds no dist directory", packed.display()))?;
+    fs::remove_dir_all(&unpacked)
+        .with_context(|| format!("could not clear {}", unpacked.display()))?;
+    Ok(true)
+}
+
+/// Builds abc, with the web app [`pack_web`] packed for HEAD, and tailscaled for `target`, and
+/// packages them in [`DIST`], running each command with `run`; reports whether every step
+/// passed, and says in `out` what failed and how to fix it. It runs no node: the web app is
+/// built once, on a machine node runs on, rather than once per target in its build environment.
 pub(crate) fn package(
     root: &Path,
     target: Target,
-    toolchain: &web::Toolchain,
     run: &mut Runner<'_>,
     out: &mut impl Write,
 ) -> anyhow::Result<bool> {
@@ -550,8 +672,7 @@ pub(crate) fn package(
         writeln!(out, "xtask release: {error}")?;
         return Ok(false);
     }
-    if let Some(step) = web::build(root, toolchain, run)? {
-        writeln!(out, "xtask release: {} failed: {}", step.name, step.fix)?;
+    if !unpack_web(root, out)? {
         return Ok(false);
     }
     let target_dir = web::target_dir(root);
@@ -1000,8 +1121,8 @@ mod tests {
 
     use super::{
         FORMULA_TEMPLATE, GoPin, Pin, Program, TAILSCALE_PIN, TapPlan, Target, Versions, archive,
-        check_tag, formula, glibc_versions, go, go_mod_version, go_platform, package, render,
-        tagged_commit, tailscale_source, tap_plan, within_glibc,
+        check_tag, formula, glibc_versions, go, go_mod_version, go_platform, pack_web, package,
+        render, tagged_commit, tailscale_source, tap_plan, within_glibc,
     };
     use crate::testing::{fake_web, git, repository};
 
@@ -1802,8 +1923,6 @@ mod tests {
     /// that records it, writes the binaries a build would (abc with `abc`'s bytes) and fails the
     /// command whose program is `fail`. Returns whether it passed, what it said and what ran.
     fn packaged(root: &Path, target: Target, abc: &[u8], fail: &str) -> (bool, String, Vec<Ran>) {
-        let tools = root.join("../tools");
-        let toolchain = fake_web(&tools, "");
         let ran = RefCell::new(Vec::new());
         let mut run = |command: &mut Command| -> anyhow::Result<bool> {
             let seen = Ran::of(command);
@@ -1832,7 +1951,7 @@ mod tests {
             Ok(passed)
         };
         let mut out = Vec::new();
-        let passed = package(root, target, &toolchain, &mut run, &mut out).unwrap();
+        let passed = package(root, target, &mut run, &mut out).unwrap();
         (passed, String::from_utf8(out).unwrap(), ran.into_inner())
     }
 
@@ -1852,6 +1971,15 @@ mod tests {
         )
         .unwrap();
         fs::write(source.join("PATENTS"), "patent grant\n").unwrap();
+        // The web app, built and packed once for HEAD; packaging puts it back in place.
+        let toolchain = fake_web(&root.join("../tools"), "");
+        let mut said = Vec::new();
+        assert!(
+            pack_web(&root, &toolchain, &mut crate::web::run_here, &mut said).unwrap(),
+            "{}",
+            String::from_utf8_lossy(&said)
+        );
+        fs::remove_dir_all(root.join("web/dist")).unwrap();
         root
     }
 
@@ -1870,21 +1998,21 @@ mod tests {
                 .iter()
                 .map(|(program, _)| *program)
                 .collect::<Vec<_>>(),
-            ["pnpm", "pnpm", "rustup", "cargo", "go"],
-            "the web app, then the target, abc and tailscaled"
+            ["rustup", "cargo", "go"],
+            "the target, abc and tailscaled, and no node"
         );
         assert_eq!(
-            ran[2].args,
+            ran[0].args,
             ["target", "add", "aarch64-unknown-linux-gnu"],
             "the target's standard library"
         );
         assert_eq!(
-            ran[2].dir.as_deref(),
+            ran[0].dir.as_deref(),
             Some(root.as_path()),
             "for the pinned toolchain"
         );
         assert_eq!(
-            ran[3].args,
+            ran[1].args,
             [
                 "build",
                 "--release",
@@ -1898,17 +2026,17 @@ mod tests {
             ],
             "a locked release build for the target"
         );
-        assert_eq!(ran[3].dir.as_deref(), Some(root.as_path()), "in the tree");
+        assert_eq!(ran[1].dir.as_deref(), Some(root.as_path()), "in the tree");
         assert_eq!(
-            ran[3].env("MACOSX_DEPLOYMENT_TARGET"),
+            ran[1].env("MACOSX_DEPLOYMENT_TARGET"),
             None,
             "no macOS floor on Linux"
         );
         assert!(
-            ran[3].env.contains(&("CARGO_TARGET_DIR".to_owned(), None)),
+            ran[1].env.contains(&("CARGO_TARGET_DIR".to_owned(), None)),
             "the tree's own target directory"
         );
-        let go = &ran[4];
+        let go = &ran[2];
         assert_eq!(
             go.args[..4],
             [
@@ -2022,11 +2150,11 @@ mod tests {
         let (passed, said, ran) = packaged(&root, Target::AppleIntel, b"GLIBC_2.99", "");
         assert!(passed, "glibc is no matter on macOS: {said}");
         assert_eq!(
-            ran[3].env("MACOSX_DEPLOYMENT_TARGET"),
+            ran[1].env("MACOSX_DEPLOYMENT_TARGET"),
             Some("12.0"),
             "abc runs on macOS 12"
         );
-        let go = &ran[4];
+        let go = &ran[2];
         for (name, value) in [
             ("GOOS", "darwin"),
             ("GOARCH", "amd64"),
@@ -2039,11 +2167,11 @@ mod tests {
         }
         let (_, _, arm) = packaged(&root, Target::AppleArm, b"", "");
         assert_eq!(
-            arm[4].env("CGO_CFLAGS"),
+            arm[2].env("CGO_CFLAGS"),
             Some("-arch arm64 -mmacosx-version-min=12.0"),
             "arm64 keeps Go's name"
         );
-        assert_eq!(arm[4].env("GOARCH"), Some("arm64"), "on Apple silicon");
+        assert_eq!(arm[2].env("GOARCH"), Some("arm64"), "on Apple silicon");
     }
 
     #[test]
@@ -2066,26 +2194,98 @@ mod tests {
     }
 
     #[test]
+    fn packs_the_web_app_once_and_embeds_exactly_that_build() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = tree_with_source(&temp.path().join("tree"));
+        let head = git(&root, &["rev-parse", "HEAD"]).trim().to_owned();
+        let packed = root.join(format!("target/web/web-{head}.tar.gz"));
+        let names: Vec<String> = entries(&packed)
+            .into_iter()
+            .map(|(name, mode, _, _, _, _)| format!("{name} {mode:o}"))
+            .collect();
+        assert_eq!(
+            names,
+            ["dist/index.html 644"],
+            "web/dist's files, under dist/, for HEAD"
+        );
+        // A stale build in web/dist is replaced by the packed one.
+        fs::create_dir_all(root.join("web/dist")).unwrap();
+        fs::write(root.join("web/dist/stale.js"), "old").unwrap();
+        let (passed, said, _) = packaged(&root, Target::AppleArm, b"", "");
+        assert!(passed, "{said}");
+        assert!(
+            root.join("web/dist/index.html").is_file() && !root.join("web/dist/stale.js").exists(),
+            "the binary embeds exactly the packed web app"
+        );
+        assert!(
+            !root.join("target/web/unpacked").exists(),
+            "leaving nothing beside it"
+        );
+
+        git(
+            &root,
+            &["commit", "--quiet", "--allow-empty", "-m", "later"],
+        );
+        let (later, later_said, ran) = packaged(&root, Target::AppleArm, b"", "");
+        assert!(!later, "a web app packed at another commit");
+        assert_eq!(
+            later_said,
+            format!(
+                "xtask release: {} holds no web app built at HEAD: run `cargo xtask release \
+                 web` first, on this commit (the release workflow's web job does, and every \
+                 build downloads its archive)\n",
+                root.join(format!(
+                    "target/web/web-{}.tar.gz",
+                    git(&root, &["rev-parse", "HEAD"]).trim()
+                ))
+                .display()
+            ),
+            "names the command that packs it"
+        );
+        assert!(ran.is_empty(), "before building anything");
+    }
+
+    #[test]
+    fn a_failed_web_build_packs_nothing() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = tree(&temp.path().join("tree"), COMMIT);
+        fs::create_dir_all(root.join("web")).unwrap();
+        fs::write(root.join("web/package.json"), "{}\n").unwrap();
+        let toolchain = fake_web(&temp.path().join("tools"), "build");
+        let mut said = Vec::new();
+        assert!(
+            !pack_web(&root, &toolchain, &mut crate::web::run_here, &mut said).unwrap(),
+            "the build fails"
+        );
+        assert!(
+            String::from_utf8(said)
+                .unwrap()
+                .starts_with("xtask release: web build failed: "),
+            "names the step"
+        );
+        assert!(!root.join("target/web").exists(), "and packs nothing");
+    }
+
+    #[test]
     fn stops_at_the_first_step_that_fails() {
         let temp = tempfile::tempdir().unwrap();
         let root = tree_with_source(&temp.path().join("tree"));
         for (fail, said, steps) in [
-            ("pnpm", "xtask release: web install failed: ", 1),
             (
                 "rustup",
                 "xtask release: aarch64-apple-darwin: rustup could not add the target\n",
-                3,
+                1,
             ),
             (
                 "cargo",
                 "xtask release: aarch64-apple-darwin: cargo build failed: fix each error above\n",
-                4,
+                2,
             ),
             (
                 "go",
                 "xtask release: aarch64-apple-darwin: go build of tailscaled failed: fix each \
                  error above; the Go version is the one Tailscale's go.mod names\n",
-                5,
+                3,
             ),
         ] {
             let (passed, out, ran) = packaged(&root, Target::AppleArm, b"", fail);
@@ -2763,8 +2963,9 @@ mod tests {
             yaml_rust2::YamlLoader::load_from_str("push:\n  tags: [\"v*\"]\n").unwrap()[0],
             "a release runs on a tag alone"
         );
-        // The dry run builds only when the change touches what a release builds from.
-        let mut gated = dry_run["jobs"]["build"].as_hash().unwrap().clone();
+        // The dry run builds only when the change touches what a release builds from: its web
+        // job, which every other job needs, waits for the inputs.
+        let mut gated = dry_run["jobs"]["web"].as_hash().unwrap().clone();
         for (key, value) in [
             ("needs", "inputs"),
             ("if", "needs.inputs.outputs.changed == 'true'"),
@@ -2772,13 +2973,13 @@ mod tests {
             assert_eq!(
                 gated.remove(&yaml_rust2::Yaml::String(key.to_owned())),
                 Some(yaml_rust2::Yaml::String(value.to_owned())),
-                "the dry run's build is gated on its inputs by {key}"
+                "the dry run's web job is gated on its inputs by {key}"
             );
         }
         let gated = yaml_rust2::Yaml::Hash(gated);
-        for (id, cached) in [("build", 1), ("formula", 1), ("install", 0)] {
+        for (id, cached) in [("web", 1), ("build", 1), ("formula", 1), ("install", 0)] {
             let job = &release["jobs"][id];
-            let dry_job = if id == "build" {
+            let dry_job = if id == "web" {
                 &gated
             } else {
                 &dry_run["jobs"][id]
@@ -2803,6 +3004,17 @@ mod tests {
                 without(dry_job, &cache),
                 "release.yml's {id} is the dry run's, without its caches and with the tag check"
             );
+        }
+        for workflow in [&release, &dry_run] {
+            for step in workflow["jobs"]["build"]["steps"].as_vec().unwrap() {
+                let run = step["run"].as_str().unwrap_or_default();
+                assert!(
+                    !["node", "pnpm", "release web"]
+                        .iter()
+                        .any(|word| run.contains(word)),
+                    "no target's build runs node, which the AlmaLinux 8 container cannot: {run}"
+                );
+            }
         }
         assert_eq!(
             release["concurrency"]["group"].as_str(),
