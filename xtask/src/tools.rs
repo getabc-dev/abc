@@ -9,7 +9,7 @@ use std::fs::{self, Permissions};
 use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
-use std::process::{Child, Command, ExitCode, ExitStatus};
+use std::process::{Child, Command, ExitCode, ExitStatus, Stdio};
 
 use anyhow::{Context, bail, ensure};
 use flate2::read::GzDecoder;
@@ -1081,16 +1081,68 @@ pub(crate) fn pinned(home: &Path, name: &str) -> anyhow::Result<PathBuf> {
     Manifest::load(home)?.tool(name)?.installed(home)
 }
 
-/// A tool the tests of the tree at `tree` run themselves, such as the Postgres a gate hands them:
-/// marked `for-tests` in that tree's own tool list and installed in its own `.tools/`, as its
-/// `cargo xtask setup --for-tests` put it there. Under `--root` the gates' own programs, those
-/// that run the tests included, stay xtask's ([`pinned`]), so a pull request cannot change what
-/// judges it; a tool from here is the tree's code running the tree's tests, which no trust
-/// boundary separates.
+/// A tool the tests of this checkout at `tree` run themselves, such as the Postgres a gate hands
+/// them: marked `for-tests` in its tool list and installed in its `.tools/`, as its `cargo xtask
+/// setup --for-tests` put it there. Under `--root` the gates' own programs, those that run the
+/// tests included, stay xtask's ([`pinned`]), so a pull request cannot change what judges it,
+/// while the tree's own xtask names its tests' tools ([`of_tree`]): the tree's code running the
+/// tree's tests, which no trust boundary separates.
 pub(crate) fn for_tests(tree: &Path, name: &str) -> anyhow::Result<PathBuf> {
     Manifest::load(tree)
         .with_context(|| format!("{}: its tests run tools its own list pins", tree.display()))?
         .for_tests(tree, name)
+}
+
+/// The cargo arguments that run a tree's own xtask, before its subcommand, as its `cargo xtask`
+/// alias does.
+const TREE_XTASK: [&str; 6] = [
+    "run",
+    "--quiet",
+    "--locked",
+    "--manifest-path",
+    "xtask/Cargo.toml",
+    "--",
+];
+
+/// The tool `name` the tests of another tree at `tree` run, as that tree's own xtask names it
+/// with `cargo xtask test-tool`, built with `cargo` and the tree's own toolchain. The tree's tool
+/// list, its schema and its install layout are the tree's own, so a gate under `--root` never
+/// reads them with its own code: a pull request that changes them is judged with them. Running
+/// the tree's xtask is the tree's code, which already runs the tree's tests; the gate's verdict
+/// stays with its own programs.
+pub(crate) fn of_tree(cargo: &Path, tree: &Path, name: &str) -> anyhow::Result<PathBuf> {
+    let output = Command::new(cargo)
+        .args(TREE_XTASK)
+        .args(["test-tool", name])
+        .current_dir(tree)
+        // Let the tree's rust-toolchain.toml choose the toolchain, not the one running here.
+        .env_remove("RUSTUP_TOOLCHAIN")
+        .env_remove("CARGO")
+        .stdin(Stdio::null())
+        .output()
+        .with_context(|| format!("could not run cargo in {}", tree.display()))?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    ensure!(
+        output.status.success(),
+        "{}: its tests run {name}, and its own `cargo xtask test-tool {name}` failed ({}): {}\n\
+         a tree whose xtask has no `test-tool` predates it: merge the default branch into it",
+        tree.display(),
+        output.status,
+        stderr.trim()
+    );
+    let stdout = String::from_utf8(output.stdout).with_context(|| {
+        format!(
+            "{}: `cargo xtask test-tool {name}` printed non-UTF-8",
+            tree.display()
+        )
+    })?;
+    let path = PathBuf::from(stdout.trim_end_matches('\n'));
+    ensure!(
+        path.is_absolute() && path.is_file(),
+        "{}: `cargo xtask test-tool {name}` printed {stdout:?}, not the path of a file",
+        tree.display()
+    );
+    Ok(path)
 }
 
 /// `cargo xtask tool`: runs a pinned tool's `executable` with the given arguments in `root`.
@@ -2121,6 +2173,76 @@ targets.aarch64-unknown-linux-gnu = {{ platform = "linux-arm64", sha256 = "{sha2
                 none.display()
             )) && !no_list.contains("setup"),
             "a tree with no tool list: {no_list}"
+        );
+    }
+
+    #[test]
+    fn another_trees_own_xtask_names_its_tests_tools() {
+        let temp = tempfile::tempdir().unwrap();
+        let tree = temp.path().join("tree");
+        fs::create_dir_all(&tree).unwrap();
+        let postgres = tree.join(".tools/postgresql/18/bin/postgres");
+        write_executable(&postgres, b"");
+        let cargo = temp.path().join("cargo");
+        // The fake cargo answers only as the tree's own xtask would be run: in the tree, with
+        // the tree free to choose its toolchain.
+        write_executable(
+            &cargo,
+            format!(
+                "#!/bin/sh\n\
+                 [ \"$*\" = 'run --quiet --locked --manifest-path xtask/Cargo.toml -- test-tool postgresql' ] || {{ echo \"error: unrecognized subcommand in $*\" >&2; exit 2; }}\n\
+                 [ \"$(pwd -P)\" = '{}' ] || exit 3\n\
+                 [ -z \"${{RUSTUP_TOOLCHAIN+set}}${{CARGO+set}}\" ] || exit 4\n\
+                 echo \"${{ANSWER-{}}}\"\n",
+                tree.canonicalize().unwrap().display(),
+                postgres.display()
+            )
+            .as_bytes(),
+        );
+        assert_eq!(
+            super::of_tree(&cargo, &tree, "postgresql").unwrap(),
+            postgres,
+            "the path the tree's xtask prints"
+        );
+
+        let predates = format!("{:#}", super::of_tree(&cargo, &tree, "jre").unwrap_err());
+        assert!(
+            predates.starts_with(&format!(
+                "{}: its tests run jre, and its own `cargo xtask test-tool jre` failed (exit status: 2): error: unrecognized subcommand in run --quiet --locked --manifest-path xtask/Cargo.toml -- test-tool jre\n",
+                tree.display()
+            )) && predates.ends_with("merge the default branch into it"),
+            "{predates}"
+        );
+
+        let answer = |printed: &str| {
+            let fake = temp.path().join(format!("answers-{}", printed.len()));
+            write_executable(
+                &fake,
+                format!(
+                    "#!/bin/sh\nANSWER='{printed}' exec '{}' \"$@\"\n",
+                    cargo.display()
+                )
+                .as_bytes(),
+            );
+            format!(
+                "{:#}",
+                super::of_tree(&fake, &tree, "postgresql").unwrap_err()
+            )
+        };
+        for printed in ["bin/postgres", "/no/such/postgres", ""] {
+            let error = answer(printed);
+            assert!(
+                error.contains(&format!("printed \"{printed}\\n\", not the path of a file")),
+                "{error}"
+            );
+        }
+        assert!(
+            format!(
+                "{:#}",
+                super::of_tree(&temp.path().join("absent"), &tree, "postgresql").unwrap_err()
+            )
+            .starts_with(&format!("could not run cargo in {}", tree.display())),
+            "no cargo"
         );
     }
 

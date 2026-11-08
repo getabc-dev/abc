@@ -281,6 +281,13 @@ enum Task {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<OsString>,
     },
+    /// Print the path of a tool this tree's tests run: marked `for-tests` in its
+    /// xtask/tools.toml and installed in its .tools/. A gate run on this tree with `--root` asks
+    /// it this, so the tree alone reads its own tool list.
+    TestTool {
+        /// The tool's name in xtask/tools.toml.
+        name: String,
+    },
     /// Run a Claude Code hook on the hook input from stdin, in the checkout the agent is in. It
     /// answers in Claude Code's hook JSON on stdout and exits 0; xtask/hooks/hook.sh runs it.
     Hook {
@@ -349,7 +356,7 @@ impl Invocation<'static> {
             home,
             root,
             tool: &pinned_tool,
-            test_tool: &tools::for_tests,
+            test_tool: &tree_test_tool,
             env: &env_var,
         })
     }
@@ -358,6 +365,16 @@ impl Invocation<'static> {
 /// A tool pinned in the repository xtask was built from.
 fn pinned_tool(name: &str) -> anyhow::Result<PathBuf> {
     tools::pinned(&repo_root()?, name)
+}
+
+/// A tool the tests of the tree at `tree` run: this checkout's own, or one another tree's own
+/// xtask names.
+fn tree_test_tool(tree: &Path, name: &str) -> anyhow::Result<PathBuf> {
+    if tree == repo_root()? {
+        tools::for_tests(tree, name)
+    } else {
+        tools::of_tree(Path::new("cargo"), tree, name)
+    }
 }
 
 fn env_var(name: &str) -> Option<OsString> {
@@ -497,11 +514,18 @@ fn perform(
             Ok(ExitCode::SUCCESS)
         }
         Task::Tool { name, args } => tools::run(&tool(&name)?, root, &args),
+        Task::TestTool { name } => print_path(&(invocation.test_tool)(root, &name)?),
         Task::Build => run_web(WebTask::Build, root, tool, report),
         Task::Pnpm { args } => run_web(WebTask::Pnpm(args), root, tool, report),
         Task::E2e => run_web(WebTask::E2e, root, tool, report),
         Task::Hook { event } => run_hook(event, home, report),
     }
+}
+
+/// Prints `path` on stdout, for the program that asked for it.
+fn print_path(path: &Path) -> anyhow::Result<ExitCode> {
+    writeln!(io::stdout().lock(), "{}", path.display())?;
+    Ok(ExitCode::SUCCESS)
 }
 
 /// The gate lock `task` takes, if it is a heavy gate, and whether it waits for another gate.
@@ -534,6 +558,7 @@ const fn gate_of(task: &Task) -> Option<(gate::Gate, gate::Wait)> {
         | Task::Doctor { .. }
         | Task::Pin
         | Task::Tool { .. }
+        | Task::TestTool { .. }
         | Task::Hook { .. } => None,
     }
 }
@@ -971,6 +996,26 @@ mod tests {
                 "the tree's own setup is missing, whatever xtask's home holds"
             );
         }
+    }
+
+    #[test]
+    fn test_tool_names_a_tool_the_trees_tests_run() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        fs::create_dir_all(home.join("tools")).unwrap();
+        let root = crate::testing::repository(&temp.path().join("root"));
+        let no_env = |_: &str| None;
+        let test_tool = |name: &str| Task::TestTool {
+            name: name.to_owned(),
+        };
+        assert_eq!(
+            dispatch(test_tool("postgresql"), &home, &root, &no_env).unwrap(),
+            ExitCode::SUCCESS
+        );
+        let error = dispatch(test_tool("node"), &home, &root, &no_env)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(error, "node is not a tool the tests run");
     }
 
     #[test]
@@ -1583,10 +1628,22 @@ mod tests {
         );
         assert!(
             error.starts_with(&format!(
-                "{}: its tests run tools its own list pins",
+                "{}: its tests run postgresql, and its own `cargo xtask test-tool postgresql` \
+                 failed",
                 elsewhere.root.display()
             )),
-            "the tests' tools come from the tree at --root, which has no tool list: {error}"
+            "the tree at --root names its tests' tools with its own xtask, which it lacks: {error}"
+        );
+        let unpinned = format!(
+            "{:#}",
+            (here.test_tool)(&here.root, "no-such-tool").unwrap_err()
+        );
+        assert!(
+            unpinned.starts_with(&format!(
+                "{}: its tests run no-such-tool: ",
+                here.root.display()
+            )),
+            "xtask reads its own checkout's list itself: {unpinned}"
         );
         assert!(
             Invocation::new(Some(temp.path().join("absent"))).is_err(),
