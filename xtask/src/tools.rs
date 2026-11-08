@@ -78,7 +78,7 @@ struct RawManifest {
 /// project publishes no verifiable build for every target.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct Tool {
+struct Tool {
     name: String,
     version: String,
     /// Download URL template; `{version}` and `{platform}` are filled in.
@@ -117,7 +117,7 @@ pub(crate) struct Tool {
     /// Whether the tests run the tool, so every CI job that runs tests installs it with
     /// `cargo xtask setup --for-tests`.
     #[serde(rename = "for-tests", default)]
-    pub(crate) for_tests: bool,
+    for_tests: bool,
     /// Whether the whole archive is installed as the tool's directory, for a tool that needs the
     /// files beside its executable at run time, such as pnpm's `dist/`. `binary` is then the
     /// executable's path in that directory, and each target's `tree-sha256` pins the directory.
@@ -174,12 +174,12 @@ struct Asset {
 
 /// The validated tool list.
 #[derive(Debug)]
-pub(crate) struct Manifest {
+struct Manifest {
     tools: Vec<Tool>,
 }
 
 impl Manifest {
-    pub(crate) fn load(root: &Path) -> anyhow::Result<Self> {
+    fn load(root: &Path) -> anyhow::Result<Self> {
         let path = root.join(MANIFEST);
         let text = fs::read_to_string(&path)
             .with_context(|| format!("could not read {}", path.display()))?;
@@ -219,17 +219,27 @@ impl Manifest {
         })
     }
 
-    /// The installed tool `name`, which must be one the tests run, in the tree at `tree`.
+    /// The installed tool `name`, which must be one the tests run, in the tree at `tree`, whose
+    /// tool list this is. Only a missing or modified install is fixed by `setup`, so only that
+    /// error says to run it.
     fn for_tests(&self, tree: &Path, name: &str) -> anyhow::Result<PathBuf> {
-        let tool = self.tool(name)?;
+        let tool = self
+            .tool(name)
+            .with_context(|| format!("{}: its tests run {name}", tree.display()))?;
         ensure!(
             tool.for_tests,
-            "{name} is not marked `for-tests` in {MANIFEST}"
+            "{}: its tests run {name}, which its {MANIFEST} does not mark `for-tests`",
+            tree.display()
         );
-        tool.installed(tree)
+        tool.installed(tree).with_context(|| {
+            format!(
+                "the tests of {} run its own {name}: run `cargo xtask setup --for-tests` in {0}",
+                tree.display()
+            )
+        })
     }
 
-    pub(crate) fn tool(&self, name: &str) -> anyhow::Result<&Tool> {
+    fn tool(&self, name: &str) -> anyhow::Result<&Tool> {
         self.tools
             .iter()
             .find(|tool| tool.name == name)
@@ -548,7 +558,7 @@ impl Tool {
 
     /// The installed executable, once its sha256 matches the pin; otherwise an error saying how
     /// to install it.
-    pub(crate) fn installed(&self, root: &Path) -> anyhow::Result<PathBuf> {
+    fn installed(&self, root: &Path) -> anyhow::Result<PathBuf> {
         let target = Target::host()?;
         let executable = self.executable(root, target)?;
         ensure!(
@@ -1071,20 +1081,16 @@ pub(crate) fn pinned(home: &Path, name: &str) -> anyhow::Result<PathBuf> {
     Manifest::load(home)?.tool(name)?.installed(home)
 }
 
-/// A tool the tests of the tree at `tree` run, such as the Postgres a gate hands them: pinned
-/// `for-tests` in that tree's own tool list and installed in its own `.tools/`, as its `cargo
-/// xtask setup --for-tests` put it there. Under `--root` the gates' own programs stay xtask's
-/// ([`pinned`]), so a pull request cannot change what judges it; these are the tree's code
-/// running the tree's tests, which no trust boundary separates.
+/// A tool the tests of the tree at `tree` run themselves, such as the Postgres a gate hands them:
+/// marked `for-tests` in that tree's own tool list and installed in its own `.tools/`, as its
+/// `cargo xtask setup --for-tests` put it there. Under `--root` the gates' own programs, those
+/// that run the tests included, stay xtask's ([`pinned`]), so a pull request cannot change what
+/// judges it; a tool from here is the tree's code running the tree's tests, which no trust
+/// boundary separates.
 pub(crate) fn for_tests(tree: &Path, name: &str) -> anyhow::Result<PathBuf> {
     Manifest::load(tree)
-        .and_then(|manifest| manifest.for_tests(tree, name))
-        .with_context(|| {
-            format!(
-                "the tests of {} run its own {name}: run `cargo xtask setup --for-tests` in {0}",
-                tree.display()
-            )
-        })
+        .with_context(|| format!("{}: its tests run tools its own list pins", tree.display()))?
+        .for_tests(tree, name)
 }
 
 /// `cargo xtask tool`: runs a pinned tool's `executable` with the given arguments in `root`.
@@ -2040,10 +2046,10 @@ targets.aarch64-unknown-linux-gnu = {{ platform = "linux-arm64", sha256 = "{sha2
         let text = manifest_text(&sha256_hex(&archive), &sha256_hex(SCRIPT))
             .replace("name = \"fake\"\n", "name = \"fake\"\nfor-tests = true\n");
         let manifest = Manifest::parse(&text).unwrap();
-        let tree_with = |name: &str, text: &str| {
+        let tree_with = |name: &str, list: &str| {
             let tree = temp.path().join(name);
             fs::create_dir_all(tree.join("xtask")).unwrap();
-            fs::write(tree.join(super::MANIFEST), text).unwrap();
+            fs::write(tree.join(super::MANIFEST), list).unwrap();
             tree
         };
         let home = tree_with("home", &text);
@@ -2057,16 +2063,19 @@ targets.aarch64-unknown-linux-gnu = {{ platform = "linux-arm64", sha256 = "{sha2
         .unwrap();
 
         let missing = super::for_tests(&tree, "fake").unwrap_err();
-        let shown = format!("{missing:#}");
+        let not_installed = format!("{missing:#}");
         assert!(
-            shown.contains(&format!(
+            not_installed.contains(&format!(
                 "the tests of {} run its own fake: run `cargo xtask setup --for-tests` in {}",
                 tree.display(),
                 tree.display()
             )),
-            "xtask's own install does not stand in for the tree's: {shown}"
+            "xtask's own install does not stand in for the tree's: {not_installed}"
         );
-        assert!(shown.contains("fake 1.2.3 is not installed"), "{shown}");
+        assert!(
+            not_installed.contains("fake 1.2.3 is not installed"),
+            "{not_installed}"
+        );
 
         install(
             &tree,
@@ -2089,18 +2098,29 @@ targets.aarch64-unknown-linux-gnu = {{ platform = "linux-arm64", sha256 = "{sha2
             &archive,
         )
         .unwrap();
-        let shown = format!("{:#}", super::for_tests(&unmarked, "fake").unwrap_err());
-        assert!(
-            shown.contains("fake is not marked `for-tests` in xtask/tools.toml"),
-            "only a tool the tree's tests run: {shown}"
+        let not_marked = format!("{:#}", super::for_tests(&unmarked, "fake").unwrap_err());
+        assert_eq!(
+            not_marked,
+            format!(
+                "{}: its tests run fake, which its xtask/tools.toml does not mark `for-tests`",
+                unmarked.display()
+            ),
+            "only a tool the tree's tests run, and no setup hint, which would not fix it"
         );
-        let shown = format!(
-            "{:#}",
-            super::for_tests(&temp.path().join("none"), "fake").unwrap_err()
-        );
+        let not_pinned = format!("{:#}", super::for_tests(&tree, "other").unwrap_err());
         assert!(
-            shown.contains("could not read"),
-            "a tree with no tool list: {shown}"
+            not_pinned.starts_with(&format!("{}: its tests run other: ", tree.display()))
+                && not_pinned.contains("other is not a pinned tool"),
+            "{not_pinned}"
+        );
+        let none = temp.path().join("none");
+        let no_list = format!("{:#}", super::for_tests(&none, "fake").unwrap_err());
+        assert!(
+            no_list.starts_with(&format!(
+                "{}: its tests run tools its own list pins: could not read",
+                none.display()
+            )) && !no_list.contains("setup"),
+            "a tree with no tool list: {no_list}"
         );
     }
 

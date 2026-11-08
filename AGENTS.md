@@ -144,11 +144,12 @@ watchdog compares the diff with that task and the rules above, and keeps it work
 | `cargo fmt --all && cargo fmt --all --manifest-path xtask/Cargo.toml` | Fixes formatting in both workspaces; `cargo fmt --all` alone formats only the main one. |
 
 The gates take `--root <path>` to check another tree with the pinned tools of the checkout xtask
-was built from, so a tree cannot change the programs that judge it. The tools that tree's tests
-run (its `for-tests` tools that a gate hands them, such as Postgres as `ABC_TEST_POSTGRES_BIN`)
-come from the tree itself: pinned in its `xtask/tools.toml` and installed in its `.tools/` by its
-own `cargo xtask setup --for-tests`, which the gate names when one is missing. That is the tree's
-code running the tree's tests, so it opens no new trust boundary.
+was built from, so a tree cannot change the programs that judge it, the ones that run its tests
+(nextest, cargo-llvm-cov, cargo-mutants, node and pnpm) included. What a gate hands the tests to
+run themselves, today Postgres's programs as `ABC_TEST_POSTGRES_BIN`, comes from the tree itself:
+marked `for-tests` in its `xtask/tools.toml` and installed in its `.tools/` by its own `cargo
+xtask setup --for-tests`, which the gate names when it is missing. That is the tree's code running
+the tree's tests, so it opens no new trust boundary.
 
 Database tests get a fresh, uniquely named database each (`abc_store::testing::TestDatabase`) on
 the server `ABC_TEST_DATABASE_URL` names. `.cargo/config.toml` sets it to one warm Postgres 18

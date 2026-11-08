@@ -175,13 +175,7 @@ pub(crate) fn read_in_repository(path: &str) -> String {
 /// The pinned tool `name` of this repository, for a test that runs it. It must be marked
 /// `for-tests` in xtask/tools.toml, or CI's test jobs would not install it.
 pub(crate) fn pinned_for_tests(name: &str) -> PathBuf {
-    let repo = checkout();
-    let manifest = crate::tools::Manifest::load(&repo).unwrap();
-    assert!(
-        manifest.tool(name).unwrap().for_tests,
-        "a test runs {name}: mark it `for-tests = true` in xtask/tools.toml"
-    );
-    crate::tools::pinned(&repo, name).unwrap()
+    crate::tools::for_tests(&checkout(), name).unwrap_or_else(|error| panic!("{error:#}"))
 }
 
 /// A fake node and pnpm in `dir`. pnpm logs each call's arguments to `dir/pnpm.log`, fails a call

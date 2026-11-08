@@ -408,15 +408,18 @@ fn perform(
     let Invocation {
         home, root, tool, ..
     } = invocation;
-    let test_tool = |name: &str| (invocation.test_tool)(root, name);
+    // Postgres's bin directory, which the tests of `root` get as `check::POSTGRES_BIN`.
+    let postgres = || check::postgres_bin(&|name| (invocation.test_tool)(root, name));
     let env = |name: &str| (invocation.env)(name);
     let mode = annotation::Mode::from_env(&env);
     match task {
-        Task::Check { changed, .. } => Ok(verdict(check(root, changed, tool, &test_tool, report)?)),
+        Task::Check { changed, .. } => {
+            Ok(verdict(check(root, changed, tool, postgres()?, report)?))
+        }
         Task::Coverage { base } => Ok(verdict(coverage::run(
             root,
             &base,
-            &coverage::Tools::pinned(tool, &test_tool)?,
+            &coverage::Tools::pinned(tool, postgres()?)?,
             mode,
             report,
         )?)),
@@ -424,7 +427,7 @@ fn perform(
             root,
             &base,
             &mutants::Options { jobs, shard, mode },
-            &mutants::Tools::pinned(tool, &test_tool)?,
+            &mutants::Tools::pinned(tool, postgres()?)?,
             report,
         )?)),
         Task::Fuzz { seconds } => Ok(verdict(fuzz::run(
@@ -664,13 +667,13 @@ fn run_hook(event: hook::Event, home: &Path, report: &mut impl Write) -> anyhow:
     Ok(ExitCode::SUCCESS)
 }
 
-/// `cargo xtask check` on `root`, with the pinned tools `tool` finds, the tools its tests run
-/// that `test_tool` finds and the warm Postgres.
+/// `cargo xtask check` on `root`, with the pinned tools `tool` finds, the bin directory of the
+/// Postgres `root` pins for its tests and the warm Postgres.
 fn check(
     root: &Path,
     changed: bool,
     tool: &dyn Fn(&str) -> anyhow::Result<PathBuf>,
-    test_tool: &dyn Fn(&str) -> anyhow::Result<PathBuf>,
+    postgres_bin: PathBuf,
     report: &mut impl Write,
 ) -> anyhow::Result<bool> {
     let postgres = check::Postgres {
@@ -680,7 +683,7 @@ fn check(
     let tools = check::Tools {
         nextest: tool("cargo-nextest")?,
         shellcheck: tool("shellcheck")?,
-        postgres: check::postgres_bin(test_tool)?,
+        postgres: postgres_bin,
         web: Some(web::Toolchain::pinned(tool)?),
     };
     check::run(
@@ -1579,11 +1582,11 @@ mod tests {
             (elsewhere.test_tool)(&elsewhere.root, "postgresql").unwrap_err()
         );
         assert!(
-            error.contains(&format!(
-                "the tests of {} run its own postgresql: run `cargo xtask setup --for-tests` in",
+            error.starts_with(&format!(
+                "{}: its tests run tools its own list pins",
                 elsewhere.root.display()
             )),
-            "the tests' tools come from the tree at --root: {error}"
+            "the tests' tools come from the tree at --root, which has no tool list: {error}"
         );
         assert!(
             Invocation::new(Some(temp.path().join("absent"))).is_err(),
