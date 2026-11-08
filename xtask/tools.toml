@@ -196,7 +196,7 @@ targets.aarch64-unknown-linux-gnu = { platform = "linux-arm64", sha256 = "439e9c
 [[tool]]
 name = "pnpm"
 for-tests = true
-version = "12.17.0"
+version = "12.18.0"
 url = "https://github.com/pnpm/pnpm/releases/download/v{version}/pnpm-{platform}.tar.gz"
 attestations = "pnpm/pnpm"
 binary = "pnpm"
