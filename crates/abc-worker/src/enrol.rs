@@ -123,8 +123,10 @@ async fn send(
     })
 }
 
-/// This machine as it introduces itself at enrolment: its own name ([`own_name`]), or `hostname`
-/// when given, and the operating system and architecture this build is for.
+/// This machine as it introduces itself at enrolment: its own name (on macOS the computer name the
+/// owner gave it, else its local network name; elsewhere, or when neither is set, the kernel's
+/// hostname), or `hostname` when given, and the operating system and architecture this build is
+/// for.
 ///
 /// # Errors
 ///

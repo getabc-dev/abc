@@ -1402,23 +1402,37 @@ fn gc_syncs_a_worktree_behind_the_merge_its_vm_pushed() {
             "abc-w\tnot finished: feature merged in #9 at {}, which the VM's feature is at, but \
              the worktree's is at ",
             super::session::short(&pushed)
-        )) && diverged.contains(
-            "could not be synced: the worktree's feature has commits the VM's \
-             lacks; merge them by hand\n"
-        ) && diverged.ends_with("vm gc: no finished session to purge\n"),
+        )) && diverged.contains("which the merge does not hold")
+            && diverged.ends_with("vm gc: no finished session to purge\n"),
         "{diverged}"
+    );
+    assert!(
+        gc(&world, &backend, true).contains(
+            "could not be synced: the worktree's feature has \
+             commits the VM's lacks; merge them by hand\n"
+        ),
+        "--yes tries, and says why it cannot"
     );
     git(&world.worktree, &["reset", "--quiet", "--hard", &before]);
     let listed = gc(&world, &backend, false);
     assert_eq!(
         listed,
         format!(
-            "vm gc: synced the worktree's feature: {} -> {}\n\
+            "vm gc: the worktree's feature is behind the merge at {}; --yes syncs it first\n\
              abc-w\t1.0 GB\tfeature merged in #9\n\
              vm gc: 1 finished sessions hold 1.0 GB; `cargo xtask vm gc --yes` purges them\n",
+            super::session::short(&before)
+        )
+    );
+    assert_eq!(head(&world.worktree), before, "listing changes nothing");
+    let purged = gc(&world, &backend, true);
+    assert!(
+        purged.starts_with(&format!(
+            "vm gc: synced the worktree's feature: {} -> {}\n",
             super::session::short(&before),
             super::session::short(&pushed)
-        )
+        )) && purged.contains("vm gc: purged abc-w; "),
+        "{purged}"
     );
     assert_eq!(
         head(&world.worktree),

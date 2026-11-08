@@ -68,8 +68,11 @@ pub(crate) fn fetch(
         .build()
         .into();
     let mut body = Vec::new();
-    let mut retries = patience.retries.iter();
+    // Retries in a row that brought nothing new: an attempt that adds to the bytes kept starts
+    // the count again, so a long download on a network that resets often still finishes.
+    let mut idle = 0_usize;
     loop {
+        let kept = body.len();
         let error = match attempt(&agent, url, limit, patience, &mut body) {
             Ok(()) => return Ok(body),
             Err(Failure::Final(error)) => {
@@ -77,12 +80,17 @@ pub(crate) fn fetch(
             }
             Err(Failure::Transient(error)) => error,
         };
-        let Some(&delay) = retries.next() else {
+        if body.len() > kept {
+            idle = 0;
+        }
+        let Some(&delay) = patience.retries.get(idle) else {
             return Err(error.context(format!(
-                "could not download {url}: gave up after {} attempts",
+                "could not download {url}: gave up after {} attempts in a row that brought \
+                 nothing new",
                 patience.retries.len().saturating_add(1)
             )));
         };
+        idle = idle.saturating_add(1);
         writeln!(
             notes,
             "download: {url}: {error:#}; {} bytes kept, resuming in {} s",
@@ -427,6 +435,41 @@ mod tests {
         );
     }
 
+    /// The review of PR 2b: the retries were one budget for the whole download, so a long one on a
+    /// network that reset every few megabytes gave up short of the end though each attempt
+    /// brought more. Only attempts in a row that bring nothing count against the retries.
+    #[test]
+    fn retries_count_only_attempts_that_bring_nothing() {
+        let whole = body();
+        let mut script = vec![Serve::Stall(
+            format!("Content-Length: {LENGTH}\r\n"),
+            whole[..50_000].to_vec(),
+            Duration::from_secs(1),
+        )];
+        for from in [50_000, 100_000, 150_000, 200_000] {
+            script.push(Serve::Reset(
+                format!(
+                    "Content-Length: {}\r\nContent-Range: bytes {from}-299999/{LENGTH}\r\n",
+                    LENGTH.saturating_sub(from)
+                ),
+                whole[from..from.saturating_add(50_000)].to_vec(),
+            ));
+        }
+        script.push(Serve::Whole(
+            "206 Partial Content",
+            format!("Content-Length: 50000\r\nContent-Range: bytes 250000-299999/{LENGTH}\r\n"),
+            whole[250_000..].to_vec(),
+        ));
+        let attempts = script.len();
+        let (url, server) = server(script);
+        let got = fetch(&url, 1 << 20, &quick(), &mut |_| {}, &mut Vec::new()).unwrap();
+        assert!(
+            got == whole,
+            "five breaks, three retries, and the whole file"
+        );
+        assert_eq!(server.join().unwrap().len(), attempts);
+    }
+
     /// A server that ignores the range sends the whole file again: the kept bytes are dropped,
     /// not doubled.
     #[test]
@@ -526,7 +569,10 @@ mod tests {
         let error = fetch(&url, 1 << 20, &quick(), &mut |_| slept += 1, &mut notes).unwrap_err();
         assert_eq!(slept, 3, "every retry waited");
         let error = format!("{error:#}");
-        assert!(error.contains("gave up after 4 attempts"), "{error}");
+        assert!(
+            error.contains("gave up after 4 attempts in a row"),
+            "{error}"
+        );
         assert!(error.contains("503"), "{error}");
         assert_eq!(server.join().unwrap().len(), 4);
         assert_eq!(
@@ -587,7 +633,10 @@ mod tests {
         let error = fetch(&url, 1 << 20, &patience, &mut |_| {}, &mut Vec::new()).unwrap_err();
         let error = format!("{error:#}");
         assert!(error.contains("stalled"), "{error}");
-        assert!(error.contains("gave up after 1 attempts"), "{error}");
+        assert!(
+            error.contains("gave up after 1 attempts in a row"),
+            "{error}"
+        );
         server.join().unwrap();
     }
 

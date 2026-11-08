@@ -6,7 +6,9 @@
 //! this command takes the version bump from Renovate's pull request, applies it to the default
 //! branch's tool list, pins it, commits that on a branch of its own (`agent/renovate-<number>`)
 //! without touching the checkout, opens the replacement pull request, and closes Renovate's with
-//! a link to it. Renovate then leaves that version alone.
+//! a link to it. Renovate then leaves that version alone. Only the bumped tools are downloaded
+//! and repinned. Run again after a failure part way, it takes up the branch and the pull request
+//! it made when they hold the same change, and refuses a branch that holds another.
 
 use std::io::Write as _;
 use std::path::Path;
@@ -52,22 +54,38 @@ pub(super) fn run(
          xtask pin`, and `cargo xtask setup` refuses an archive whose sha256 is not pinned, so \
          this pull request carries the same bump with every checksum in `{MANIFEST}` recomputed \
          and checked against what each publisher vouches for.\n\n## Plan\n\n`cargo xtask pr \
-         renovate {number}`.\n\n## Test changes\n\nNone\n"
+         renovate {number}`.\n\n## Test changes\n\nNone\n\n## Review findings\n\nNone run: the \
+         change is {MANIFEST}'s versions and checksums alone, each checksum checked against what \
+         its publisher vouches for. Read each bumped release's notes before approving.\n"
     );
-    let opened = send(&github::Request {
-        method: "POST",
-        path: repo.path("pulls"),
-        body: Some(
-            json!({"title": title, "head": branch(number), "base": base_branch, "body": body}),
+    let existing = github::get(
+        send,
+        repo.path(&format!(
+            "pulls?state=open&head={}:{}",
+            repo.owner,
+            branch(number)
+        )),
+    )?;
+    let (opened, verb) = match existing.as_array().and_then(|pulls| pulls.first()) {
+        Some(pull) => (pull.clone(), "found"),
+        None => (
+            send(&github::Request {
+                method: "POST",
+                path: repo.path("pulls"),
+                body: Some(
+                    json!({"title": title, "head": branch(number), "base": base_branch, "body": body}),
+                ),
+            })?,
+            "opened",
         ),
-    })?;
+    };
     let replacement = opened
         .get("number")
         .and_then(Value::as_u64)
-        .context("GitHub opened the pull request but gave no number")?;
+        .context("GitHub gave the replacement pull request no number")?;
     say(
         out,
-        &format!("pr: opened #{replacement} {}", text(&opened, "/html_url")),
+        &format!("pr: {verb} #{replacement} {}", text(&opened, "/html_url")),
     );
     send(&github::Request {
         method: "POST",
@@ -160,12 +178,19 @@ fn pin_and_push(
     fetch: &mut dyn FnMut(&str) -> anyhow::Result<Vec<u8>>,
     out: &mut String,
 ) -> anyhow::Result<String> {
-    let base = git::default_branch(root)?;
-    let short = base.strip_prefix("refs/remotes/").unwrap_or(&base);
-    let (remote, base_branch) = short
-        .split_once('/')
-        .with_context(|| format!("{base} is not a remote's branch"))?;
-    git::fetch(root, remote, base_branch, git::FETCH_TIMEOUT)?;
+    // origin, where the pull request opens (`Repo::of`), never another remote.
+    let base = git::git(
+        root,
+        &["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"],
+    )
+    .context("origin/HEAD is not set; run `git remote set-head origin --auto`")?
+    .trim()
+    .to_owned();
+    let base_branch = base
+        .strip_prefix("refs/remotes/origin/")
+        .with_context(|| format!("origin/HEAD names {base}, not a branch of origin"))?
+        .to_owned();
+    git::fetch(root, "origin", &base_branch, git::FETCH_TIMEOUT)?;
     let parent = git::git(
         root,
         &["rev-parse", "--verify", &format!("{base}^{{commit}}")],
@@ -173,27 +198,57 @@ fn pin_and_push(
     .trim()
     .to_owned();
     let current = git::show(root, &parent, MANIFEST)?
-        .with_context(|| format!("{short} has no {MANIFEST}"))?;
+        .with_context(|| format!("origin/{base_branch} has no {MANIFEST}"))?;
+    let names: Vec<String> = bumps.iter().map(|bump| bump.tool.clone()).collect();
     let mut said = Vec::new();
     let pinned = tools::repin(
         &tools::bumped(&current, bumps)?,
+        Some(&names),
         &mut said,
         &mut |url: &str| fetch(url),
     );
     out.push_str(&String::from_utf8_lossy(&said));
+    let pinned = pinned?;
+    let branch = branch(number);
+    let pushed = git::git(
+        root,
+        &[
+            "ls-remote",
+            "--heads",
+            "origin",
+            &format!("refs/heads/{branch}"),
+        ],
+    )?;
+    if let Some(theirs) = pushed.split_whitespace().next() {
+        git::fetch(root, "origin", &branch, git::FETCH_TIMEOUT)?;
+        let held = git::show(root, theirs, MANIFEST)?;
+        ensure!(
+            held.as_deref() == Some(pinned.as_str()),
+            "origin already has {branch} at {}, with another {MANIFEST}; delete that branch, or \
+             finish it by hand",
+            git_short(theirs)
+        );
+        say(
+            out,
+            &format!(
+                "pr: {branch} already holds this change at {}",
+                git_short(theirs)
+            ),
+        );
+        return Ok(base_branch);
+    }
     let message = format!(
         "{title}\n\nRenovate's #{number} bumped {MANIFEST} but cannot run `cargo xtask pin`; this \
-         is its bump with every checksum recomputed and checked against what each publisher \
+         is its bump with its checksums recomputed and checked against what each publisher \
          vouches for, made by `cargo xtask pr renovate {number}`.\n"
     );
-    let commit = commit_file(root, &parent, MANIFEST, &pinned?, &message)?;
-    let branch = branch(number);
-    push(root, remote, &commit, &branch)?;
+    let commit = commit_file(root, &parent, MANIFEST, &pinned, &message)?;
+    push(root, "origin", &commit, &branch)?;
     say(
         out,
         &format!("pr: pushed {} to {branch}", git_short(&commit)),
     );
-    Ok(base_branch.to_owned())
+    Ok(base_branch)
 }
 
 /// The first twelve characters of a commit's name.
@@ -316,11 +371,20 @@ mod tests {
     const ZEROS: &str = "0000000000000000000000000000000000000000000000000000000000000000";
     const RELEASE: &[u8] = b"#!/bin/sh\necho 'fake 1.3.0'\n";
 
-    /// A tool list with one tool, `fake` at `version`, whose release asset is its executable,
-    /// pinned at `sha256` on every target.
+    /// A tool list with `fake` at `version`, whose release asset is its executable, pinned at
+    /// `sha256` on every target; and `other`, which no bump moves, pinned at zeros.
     fn tool_list(version: &str, sha256: &str) -> String {
         format!(
             r#"# The tools.
+[[tool]]
+name = "other"
+version = "9.9.9"
+url = "https://example.com/other-{{version}}-{{platform}}"
+attestations = "example/other"
+targets.aarch64-apple-darwin = {{ platform = "mac", sha256 = "{ZEROS}", binary-sha256 = "{ZEROS}" }}
+targets.x86_64-unknown-linux-gnu = {{ platform = "linux-x64", sha256 = "{ZEROS}", binary-sha256 = "{ZEROS}" }}
+targets.aarch64-unknown-linux-gnu = {{ platform = "linux-arm64", sha256 = "{ZEROS}", binary-sha256 = "{ZEROS}" }}
+
 [[tool]]
 name = "fake"
 version = "{version}"
@@ -352,10 +416,13 @@ targets.aarch64-unknown-linux-gnu = {{ platform = "linux-arm64", sha256 = "{sha2
     }
 
     /// A Renovate pull request #30 that moves fake from 1.2.3 to 1.3.0 in a tool list that
-    /// `files` lists, answered as GitHub does; records every call.
+    /// `files` lists, answered as GitHub does; `listed` is the open pull requests from
+    /// `agent/renovate-30`, and opening one fails when `open_fails`.
     fn renovate_github(
         author: &'static str,
         files: Value,
+        listed: Value,
+        open_fails: bool,
     ) -> impl FnMut(&Request) -> anyhow::Result<Value> {
         move |request: &Request| {
             Ok(match (request.method, request.path.as_str()) {
@@ -370,6 +437,8 @@ targets.aarch64-unknown-linux-gnu = {{ platform = "linux-arm64", sha256 = "{sha2
                 ("GET", "/repos/o/r/contents/xtask/tools.toml?ref=h0") => {
                     contents(&tool_list("1.3.0", ZEROS))
                 }
+                ("GET", "/repos/o/r/pulls?state=open&head=o:agent/renovate-30") => listed.clone(),
+                ("POST", "/repos/o/r/pulls") if open_fails => anyhow::bail!("GitHub answered 502"),
                 ("POST", "/repos/o/r/pulls") => {
                     json!({"number": 47, "html_url": "https://github.com/o/r/pull/47"})
                 }
@@ -416,7 +485,12 @@ targets.aarch64-unknown-linux-gnu = {{ platform = "linux-arm64", sha256 = "{sha2
         let temp = tempfile::tempdir().unwrap();
         let work = checkout(temp.path());
         let calls = std::cell::RefCell::new(Vec::new());
-        let mut github = renovate_github("renovate[bot]", json!([{"filename": MANIFEST}]));
+        let mut github = renovate_github(
+            "renovate[bot]",
+            json!([{"filename": MANIFEST}]),
+            json!([]),
+            false,
+        );
         let mut send = |request: &Request| {
             calls.borrow_mut().push(request.clone());
             github(request)
@@ -430,7 +504,8 @@ targets.aarch64-unknown-linux-gnu = {{ platform = "linux-arm64", sha256 = "{sha2
                 &["show", &format!("origin/agent/renovate-30:{MANIFEST}")]
             ),
             tool_list("1.3.0", &pinned),
-            "the bump, pinned, on main's tool list"
+            "the bump, pinned, on main's tool list; `other`, which it does not move, is neither \
+             downloaded nor repinned"
         );
         assert_eq!(
             git(&work, &["rev-parse", "origin/agent/renovate-30^"]),
@@ -462,6 +537,10 @@ targets.aarch64-unknown-linux-gnu = {{ platform = "linux-arm64", sha256 = "{sha2
                 .unwrap()
                 .contains("## Test changes\n\nNone\n"),
             "{body}"
+        );
+        assert!(
+            super::super::reviewed(body["body"].as_str().unwrap()),
+            "a description `pr update` takes: {body}"
         );
         let comment = calls
             .iter()
@@ -507,7 +586,7 @@ targets.aarch64-unknown-linux-gnu = {{ platform = "linux-arm64", sha256 = "{sha2
             |author: &'static str,
              files: Value,
              fetch: &mut dyn FnMut(&str) -> anyhow::Result<Vec<u8>>| {
-                let mut github = renovate_github(author, files);
+                let mut github = renovate_github(author, files, json!([]), false);
                 let mut out = String::new();
                 format!(
                     "{:#}",
@@ -538,6 +617,69 @@ targets.aarch64-unknown-linux-gnu = {{ platform = "linux-arm64", sha256 = "{sha2
         assert!(
             git(&work, &["ls-remote", "origin", "agent/renovate-30"]).is_empty(),
             "nothing pushed"
+        );
+    }
+
+    /// The review of PR 2b: a run that failed after its push could not run again, since a new
+    /// commit to the pushed branch was refused. A run again takes up the branch and the pull
+    /// request when they hold the same change, and refuses a branch that holds another.
+    #[test]
+    fn a_second_run_takes_up_what_the_first_left() {
+        let temp = tempfile::tempdir().unwrap();
+        let work = checkout(temp.path());
+        let manifest = json!([{"filename": MANIFEST}]);
+        let mut out = String::new();
+        let mut failing = renovate_github("renovate[bot]", manifest.clone(), json!([]), true);
+        let failed = run(30, &work, &repo(), &mut failing, &mut downloads, &mut out).unwrap_err();
+        assert!(format!("{failed:#}").contains("502"), "{failed:#}");
+        let pushed = git(&work, &["rev-parse", "origin/agent/renovate-30"]);
+        let mut again = renovate_github("renovate[bot]", manifest.clone(), json!([]), false);
+        let mut taken = String::new();
+        assert!(run(30, &work, &repo(), &mut again, &mut downloads, &mut taken).unwrap());
+        assert!(
+            taken.contains("pr: agent/renovate-30 already holds this change at "),
+            "{taken}"
+        );
+        assert_eq!(
+            git(&work, &["rev-parse", "origin/agent/renovate-30"]),
+            pushed,
+            "the branch as the first run left it"
+        );
+        let open = json!([{"number": 47, "html_url": "https://github.com/o/r/pull/47"}]);
+        let mut found = renovate_github("renovate[bot]", manifest.clone(), open, true);
+        let mut kept_pull = String::new();
+        assert!(
+            run(
+                30,
+                &work,
+                &repo(),
+                &mut found,
+                &mut downloads,
+                &mut kept_pull
+            )
+            .unwrap()
+        );
+        assert!(kept_pull.contains("pr: found #47 "), "{kept_pull}");
+        let other_release = |url: &str| -> anyhow::Result<Vec<u8>> {
+            if url.contains("/attestations/") {
+                downloads(url)
+            } else {
+                Ok(b"another build".to_vec())
+            }
+        };
+        let mut refused = renovate_github("renovate[bot]", manifest, json!([]), false);
+        let error = run(
+            30,
+            &work,
+            &repo(),
+            &mut refused,
+            &mut { other_release },
+            &mut String::new(),
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("origin already has agent/renovate-30 at "),
+            "{error:#}"
         );
     }
 }

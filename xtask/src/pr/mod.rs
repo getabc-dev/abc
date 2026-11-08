@@ -143,12 +143,16 @@ pub(crate) fn prepare(
 /// Whether `body` has a `## Review findings` section with something in it besides comments: what
 /// `/code-review` and `/security-review` found on the branch, or "None". #33 opened before they
 /// ran, and they then found a data-loss bug and 8 more issues that every gate had passed.
+/// The section is the lines after a line that is exactly that heading, up to the next heading of
+/// any level, whatever the line endings.
 fn reviewed(body: &str) -> bool {
-    let Some((_, rest)) = body.split_once("## Review findings\n") else {
+    let mut lines = body.lines().map(str::trim_end);
+    if !lines.any(|line| line == "## Review findings") {
         return false;
-    };
-    let section = rest.split("\n## ").next().unwrap_or_default();
-    let mut text = section;
+    }
+    let section: Vec<&str> = lines.take_while(|line| !line.starts_with('#')).collect();
+    let joined = section.join("\n");
+    let mut text = joined.as_str();
     let mut kept = String::new();
     while let Some((before, after)) = text.split_once("<!--") {
         kept.push_str(before);
@@ -245,7 +249,16 @@ pub(crate) fn send(
     match plan {
         Plan::Renovate(number) => renovate::run(number, root, repo, send, fetch, out),
         Plan::Checks(number) => {
-            stale(repo, number, send, out)?;
+            // A warning only: a comparison GitHub cannot make never hides the checks.
+            if let Err(error) = stale(repo, number, send, out) {
+                say(
+                    out,
+                    &format!(
+                        "pr: could not compare #{number} with its base branch, so whether it \
+                         moved on is unknown: {error:#}"
+                    ),
+                );
+            }
             checks::run(repo, number, send, out)
         }
         Plan::Open {

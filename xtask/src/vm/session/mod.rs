@@ -355,7 +355,8 @@ impl Session {
     /// host uses: the VM has no SSH key, reaches the network only over HTTPS, and its credential
     /// helper answers only for `https://github.com`.
     fn seal(&self, repo: &Path) -> anyhow::Result<()> {
-        let origin = git_main(&self.common, &["config", "remote.origin.url"])
+        // `remote get-url` applies `url.<base>.insteadOf`, as git would to reach origin.
+        let origin = git_main(&self.common, &["remote", "get-url", "origin"])
             .context("the main clone has no origin")?;
         let origin = crate::github::Repo::parse(origin.trim())?.https_url();
         let mut config = format!(
@@ -719,6 +720,29 @@ pub(crate) fn unshared(state: &Path, elsewhere: &[String]) -> anyhow::Result<Vec
             format!("{} {subject}", short(commit))
         })
         .collect())
+}
+
+/// Whether the session repository under `state` holds `ancestor` and `of`, and `ancestor` is an
+/// ancestor of `of` or `of` itself. Read only through [`sealed`] git.
+pub(crate) fn is_ancestor(state: &Path, ancestor: &str, of: &str) -> anyhow::Result<bool> {
+    let mut check = sealed(&state.join("git"));
+    check.args([
+        "merge-base",
+        "--is-ancestor",
+        "--end-of-options",
+        ancestor,
+        of,
+    ]);
+    let output = check.output().context("could not run git")?;
+    match output.status.code() {
+        Some(0) => Ok(true),
+        // 1: not an ancestor; 128: a commit the repository lacks, which it cannot show either.
+        Some(1 | 128) => Ok(false),
+        _ => bail!(
+            "git merge-base failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ),
+    }
 }
 
 /// The first twelve characters of a commit's name.

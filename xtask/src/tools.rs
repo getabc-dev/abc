@@ -828,7 +828,7 @@ pub(crate) fn pin(root: &Path, out: &mut impl Write) -> anyhow::Result<()> {
     let path = root.join(MANIFEST);
     let text =
         fs::read_to_string(&path).with_context(|| format!("could not read {}", path.display()))?;
-    let pinned = pin_each(&text, out, &mut download)?;
+    let pinned = pin_each(&text, None, out, &mut download)?;
     fs::write(&path, &pinned.text)
         .with_context(|| format!("could not write {}", path.display()))?;
     pinned.result()
@@ -854,18 +854,20 @@ impl Pinned {
             .map(|(tool, error)| format!("{tool}: {error:#}"))
             .collect();
         bail!(
-            "could not pin {} of the tools; {MANIFEST} keeps the pins computed, and those tools              keep their old ones until `cargo xtask pin` runs again:\n{}",
+            "could not pin {} of the tools; {MANIFEST} keeps the pins computed, and those tools keep \
+             their old ones until `cargo xtask pin` runs again:\n{}",
             failures.len(),
             failures.join("\n")
         )
     }
 }
 
-/// The tool list `text` with every sha256 recomputed from downloads by `fetch`. Where a tool
-/// publishes checksums, each download must match them. A tool is pinned whole or not at all, and
-/// one that fails is recorded, not fatal.
+/// The tool list `text` with the sha256s of every tool, or of those named in `only`, recomputed
+/// from downloads by `fetch`. Where a tool publishes checksums, each download must match them. A
+/// tool is pinned whole or not at all, and one that fails is recorded, not fatal.
 fn pin_each(
     text: &str,
+    only: Option<&[String]>,
     out: &mut impl Write,
     fetch: &mut impl FnMut(&str) -> anyhow::Result<Vec<u8>>,
 ) -> anyhow::Result<Pinned> {
@@ -873,7 +875,11 @@ fn pin_each(
     let mut document: DocumentMut = text.parse()?;
     let mut published: BTreeMap<String, String> = BTreeMap::new();
     let mut failed = Vec::new();
-    for tool in &manifest.tools {
+    for tool in manifest
+        .tools
+        .iter()
+        .filter(|tool| only.is_none_or(|names| names.contains(&tool.name)))
+    {
         let mut lines = Vec::new();
         match pins_of(tool, &mut lines, &mut published, fetch) {
             Ok(pins) => {
@@ -979,14 +985,15 @@ pub(crate) fn bumped(text: &str, bumps: &[Bump]) -> anyhow::Result<String> {
     Ok(document.to_string())
 }
 
-/// The tool list `text` with every pin recomputed from downloads by `fetch`, as `cargo xtask pin`
-/// does; fails unless every tool was pinned.
+/// The tool list `text` with the pins of the tools named in `only`, or of every tool, recomputed
+/// from downloads by `fetch`, as `cargo xtask pin` does; fails unless each was pinned.
 pub(crate) fn repin(
     text: &str,
+    only: Option<&[String]>,
     out: &mut impl Write,
     fetch: &mut impl FnMut(&str) -> anyhow::Result<Vec<u8>>,
 ) -> anyhow::Result<String> {
-    let pinned = pin_each(text, out, fetch)?;
+    let pinned = pin_each(text, only, out, fetch)?;
     pinned.result()?;
     Ok(pinned.text)
 }
@@ -2490,7 +2497,7 @@ targets.aarch64-unknown-linux-gnu = {{ platform = "linux-arm64", sha256 = "{sha2
         out: &mut impl std::io::Write,
         fetch: &mut impl FnMut(&str) -> anyhow::Result<Vec<u8>>,
     ) -> anyhow::Result<String> {
-        super::repin(text, out, fetch)
+        super::repin(text, None, out, fetch)
     }
 
     /// Renovate moves a version in the tool list; `pr renovate` reads which ones moved and moves
@@ -2544,7 +2551,7 @@ targets.aarch64-unknown-linux-gnu = {{ platform = "linux-arm64", sha256 = "{sha2
             serve(url)
         };
         let mut out = Vec::new();
-        let pinned = pin_each(&text, &mut out, &mut fetch).unwrap();
+        let pinned = pin_each(&text, None, &mut out, &mut fetch).unwrap();
         let (fake, rest) = pinned.text.split_once("name = \"other\"").unwrap();
         assert!(
             fake.contains(&sha256_hex(&archive)) && !fake.contains(SHA_A),
@@ -2555,10 +2562,11 @@ targets.aarch64-unknown-linux-gnu = {{ platform = "linux-arm64", sha256 = "{sha2
             "other is pinned whole or not at all, so it keeps every old pin: {rest}"
         );
         let error = format!("{:#}", pinned.result().unwrap_err());
-        assert!(
-            error.contains("could not pin 1 of the tools")
-                && error.contains("other 1.2.3: the connection was reset"),
-            "{error}"
+        assert_eq!(
+            error,
+            "could not pin 1 of the tools; xtask/tools.toml keeps the pins computed, and those \
+             tools keep their old ones until `cargo xtask pin` runs again:\nother 1.2.3: the \
+             connection was reset"
         );
         let out = String::from_utf8(out).unwrap();
         assert!(

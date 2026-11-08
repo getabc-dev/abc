@@ -187,6 +187,24 @@ fn opens_only_with_the_review_findings() {
         &work,
     );
     assert!(blank.contains("## Review findings"), "{blank}");
+    for (text, why) in [
+        (
+            format!("{unreviewed_text}## Review findings\n## After\n\nx\n"),
+            "a heading right after the heading",
+        ),
+        (
+            format!("{unreviewed_text}### Review findings\n\nNone.\n"),
+            "another heading level",
+        ),
+    ] {
+        let refused = refusal(open("t", body(temp.path(), &text)), &work);
+        assert!(refused.contains("## Review findings"), "{why}: {refused}");
+    }
+    let crlf = REASONED.replace('\n', "\r\n");
+    assert!(
+        super::reviewed(&crlf),
+        "CRLF line endings, as a browser may send"
+    );
 }
 
 #[test]
@@ -731,6 +749,24 @@ fn checks_warn_when_main_moved_on_the_pull_requests_files() {
         "{out}"
     );
     let (_, current) = run(0, "open");
+    let mut failing = |request: &Request| -> anyhow::Result<Value> {
+        if request.path.contains("/compare/") {
+            anyhow::bail!("GitHub answered 500: the diff is taking too long")
+        }
+        Ok(answer(2, "open")(request))
+    };
+    let mut unknown = String::new();
+    assert!(
+        send_plan(Plan::Checks(25), &mut failing, &mut unknown),
+        "a comparison that fails hides no check: {unknown}"
+    );
+    assert!(
+        unknown.starts_with(
+            "pr: could not compare #25 with its base branch, so whether it moved on is unknown: \
+             GitHub answered 500"
+        ) && unknown.contains("\n#25 head at 111111111111"),
+        "{unknown}"
+    );
     assert!(current.starts_with("#25 head at"), "not behind: {current}");
     let (_, merged) = run(2, "closed");
     assert!(merged.starts_with("#25 head at"), "closed: {merged}");

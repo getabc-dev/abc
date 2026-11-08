@@ -810,7 +810,7 @@ struct Candidate {
 /// `origin` nor a merged pull request has is kept, naming them, and `--yes` then fails after
 /// purging the others.
 fn gc(host: &Host, backend: &dyn Backend, yes: bool, out: &mut impl Write) -> anyhow::Result<()> {
-    let (candidates, unfinished) = finished(host, backend, out)?;
+    let (candidates, unfinished) = finished(host, backend, yes, out)?;
     for (name, why) in &unfinished {
         writeln!(out, "{name}\tnot finished: {why}")?;
     }
@@ -866,11 +866,12 @@ fn gc(host: &Host, backend: &dyn Backend, yes: bool, out: &mut impl Write) -> an
 }
 
 /// The sessions that are not running and are finished, each with whether it must be kept; and
-/// the sessions whose branch GitHub merged that are not finished, each with why. A session that
-/// syncing finishes is synced, and that is said in `out`.
+/// the sessions whose branch GitHub merged that are not finished, each with why. With `yes`, a
+/// session that syncing finishes is synced, and that is said in `out` ([`merged`]).
 fn finished(
     host: &Host,
     backend: &dyn Backend,
+    yes: bool,
     out: &mut impl Write,
 ) -> anyhow::Result<(Vec<Candidate>, Vec<Unfinished>)> {
     let worktrees = session::worktrees(&host.repo)?;
@@ -903,7 +904,7 @@ fn finished(
         let state = id.state(&host.state);
         let why = match worktrees.iter().find(|worktree| worktree.session == id) {
             None => Finished::WorktreeGone,
-            Some(worktree) => match merged(host, worktree, &state, out)? {
+            Some(worktree) => match merged(host, worktree, &state, yes, out)? {
                 Merge::Finished(why) => why,
                 Merge::Unfinished(why) => {
                     unfinished.push((name, why));
@@ -1000,12 +1001,15 @@ enum Merge {
 /// repository without the branch is not at the merge: nothing shows what it holds is merged.
 ///
 /// An agent pushes from its VM, so the session's branch is at the merge while the worktree's
-/// branch on the host lags behind it until `vm sync`. Then the session is synced here, which moves
-/// the worktree's branch forward to the VM's and never back, and is finished; `out` says so.
+/// branch on the host lags behind it until `vm sync`. Such a session is finished when the merge
+/// holds the worktree's commit: with `yes` the worktree is synced first, which moves its branch
+/// forward to the VM's and never back, and `out` says so; without, nothing changes and `out` says
+/// that `--yes` will sync it.
 fn merged(
     host: &Host,
     worktree: &session::Worktree,
     state: &Path,
+    yes: bool,
     out: &mut impl Write,
 ) -> anyhow::Result<Merge> {
     let Some(branch) = &worktree.branch else {
@@ -1031,6 +1035,24 @@ fn merged(
     );
     match in_session {
         Some(theirs) if theirs == *merge && worktree.commit == *merge => Ok(finished()),
+        Some(theirs) if theirs == *merge && !yes => {
+            if session::is_ancestor(state, &worktree.commit, merge)? {
+                writeln!(
+                    out,
+                    "vm gc: the worktree's {branch} is behind the merge at {}; --yes syncs it \
+                     first",
+                    session::short(&worktree.commit)
+                )?;
+                Ok(finished())
+            } else {
+                Ok(Merge::Unfinished(format!(
+                    "{merged_at}, which the VM's {branch} is at, but the worktree's is at {}, \
+                     which the merge does not hold: the worktree's {branch} has commits the VM's \
+                     lacks; merge them by hand",
+                    session::short(&worktree.commit)
+                )))
+            }
+        }
         Some(theirs) if theirs == *merge => {
             let synced = Session::open(&worktree.path, &host.repo, &host.state)
                 .and_then(|session| session.sync());
