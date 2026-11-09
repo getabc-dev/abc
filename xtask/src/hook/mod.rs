@@ -93,8 +93,12 @@ pub(crate) enum Event {
     /// cannot read.
     PreToolUse,
     /// `Stop` and `SubagentStop`: run `cargo xtask check --changed`, honour a BLOCKED
-    /// declaration and, for the main agent, the watchdog.
+    /// declaration and, for the main agent, the watchdog; and record the stop in the checkpoint
+    /// (`crate::progress`).
     Stop,
+    /// `PostToolUse` on Bash: render the checkpoint again when HEAD moved, as a commit moves it.
+    /// It never blocks.
+    PostToolUse,
 }
 
 impl Event {
@@ -102,6 +106,7 @@ impl Event {
         match self {
             Self::PreToolUse => "pre-tool-use",
             Self::Stop => "stop",
+            Self::PostToolUse => "post-tool-use",
         }
     }
 }
@@ -150,6 +155,8 @@ struct HookInput {
     /// Whether the agent is already working on because a stop hook blocked it.
     #[serde(default)]
     stop_hook_active: bool,
+    /// What the agent last said, for `Stop` and `SubagentStop`.
+    last_assistant_message: Option<String>,
 }
 
 /// The part of a tool call's input the hook reads.
@@ -248,7 +255,7 @@ impl Answer {
                 system_message: Some(message.clone()),
                 ..Printed::default()
             },
-            (Self::Block(reason), Event::Stop) => Printed {
+            (Self::Block(reason), Event::Stop | Event::PostToolUse) => Printed {
                 decision: Some(StopDecision::Block),
                 reason: Some(reason.clone()),
                 ..Printed::default()
@@ -284,7 +291,7 @@ impl Answer {
                 },
             ) => Ok(Self::Notify(message)),
             (
-                Event::Stop,
+                Event::Stop | Event::PostToolUse,
                 Printed {
                     system_message: None,
                     decision: Some(StopDecision::Block),
@@ -327,6 +334,42 @@ pub(crate) fn run(event: Event, input: &str, context: &Context, log: &mut Vec<u8
         // The watchdog's own session stops without a check, so it never starts another watchdog.
         Event::Stop if context.inside_watchdog => Answer::Allow,
         Event::Stop => stop_hook(input, context, log),
+        Event::PostToolUse if context.inside_watchdog => Answer::Allow,
+        Event::PostToolUse => match checkpoint_where(input, context) {
+            Ok(answer) => answer,
+            Err(error) => note(
+                log,
+                &format!("xtask hook: the checkpoint was not rendered: {error:#}"),
+            ),
+        },
+    }
+}
+
+/// The `PostToolUse` hook, in the checkout the agent is in: renders the checkpoint again when HEAD
+/// moved. The caller lets the action stand whatever happens, noting what went wrong.
+fn checkpoint_where(input: &str, context: &Context) -> anyhow::Result<Answer> {
+    let fields = serde_json::from_str::<HookInput>(input)
+        .context("could not read the PostToolUse hook input")?;
+    match locate(
+        fields.cwd.as_deref(),
+        context.project_dir.as_deref(),
+        &context.own_root,
+    )? {
+        Location::Here => {
+            crate::progress::observed(&context.own_root, crate::progress::now())?;
+            Ok(Answer::Allow)
+        }
+        Location::Worktree(root) if !root.join(LAUNCHER).is_file() => Ok(Answer::Allow),
+        Location::Worktree(root) => {
+            ensure!(
+                !context.delegated,
+                "{} was handed this hook, but the agent is in another checkout: {}",
+                context.own_root.display(),
+                root.display()
+            );
+            delegate(&context.cargo, &root, Event::PostToolUse, input)
+        }
+        Location::Elsewhere(_) => Ok(Answer::Allow),
     }
 }
 
@@ -464,6 +507,17 @@ fn stop_hook(input: &str, context: &Context, log: &mut Vec<u8>) -> Answer {
 /// stop through with a note, and a failure is [`Answer::Held`], which the launcher counts under its
 /// own cap.
 fn stop_with(root: &Path, fields: &HookInput, steps: &mut impl Steps, log: &mut Vec<u8>) -> Answer {
+    // The checkpoint is a record, never a decision: a failure to write it is only noted.
+    if let Err(error) = crate::progress::stopped(
+        root,
+        fields.last_assistant_message.as_deref(),
+        crate::progress::now(),
+    ) {
+        let _noted = writeln!(
+            log,
+            "xtask stop hook: the checkpoint was not written: {error:#}"
+        );
+    }
     let mut remembered = Remembered { steps, check: None };
     let error = match drive(root, fields, &mut remembered, log) {
         Ok(answer) => return answer,

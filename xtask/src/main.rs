@@ -17,6 +17,7 @@ mod junit;
 mod mutants;
 mod postgres;
 mod pr;
+mod progress;
 mod release;
 mod review;
 mod rulesets;
@@ -126,6 +127,12 @@ enum TaskAction {
     Show,
     /// Forget the recorded task.
     Clear,
+    /// Record your next step in the checkpoint, .abc/progress.md, which a fresh session carries
+    /// on from after a limit, an outage or a reboot. Run it at each milestone.
+    Next {
+        /// The next step, in a sentence or two.
+        text: String,
+    },
     /// Declare the task BLOCKED when what stops it is outside your control. The main agent's next
     /// stop asks the watchdog once whether it is, then lets the stop through with this handoff.
     Blocked {
@@ -426,10 +433,23 @@ fn run(
     let Some((gate, wait)) = gate_of(&task) else {
         return perform(task, invocation, report);
     };
+    let label = match &task {
+        Task::Check { changed: true, .. } => format!("{} --changed", gate.name()),
+        _ => gate.name().to_owned(),
+    };
     match gate::take(&invocation.root, gate, wait, report)? {
         gate::Taken::Held(held) => {
             let result = perform(task, invocation, report);
             drop(held);
+            if matches!(result, Ok(code) if code == ExitCode::SUCCESS)
+                && invocation.root == invocation.home
+                && let Err(error) = progress::gate_passed(&invocation.root, &label, progress::now())
+            {
+                writeln!(
+                    report,
+                    "{label}: passed, but the checkpoint was not written: {error:#}"
+                )?;
+            }
             result
         }
         gate::Taken::Busy(holder) => {
@@ -872,6 +892,7 @@ fn run_task(action: TaskAction, root: &Path, report: &mut impl Write) -> anyhow:
             None => writeln!(report, "no task recorded")?,
         },
         TaskAction::Clear => task::clear(root)?,
+        TaskAction::Next { text } => progress::set_next(root, &text, progress::now())?,
         TaskAction::Blocked { text } => task::block(root, &text, report)?,
     }
     Ok(ExitCode::SUCCESS)

@@ -29,7 +29,7 @@ fn write(root: &Path, file: &str, text: &str) -> anyhow::Result<()> {
 }
 
 /// Records `text` as the current task. A new task starts every stop record afresh: no BLOCKED
-/// declaration and no blocked stops counted. What the state's IO says goes to `note`.
+/// declaration and no blocked stops counted; and the checkpoint too: no next step. What the state's IO says goes to `note`.
 pub(crate) fn set(root: &Path, text: &str, note: &mut dyn std::io::Write) -> anyhow::Result<()> {
     ensure!(
         !text.trim().is_empty(),
@@ -37,7 +37,7 @@ pub(crate) fn set(root: &Path, text: &str, note: &mut dyn std::io::Write) -> any
     );
     write(root, TASK, &format!("{}\n", text.trim()))?;
     stop::apply(root, stop::Event::TaskSet, note)?;
-    Ok(())
+    crate::progress::new_task(root, crate::progress::now())
 }
 
 /// Declares the task BLOCKED: what is missing and what was tried. The main agent's next stop
