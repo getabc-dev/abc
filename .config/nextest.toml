@@ -11,10 +11,10 @@ slow-timeout = { period = "30s", terminate-after = 4 }
 [profile.default.junit]
 path = "junit.xml"
 
-# The opt-in Tailscale passthrough check waits for two nodes to join a tailnet and for Serve's first
-# certificate, which takes minutes.
+# The opt-in real-tailnet check runs abc server setup, which waits for abc's node to join the
+# tailnet, and then for Serve's first certificate, which takes minutes.
 [[profile.default.overrides]]
-filter = "test(serve_passes_identity_websockets_and_unbuffered_sse_to_the_unix_socket)"
+filter = "test(abc_server_setup_serves_the_real_binaries_through_tailscale)"
 slow-timeout = { period = "60s", terminate-after = 10 }
 
 # Builds xtask from a copy of the repository, from scratch the first time.

@@ -38,11 +38,14 @@ function SessionNotice({
 export function SessionGate({
   api,
   origin,
+  setupCode,
   children,
 }: {
   readonly api: ApiClient;
   /** The server's public URL. */
   readonly origin: string;
+  /** The setup code the claim link carried, or "". */
+  readonly setupCode: string;
   /** The routes, which a member sees inside the shell. */
   readonly children: ReactNode;
 }) {
@@ -88,7 +91,7 @@ export function SessionGate({
   const view = session.data;
   switch (view.state) {
     case "unclaimed":
-      return <ClaimScreen api={api} login={view.login} />;
+      return <ClaimScreen api={api} login={view.login} setupCode={setupCode} />;
     case "member":
       return (
         <SignedIn

@@ -61,12 +61,29 @@ pub(crate) const XTASK: Workspace = Workspace {
 };
 
 /// The shell scripts of the repository, which shellcheck lints.
-pub(crate) const SCRIPTS: [&str; 5] = [
+pub(crate) const SCRIPTS: [&str; 21] = [
     ".github/release/publish.sh",
     "xtask/hooks/hook.sh",
     "xtask/vm/entrypoint.sh",
     "xtask/vm/agent-exec",
     "xtask/vm/own-disks",
+    // abc server setup's test fakes, which source bin/lib.sh (shellcheck follows it).
+    "crates/abc-host/tests/fakes/bin/launchctl",
+    "crates/abc-host/tests/fakes/bin/loginctl",
+    "crates/abc-host/tests/fakes/bin/open",
+    "crates/abc-host/tests/fakes/bin/sudo",
+    "crates/abc-host/tests/fakes/bin/systemctl",
+    "crates/abc-host/tests/fakes/bin/tailscale",
+    "crates/abc-host/tests/fakes/bin/xdg-open",
+    "crates/abc-host/tests/fakes/programs/abc",
+    "crates/abc-host/tests/fakes/programs/pg/initdb",
+    "crates/abc-host/tests/fakes/programs/pg/pg_dump",
+    "crates/abc-host/tests/fakes/programs/pg/pg_isready",
+    "crates/abc-host/tests/fakes/programs/pg/pg_restore",
+    "crates/abc-host/tests/fakes/programs/pg/postgres",
+    "crates/abc-host/tests/fakes/programs/pg/psql",
+    "crates/abc-host/tests/fakes/programs/tailscale",
+    "crates/abc-host/tests/fakes/programs/tailscaled",
 ];
 
 /// What the check covers.

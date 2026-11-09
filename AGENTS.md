@@ -97,8 +97,11 @@ brief.
   goes through the event path.
 - **Agents:** `claude -p` with stream-json on the user's own login, Codex through its app-server,
   other agents over ACP, model APIs over HTTP.
-- **Network:** the user's `tailscaled` on workers and the official Tailscale sidecar on the server.
-  Only the webhook path is public.
+- **Network:** the user's `tailscaled` on workers; on the server, abc's own unprivileged,
+  userspace `tailscaled` as the node `abc`, whose Serve proxies to abc's Unix socket
+  (`abc server setup`, decision 51). Only the webhook path is public.
+- **Server host:** `abc server setup` runs a private Postgres 18, that `tailscaled` and abc server
+  as launchd agents or systemd user units; root is used once, for Serve (`docs/server.md`).
 - **Sandbox:** Seatbelt on macOS; bubblewrap and seccomp on Linux.
 - **Licence:** MIT.
 
@@ -164,6 +167,11 @@ and a `DATABASE_URL` is never used. Test databases are dropped when their test e
 of killed runs (`abc_test_*`, `abc_query_cache_*`) are swept after a day. sqlx's query macros
 always read the committed `.sqlx/` cache (`SQLX_OFFLINE`), and `check` fails when a cache no
 longer matches its queries, saying how to regenerate it.
+
+`abc server setup`'s end-to-end test (`crates/abc/tests/server_setup.rs`) runs abc's private
+Postgres for real, with Postgres 18's programs from the pinned `for-tests` tool `postgresql`
+(theseus-rs's attested builds): `check`, `coverage` and `mutants` give the tests its bin directory
+as `ABC_TEST_POSTGRES_BIN`, and the test never looks on `PATH`.
 
 CI runs `check`, `e2e`, `integrity`, `coverage`, `mutants` (in eight shards, reported as one
 `Mutants` check), `review` and `fuzz` (for a minute; for an hour nightly on `main`) on every pull

@@ -40,6 +40,13 @@ describe("claim", () => {
     expect(effects).toEqual([]);
   });
 
+  test("starts with the claim link's code filled in", () => {
+    const [model, effects] = init("ABCDE-FGHJK");
+    expect(model.fields).toEqual({ code: "ABCDE-FGHJK", displayName: "", workspaceName: "" });
+    expect(model.phase).toEqual({ state: "editing", errors: {}, problem: null });
+    expect(effects).toEqual([]);
+  });
+
   test("submitting a filled form claims with the trimmed fields", () => {
     const [model, effects] = update(replay(...typed(filled)), { type: "submitted" });
     expect(model.phase).toEqual({ state: "claiming" });

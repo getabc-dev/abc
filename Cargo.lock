@@ -7,6 +7,7 @@ name = "abc"
 version = "0.1.0"
 dependencies = [
  "abc-core",
+ "abc-host",
  "abc-platform",
  "abc-protocol",
  "abc-server",
@@ -23,6 +24,7 @@ dependencies = [
  "serde_json",
  "sqlx",
  "tempfile",
+ "time",
  "tokio",
  "tokio-rustls",
  "tracing",
@@ -46,6 +48,20 @@ dependencies = [
  "ts-rs",
  "uuid",
  "zeroize",
+]
+
+[[package]]
+name = "abc-host"
+version = "0.1.0"
+dependencies = [
+ "abc-protocol",
+ "rustix",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "time",
+ "toml_edit",
 ]
 
 [[package]]
@@ -93,8 +109,6 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
- "rustls",
- "rustls-platform-verifier",
  "schemars",
  "semver",
  "serde",
@@ -104,7 +118,6 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
- "tokio-rustls",
  "tokio-stream",
  "tokio-tungstenite",
  "tracing",

@@ -1,0 +1,17 @@
+#!/bin/sh
+# A stand-in for Postgres 18's initdb: makes a cluster directory that says it is 18.
+ROOT=$(cd "$(dirname "$0")/../.." && pwd)
+# shellcheck source-path=SCRIPTDIR source=../../bin/lib.sh
+. "$ROOT/bin/lib.sh"
+record initdb "$@"
+while [ "$#" -gt 0 ]; do
+	if [ "$1" = --pgdata ]; then
+		mkdir -p "$2"
+		chmod 700 "$2"
+		echo 18 >"$2/PG_VERSION"
+		exit 0
+	fi
+	shift
+done
+echo "initdb: no data directory specified" >&2
+exit 1

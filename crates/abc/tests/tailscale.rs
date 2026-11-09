@@ -1,36 +1,47 @@
-//! The real binaries behind real Tailscale Serve (decision 39, opt-in): `abc server` serves its
-//! sidecar socket through the pinned `tailscale/tailscale` image's Serve on
-//! `https://<node>.<tailnet>`; the test claims it, issues an enrolment token, runs `abc worker
-//! enrol` and `abc worker` against that URL, and watches the server report the worker online, then
-//! offline once the worker is stopped. The worker verifies Serve's Let's Encrypt certificate for
-//! the `ts.net` name with the operating system's trust (decision W4), so this is also the proof that
-//! the real chain verifies under the platform verifier.
+//! The real thing on a real tailnet (decision 39, opt-in): `abc server setup --auth-key-file`
+//! runs abc's own unprivileged tailscaled with Tailscale's own programs, logs it in as a node of
+//! its own, points Serve at abc's socket with the machine's own `sudo`, and starts the pinned
+//! Postgres and the real `abc server` (under the fake service manager of
+//! `crates/abc-host/tests/fakes`, since a CI runner has no user systemd). From this machine's own
+//! node, the test then claims the server with the code setup opened the claim page with, issues
+//! an enrolment token, runs `abc worker enrol` and `abc worker` against the node's URL, watches
+//! the server's live stream report the worker online, then offline once it stops, checks
+//! `abc server status`, and uninstalls, which logs the node out. The worker verifies Serve's
+//! Let's Encrypt certificate with the operating system's trust (decision W4), so this is also the
+//! proof that the real chain verifies under the platform verifier, and the claim, the worker's
+//! WebSocket and the live stream prove Serve's identity header, upgrade and streaming.
 //!
 //! It needs a real tailnet, so it is ignored unless asked for (`--run-ignored only`), and then
 //! fails unless these are set:
 //!
 //! * `ABC_TAILSCALE_AUTHKEY`: an ephemeral auth key owned by a user (not tagged: tagged devices
-//!   carry no identity), approved in advance. It must be ephemeral: a node a killed run leaves
-//!   behind then disappears from the tailnet by itself, and the test logs its node out on the way
-//!   out;
-//! * `ABC_TAILSCALE_TAILNET`: the tailnet's DNS name, such as `tail1234.ts.net`, with `MagicDNS` and
-//!   HTTPS certificates enabled.
+//!   carry no identity), approved in advance, on a tailnet with `MagicDNS` and HTTPS certificates.
+//!   Ephemeral, so a node a killed run leaves behind disappears by itself;
+//! * `ABC_TAILSCALE_BIN`: a directory holding the `tailscaled` and `tailscale` to run;
+//! * `ABC_TEST_POSTGRES_BIN`, as for every test that runs Postgres (`cargo xtask setup
+//!   --for-tests` installs it).
 //!
 //! The machine running it must itself be a node of that tailnet whose resolver answers the
-//! tailnet's names, as the worker's machine is in production: the `Tailscale` workflow joins the
-//! runner with the same image in kernel mode and points systemd-resolved at `MagicDNS` first. It
-//! also needs Docker on a Linux host, to share the sidecar socket with the Serve container.
+//! tailnet's names, as a worker's machine is, and `sudo` must not ask for a password: the
+//! `Tailscale` workflow joins the runner as a node of its own and points systemd-resolved at
+//! `MagicDNS` first.
+
+#[cfg(test)]
+#[expect(
+    dead_code,
+    reason = "the shared harness; this test needs only part of it"
+)]
+mod common;
 
 #[cfg(test)]
 mod tests {
     use std::io::Write as _;
     use std::os::unix::fs::PermissionsExt as _;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::process::{Child, Command, ExitStatus, Output};
     use std::sync::Arc;
     use std::time::Duration;
 
-    use abc_store::testing::TestDatabase;
     use http_body_util::{BodyExt as _, Full};
     use hyper::body::Bytes;
     use hyper::{Request, StatusCode};
@@ -41,35 +52,7 @@ mod tests {
     use tokio_rustls::TlsConnector;
     use tokio_rustls::client::TlsStream;
 
-    /// The Tailscale image, pinned by digest in the one file the Tailscale workflow and both
-    /// Tailscale tests read.
-    const IMAGE: &str = include_str!("../../../.github/tailscale-image").trim_ascii();
-
-    /// Logs the Serve node out of the tailnet and removes its container however the test ends.
-    struct Container(String);
-
-    impl Drop for Container {
-        fn drop(&mut self) {
-            let _logged_out = Command::new("docker")
-                .args(["exec", &self.0, "tailscale", "logout"])
-                .output();
-            let _removed = Command::new("docker").args(["rm", "-f", &self.0]).output();
-        }
-    }
-
-    /// A node name no other run shares: the workflow run and attempt, or the time and process
-    /// when the test runs by hand, so a node left behind by a killed run never collides.
-    fn unique_node(prefix: &str) -> String {
-        if let Ok(run) = std::env::var("GITHUB_RUN_ID") {
-            let attempt = std::env::var("GITHUB_RUN_ATTEMPT").unwrap_or_else(|_| String::from("1"));
-            format!("{prefix}-{run}-{attempt}")
-        } else {
-            let nanos = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |elapsed| elapsed.as_nanos());
-            format!("{prefix}-{nanos:x}-{}", std::process::id())
-        }
-    }
+    use crate::common::{Machine, Tailscale};
 
     /// The text a process wrote to the file `log`, its last 8000 bytes at most.
     fn tail(log: &Path) -> String {
@@ -79,7 +62,7 @@ mod tests {
 
     /// Prints the tails of the processes' logs when the test fails, since their output goes to
     /// files that are removed with the test's directory.
-    struct Logs(Vec<(&'static str, std::path::PathBuf)>);
+    struct Logs(Vec<(&'static str, PathBuf)>);
 
     impl Drop for Logs {
         fn drop(&mut self) {
@@ -97,7 +80,7 @@ mod tests {
     /// Kills a process the test started if the test ends before stopping it. Its output goes to a
     /// file, so a process nobody reads from never blocks on a full pipe, and the test can show
     /// the end of it.
-    struct Running(Option<Child>, std::path::PathBuf);
+    struct Running(Option<Child>, PathBuf);
 
     impl Drop for Running {
         fn drop(&mut self) {
@@ -152,41 +135,6 @@ mod tests {
         let mut command = abc(&["worker"]);
         command.args(args).arg("--home").arg(home);
         command
-    }
-
-    fn docker(args: &[&str]) {
-        let output = Command::new("docker").args(args).output().unwrap();
-        assert!(
-            output.status.success(),
-            "docker {args:?}: {}",
-            text(&output.stderr)
-        );
-    }
-
-    /// The Serve node: Tailscale Serve on `https://<node>.<tailnet>` in front of the sidecar socket
-    /// in `sockets`, configured by `serve.json` in `config`.
-    fn start_serve(key: &str, node: &str, sockets: &Path, config: &Path) -> Container {
-        let container = Container(node.to_owned());
-        docker(&[
-            "run",
-            "--detach",
-            "--name",
-            node,
-            "--env",
-            &format!("TS_AUTHKEY={key}"),
-            "--env",
-            &format!("TS_HOSTNAME={node}"),
-            "--env",
-            "TS_USERSPACE=true",
-            "--env",
-            "TS_SERVE_CONFIG=/config/serve.json",
-            "--volume",
-            &format!("{}:/run/abc-sidecar", sockets.display()),
-            "--volume",
-            &format!("{}:/config:ro", config.display()),
-            IMAGE,
-        ]);
-        container
     }
 
     /// A TLS connection to `host:443` over the tailnet, verified as the worker verifies it: by
@@ -327,86 +275,68 @@ mod tests {
         panic!("the server never reported the worker online = {online}: {seen:?}");
     }
 
-    /// Starts `abc server` on the database at `database` behind `host`, and waits until it
-    /// reports ready.
-    async fn start_server(database: &str, host: &str, socket: &Path, log: &Path) -> Running {
-        let ops = std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap();
-        let server = Running::new(
-            abc(&["server"])
-                .env("ABC_DATABASE_URL", database)
-                .env("ABC_PUBLIC_URL", format!("https://{host}"))
-                .env("ABC_SIDECAR_SOCKET", socket)
-                .env("ABC_OPS_ADDR", ops.to_string()),
-            log,
-        );
-        for _ in 0..1200 {
-            if socket.exists() {
-                return server;
-            }
-            tokio::time::sleep(Duration::from_millis(25)).await;
+    /// Uninstalls the server however the test ends, which logs abc's node out of the tailnet.
+    struct Uninstall<'a>(&'a Machine);
+
+    impl Drop for Uninstall<'_> {
+        fn drop(&mut self) {
+            let _removed = self.0.abc(&["uninstall", "--purge"]);
         }
-        panic!("abc server never bound {}", socket.display());
     }
 
     fn run(command: &mut Command) -> Output {
         command.output().unwrap()
     }
 
+    /// The claim link `abc server setup` printed: the node's host and the setup code.
+    fn claim_link(said: &str) -> (String, String) {
+        said.lines()
+            .find_map(|line| {
+                let link = line.trim().strip_prefix("https://")?;
+                let (host, code) = link.split_once("/#code=")?;
+                Some((host.to_owned(), code.to_owned()))
+            })
+            .unwrap_or_else(|| panic!("setup printed the claim link: {said}"))
+    }
+
     #[tokio::test]
-    #[ignore = "needs a tailnet this machine is on: ABC_TAILSCALE_AUTHKEY and ABC_TAILSCALE_TAILNET; run with --run-ignored only"]
-    async fn the_real_binaries_connect_through_tailscale_serve() {
-        let (Ok(key), Ok(tailnet)) = (
+    #[ignore = "needs a tailnet this machine is on: ABC_TAILSCALE_AUTHKEY and ABC_TAILSCALE_BIN; run with --run-ignored only"]
+    async fn abc_server_setup_serves_the_real_binaries_through_tailscale() {
+        let (Ok(key), Some(bin)) = (
             std::env::var("ABC_TAILSCALE_AUTHKEY"),
-            std::env::var("ABC_TAILSCALE_TAILNET"),
+            std::env::var_os("ABC_TAILSCALE_BIN"),
         ) else {
             panic!(
-                "the real-app check needs ABC_TAILSCALE_AUTHKEY and ABC_TAILSCALE_TAILNET (see \
+                "the real-tailnet check needs ABC_TAILSCALE_AUTHKEY and ABC_TAILSCALE_BIN (see \
                  this file's header)"
             );
         };
-        let database = TestDatabase::migrated().await;
-        let url = abc_store::testing::database_url_text(&database.pool(), None);
-        let node = unique_node("abc-app");
-        let host = format!("{node}.{tailnet}");
-
-        let logs = tempfile::tempdir().unwrap();
-        let (server_log, worker_log) = (
-            logs.path().join("server.log"),
-            logs.path().join("worker.log"),
+        let machine = Machine::new(&Tailscale::Real(PathBuf::from(bin)));
+        let key_file = machine.root().join("authkey");
+        std::fs::write(&key_file, key).unwrap();
+        std::fs::set_permissions(&key_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let worker_log = machine.root().join("worker.log");
+        let state = machine.root().join("state");
+        let _tails = Logs(
+            ["postgres", "tailscaled", "server"]
+                .into_iter()
+                .map(|part| (part, state.join(format!("abc-{part}.service.log"))))
+                .chain(std::iter::once(("worker", worker_log.clone())))
+                .collect(),
         );
-        let _tails = Logs(vec![
-            ("server", server_log.clone()),
-            ("worker", worker_log.clone()),
-        ]);
-        let sockets = tempfile::tempdir().unwrap();
-        // The Serve container's root reaches the socket through the group bits.
-        std::fs::set_permissions(sockets.path(), std::fs::Permissions::from_mode(0o770)).unwrap();
-        let socket = sockets.path().join("abc.sock");
-        let serve_config = tempfile::tempdir().unwrap();
-        let serve = json!({
-            "TCP": { "443": { "HTTPS": true } },
-            "Web": { "${TS_CERT_DOMAIN}:443": { "Handlers": { "/": {
-                "Proxy": "unix:/run/abc-sidecar/abc.sock"
-            } } } }
-        });
-        std::fs::write(serve_config.path().join("serve.json"), serve.to_string()).unwrap();
+        let uninstall = Uninstall(&machine);
 
-        let server = start_server(&url, &host, &socket, &server_log).await;
-        let container = start_serve(&key, &node, sockets.path(), serve_config.path());
+        let setup = machine.abc(&["setup", "--auth-key-file", key_file.to_str().unwrap()]);
+        let said = text(&setup.stdout);
+        assert!(
+            setup.status.success(),
+            "abc server setup: {said}\n{}",
+            text(&setup.stderr)
+        );
+        let (host, code) = claim_link(&said);
         let session = first_session(&host).await.unwrap();
         assert_eq!(session.1["state"], "unclaimed", "{}", session.1);
 
-        let setup = run(abc(&["server", "setup-code"]).env("ABC_DATABASE_URL", &url));
-        assert!(setup.status.success(), "{}", text(&setup.stderr));
-        let printed = text(&setup.stdout);
-        let code = printed
-            .lines()
-            .next()
-            .and_then(|line| line.rsplit(' ').next())
-            .unwrap_or_else(|| panic!("a setup code: {printed}"));
         let claim = json!({ "code": code, "display_name": "Alice", "workspace_name": "Home" });
         let (claim_status, claimed) = call(&host, "POST", "/api/owner/claim", Some(claim)).await;
         assert_eq!(claim_status, StatusCode::OK, "{claimed}");
@@ -416,8 +346,7 @@ mod tests {
         assert_eq!(issue_status, StatusCode::OK, "{issued}");
         let token = issued["token"].as_str().unwrap();
 
-        let homes = tempfile::tempdir().unwrap();
-        let home = homes.path().join("worker");
+        let home = machine.root().join("worker");
         let enrolled = run(worker(
             &[
                 "enrol",
@@ -437,7 +366,6 @@ mod tests {
         let running = Running::new(worker(&[], &home).env("ABC_LOG", "info"), &worker_log);
         let online = until_online(&host, &workspace, true).await;
         assert_eq!(online[0]["hostname"], "ci-runner", "{online:?}");
-
         let (worker_exit, worker_output) = running.terminate().await;
         assert!(
             worker_exit.success(),
@@ -445,11 +373,13 @@ mod tests {
         );
         until_online(&host, &workspace, false).await;
 
-        let (server_exit, server_output) = server.terminate().await;
+        let status = machine.abc(&["status"]);
         assert!(
-            server_exit.success(),
-            "the server exits cleanly on SIGTERM: {server_output}"
+            status.status.success(),
+            "every part is healthy, Serve's real target among them: {}",
+            text(&status.stdout)
         );
-        drop(container);
+        drop(uninstall);
+        assert!(!machine.home().exists(), "uninstalled and purged");
     }
 }

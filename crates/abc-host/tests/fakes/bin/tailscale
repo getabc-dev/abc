@@ -1,0 +1,7 @@
+#!/bin/sh
+# The user's own tailscale on the PATH, which abc must never run.
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
+# shellcheck source-path=SCRIPTDIR source=lib.sh
+. "$ROOT/bin/lib.sh"
+record "the user's tailscale" "$@"
+exit 1
