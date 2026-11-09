@@ -840,7 +840,7 @@ fn gc_keeps_running_and_unmerged_sessions_and_commits_made_after_the_merge() {
         &world,
         "[{\"number\":7,\"headRefOid\":\"0123456789012345678901234567890123456789\"}]",
     );
-    let short = |full: &str| super::session::short(full).to_owned();
+    let short = |full: &str| crate::git::short(full).to_owned();
     assert_eq!(
         gc(&world, &backend, true),
         format!(
@@ -1287,7 +1287,7 @@ fn gc_keeps_a_gone_sessions_commits_that_are_nowhere_else() {
     let kept = format!(
         "abc-gone\t0.0 GB\tkept: its worktree is gone, but its repository has commits on neither \
          origin nor a merged pull request: {} only in the VM\n",
-        super::session::short(&lost)
+        crate::git::short(&lost)
     );
     assert!(
         listed.contains("abc-done\t0.0 GB\tits worktree is gone\n"),
@@ -1332,7 +1332,7 @@ fn gc_needs_the_sessions_branch_at_the_merged_commit() {
             "abc-w\tnot finished: feature merged in #32 at {}, but the session's repository has \
              no feature, so nothing shows its commits are merged\n\
              vm gc: no finished session to purge\n",
-            super::session::short(&head(&world.worktree))
+            crate::git::short(&head(&world.worktree))
         )
     );
 }
@@ -1401,7 +1401,7 @@ fn gc_syncs_a_worktree_behind_the_merge_its_vm_pushed() {
         diverged.starts_with(&format!(
             "abc-w\tnot finished: feature merged in #9 at {}, which the VM's feature is at, but \
              the worktree's is at ",
-            super::session::short(&pushed)
+            crate::git::short(&pushed)
         )) && diverged.contains("which the merge does not hold")
             && diverged.ends_with("vm gc: no finished session to purge\n"),
         "{diverged}"
@@ -1421,7 +1421,7 @@ fn gc_syncs_a_worktree_behind_the_merge_its_vm_pushed() {
             "vm gc: the worktree's feature is behind the merge at {}; --yes syncs it first\n\
              abc-w\t1.0 GB\tfeature merged in #9\n\
              vm gc: 1 finished sessions hold 1.0 GB; `cargo xtask vm gc --yes` purges them\n",
-            super::session::short(&before)
+            crate::git::short(&before)
         )
     );
     assert_eq!(head(&world.worktree), before, "listing changes nothing");
@@ -1429,8 +1429,8 @@ fn gc_syncs_a_worktree_behind_the_merge_its_vm_pushed() {
     assert!(
         purged.starts_with(&format!(
             "vm gc: synced the worktree's feature: {} -> {}\n",
-            super::session::short(&before),
-            super::session::short(&pushed)
+            crate::git::short(&before),
+            crate::git::short(&pushed)
         )) && purged.contains("vm gc: purged abc-w; "),
         "{purged}"
     );

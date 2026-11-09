@@ -421,7 +421,10 @@ impl Session {
         ]);
         let theirs = run(parse, "rev-parse")?.trim().to_owned();
         if theirs == ours {
-            return Ok(format!("{branch} is already at {}", short(&ours)));
+            return Ok(format!(
+                "{branch} is already at {}",
+                crate::git::short(&ours)
+            ));
         }
         let mut fetch = sealed(&self.worktree);
         fetch
@@ -440,7 +443,11 @@ impl Session {
         let mut reset = self.worktree_git();
         reset.args(["reset", "--quiet", "--mixed", &theirs]);
         run(reset, "reset")?;
-        Ok(format!("{branch}: {} -> {}", short(&ours), short(&theirs)))
+        Ok(format!(
+            "{branch}: {} -> {}",
+            crate::git::short(&ours),
+            crate::git::short(&theirs)
+        ))
     }
 
     /// The commits the worktree's branch has and the VM's lacks, as a bundle for a running VM,
@@ -474,7 +481,7 @@ impl Session {
         if theirs == ours {
             return Ok(Push::Current(format!(
                 "the VM's {branch} is already at {}",
-                short(&ours)
+                crate::git::short(&ours)
             )));
         }
         let mut known = self.worktree_git();
@@ -494,8 +501,8 @@ impl Session {
             ancestor.status().context("could not run git")?.success(),
             "the VM's {branch} ({}) is not behind the worktree's ({}): the branches diverged; \
              merge them by hand",
-            short(&theirs),
-            short(&ours)
+            crate::git::short(&theirs),
+            crate::git::short(&ours)
         );
         let mut bundle = self.worktree_git();
         bundle.args([
@@ -717,7 +724,7 @@ pub(crate) fn unshared(state: &Path, elsewhere: &[String]) -> anyhow::Result<Vec
         .lines()
         .map(|line| {
             let (commit, subject) = line.split_once(' ').unwrap_or((line, ""));
-            format!("{} {subject}", short(commit))
+            format!("{} {subject}", crate::git::short(commit))
         })
         .collect())
 }
@@ -743,11 +750,6 @@ pub(crate) fn is_ancestor(state: &Path, ancestor: &str, of: &str) -> anyhow::Res
             String::from_utf8_lossy(&output.stderr).trim()
         ),
     }
-}
-
-/// The first twelve characters of a commit's name.
-pub(crate) fn short(commit: &str) -> &str {
-    commit.get(..12).unwrap_or(commit)
 }
 
 #[cfg(test)]

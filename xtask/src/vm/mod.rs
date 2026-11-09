@@ -733,8 +733,8 @@ fn push(session: &Session, backend: &dyn Backend) -> anyhow::Result<String> {
     );
     Ok(format!(
         "the VM's {branch}: {} -> {}; its index now matches the new commit",
-        session::short(&from),
-        session::short(&to)
+        crate::git::short(&from),
+        crate::git::short(&to)
     ))
 }
 
@@ -1031,7 +1031,7 @@ fn merged(
     let merged_at = format!(
         "{branch} merged in #{} at {}",
         pull.number,
-        session::short(merge)
+        crate::git::short(merge)
     );
     match in_session {
         Some(theirs) if theirs == *merge && worktree.commit == *merge => Ok(finished()),
@@ -1041,7 +1041,7 @@ fn merged(
                     out,
                     "vm gc: the worktree's {branch} is behind the merge at {}; --yes syncs it \
                      first",
-                    session::short(&worktree.commit)
+                    crate::git::short(&worktree.commit)
                 )?;
                 Ok(finished())
             } else {
@@ -1049,7 +1049,7 @@ fn merged(
                     "{merged_at}, which the VM's {branch} is at, but the worktree's is at {}, \
                      which the merge does not hold: the worktree's {branch} has commits the VM's \
                      lacks; merge them by hand",
-                    session::short(&worktree.commit)
+                    crate::git::short(&worktree.commit)
                 )))
             }
         }
@@ -1064,13 +1064,13 @@ fn merged(
                 Err(error) => Ok(Merge::Unfinished(format!(
                     "{merged_at}, which the VM's {branch} is at, but the worktree's is at {} and \
                      could not be synced: {error:#}",
-                    session::short(&worktree.commit)
+                    crate::git::short(&worktree.commit)
                 ))),
             }
         }
         Some(theirs) => Ok(Merge::Unfinished(format!(
             "{merged_at}, but the VM's {branch} is at {}, so what it holds is not all merged",
-            session::short(&theirs)
+            crate::git::short(&theirs)
         ))),
         None => Ok(Merge::Unfinished(format!(
             "{merged_at}, but the session's repository has no {branch}, so nothing shows its \

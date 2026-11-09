@@ -1,7 +1,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use super::{APPLY_PUSH, Id, Push, Session, branches, sealed, short, slug};
+use super::{APPLY_PUSH, Id, Push, Session, branches, sealed, slug};
+use crate::git::short;
 use crate::testing::{git, repository, script};
 
 /// A main clone with an `origin/main` and a linked worktree on branch `feature`; returns the main
