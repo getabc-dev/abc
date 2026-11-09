@@ -29,7 +29,12 @@ Claude included.
   start, the launcher answers itself: it holds a stop at most 5 times in a row
   (`.abc/hook-holds`), never honouring a declaration, and denies git and gh commands while letting
   everything else run. Read-only subagents (Explore, Plan and the like) and Claude Code's internal
-  agents are exempt. The PreToolUse hook on Bash and Monitor is the git guard: it catches
+  agents are exempt. Every stop, and every Bash call after which HEAD moved (the PostToolUse
+  hook), also renders the checkpoint `.abc/progress.md`: the task, your next step
+  (`cargo xtask task next "<step>"`), each gate's last pass with its commit, the commits and your
+  last message. A supervised run (`vm run`) restarts a fresh session on it and the brief after a
+  usage limit, an outage or a reboot, so keep your next step current; the checkpoint never
+  decides a stop. The PreToolUse hook on Bash and Monitor is the git guard: it catches
   accidental force pushes, git or gh commands it cannot read, gh changes made as the user,
   and pull requests opened or edited with gh rather than `cargo xtask pr`;
   GitHub's ruleset and the agent App's permissions are the enforcement. In an agent VM it first

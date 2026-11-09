@@ -35,7 +35,7 @@ pub(crate) enum Action {
     /// subscription token from the keychain, and a check that Claude Code uses only that.
     Start { worktree: PathBuf },
     /// Run COMMAND in the session as the agent; Claude Code when none is given. With a terminal
-    /// this is the interactive way in; `vm run` drives a session from a script.
+    /// this is the interactive way in; `vm run` drives a supervised run of a brief.
     Shell {
         worktree: PathBuf,
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
