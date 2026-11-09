@@ -595,6 +595,28 @@ mod tests {
         assert_eq!(server.join().unwrap().len(), 1);
     }
 
+    /// A 416 to a request for the whole file asked for no range, so asking again cannot help.
+    #[test]
+    fn a_range_refused_to_a_fresh_request_fails_at_once() {
+        let (url, server) = server(vec![Serve::Whole(
+            "416 Range Not Satisfiable",
+            "Content-Length: 0\r\n".to_owned(),
+            Vec::new(),
+        )]);
+        let mut slept = 0;
+        let error = fetch(
+            &url,
+            1 << 20,
+            &quick(),
+            &mut |_| slept += 1,
+            &mut Vec::new(),
+        )
+        .unwrap_err();
+        assert_eq!(slept, 0, "no retry");
+        assert!(format!("{error:#}").contains("416"), "{error:#}");
+        assert_eq!(server.join().unwrap().len(), 1);
+    }
+
     /// Server errors are retried, and the download gives up once the retries are spent, saying
     /// how many attempts it made.
     #[test]
