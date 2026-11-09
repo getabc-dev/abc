@@ -2,14 +2,15 @@
 //! running them from there. Nothing here runs a tool from `PATH`.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fmt::Write as _;
 use std::fs::{self, Permissions};
 use std::io::{Read, Write};
+use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
-use std::process::{Child, Command, ExitCode, ExitStatus};
+use std::process::{Child, Command, ExitCode, ExitStatus, Stdio};
 use std::time::Duration;
 
 use anyhow::{Context, bail, ensure};
@@ -79,7 +80,7 @@ struct RawManifest {
 /// project publishes no verifiable build for every target.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct Tool {
+struct Tool {
     name: String,
     version: String,
     /// Download URL template; `{version}` and `{platform}` are filled in.
@@ -118,7 +119,7 @@ pub(crate) struct Tool {
     /// Whether the tests run the tool, so every CI job that runs tests installs it with
     /// `cargo xtask setup --for-tests`.
     #[serde(rename = "for-tests", default)]
-    pub(crate) for_tests: bool,
+    for_tests: bool,
     /// Whether the whole archive is installed as the tool's directory, for a tool that needs the
     /// files beside its executable at run time, such as pnpm's `dist/`. `binary` is then the
     /// executable's path in that directory, and each target's `tree-sha256` pins the directory.
@@ -182,12 +183,12 @@ struct Asset {
 
 /// The validated tool list.
 #[derive(Debug)]
-pub(crate) struct Manifest {
+struct Manifest {
     tools: Vec<Tool>,
 }
 
 impl Manifest {
-    pub(crate) fn load(root: &Path) -> anyhow::Result<Self> {
+    fn load(root: &Path) -> anyhow::Result<Self> {
         let path = root.join(MANIFEST);
         let text = fs::read_to_string(&path)
             .with_context(|| format!("could not read {}", path.display()))?;
@@ -260,7 +261,27 @@ impl Manifest {
             .transpose()
     }
 
-    pub(crate) fn tool(&self, name: &str) -> anyhow::Result<&Tool> {
+    /// The installed tool `name`, which must be one the tests run, in the tree at `tree`, whose
+    /// tool list this is. Only a missing or modified install is fixed by `setup`, so only that
+    /// error says to run it.
+    fn for_tests(&self, tree: &Path, name: &str) -> anyhow::Result<PathBuf> {
+        let tool = self
+            .tool(name)
+            .with_context(|| format!("{}: its tests run {name}", tree.display()))?;
+        ensure!(
+            tool.for_tests,
+            "{}: its tests run {name}, which its {MANIFEST} does not mark `for-tests`",
+            tree.display()
+        );
+        tool.installed(tree).with_context(|| {
+            format!(
+                "the tests of {} run its own {name}: run `cargo xtask setup --for-tests` in {0}",
+                tree.display()
+            )
+        })
+    }
+
+    fn tool(&self, name: &str) -> anyhow::Result<&Tool> {
         self.tools
             .iter()
             .find(|tool| tool.name == name)
@@ -592,7 +613,7 @@ impl Tool {
 
     /// The installed executable, once its sha256 matches the pin; otherwise an error saying how
     /// to install it.
-    pub(crate) fn installed(&self, root: &Path) -> anyhow::Result<PathBuf> {
+    fn installed(&self, root: &Path) -> anyhow::Result<PathBuf> {
         let target = Target::host()?;
         let executable = self.executable(root, target)?;
         ensure!(
@@ -1147,6 +1168,86 @@ pub(crate) fn runtime(home: &Path, name: &str) -> anyhow::Result<Option<PathBuf>
         .runtime_of(tool)?
         .map(|runtime| runtime.installed(home))
         .transpose()
+}
+
+/// A tool the tests of this checkout at `tree` run themselves, such as the Postgres a gate hands
+/// them: marked `for-tests` in its tool list and installed in its `.tools/`, as its `cargo xtask
+/// setup --for-tests` put it there. Under `--root` the gates' own programs, those that run the
+/// tests included, stay xtask's ([`pinned`]), so a pull request cannot change what judges it,
+/// while the tree's own xtask names its tests' tools ([`of_tree`]): the tree's code running the
+/// tree's tests, which no trust boundary separates.
+pub(crate) fn for_tests(tree: &Path, name: &str) -> anyhow::Result<PathBuf> {
+    Manifest::load(tree)
+        .with_context(|| format!("{}: its tests run tools its own list pins", tree.display()))?
+        .for_tests(tree, name)
+}
+
+/// `cargo` run in the checkout at `checkout`, to build and run that checkout's own xtask with its
+/// own toolchain: the one its rust-toolchain.toml chooses, not the one running here.
+pub(crate) fn own_xtask(cargo: &Path, checkout: &Path) -> Command {
+    let mut command = Command::new(cargo);
+    command
+        .current_dir(checkout)
+        .env_remove("RUSTUP_TOOLCHAIN")
+        .env_remove("CARGO");
+    command
+}
+
+/// The cargo arguments that run a tree's own xtask, before its subcommand, as its `cargo xtask`
+/// alias does.
+const TREE_XTASK: [&str; 6] = [
+    "run",
+    "--quiet",
+    "--locked",
+    "--manifest-path",
+    "xtask/Cargo.toml",
+    "--",
+];
+
+/// The tool `name` the tests of another tree at `tree` run, as that tree's own xtask names it
+/// with `cargo xtask test-tool`, built with `cargo` and the tree's own toolchain. The tree's tool
+/// list, its schema and its install layout are the tree's own, so a gate under `--root` never
+/// reads them with its own code: a pull request that changes them is judged with them. Running
+/// the tree's xtask is the tree's code, which already runs the tree's tests; the gate's verdict
+/// stays with its own programs.
+pub(crate) fn of_tree(cargo: &Path, tree: &Path, name: &str) -> anyhow::Result<PathBuf> {
+    let output = own_xtask(cargo, tree)
+        .args(TREE_XTASK)
+        .args(["test-tool", name])
+        .stdin(Stdio::null())
+        .output()
+        .with_context(|| format!("could not run cargo in {}", tree.display()))?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stderr = stderr.trim();
+    ensure!(
+        output.status.success(),
+        "{}: its tests run {name}, and its own `cargo xtask test-tool {name}` failed ({}): \
+         {stderr}{}",
+        tree.display(),
+        output.status,
+        if stderr.contains("unrecognized subcommand 'test-tool'") {
+            "\nits xtask predates `test-tool`: merge the default branch into it"
+        } else {
+            ""
+        }
+    );
+    // A path is bytes, not text: it comes back exactly as the tree's xtask wrote it.
+    let printed = output.stdout.strip_suffix(b"\n").unwrap_or(&output.stdout);
+    let path = PathBuf::from(OsStr::from_bytes(printed));
+    ensure!(
+        path.is_absolute() && path.is_file(),
+        "{}: `cargo xtask test-tool {name}` printed {:?}, not the path of a file",
+        tree.display(),
+        String::from_utf8_lossy(&output.stdout)
+    );
+    Ok(path)
+}
+
+/// Writes `path` and a newline to `out`, as the bytes it is, for [`of_tree`] to read.
+pub(crate) fn print_path(path: &Path, out: &mut impl Write) -> anyhow::Result<()> {
+    out.write_all(path.as_os_str().as_bytes())?;
+    out.write_all(b"\n")?;
+    Ok(())
 }
 
 /// `cargo xtask tool`: runs a pinned tool's `executable` with the given arguments in `root`, with
@@ -2425,6 +2526,209 @@ targets.aarch64-unknown-linux-gnu = {{ platform = "linux-arm64", sha256 = "{sha2
             fs::read(&executable).unwrap(),
             SCRIPT,
             "and replaced by the pinned build"
+        );
+    }
+
+    #[test]
+    fn the_tests_tools_come_from_the_tree_under_test() {
+        let temp = tempfile::tempdir().unwrap();
+        let archive = tarball(&[("fake-1.2.3/fake", SCRIPT, 0o755)]);
+        let text = manifest_text(&sha256_hex(&archive), &sha256_hex(SCRIPT))
+            .replace("name = \"fake\"\n", "name = \"fake\"\nfor-tests = true\n");
+        let manifest = Manifest::parse(&text).unwrap();
+        let tree_with = |name: &str, list: &str| {
+            let tree = temp.path().join(name);
+            fs::create_dir_all(tree.join("xtask")).unwrap();
+            fs::write(tree.join(super::MANIFEST), list).unwrap();
+            tree
+        };
+        let home = tree_with("home", &text);
+        let tree = tree_with("tree", &text);
+        install(
+            &home,
+            only_tool(&manifest),
+            None,
+            Target::host().unwrap(),
+            &archive,
+        )
+        .unwrap();
+
+        let missing = super::for_tests(&tree, "fake").unwrap_err();
+        let not_installed = format!("{missing:#}");
+        assert!(
+            not_installed.contains(&format!(
+                "the tests of {} run its own fake: run `cargo xtask setup --for-tests` in {}",
+                tree.display(),
+                tree.display()
+            )),
+            "xtask's own install does not stand in for the tree's: {not_installed}"
+        );
+        assert!(
+            not_installed.contains("fake 1.2.3 is not installed"),
+            "{not_installed}"
+        );
+
+        install(
+            &tree,
+            only_tool(&manifest),
+            None,
+            Target::host().unwrap(),
+            &archive,
+        )
+        .unwrap();
+        assert_eq!(
+            super::for_tests(&tree, "fake").unwrap(),
+            tree.join(".tools/fake/1.2.3/fake"),
+            "the tree's own install"
+        );
+
+        let unmarked = tree_with("unmarked", &text.replace("for-tests = true\n", ""));
+        install(
+            &unmarked,
+            only_tool(&manifest),
+            None,
+            Target::host().unwrap(),
+            &archive,
+        )
+        .unwrap();
+        let not_marked = format!("{:#}", super::for_tests(&unmarked, "fake").unwrap_err());
+        assert_eq!(
+            not_marked,
+            format!(
+                "{}: its tests run fake, which its xtask/tools.toml does not mark `for-tests`",
+                unmarked.display()
+            ),
+            "only a tool the tree's tests run, and no setup hint, which would not fix it"
+        );
+        let not_pinned = format!("{:#}", super::for_tests(&tree, "other").unwrap_err());
+        assert!(
+            not_pinned.starts_with(&format!("{}: its tests run other: ", tree.display()))
+                && not_pinned.contains("other is not a pinned tool"),
+            "{not_pinned}"
+        );
+        let none = temp.path().join("none");
+        let no_list = format!("{:#}", super::for_tests(&none, "fake").unwrap_err());
+        assert!(
+            no_list.starts_with(&format!(
+                "{}: its tests run tools its own list pins: could not read",
+                none.display()
+            )) && !no_list.contains("setup"),
+            "a tree with no tool list: {no_list}"
+        );
+    }
+
+    #[test]
+    fn this_trees_spec_tools_are_tools_its_tests_run() {
+        // A gate under `--root` asks this tree's `cargo xtask test-tool` for them by these names.
+        let checkout = crate::testing::checkout();
+        for name in ["jre", "apalache", "quint"] {
+            assert_eq!(
+                super::for_tests(&checkout, name).unwrap(),
+                super::pinned(&checkout, name).unwrap(),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn another_trees_own_xtask_names_its_tests_tools() {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let temp = tempfile::tempdir().unwrap();
+        let tree = temp.path().join("tree");
+        fs::create_dir_all(&tree).unwrap();
+        let postgres = tree.join(".tools/postgresql/18/bin/postgres");
+        write_executable(&postgres, b"");
+        let cargo = temp.path().join("cargo");
+        // The fake cargo answers only as the tree's own xtask would be run: in the tree, with
+        // the tree free to choose its toolchain. An xtask without `test-tool` answers as clap
+        // does.
+        write_executable(
+            &cargo,
+            format!(
+                "#!/bin/sh\n\
+                 run='run --quiet --locked --manifest-path xtask/Cargo.toml -- test-tool'\n\
+                 [ \"$(pwd -P)\" = '{}' ] || exit 3\n\
+                 [ -z \"${{RUSTUP_TOOLCHAIN+set}}${{CARGO+set}}\" ] || exit 4\n\
+                 case \"$*\" in\n\
+                 \"$run postgresql\") if [ -n \"$ANSWER_FILE\" ]; then cat \"$ANSWER_FILE\"; else echo \"${{ANSWER-{}}}\"; fi ;;\n\
+                 \"$run jre\") echo 'error: jre is not installed: run setup' >&2; exit 1 ;;\n\
+                 *) echo \"error: unrecognized subcommand 'test-tool'\" >&2; exit 2 ;;\n\
+                 esac\n",
+                tree.canonicalize().unwrap().display(),
+                postgres.display()
+            )
+            .as_bytes(),
+        );
+        assert_eq!(
+            super::of_tree(&cargo, &tree, "postgresql").unwrap(),
+            postgres,
+            "the path the tree's xtask prints"
+        );
+
+        let failed = format!("{:#}", super::of_tree(&cargo, &tree, "jre").unwrap_err());
+        assert_eq!(
+            failed,
+            format!(
+                "{}: its tests run jre, and its own `cargo xtask test-tool jre` failed (exit \
+                 status: 1): error: jre is not installed: run setup",
+                tree.display()
+            ),
+            "the tree's own reason, and no hint to merge, which would not fix it"
+        );
+        let predates = format!("{:#}", super::of_tree(&cargo, &tree, "quint").unwrap_err());
+        assert_eq!(
+            predates,
+            format!(
+                "{}: its tests run quint, and its own `cargo xtask test-tool quint` failed (exit \
+                 status: 2): error: unrecognized subcommand 'test-tool'\nits xtask predates \
+                 `test-tool`: merge the default branch into it",
+                tree.display()
+            )
+        );
+
+        let fake_with = |variable: &str, value: &Path| {
+            let fake = temp.path().join("fake-with");
+            write_executable(
+                &fake,
+                format!(
+                    "#!/bin/sh\n{variable}='{}' exec '{}' \"$@\"\n",
+                    value.display(),
+                    cargo.display()
+                )
+                .as_bytes(),
+            );
+            super::of_tree(&fake, &tree, "postgresql")
+        };
+        for printed in ["bin/postgres", "/no/such/postgres", ""] {
+            let error = format!("{:#}", fake_with("ANSWER", Path::new(printed)).unwrap_err());
+            assert!(
+                error.contains(&format!("printed \"{printed}\\n\", not the path of a file")),
+                "{error}"
+            );
+        }
+
+        // A path that is not UTF-8 comes back byte for byte.
+        let odd = tree.join(std::ffi::OsStr::from_bytes(b"post\xffgres"));
+        write_executable(&odd, b"");
+        let mut printed = Vec::new();
+        super::print_path(&odd, &mut printed).unwrap();
+        assert_eq!(
+            printed,
+            [odd.as_os_str().as_bytes(), b"\n"].concat(),
+            "the path's bytes and a newline"
+        );
+        let answer_file = temp.path().join("answer");
+        fs::write(&answer_file, &printed).unwrap();
+        assert_eq!(fake_with("ANSWER_FILE", &answer_file).unwrap(), odd);
+
+        assert!(
+            format!(
+                "{:#}",
+                super::of_tree(&temp.path().join("absent"), &tree, "postgresql").unwrap_err()
+            )
+            .starts_with(&format!("could not run cargo in {}", tree.display())),
+            "no cargo"
         );
     }
 

@@ -118,7 +118,7 @@ watchdog compares the diff with that task and the rules above, and keeps it work
 | `cargo xtask setup [--for-tests] [TOOLS]` | Installs the tools pinned in `xtask/tools.toml` into `.tools/`, checking the sha256 of each archive or crate and of the executable. Run it in every new clone or worktree, and after the list changes. It never touches git config. `--for-tests` installs the tools marked `for-tests`, those the tests run, with any named; every CI job that runs tests uses it, and `rulesets check` fails one that does not. |
 | `cargo xtask doctor [--for-tests] [TOOLS]` | Fails unless every pinned tool, or each one named or marked `for-tests`, is installed, matches its pinned sha256 and reports its pinned version. |
 | `cargo xtask check` | Format check, clippy (`--all-targets --locked -D warnings`), nextest, sqlx's query cache check, doctests and rustdoc with warnings denied, on both workspaces, the main one and xtask's, and the pinned shellcheck on the shell scripts. Then the web app's gates (`web/package.json`'s scripts): it installs `web/node_modules` with the pinned pnpm (`--frozen-lockfile`), builds `web/dist`, and runs Biome (format and lint), Oxlint with type-aware rules, `tsc` (TypeScript 7), knip (unused files, exports and dependencies) and Vitest; each failure names its fix. Then the specs' gate (`spec`, below). Property tests and Vitest's shuffled order run with a fixed seed. Database tests use the warm Postgres 18 container (below). It first fails when the changes since the merge base with the default branch are larger than the Gemini review accepts (the plain diff with three lines of context, without generated files, as `review` measures it), so an oversized change is split before CI; files not yet added to git are not counted. `check`, `coverage`, `mutants`, `fuzz`, `e2e` and `spec` hold one gate lock (`gate.lock` in the checkout's git directory, released when the gate ends or dies) so that only one heavy gate runs at a time: a second waits, naming the one running; `check --wait-at-most <seconds>`, as the stop hook runs it (300 s), exits 75 once that time has passed instead. |
-| `cargo xtask check --changed` | The same, limited to the crates affected by changes since the merge base with the default branch (`upstream/HEAD`, else `origin/HEAD`), to the web gates when `web/` or `xtask/tools.toml` changed, and to the specs' gate when `spec/` or `xtask/tools.toml` changed. The `abc` crate embeds `web/dist`, so a change to the main workspace builds the web app first when no build is there. |
+| `cargo xtask check --changed` | The same, limited to the crates affected by changes since the merge base with the default branch (`upstream/HEAD`, else `origin/HEAD`), to the web gates when `web/` or `xtask/tools.toml` changed, and to the specs' gate when `spec/`, `xtask/tools.toml` or `xtask/src/spec.rs` changed. The `abc` crate embeds `web/dist`, so a change to the main workspace builds the web app first when no build is there. |
 | `cargo xtask build` | Builds the web app with the pinned pnpm, then the `abc` binary with it embedded (`cargo build --release -p abc`), into `target/release/abc`. A plain `cargo build` of `abc` without a web build fails and names this command. |
 | `cargo xtask pnpm [args]` | Runs the pinned pnpm in `web/` with the pinned node first on `PATH`: `install` after `web/package.json` changes, `run dev` for Vite's dev server, `exec biome check --write` to format. pnpm refuses packages published less than 3 days ago (`web/pnpm-workspace.yaml`). |
 | `cargo xtask e2e` | Builds abc as `build` does, starts `abc server` on a fresh database on the test Postgres server behind `web/e2e/sidecar.ts`, a stand-in for the Tailscale sidecar that answers over HTTPS on the server's public origin, as Serve does, and runs Playwright's tests (`web/e2e/`) in Chromium, which it installs first; on Linux, `cargo xtask pnpm exec playwright install --with-deps chromium` installs its system libraries, and agent VMs have Chromium in their image. |
@@ -141,11 +141,18 @@ watchdog compares the diff with that task and the rules above, and keeps it work
 | `cargo xtask rulesets check` | Checks `.github/rulesets/main.json` against the CI workflows: every job that runs on pull requests and in the merge queue is a required check. |
 | `cargo xtask rulesets apply` | For the maintainer only, with their own gh login: puts `.github/rulesets/` on GitHub (`main`, the `agent/*` branch limit and the tag rule), replacing the rulesets they supersede. Agents never run it. |
 | `cargo xtask tool <name> [args]` | Runs a pinned tool from `.tools/`, such as `cargo xtask tool cargo-deny check`. Never run these tools from `PATH`. |
+| `cargo xtask test-tool <name>` | Prints the path of a tool this tree's tests run, marked `for-tests` in `xtask/tools.toml`, once it matches its pin in `.tools/`; when it is missing, names `cargo xtask setup --for-tests`. A gate run with `--root` asks the tree's own xtask this (below). |
 | `cargo xtask pin` | After a version changes in `xtask/tools.toml`, records each target's archive sha256 and its executable's, or a crate's sha256 from the crates.io index. To add a tool, write zeros and run it. |
 | `cargo fmt --all && cargo fmt --all --manifest-path xtask/Cargo.toml` | Fixes formatting in both workspaces; `cargo fmt --all` alone formats only the main one. |
 
 The gates take `--root <path>` to check another tree with the pinned tools of the checkout xtask
-was built from.
+was built from, so a tree cannot change the programs that judge it, the ones that run its tests
+(nextest, cargo-llvm-cov, cargo-mutants, node and pnpm) included. What a gate hands the tests to
+run themselves, today Postgres's programs as `ABC_TEST_POSTGRES_BIN`, comes from the tree itself:
+its own xtask names it (`cargo xtask test-tool`), as marked `for-tests` in its `xtask/tools.toml`
+and installed in its `.tools/` by its own `cargo xtask setup --for-tests`, so a tree's tool list,
+its schema and its install layout are judged with the tree that changes them. That is the tree's
+code running the tree's tests, so it opens no new trust boundary.
 
 Database tests get a fresh, uniquely named database each (`abc_store::testing::TestDatabase`) on
 the server `ABC_TEST_DATABASE_URL` names. `.cargo/config.toml` sets it to one warm Postgres 18
@@ -208,8 +215,9 @@ changes no tests.
 The gate files are the files that decide what passes: CI and rulesets (`.github/`), cargo, lint,
 toolchain and tool configuration, `Cargo.toml` and `Cargo.lock` (the fuzz workspace's too, with
 `fuzz/deny.toml`), the web app's manifest, lockfile, pnpm, TypeScript, Vite, Biome, Oxlint, knip, Playwright and
-osv-scanner configuration, the agent settings, this file and `CLAUDE.md`, and all of `xtask/`, its
-workspace's manifest, lockfile and `deny.toml` included. `GATES` in
+osv-scanner configuration, the agent settings, this file and `CLAUDE.md`, all of `xtask/`, its
+workspace's manifest, lockfile and `deny.toml` included, and the formal specs in `spec/` (brief
+decision 68): a spec's properties judge the code as tests do, and integrity does not read Quint. `GATES` in
 `xtask/src/integrity/mod.rs` lists them, and a test keeps `.github/CODEOWNERS` identical. A change
 to one needs the integrity approval and a code owner's review.
 

@@ -35,7 +35,7 @@ use crate::git;
 /// The gate files: whatever decides what passes. CODEOWNERS patterns, the single list both the
 /// check and `.github/CODEOWNERS` follow: a trailing `/` covers a directory, anything else is one
 /// file, both from the repository root.
-pub(crate) const GATES: [&str; 30] = [
+pub(crate) const GATES: [&str; 31] = [
     "/.cargo/",
     "/.claude/settings.json",
     "/.config/",
@@ -53,6 +53,7 @@ pub(crate) const GATES: [&str; 30] = [
     "/fuzz/deny.toml",
     "/rust-toolchain.toml",
     "/rustfmt.toml",
+    "/spec/",
     "/web/.oxlintrc.json",
     "/web/biome.json",
     "/web/knip.jsonc",
@@ -652,6 +653,7 @@ mod tests {
             "xtask/Cargo.toml",
             ".claude/settings.json",
             "web/osv-scanner.toml",
+            "spec/runner/runner.qnt",
         ] {
             assert!(is_gate_file(path), "{path} is a gate file");
         }
@@ -661,6 +663,7 @@ mod tests {
             "README.md",
             ".claude/settings.local.json",
             "docs/AGENTS.md",
+            "docs/spec/runner.md",
             "xtask",
         ] {
             assert!(!is_gate_file(path), "{path} is not a gate file");

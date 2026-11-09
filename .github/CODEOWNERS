@@ -18,6 +18,7 @@
 /fuzz/deny.toml           @snehilvj
 /rust-toolchain.toml      @snehilvj
 /rustfmt.toml             @snehilvj
+/spec/                    @snehilvj
 /web/.oxlintrc.json       @snehilvj
 /web/biome.json           @snehilvj
 /web/knip.jsonc           @snehilvj
