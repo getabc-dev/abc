@@ -564,6 +564,14 @@ targets.aarch64-unknown-linux-gnu = {{ platform = "linux-arm64", sha256 = "{sha2
             "closed last, once the replacement is open"
         );
         assert!(out.contains("pr: #30 bumps fake 1.2.3 -> 1.3.0\n"), "{out}");
+        let pushed = git(&work, &["rev-parse", "origin/agent/renovate-30"]);
+        assert!(
+            out.contains(&format!(
+                "pr: pushed {} to agent/renovate-30\n",
+                pushed.get(..12).unwrap()
+            )),
+            "{out}"
+        );
         assert!(
             out.contains("changed  fake 1.3.0 aarch64-apple-darwin"),
             "{out}"
@@ -680,6 +688,37 @@ targets.aarch64-unknown-linux-gnu = {{ platform = "linux-arm64", sha256 = "{sha2
         assert!(
             format!("{error:#}").contains("origin already has agent/renovate-30 at "),
             "{error:#}"
+        );
+    }
+
+    /// The index `commit_file` builds in is its own and goes when it is done, whether the
+    /// commit was made or not; a failure to remove it is said, and one that never existed is not.
+    #[test]
+    fn the_commit_leaves_no_index_behind() {
+        let temp = tempfile::tempdir().unwrap();
+        let work = checkout(temp.path());
+        let index =
+            work.join(git(&work, &["rev-parse", "--git-path", "abc-renovate-index"]).trim());
+        let main = git(&work, &["rev-parse", "origin/main"]);
+        super::commit_file(&work, main.trim(), MANIFEST, "x\n", "m\n").unwrap();
+        assert!(!index.exists(), "removed after the commit");
+        let unknown = super::commit_file(
+            &work,
+            "0000000000000000000000000000000000000001",
+            MANIFEST,
+            "x\n",
+            "m\n",
+        )
+        .unwrap_err();
+        assert!(
+            format!("{unknown:#}").starts_with("git read-tree "),
+            "the git error, not a missing index's: {unknown:#}"
+        );
+        fs::create_dir_all(&index).unwrap();
+        let stuck = super::commit_file(&work, main.trim(), MANIFEST, "x\n", "m\n").unwrap_err();
+        assert!(
+            format!("{stuck:#}").starts_with("could not remove "),
+            "{stuck:#}"
         );
     }
 }
