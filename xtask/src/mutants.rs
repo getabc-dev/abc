@@ -206,12 +206,16 @@ pub(crate) struct Tools {
 }
 
 impl Tools {
-    /// The pinned ones, found with `tool`.
-    pub(crate) fn pinned(tool: &dyn Fn(&str) -> anyhow::Result<PathBuf>) -> anyhow::Result<Self> {
+    /// The gate's own programs, found with `tool`, and the bin directory of the Postgres the
+    /// tree under test pins for its tests.
+    pub(crate) fn pinned(
+        tool: &dyn Fn(&str) -> anyhow::Result<PathBuf>,
+        postgres: PathBuf,
+    ) -> anyhow::Result<Self> {
         Ok(Self {
             mutants: tool("cargo-mutants")?,
             nextest: tool("cargo-nextest")?,
-            postgres: check::postgres_bin(tool)?,
+            postgres,
             web: crate::web::Toolchain::pinned(tool)?,
         })
     }

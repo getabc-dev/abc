@@ -281,6 +281,13 @@ enum Task {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<OsString>,
     },
+    /// Print the path of a tool this tree's tests run: marked `for-tests` in its
+    /// xtask/tools.toml and installed in its .tools/. A gate run on this tree with `--root` asks
+    /// it this, so the tree alone reads its own tool list.
+    TestTool {
+        /// The tool's name in xtask/tools.toml.
+        name: String,
+    },
     /// Run a Claude Code hook on the hook input from stdin, in the checkout the agent is in. It
     /// answers in Claude Code's hook JSON on stdout and exits 0; xtask/hooks/hook.sh runs it.
     Hook {
@@ -328,8 +335,11 @@ struct Invocation<'a> {
     home: PathBuf,
     /// The tree a gate checks: `home`, or the tree given with `--root`.
     root: PathBuf,
-    /// A pinned tool's executable, by name.
+    /// A pinned tool's executable, by name: one of the gates' own programs, from `home`.
     tool: &'a dyn Fn(&str) -> anyhow::Result<PathBuf>,
+    /// A tool the tests of a tree run, by the tree and the tool's name: from that tree, as
+    /// [`tree_test_tool`] finds it.
+    test_tool: &'a dyn Fn(&Path, &str) -> anyhow::Result<PathBuf>,
     /// An environment variable.
     env: &'a dyn Fn(&str) -> Option<OsString>,
 }
@@ -346,6 +356,7 @@ impl Invocation<'static> {
             home,
             root,
             tool: &pinned_tool,
+            test_tool: &test_tool_here,
             env: &env_var,
         })
     }
@@ -354,6 +365,26 @@ impl Invocation<'static> {
 /// A tool pinned in the repository xtask was built from.
 fn pinned_tool(name: &str) -> anyhow::Result<PathBuf> {
     tools::pinned(&repo_root()?, name)
+}
+
+/// A tool the tests of the tree at `tree` run, as [`tree_test_tool`] finds it from this checkout
+/// with the `cargo` on `PATH`.
+fn test_tool_here(tree: &Path, name: &str) -> anyhow::Result<PathBuf> {
+    tree_test_tool(Path::new("cargo"), &repo_root()?, tree, name)
+}
+
+/// A tool the tests of the tree at `tree` run, seen from xtask's own checkout at `home`: read
+/// from its own tool list when the tree is that checkout, and otherwise named by the tree's own
+/// xtask, which `cargo` builds and runs there.
+fn tree_test_tool(cargo: &Path, home: &Path, tree: &Path, name: &str) -> anyhow::Result<PathBuf> {
+    let canonical = |path: &Path| {
+        std::fs::canonicalize(path).with_context(|| format!("{} does not exist", path.display()))
+    };
+    if canonical(tree)? == canonical(home)? {
+        tools::for_tests(tree, name)
+    } else {
+        tools::of_tree(cargo, tree, name)
+    }
 }
 
 fn env_var(name: &str) -> Option<OsString> {
@@ -404,14 +435,18 @@ fn perform(
     let Invocation {
         home, root, tool, ..
     } = invocation;
+    // Postgres's bin directory, which the tests of `root` get as `check::POSTGRES_BIN`.
+    let postgres = || check::postgres_bin(&|name| (invocation.test_tool)(root, name));
     let env = |name: &str| (invocation.env)(name);
     let mode = annotation::Mode::from_env(&env);
     match task {
-        Task::Check { changed, .. } => Ok(verdict(check(root, changed, tool, report)?)),
+        Task::Check { changed, .. } => {
+            Ok(verdict(check(root, changed, tool, postgres()?, report)?))
+        }
         Task::Coverage { base } => Ok(verdict(coverage::run(
             root,
             &base,
-            &coverage::Tools::pinned(tool)?,
+            &coverage::Tools::pinned(tool, postgres()?)?,
             mode,
             report,
         )?)),
@@ -419,7 +454,7 @@ fn perform(
             root,
             &base,
             &mutants::Options { jobs, shard, mode },
-            &mutants::Tools::pinned(tool)?,
+            &mutants::Tools::pinned(tool, postgres()?)?,
             report,
         )?)),
         Task::Fuzz { seconds } => Ok(verdict(fuzz::run(
@@ -489,11 +524,20 @@ fn perform(
             Ok(ExitCode::SUCCESS)
         }
         Task::Tool { name, args } => tools::run(&tool(&name)?, root, &args),
+        Task::TestTool { name } => test_tool(invocation, &name),
         Task::Build => run_web(WebTask::Build, root, tool, report),
         Task::Pnpm { args } => run_web(WebTask::Pnpm(args), root, tool, report),
         Task::E2e => run_web(WebTask::E2e, root, tool, report),
         Task::Hook { event } => run_hook(event, home, report),
     }
+}
+
+/// `cargo xtask test-tool NAME`: prints the path of the tool `name` the tests of the invocation's
+/// tree run, for the gate that asked.
+fn test_tool(invocation: &Invocation<'_>, name: &str) -> anyhow::Result<ExitCode> {
+    let path = (invocation.test_tool)(&invocation.root, name)?;
+    tools::print_path(&path, &mut io::stdout().lock())?;
+    Ok(ExitCode::SUCCESS)
 }
 
 /// The gate lock `task` takes, if it is a heavy gate, and whether it waits for another gate.
@@ -526,6 +570,7 @@ const fn gate_of(task: &Task) -> Option<(gate::Gate, gate::Wait)> {
         | Task::Doctor { .. }
         | Task::Pin
         | Task::Tool { .. }
+        | Task::TestTool { .. }
         | Task::Hook { .. } => None,
     }
 }
@@ -659,11 +704,13 @@ fn run_hook(event: hook::Event, home: &Path, report: &mut impl Write) -> anyhow:
     Ok(ExitCode::SUCCESS)
 }
 
-/// `cargo xtask check` on `root`, with the pinned tools `tool` finds and the warm Postgres.
+/// `cargo xtask check` on `root`, with the pinned tools `tool` finds, the bin directory of the
+/// Postgres `root` pins for its tests and the warm Postgres.
 fn check(
     root: &Path,
     changed: bool,
     tool: &dyn Fn(&str) -> anyhow::Result<PathBuf>,
+    postgres_bin: PathBuf,
     report: &mut impl Write,
 ) -> anyhow::Result<bool> {
     let postgres = check::Postgres {
@@ -673,7 +720,7 @@ fn check(
     let tools = check::Tools {
         nextest: tool("cargo-nextest")?,
         shellcheck: tool("shellcheck")?,
-        postgres: check::postgres_bin(&tool)?,
+        postgres: postgres_bin,
         web: Some(web::Toolchain::pinned(tool)?),
     };
     check::run(
@@ -885,15 +932,31 @@ mod tests {
         // The fixtures hold no web app, so node and pnpm are resolved but never run.
         script(&dir.join("node"), "exit 9\n");
         script(&dir.join("pnpm"), "exit 9\n");
-        // The gates hand the tests Postgres's bin directory; the fixtures' tests never run it.
-        script(&dir.join("postgresql"), "exit 9\n");
     }
 
+    /// Runs `task` on `root` with the fake tools in `home`, and the tools the tests run from
+    /// the tree under test alone: Postgres, which the fixtures' tests never run.
     fn dispatch(
         task: Task,
         home: &Path,
         root: &Path,
         env: &dyn Fn(&str) -> Option<OsString>,
+    ) -> anyhow::Result<ExitCode> {
+        let root_given = root.to_path_buf();
+        let test_tool = move |tree: &Path, name: &str| -> anyhow::Result<PathBuf> {
+            anyhow::ensure!(tree == root_given, "{name} sought in {}", tree.display());
+            anyhow::ensure!(name == "postgresql", "{name} is not a tool the tests run");
+            Ok(tree.join(".tools/postgresql/bin/postgres"))
+        };
+        dispatch_with(task, home, root, env, &test_tool)
+    }
+
+    fn dispatch_with(
+        task: Task,
+        home: &Path,
+        root: &Path,
+        env: &dyn Fn(&str) -> Option<OsString>,
+        test_tool: &dyn Fn(&Path, &str) -> anyhow::Result<PathBuf>,
     ) -> anyhow::Result<ExitCode> {
         let tools = home.join("tools");
         let tool = move |name: &str| -> anyhow::Result<PathBuf> {
@@ -905,9 +968,111 @@ mod tests {
             home: home.to_path_buf(),
             root: root.to_path_buf(),
             tool: &tool,
+            test_tool,
             env,
         };
         run(task, &invocation, &mut Vec::new())
+    }
+
+    #[test]
+    fn the_gates_take_the_tests_tools_from_the_tree_under_test() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        fs::create_dir_all(home.join("tools")).unwrap();
+        fake_tools(&home.join("tools"));
+        let root = repository_with_change(&temp.path().join("root"), &[("README.md", "x\n")]);
+        let no_env = |_: &str| None;
+        let missing = |tree: &Path, name: &str| -> anyhow::Result<PathBuf> {
+            anyhow::bail!("{name} is not set up in {}", tree.display())
+        };
+        for task in [
+            Task::Check {
+                changed: false,
+                wait_at_most: None,
+            },
+            Task::Coverage {
+                base: "base".to_owned(),
+            },
+            Task::Mutants {
+                base: "base".to_owned(),
+                jobs: 1,
+                shard: None,
+            },
+        ] {
+            let error = dispatch_with(task, &home, &root, &no_env, &missing)
+                .unwrap_err()
+                .to_string();
+            assert_eq!(
+                error,
+                format!("postgresql is not set up in {}", root.display()),
+                "the tree's own setup is missing, whatever xtask's home holds"
+            );
+        }
+    }
+
+    #[test]
+    fn the_tests_tools_of_another_tree_come_from_its_own_xtask() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let other = temp.path().join("other");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&other).unwrap();
+        let alias = temp.path().join("alias");
+        std::os::unix::fs::symlink(&home, &alias).unwrap();
+        let no_cargo = temp.path().join("no-cargo");
+        let resolve = |tree: &Path| {
+            format!(
+                "{:#}",
+                super::tree_test_tool(&no_cargo, &home, tree, "postgresql").unwrap_err()
+            )
+        };
+        for own in [&home, &alias] {
+            assert_eq!(
+                resolve(own),
+                format!(
+                    "{}: its tests run tools its own list pins: could not read {}: No such file \
+                     or directory (os error 2)",
+                    own.display(),
+                    own.join("xtask/tools.toml").display()
+                ),
+                "xtask's own checkout, by any path, is read here, running no cargo"
+            );
+        }
+        assert_eq!(
+            resolve(&other),
+            format!(
+                "could not run cargo in {}: No such file or directory (os error 2)",
+                other.display()
+            ),
+            "another tree's own xtask is asked, with the cargo given"
+        );
+        assert!(
+            resolve(&temp.path().join("absent")).ends_with(
+                "absent does not exist: No such file \
+                                                          or directory (os error 2)"
+            ),
+            "a tree that does not exist"
+        );
+    }
+
+    #[test]
+    fn test_tool_names_a_tool_the_trees_tests_run() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        fs::create_dir_all(home.join("tools")).unwrap();
+        let root = crate::testing::repository(&temp.path().join("root"));
+        let no_env = |_: &str| None;
+        let test_tool = |name: &str| Task::TestTool {
+            name: name.to_owned(),
+        };
+        assert_eq!(
+            dispatch(test_tool("postgresql"), &home, &root, &no_env).unwrap(),
+            ExitCode::SUCCESS
+        );
+        let error = dispatch(test_tool("node"), &home, &root, &no_env)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(error, "node is not a tool the tests run");
     }
 
     #[test]
@@ -1513,7 +1678,26 @@ mod tests {
             temp.path().canonicalize().unwrap(),
             "--root, canonical"
         );
-        assert_eq!(elsewhere.home, own, "the tools stay xtask's own");
+        assert_eq!(elsewhere.home, own, "the gates' tools stay xtask's own");
+        // xtask reads its own checkout's tool list itself, which a copy of `xtask/` alone, as
+        // `cargo xtask mutants` builds, does not have.
+        let unpinned = format!(
+            "{:#}",
+            (here.test_tool)(&here.root, "no-such-tool").unwrap_err()
+        );
+        let expected = if own.join("xtask/tools.toml").is_file() {
+            format!(
+                "{}: its tests run no-such-tool: no-such-tool is not a pinned tool",
+                own.display()
+            )
+        } else {
+            format!(
+                "{}: its tests run tools its own list pins: could not read {}",
+                own.display(),
+                own.join("xtask/tools.toml").display()
+            )
+        };
+        assert!(unpinned.starts_with(&expected), "{unpinned}");
         assert!(
             Invocation::new(Some(temp.path().join("absent"))).is_err(),
             "a --root that does not exist"
