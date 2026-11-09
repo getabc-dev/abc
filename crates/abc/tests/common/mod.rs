@@ -12,17 +12,43 @@ use sqlx::PgPool;
 /// Postgres 18's bin directory: the pinned `postgresql` tool's, which `cargo xtask check`,
 /// `coverage` and `mutants` give the tests. Never one from `PATH`.
 pub(crate) fn postgres_bin() -> PathBuf {
-    std::env::var_os("ABC_TEST_POSTGRES_BIN")
-        .map(PathBuf::from)
-        .filter(|bin| bin.join("initdb").is_file())
-        .unwrap_or_else(|| {
-            panic!(
-                "these tests run abc's private Postgres for real: run them through `cargo \
-                 xtask check`, which gives them the pinned Postgres 18 (`cargo xtask setup \
-                 --for-tests` installs it), or set ABC_TEST_POSTGRES_BIN to a Postgres 18 bin \
-                 directory"
-            )
-        })
+    programs_dir(
+        "ABC_TEST_POSTGRES_BIN",
+        std::env::var_os("ABC_TEST_POSTGRES_BIN"),
+        "initdb",
+    )
+    .unwrap_or_else(|wrong| {
+        panic!(
+            "these tests run abc's private Postgres for real: {wrong}. Run them through `cargo \
+             xtask check`, which gives them the pinned Postgres 18 (`cargo xtask setup \
+             --for-tests` installs it), or set ABC_TEST_POSTGRES_BIN to the absolute path of \
+             `dirname \"$(cargo xtask test-tool postgresql)\"`"
+        )
+    })
+}
+
+/// The directory of programs the variable `name` holds, read from `value`, once it is checked to
+/// be an absolute path to a directory holding `program`.
+pub(crate) fn programs_dir(
+    name: &str,
+    value: Option<std::ffi::OsString>,
+    program: &str,
+) -> Result<PathBuf, String> {
+    let dir = PathBuf::from(value.ok_or_else(|| format!("{name} is not set"))?);
+    let shown = dir.display();
+    if dir.is_relative() {
+        return Err(format!(
+            "{name} is `{shown}`, a relative path, and the tests run from their crate's \
+             directory: give an absolute one"
+        ));
+    }
+    if !dir.is_dir() {
+        return Err(format!("{name} is `{shown}`, which is not a directory"));
+    }
+    if !dir.join(program).is_file() {
+        return Err(format!("{name} is `{shown}`, which holds no `{program}`"));
+    }
+    Ok(dir)
 }
 
 pub(crate) fn copy_tree(from: &Path, to: &Path) {
