@@ -2595,6 +2595,17 @@ targets.aarch64-unknown-linux-gnu = {{ platform = "linux-arm64", sha256 = "{sha2
         );
     }
 
+    /// `setup` and `pin` download through the patient fetch, up to the archive limit.
+    #[test]
+    fn downloads_through_the_patient_fetch() {
+        let (url, server) = crate::testing::serve_once("200 OK", "the archive");
+        assert_eq!(
+            super::download(&format!("{url}/tool.tar.gz")).unwrap(),
+            b"the archive"
+        );
+        assert!(server.join().unwrap().starts_with("GET /tool.tar.gz "));
+    }
+
     #[test]
     fn pin_records_the_archive_and_executable_checksums() {
         let archive = tarball(&[("fake-1.2.3/fake", SCRIPT, 0o755)]);
