@@ -1,7 +1,7 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "description": [
-    "Every update in one pull request a week (group:all, schedule:weekly: Monday before 4 AM UTC), majors included (group:all sets separateMajorMinor false), each past the 3-day minimum release age. An agent folds the week's pull request into one of ours with `cargo xtask pr renovate <number>`, which re-applies the whole group, pins what needs pins and fixes what breaks. Packages that must move together (the Rust toolchain and every rust-version, React and its types, Tailwind CSS and its Vite plugin, oxlint and oxlint-tsgolint, Vitest and its coverage provider, tailscaled and Go) move together because everything does; the Dependency Dashboard (config:best-practices) lists what is pending."
+    "Every update in one pull request a week (group:all, schedule:weekly: Monday before 4 AM UTC), majors included (group:all sets separateMajorMinor false), each past the 3-day minimum release age, except GitHub Actions', which come in a weekly pull request of their own (below). An agent folds the week's pull request into one of ours with `cargo xtask pr renovate <number>`, which re-applies the whole group, pins what needs pins and fixes what breaks. Packages that must move together (the Rust toolchain and every rust-version, React and its types, Tailwind CSS and its Vite plugin, oxlint and oxlint-tsgolint, Vitest and its coverage provider, tailscaled and Go) move together because everything does; the Dependency Dashboard (config:best-practices) lists what is pending."
   ],
   "extends": [
     "config:best-practices",
@@ -53,6 +53,14 @@
       "prBodyNotes": [
         "When Go's version changes, copy the sha256 go.dev publishes for each of the three archives in `packaging/tailscale.toml` from https://go.dev/dl/ and commit them: the release workflow refuses any other archive."
       ]
+    },
+    {
+      "description": "GitHub Actions updates come in a weekly pull request of their own, which the maintainer reviews and merges as Renovate opened it: the agent App cannot push a workflow change, so `cargo xtask pr renovate` cannot fold one, and none needs a pin of ours (Renovate pins each action's digest itself, with its version in a comment, as pinact checks).",
+      "matchManagers": [
+        "github-actions"
+      ],
+      "groupName": "GitHub Actions",
+      "groupSlug": "github-actions"
     },
     {
       "description": "Pinned tools need new checksums with every version.",

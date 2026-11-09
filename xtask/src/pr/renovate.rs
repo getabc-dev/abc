@@ -6,12 +6,17 @@
 //! such a pull request never passed (#30, #31); the agent App cannot push to Renovate's
 //! `renovate/*` branches either. So this command fetches the pull request's head, re-applies the
 //! whole group onto the freshly fetched default branch with a three-way merge, puts the default
-//! branch's tool list with the group's version bumps in place of Renovate's, pins the bumped tools
-//! alone, commits that on a branch of its own (`agent/renovate-<number>`) without touching the
-//! checkout, opens the replacement pull request, and closes Renovate's with a link to it.
-//! Renovate then leaves those versions alone. A group that conflicts with the default branch is
-//! refused, naming the files. Run again after a failure part way, it takes up the branch and the
-//! pull request it made when they hold the same tree, and refuses a branch that holds another.
+//! branch's tool list with the group's version bumps in place of Renovate's (a bump the default
+//! branch already has is left out), pins the bumped tools alone, commits that on a branch of its
+//! own (`agent/renovate-<number>`) without touching the checkout, opens the replacement as a
+//! draft, since the B1 reviews come before it is ready, and closes Renovate's with a link to it.
+//!
+//! A group that conflicts with the default branch outside the tool list, or changes workflows,
+//! which the App cannot push, is refused, naming the files. Renovate recreates a closed group on
+//! its next weekly run while its updates are not on the default branch, so a group is refused
+//! while another replacement is open. Run again after a failure part way, it takes up the branch,
+//! the pull request and the linking comment it made when they hold the same tree, and refuses a
+//! branch that holds another.
 
 use std::io::Write as _;
 use std::path::Path;
@@ -28,10 +33,16 @@ use crate::tools::{self, MANIFEST};
 /// Renovate's login, as GitHub names the pull requests it opens.
 const RENOVATE_LOGIN: &str = "renovate[bot]";
 
+/// The prefix of every replacement's branch.
+const BRANCH_PREFIX: &str = "agent/renovate-";
+
 /// The branch the replacement for Renovate's pull request `number` comes from.
 fn branch(number: u64) -> String {
-    format!("agent/renovate-{number}")
+    format!("{BRANCH_PREFIX}{number}")
 }
+
+/// Where workflows live: the agent App cannot push a change to them.
+const WORKFLOWS: &str = ".github/workflows/";
 
 /// Replaces Renovate's pull request `number` in `repo` with one built on the default branch and
 /// pinned: reads it through `send`, pins with downloads from `fetch`, commits and pushes from the
@@ -56,12 +67,24 @@ pub(super) fn run(
         "#{number} is {}",
         text(&pull, "/state")
     );
-    let renovated = Renovated {
-        number,
-        base: text(&pull, "/base/sha").to_owned(),
-        head: text(&pull, "/head/sha").to_owned(),
-    };
-    let folded = fold(&renovated, root, fetch, out)?;
+    let open = open_pulls(send, repo)?;
+    let ours = branch(number);
+    if let Some(other) = open.iter().find(|pull| {
+        let head = text(pull, "/head/ref");
+        head.starts_with(BRANCH_PREFIX) && head != ours
+    }) {
+        bail!(
+            "#{} ({}) still folds an earlier Renovate group, whose updates Renovate repeats in \
+             #{number}: merge or close it first",
+            other
+                .get("number")
+                .and_then(Value::as_u64)
+                .unwrap_or_default(),
+            text(other, "/head/ref")
+        );
+    }
+    let head = text(&pull, "/head/sha").to_owned();
+    let folded = fold(number, &head, root, fetch, out)?;
     let title = format!("Fold Renovate's #{number}: {}", text(&pull, "/title"));
     let pushed = push_once(&folded, number, root, &title, out)?;
     let updates = if folded.bumps.is_empty() {
@@ -80,30 +103,24 @@ pub(super) fn run(
          the same updates, re-applied on `{}` by a three-way merge.{updates}\n\nChanged: {}.\n\n\
          ## Plan\n\n`cargo xtask pr renovate {number}`; read each update's release notes, and fix \
          what an update breaks in this pull request.\n\n## Test changes\n\nNone\n\n\
-         ## Review findings\n\nNone run: the change is dependency versions, lockfiles and pins \
-         alone.\n",
+         ## Review findings\n\nNot run yet, so this pull request is a draft. Run `/code-review \
+         high` and `/security-review` on `{ours}`, fix what they find and what an update breaks, \
+         put what they found here with `cargo xtask pr update`, then mark it ready.\n",
         folded.base_branch,
         folded.files.join(", ")
     );
-    let existing = github::get(
-        send,
-        repo.path(&format!(
-            "pulls?state=open&head={}:{}",
-            repo.owner,
-            branch(number)
-        )),
-    )?;
-    let (opened, verb) = match existing.as_array().and_then(|pulls| pulls.first()) {
-        Some(open) => (open.clone(), "found"),
+    let (opened, verb) = match open.iter().find(|pull| text(pull, "/head/ref") == ours) {
+        Some(found) => (found.clone(), "found"),
         None => (
             send(&github::Request {
                 method: "POST",
                 path: repo.path("pulls"),
                 body: Some(json!({
                     "title": title,
-                    "head": branch(number),
+                    "head": ours,
                     "base": folded.base_branch,
-                    "body": body
+                    "body": body,
+                    "draft": true
                 })),
             })?,
             "opened",
@@ -115,20 +132,36 @@ pub(super) fn run(
         .context("GitHub gave the replacement pull request no number")?;
     say(
         out,
-        &format!("pr: {verb} #{replacement} {}", text(&opened, "/html_url")),
+        &format!(
+            "pr: {verb} #{replacement} {}; it stays a draft until the B1 reviews are in its \
+             description",
+            text(&opened, "/html_url")
+        ),
     );
-    send(&github::Request {
-        method: "POST",
-        path: repo.path(&format!("issues/{number}/comments")),
-        body: Some(json!({
-            "body": format!(
-                "Folded into #{replacement}, which carries these updates on `{}` with any tool \
-                 bump pinned (`cargo xtask pr renovate {number}`, at {}).",
-                folded.base_branch,
-                git_short(&pushed)
-            )
-        })),
-    })?;
+    let link = format!("Folded into #{replacement}");
+    let comments = github::get(
+        send,
+        repo.path(&format!("issues/{number}/comments?per_page=100")),
+    )?;
+    let linked = comments.as_array().is_some_and(|comments| {
+        comments
+            .iter()
+            .any(|comment| text(comment, "/body").starts_with(&link))
+    });
+    if !linked {
+        send(&github::Request {
+            method: "POST",
+            path: repo.path(&format!("issues/{number}/comments")),
+            body: Some(json!({
+                "body": format!(
+                    "{link}, which carries these updates on `{}` with any tool bump pinned \
+                     (`cargo xtask pr renovate {number}`, at {}).",
+                    folded.base_branch,
+                    git::short(&pushed)
+                )
+            })),
+        })?;
+    }
     send(&github::Request {
         method: "PATCH",
         path: repo.path(&format!("pulls/{number}")),
@@ -141,11 +174,23 @@ pub(super) fn run(
     Ok(true)
 }
 
-/// Renovate's pull request: its number, and the commits it was built on and is at.
-struct Renovated {
-    number: u64,
-    base: String,
-    head: String,
+/// Every open pull request in `repo`, a page of a hundred at a time.
+fn open_pulls(send: &mut Send<'_>, repo: &Repo) -> anyhow::Result<Vec<Value>> {
+    let mut pulls = Vec::new();
+    for page in 1.. {
+        let listed = github::get(
+            send,
+            repo.path(&format!("pulls?state=open&per_page=100&page={page}")),
+        )?;
+        let listed = listed
+            .as_array()
+            .context("GitHub listed open pull requests as something other than a list")?;
+        pulls.extend(listed.iter().cloned());
+        if listed.len() < 100 {
+            break;
+        }
+    }
+    Ok(pulls)
 }
 
 /// What [`fold`] made.
@@ -161,18 +206,19 @@ struct Folded {
     bumps: Vec<tools::Bump>,
 }
 
-/// Fetches origin's default branch and Renovate's pull request into the checkout at `root` and
-/// merges the pull request's updates onto the default branch, in git's object store alone. When
-/// the pull request moves tool versions, the tool list is the default branch's with those
-/// versions, the bumped tools pinned with downloads from `fetch`. Nothing is written unless every
-/// pin was computed and the merge has no conflict.
+/// Fetches origin's default branch and Renovate's pull request `number`, at `head`, into the
+/// checkout at `root` and merges the pull request's updates onto the default branch, in git's
+/// object store alone. When the pull request changes the tool list, the tool list is the default
+/// branch's with the versions it moves that the default branch does not have yet, those tools
+/// pinned with downloads from `fetch`. Nothing is written unless every pin was computed and the
+/// merge has no conflict outside the tool list.
 fn fold(
-    renovated: &Renovated,
+    number: u64,
+    head: &str,
     root: &Path,
     fetch: &mut dyn FnMut(&str) -> anyhow::Result<Vec<u8>>,
     out: &mut String,
 ) -> anyhow::Result<Folded> {
-    let number = renovated.number;
     // origin, where the pull request opens (`Repo::of`), never another remote.
     let base = git::git(
         root,
@@ -185,19 +231,19 @@ fn fold(
         .strip_prefix("refs/remotes/origin/")
         .with_context(|| format!("origin/HEAD names {base}, not a branch of origin"))?
         .to_owned();
-    git::fetch(root, "origin", &base_branch, git::FETCH_TIMEOUT)?;
+    git::fetch(root, "origin", &base_branch, git::REMOTE_TIMEOUT)?;
     git::fetch(
         root,
         "origin",
         &format!("pull/{number}/head"),
-        git::FETCH_TIMEOUT,
+        git::REMOTE_TIMEOUT,
     )?;
     let fetched = git::git(root, &["rev-parse", "--verify", "FETCH_HEAD^{commit}"])?;
     ensure!(
-        fetched.trim() == renovated.head,
+        fetched.trim() == head,
         "#{number}'s head moved to {} since GitHub named {}; run this again",
-        git_short(fetched.trim()),
-        git_short(&renovated.head)
+        git::short(fetched.trim()),
+        git::short(head)
     );
     let parent = git::git(
         root,
@@ -205,9 +251,15 @@ fn fold(
     )?
     .trim()
     .to_owned();
+    // Where Renovate's group left the default branch: its changes are the ones since, as the merge
+    // takes them. GitHub's base sha is the default branch as GitHub last saw it, so the default
+    // branch's own changes since the group left it would read as the group's, reversed.
+    let fork = git::git(root, &["merge-base", "--end-of-options", &parent, head])?
+        .trim()
+        .to_owned();
     let merged = Command::new("git")
         .args(["merge-tree", "--write-tree", "--name-only", "--no-messages"])
-        .args(["--end-of-options", &parent, &renovated.head])
+        .args(["--end-of-options", &parent, head])
         .current_dir(root)
         .stdin(Stdio::null())
         .output()
@@ -217,36 +269,61 @@ fn fold(
     let mut tree = lines.next().unwrap_or_default().trim().to_owned();
     match merged.status.code() {
         Some(0) => {}
-        Some(1) => bail!(
-            "#{number} conflicts with origin/{base_branch} in {}; Renovate rebases it on its next \
-             run, or fold it by hand",
-            lines.collect::<Vec<_>>().join(", ")
-        ),
+        Some(1) => {
+            // The tool list is replaced whole below, so a conflict there is no conflict.
+            let conflicts: Vec<&str> = lines
+                .filter(|path| !path.is_empty() && *path != MANIFEST)
+                .collect();
+            ensure!(
+                conflicts.is_empty(),
+                "#{number} conflicts with origin/{base_branch} in {}; Renovate rebases it on its \
+                 next run, or fold it by hand",
+                conflicts.join(", ")
+            );
+        }
         _ => bail!(
             "git merge-tree failed: {}",
             String::from_utf8_lossy(&merged.stderr).trim()
         ),
     }
     let tool_list = |commit: &str| git::show(root, commit, MANIFEST);
-    let bumps = match (tool_list(&renovated.base)?, tool_list(&renovated.head)?) {
-        (Some(before), Some(after)) => tools::bumps(&before, &after)?,
-        _ => Vec::new(),
-    };
-    if !bumps.is_empty() {
-        let moved: Vec<String> = bumps.iter().map(ToString::to_string).collect();
-        say(out, &format!("pr: #{number} bumps {}", moved.join(", ")));
+    let mut bumps = Vec::new();
+    let (before, after) = (tool_list(&fork)?, tool_list(head)?);
+    if before != after {
+        let (Some(before), Some(after)) = (before, after) else {
+            bail!("#{number} adds or removes {MANIFEST}; only a version bump is taken");
+        };
         let current = tool_list(&parent)?
             .with_context(|| format!("origin/{base_branch} has no {MANIFEST}"))?;
-        let names: Vec<String> = bumps.iter().map(|bump| bump.tool.clone()).collect();
-        let mut said = Vec::new();
-        let pinned = tools::repin(
-            &tools::bumped(&current, &bumps)?,
-            Some(&names),
-            &mut said,
-            &mut |url: &str| fetch(url),
-        );
-        out.push_str(&String::from_utf8_lossy(&said));
-        tree = replace_file(root, &tree, MANIFEST, &pinned?)?;
+        let (to_apply, applied) = tools::outstanding(&current, tools::bumps(&before, &after)?)
+            .with_context(|| format!("origin/{base_branch} moved a tool #{number} bumps"))?;
+        for bump in &applied {
+            say(
+                out,
+                &format!(
+                    "pr: origin/{base_branch} already has {} {}",
+                    bump.tool, bump.to
+                ),
+            );
+        }
+        let list = if to_apply.is_empty() {
+            current
+        } else {
+            let moved: Vec<String> = to_apply.iter().map(ToString::to_string).collect();
+            say(out, &format!("pr: #{number} bumps {}", moved.join(", ")));
+            let names: Vec<String> = to_apply.iter().map(|bump| bump.tool.clone()).collect();
+            let mut said = Vec::new();
+            let pinned = tools::repin(
+                &tools::bumped(&current, &to_apply)?,
+                Some(&names),
+                &mut said,
+                &mut |url: &str| fetch(url),
+            );
+            out.push_str(&String::from_utf8_lossy(&said));
+            pinned?
+        };
+        tree = replace_file(root, &tree, MANIFEST, &list)?;
+        bumps = to_apply;
     }
     let files: Vec<String> = git::git(root, &["diff", "--name-only", &parent, &tree, "--"])?
         .lines()
@@ -255,6 +332,17 @@ fn fold(
     ensure!(
         !files.is_empty(),
         "#{number} changes nothing origin/{base_branch} does not already have"
+    );
+    let workflows: Vec<&str> = files
+        .iter()
+        .map(String::as_str)
+        .filter(|file| file.starts_with(WORKFLOWS))
+        .collect();
+    ensure!(
+        workflows.is_empty(),
+        "#{number} changes workflows ({}), which the agent App cannot push; GitHub Actions \
+         updates come in a group of their own (renovate.json), for the maintainer to merge",
+        workflows.join(", ")
     );
     Ok(Folded {
         base_branch,
@@ -286,7 +374,7 @@ fn push_once(
         ],
     )?;
     if let Some(theirs) = pushed.split_whitespace().next() {
-        git::fetch(root, "origin", &branch, git::FETCH_TIMEOUT)?;
+        git::fetch(root, "origin", &branch, git::REMOTE_TIMEOUT)?;
         let held = git::git(
             root,
             &["rev-parse", "--verify", &format!("{theirs}^{{tree}}")],
@@ -295,13 +383,13 @@ fn push_once(
             held.trim() == folded.tree,
             "origin already has {branch} at {}, with other files; delete that branch, or finish \
              it by hand",
-            git_short(theirs)
+            git::short(theirs)
         );
         say(
             out,
             &format!(
                 "pr: {branch} already holds this change at {}",
-                git_short(theirs)
+                git::short(theirs)
             ),
         );
         return Ok(theirs.to_owned());
@@ -319,17 +407,12 @@ fn push_once(
     )?
     .trim()
     .to_owned();
-    push(root, "origin", &commit, &branch)?;
+    git::push(root, "origin", &commit, &branch, git::REMOTE_TIMEOUT)?;
     say(
         out,
-        &format!("pr: pushed {} to {branch}", git_short(&commit)),
+        &format!("pr: pushed {} to {branch}", git::short(&commit)),
     );
     Ok(commit)
-}
-
-/// The first twelve characters of a commit's name.
-fn git_short(commit: &str) -> &str {
-    commit.get(..12).unwrap_or(commit)
 }
 
 /// The tree `tree` with the file at `path` set to `contents`, made with git's plumbing in an
@@ -395,29 +478,6 @@ fn with_input(
     String::from_utf8(output.stdout).context("git printed text that is not UTF-8")
 }
 
-/// Pushes `commit` to `branch` on `remote`, never waiting on a person: no terminal prompt and no
-/// askpass program, so a remote that wants credentials the configured helpers lack fails at once.
-/// A branch that exists and does not lead to `commit` is refused, never forced.
-fn push(root: &Path, remote: &str, commit: &str, branch: &str) -> anyhow::Result<()> {
-    let output = Command::new("git")
-        .args(["-c", "core.askPass=", "push", "--quiet", remote])
-        .arg(format!("{commit}:refs/heads/{branch}"))
-        .current_dir(root)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_ASKPASS", "")
-        .env_remove("SSH_ASKPASS")
-        .env("SSH_ASKPASS_REQUIRE", "never")
-        .stdin(Stdio::null())
-        .output()
-        .context("could not run git")?;
-    ensure!(
-        output.status.success(),
-        "git push {remote} {branch} failed: {}",
-        String::from_utf8_lossy(&output.stderr).trim()
-    );
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -476,64 +536,84 @@ targets.aarch64-unknown-linux-gnu = {{ platform = "linux-arm64", sha256 = "{sha2
     /// A recorded grouped Renovate pull request #30 in a checkout on `agent/work`.
     struct Grouped {
         work: PathBuf,
-        /// The commit Renovate built on, and its head: fake 1.2.3 -> 1.3.0 with Renovate's
-        /// stale pins, and vite 8.3.5 -> 8.3.6 in `web/package.json`.
-        base: String,
+        /// Renovate's head: fake 1.2.3 -> 1.3.0 with Renovate's stale pins, and vite 8.3.5 ->
+        /// 8.3.6 in `web/package.json`, with `group`'s files.
         head: String,
     }
 
-    /// Renovate's weekly pull request as `refs/pull/30/head` on origin, then main moving on
-    /// `README.md`, which the group does not change, or on `web/package.json` too when `clash`.
-    fn recorded(temp: &Path, clash: bool) -> Grouped {
+    /// Renovate's weekly pull request as `refs/pull/30/head` on origin, with `group`'s files
+    /// besides its updates, then main moving on `README.md`, which the group does not change, and
+    /// on `main`'s files.
+    fn recorded(temp: &Path, group: &[(&str, String)], main: &[(&str, String)]) -> Grouped {
         let work = clone_with_origin(temp);
         git(&work, &["config", "user.name", "agent"]);
         git(&work, &["config", "user.email", "agent@example.com"]);
         git(&work, &["config", "commit.gpgsign", "false"]);
-        fs::create_dir_all(work.join("xtask")).unwrap();
-        fs::create_dir_all(work.join("web")).unwrap();
-        fs::write(work.join(MANIFEST), tool_list("1.2.3", ZEROS)).unwrap();
-        fs::write(work.join("web/package.json"), "{\"vite\": \"8.3.5\"}\n").unwrap();
-        fs::write(work.join("README.md"), "abc\n").unwrap();
+        let write = |files: &[(&str, String)]| {
+            for (path, text) in files {
+                let path = work.join(path);
+                fs::create_dir_all(path.parent().unwrap()).unwrap();
+                fs::write(path, text).unwrap();
+            }
+        };
+        write(&[
+            (MANIFEST, tool_list("1.2.3", ZEROS)),
+            ("web/package.json", VITE_BEFORE.to_owned()),
+            ("README.md", "abc\n".to_owned()),
+        ]);
         let base = commit(&work, "main");
-        fs::write(work.join(MANIFEST), tool_list("1.3.0", ZEROS)).unwrap();
-        fs::write(work.join("web/package.json"), "{\"vite\": \"8.3.6\"}\n").unwrap();
+        write(&[
+            (MANIFEST, tool_list("1.3.0", ZEROS)),
+            ("web/package.json", VITE_AFTER.to_owned()),
+        ]);
+        write(group);
         let head = commit(&work, "Update all dependencies");
         git(
             &work,
             &["push", "--quiet", "origin", "HEAD:refs/pull/30/head"],
         );
         git(&work, &["reset", "--quiet", "--hard", &base]);
-        fs::write(work.join("README.md"), "abc, moved on\n").unwrap();
-        if clash {
-            fs::write(work.join("web/package.json"), "{\"vite\": \"9.0.0\"}\n").unwrap();
-        }
+        write(&[("README.md", "abc, moved on\n".to_owned())]);
+        write(main);
         commit(&work, "main moves on");
         git(&work, &["push", "--quiet", "origin", "HEAD:main"]);
         git(&work, &["switch", "--quiet", "-c", "agent/work"]);
         fs::write(work.join("scratch.txt"), "uncommitted work\n").unwrap();
-        Grouped { work, base, head }
+        Grouped { work, head }
     }
 
-    /// GitHub as it answers for `grouped`'s pull request by `author`; `listed` is the open pull
-    /// requests from `agent/renovate-30`, and opening one fails when `open_fails`.
+    const VITE_BEFORE: &str = "{\"vite\": \"8.3.5\"}\n";
+    const VITE_AFTER: &str = "{\"vite\": \"8.3.6\"}\n";
+
+    /// The open pull request from `branch`, numbered `number`.
+    fn open_from(number: u64, branch: &str) -> Value {
+        json!({
+            "number": number,
+            "html_url": format!("https://github.com/o/r/pull/{number}"),
+            "head": {"ref": branch}
+        })
+    }
+
+    /// GitHub as it answers for `grouped`'s pull request by `author`: `open` is the repository's
+    /// open pull requests, `comments` the ones on #30, and opening one fails when `open_fails`.
     fn github(
         grouped: &Grouped,
         author: &'static str,
-        listed: Value,
+        open: Value,
+        comments: Value,
         open_fails: bool,
     ) -> impl FnMut(&Request) -> anyhow::Result<Value> + use<> {
-        let (base, head) = (grouped.base.clone(), grouped.head.clone());
+        let head = grouped.head.clone();
         move |request: &Request| {
             Ok(match (request.method, request.path.as_str()) {
                 ("GET", "/repos/o/r/pulls/30") => json!({
                     "user": {"login": author}, "state": "open", "title": "Update all dependencies",
-                    "base": {"sha": base}, "head": {"sha": head}
+                    "head": {"sha": head}
                 }),
-                ("GET", "/repos/o/r/pulls?state=open&head=o:agent/renovate-30") => listed.clone(),
+                ("GET", "/repos/o/r/pulls?state=open&per_page=100&page=1") => open.clone(),
+                ("GET", "/repos/o/r/issues/30/comments?per_page=100") => comments.clone(),
                 ("POST", "/repos/o/r/pulls") if open_fails => anyhow::bail!("GitHub answered 502"),
-                ("POST", "/repos/o/r/pulls") => {
-                    json!({"number": 47, "html_url": "https://github.com/o/r/pull/47"})
-                }
+                ("POST", "/repos/o/r/pulls") => open_from(47, "agent/renovate-30"),
                 ("POST", "/repos/o/r/issues/30/comments") | ("PATCH", "/repos/o/r/pulls/30") => {
                     json!({})
                 }
@@ -553,17 +633,22 @@ targets.aarch64-unknown-linux-gnu = {{ platform = "linux-arm64", sha256 = "{sha2
         })
     }
 
+    /// Every download fails: nothing may be pinned.
+    fn offline(_: &str) -> anyhow::Result<Vec<u8>> {
+        anyhow::bail!("offline")
+    }
+
     /// Renovate's tool bumps (#30, #31) always failed: Renovate cannot pin, and the App cannot
     /// push to `renovate/*`. Its weekly group is re-applied on main as main stands, its tool bump
     /// pinned, pushed on `agent/renovate-30` without touching the checkout, and the replacement
-    /// opened and Renovate's closed with a link.
+    /// opened as a draft, since the B1 reviews come first, and Renovate's closed with a link.
     #[test]
     fn folds_a_grouped_renovate_pull_request_onto_main() {
         let temp = tempfile::tempdir().unwrap();
-        let grouped = recorded(temp.path(), false);
+        let grouped = recorded(temp.path(), &[], &[]);
         let work = &grouped.work;
         let calls = std::cell::RefCell::new(Vec::new());
-        let mut answer = github(&grouped, "renovate[bot]", json!([]), false);
+        let mut answer = github(&grouped, "renovate[bot]", json!([]), json!([]), false);
         let mut send = |request: &Request| {
             calls.borrow_mut().push(request.clone());
             answer(request)
@@ -576,11 +661,7 @@ targets.aarch64-unknown-linux-gnu = {{ platform = "linux-arm64", sha256 = "{sha2
             tool_list("1.3.0", &sha256_hex(RELEASE)),
             "the bump pinned on main's tool list; `other` neither downloaded nor repinned"
         );
-        assert_eq!(
-            folded("web/package.json"),
-            "{\"vite\": \"8.3.6\"}\n",
-            "the whole group"
-        );
+        assert_eq!(folded("web/package.json"), VITE_AFTER, "the whole group");
         assert_eq!(
             folded("README.md"),
             "abc, moved on\n",
@@ -609,6 +690,7 @@ targets.aarch64-unknown-linux-gnu = {{ platform = "linux-arm64", sha256 = "{sha2
         let body = opened.body.as_ref().unwrap();
         assert_eq!(body["head"], "agent/renovate-30");
         assert_eq!(body["base"], "main");
+        assert_eq!(body["draft"], true, "a draft until the B1 reviews are in");
         assert_eq!(
             body["title"],
             "Fold Renovate's #30: Update all dependencies"
@@ -617,22 +699,22 @@ targets.aarch64-unknown-linux-gnu = {{ platform = "linux-arm64", sha256 = "{sha2
         assert!(
             text.contains("Changed: web/package.json, xtask/tools.toml.")
                 && text.contains("(fake 1.2.3 -> 1.3.0) are pinned")
-                && text.contains("## Test changes\n\nNone\n"),
+                && text.contains("## Test changes\n\nNone\n")
+                && text.contains(
+                    "## Review findings\n\nNot run yet, so this pull request is a draft. Run \
+                     `/code-review high` and `/security-review` on `agent/renovate-30`"
+                ),
             "{text}"
-        );
-        assert!(
-            super::super::reviewed(text),
-            "a description `pr update` takes"
         );
         let comment = calls
             .iter()
-            .find(|call| call.path.ends_with("/issues/30/comments"))
+            .find(|call| call.method == "POST" && call.path.ends_with("/issues/30/comments"))
             .unwrap();
         assert!(
             comment.body.as_ref().unwrap()["body"]
                 .as_str()
                 .unwrap()
-                .starts_with("Folded into #47"),
+                .starts_with("Folded into #47, which carries"),
             "{comment:?}"
         );
         let closed = calls.last().unwrap();
@@ -654,24 +736,72 @@ targets.aarch64-unknown-linux-gnu = {{ platform = "linux-arm64", sha256 = "{sha2
                     pushed.get(..12).unwrap()
                 ))
                 && out.ends_with(
-                    "pr: opened #47 https://github.com/o/r/pull/47\npr: closed #30 with a link \
-                     to #47\n"
+                    "pr: opened #47 https://github.com/o/r/pull/47; it stays a draft until the B1 \
+                     reviews are in its description\npr: closed #30 with a link to #47\n"
                 ),
             "{out}"
         );
     }
 
-    /// Only Renovate's open pull requests are folded, at the head GitHub names, and nothing is
-    /// pushed when the group conflicts with main or a pin cannot be computed.
+    /// Main moved its tool list after the group left it: it bumped `other` and made the group's
+    /// own bump by hand, pinned. The group's changes are read from where it left main, so neither
+    /// reads as a bump back; main's tool list conflicts with Renovate's, which is no conflict,
+    /// since main's replaces it; and a bump main has is neither made again nor downloaded.
+    #[test]
+    fn a_tool_list_main_moved_is_main_s() {
+        let temp = tempfile::tempdir().unwrap();
+        let mains = tool_list("1.3.0", &sha256_hex(RELEASE))
+            .replace("version = \"9.9.9\"", "version = \"9.9.10\"");
+        let grouped = recorded(temp.path(), &[], &[(MANIFEST, mains.clone())]);
+        let work = &grouped.work;
+        let mut answer = github(&grouped, "renovate[bot]", json!([]), json!([]), false);
+        let mut out = String::new();
+        assert!(run(30, work, &repo(), &mut answer, &mut offline, &mut out).unwrap());
+        let folded = |path: &str| git(work, &["show", &format!("origin/agent/renovate-30:{path}")]);
+        assert_eq!(folded(MANIFEST), mains, "main's tool list, whole");
+        assert_eq!(
+            folded("web/package.json"),
+            VITE_AFTER,
+            "the rest of the group"
+        );
+        assert!(
+            out.starts_with("pr: origin/main already has fake 1.3.0\npr: pushed "),
+            "{out}"
+        );
+
+        let moved_dir = tempfile::tempdir().unwrap();
+        let elsewhere = tool_list("1.4.0", ZEROS);
+        let moved = recorded(moved_dir.path(), &[], &[(MANIFEST, elsewhere)]);
+        let mut answer = github(&moved, "renovate[bot]", json!([]), json!([]), false);
+        let error = run(
+            30,
+            &moved.work,
+            &repo(),
+            &mut answer,
+            &mut offline,
+            &mut String::new(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            format!("{error:#}"),
+            "origin/main moved a tool #30 bumps: fake is at 1.4.0 here, neither 1.2.3 nor 1.3.0, \
+             which the bump moves between"
+        );
+    }
+
+    /// Only Renovate's open pull requests are folded, at the head GitHub names, one group at a
+    /// time, never one that changes workflows, and nothing is pushed when the group conflicts
+    /// with main or a pin cannot be computed.
     #[test]
     fn refuses_what_it_cannot_fold_whole() {
         let temp = tempfile::tempdir().unwrap();
-        let grouped = recorded(temp.path(), false);
+        let grouped = recorded(temp.path(), &[], &[]);
         let refused =
             |author: &'static str,
              pull: &Grouped,
+             open: Value,
              fetch: &mut dyn FnMut(&str) -> anyhow::Result<Vec<u8>>| {
-                let mut answer = github(pull, author, json!([]), false);
+                let mut answer = github(pull, author, open, json!([]), false);
                 let mut out = String::new();
                 format!(
                     "{:#}",
@@ -679,22 +809,32 @@ targets.aarch64-unknown-linux-gnu = {{ platform = "linux-arm64", sha256 = "{sha2
                 )
             };
         assert_eq!(
-            refused("someone", &grouped, &mut downloads),
+            refused("someone", &grouped, json!([]), &mut downloads),
             "#30 is someone's, not Renovate's"
         );
-        let offline = refused("renovate[bot]", &grouped, &mut |_: &str| {
-            anyhow::bail!("offline")
-        });
+        assert_eq!(
+            refused(
+                "renovate[bot]",
+                &grouped,
+                json!([
+                    open_from(12, "agent/other"),
+                    open_from(46, "agent/renovate-29")
+                ]),
+                &mut downloads
+            ),
+            "#46 (agent/renovate-29) still folds an earlier Renovate group, whose updates \
+             Renovate repeats in #30: merge or close it first"
+        );
+        let offline = refused("renovate[bot]", &grouped, json!([]), &mut offline);
         assert!(
             offline.starts_with("could not pin 1 of the tools"),
             "{offline}"
         );
         let moved = Grouped {
             work: grouped.work.clone(),
-            base: grouped.base.clone(),
             head: "1111111111111111111111111111111111111111".to_owned(),
         };
-        let stale = refused("renovate[bot]", &moved, &mut downloads);
+        let stale = refused("renovate[bot]", &moved, json!([]), &mut downloads);
         assert!(
             stale.starts_with("#30's head moved to ") && stale.ends_with("run this again"),
             "{stale}"
@@ -704,23 +844,39 @@ targets.aarch64-unknown-linux-gnu = {{ platform = "linux-arm64", sha256 = "{sha2
             "nothing pushed"
         );
         let clashing_dir = tempfile::tempdir().unwrap();
-        let clashing = recorded(clashing_dir.path(), true);
+        let clashing = recorded(
+            clashing_dir.path(),
+            &[],
+            &[("web/package.json", "{\"vite\": \"9.0.0\"}\n".to_owned())],
+        );
         assert_eq!(
-            refused("renovate[bot]", &clashing, &mut downloads),
+            refused("renovate[bot]", &clashing, json!([]), &mut downloads),
             "#30 conflicts with origin/main in web/package.json; Renovate rebases it on its next \
              run, or fold it by hand"
+        );
+        let actions_dir = tempfile::tempdir().unwrap();
+        let actions = recorded(
+            actions_dir.path(),
+            &[(".github/workflows/ci.yml", "on: push\n".to_owned())],
+            &[],
+        );
+        assert_eq!(
+            refused("renovate[bot]", &actions, json!([]), &mut downloads),
+            "#30 changes workflows (.github/workflows/ci.yml), which the agent App cannot push; \
+             GitHub Actions updates come in a group of their own (renovate.json), for the \
+             maintainer to merge"
         );
     }
 
     /// A run that failed after its push could not run again, since a new commit to the pushed
-    /// branch was refused. A run again takes up the branch and the pull request when they hold
-    /// the same change, and refuses a branch that holds another.
+    /// branch was refused. A run again takes up the branch, the pull request and the linking
+    /// comment when they hold the same change, and refuses a branch that holds another.
     #[test]
     fn a_second_run_takes_up_what_the_first_left() {
         let temp = tempfile::tempdir().unwrap();
-        let grouped = recorded(temp.path(), false);
+        let grouped = recorded(temp.path(), &[], &[]);
         let work = &grouped.work;
-        let mut failing = github(&grouped, "renovate[bot]", json!([]), true);
+        let mut failing = github(&grouped, "renovate[bot]", json!([]), json!([]), true);
         let failed = run(
             30,
             work,
@@ -732,7 +888,7 @@ targets.aarch64-unknown-linux-gnu = {{ platform = "linux-arm64", sha256 = "{sha2
         .unwrap_err();
         assert!(format!("{failed:#}").contains("502"), "{failed:#}");
         let pushed = git(work, &["rev-parse", "origin/agent/renovate-30"]);
-        let mut again = github(&grouped, "renovate[bot]", json!([]), false);
+        let mut again = github(&grouped, "renovate[bot]", json!([]), json!([]), false);
         let mut taken = String::new();
         assert!(run(30, work, &repo(), &mut again, &mut downloads, &mut taken).unwrap());
         assert!(
@@ -744,21 +900,21 @@ targets.aarch64-unknown-linux-gnu = {{ platform = "linux-arm64", sha256 = "{sha2
             pushed,
             "the branch as the first run left it"
         );
-        let open = json!([{"number": 47, "html_url": "https://github.com/o/r/pull/47"}]);
-        let mut found = github(&grouped, "renovate[bot]", open, true);
+        let open = json!([open_from(47, "agent/renovate-30")]);
+        let linked = json!([{"body": "Folded into #47, which carries these updates"}]);
+        let calls = std::cell::RefCell::new(Vec::new());
+        let mut found = github(&grouped, "renovate[bot]", open, linked, true);
+        let mut send = |request: &Request| {
+            calls.borrow_mut().push(request.clone());
+            found(request)
+        };
         let mut kept_pull = String::new();
-        assert!(
-            run(
-                30,
-                work,
-                &repo(),
-                &mut found,
-                &mut downloads,
-                &mut kept_pull
-            )
-            .unwrap()
-        );
+        assert!(run(30, work, &repo(), &mut send, &mut downloads, &mut kept_pull).unwrap());
         assert!(kept_pull.contains("pr: found #47 "), "{kept_pull}");
+        assert!(
+            calls.into_inner().iter().all(|call| call.method != "POST"),
+            "neither a second pull request nor a second comment"
+        );
         let other_release = |url: &str| -> anyhow::Result<Vec<u8>> {
             if url.contains("/attestations/") {
                 downloads(url)
@@ -766,7 +922,7 @@ targets.aarch64-unknown-linux-gnu = {{ platform = "linux-arm64", sha256 = "{sha2
                 Ok(b"another build".to_vec())
             }
         };
-        let mut refusing = github(&grouped, "renovate[bot]", json!([]), false);
+        let mut refusing = github(&grouped, "renovate[bot]", json!([]), json!([]), false);
         let error = run(
             30,
             work,

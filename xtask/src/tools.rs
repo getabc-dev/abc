@@ -1010,6 +1010,31 @@ pub(crate) fn bumped(text: &str, bumps: &[Bump]) -> anyhow::Result<String> {
     Ok(document.to_string())
 }
 
+/// Splits `bumps`, made against an older tool list, by where the tool list `text` stands: the
+/// ones still to apply (the tool is at the version the bump moves from), then the ones `text`
+/// already has (the tool is at the version it moves to). Fails on a tool at neither version.
+pub(crate) fn outstanding(text: &str, bumps: Vec<Bump>) -> anyhow::Result<(Vec<Bump>, Vec<Bump>)> {
+    let manifest = Manifest::parse(text).with_context(|| format!("{MANIFEST} is invalid"))?;
+    let mut to_apply = Vec::new();
+    let mut applied = Vec::new();
+    for bump in bumps {
+        let current = &manifest.tool(&bump.tool)?.version;
+        if *current == bump.from {
+            to_apply.push(bump);
+        } else if *current == bump.to {
+            applied.push(bump);
+        } else {
+            bail!(
+                "{} is at {current} here, neither {} nor {}, which the bump moves between",
+                bump.tool,
+                bump.from,
+                bump.to
+            );
+        }
+    }
+    Ok((to_apply, applied))
+}
+
 /// The tool list `text` with the pins of the tools named in `only`, or of every tool, recomputed
 /// from downloads by `fetch`, as `cargo xtask pin` does; fails unless each was pinned.
 pub(crate) fn repin(
@@ -2822,6 +2847,30 @@ targets.aarch64-unknown-linux-gnu = {{ platform = "linux-arm64", sha256 = "{sha2
         let renamed = before.replace("name = \"fake\"", "name = \"other\"");
         let added = format!("{:#}", super::bumps(&before, &renamed).unwrap_err());
         assert!(added.contains("adds or removes a tool"), "{added}");
+    }
+
+    /// Renovate's group is made against main as it once stood. A bump main already made by
+    /// itself is not made again, and a tool main moved elsewhere is refused, never moved back.
+    #[test]
+    fn bumps_main_already_has_are_set_apart() {
+        let before = manifest_text(SHA_A, SHA_B);
+        let after = before.replace("version = \"1.2.3\"", "version = \"1.3.0\"");
+        let moved = super::bumps(&before, &after).unwrap();
+        assert_eq!(
+            super::outstanding(&before, moved.clone()).unwrap(),
+            (moved.clone(), vec![]),
+            "still to apply"
+        );
+        assert_eq!(
+            super::outstanding(&after, moved.clone()).unwrap(),
+            (vec![], moved.clone()),
+            "already applied"
+        );
+        let elsewhere = before.replace("version = \"1.2.3\"", "version = \"1.4.0\"");
+        assert_eq!(
+            format!("{:#}", super::outstanding(&elsewhere, moved).unwrap_err()),
+            "fake is at 1.4.0 here, neither 1.2.3 nor 1.3.0, which the bump moves between"
+        );
     }
 
     /// A VM's network reset one download, and `pin` wrote nothing: every pin computed was lost.
