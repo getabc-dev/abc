@@ -820,15 +820,19 @@ fn report(
     }
 }
 
-/// `cargo xtask pin`: downloads every tool for every target and records the sha256 of each
+/// `cargo xtask pin`: downloads every tool for every target with `fetch` and records the sha256 of each
 /// archive and of the executable in it, keeping the tool list's layout and comments. A tool whose
 /// downloads fail does not cost the others their pins: the tool list is written with every pin
 /// computed, then the command fails naming each tool it could not pin, for a second run.
-pub(crate) fn pin(root: &Path, out: &mut impl Write) -> anyhow::Result<()> {
+pub(crate) fn pin(
+    root: &Path,
+    out: &mut impl Write,
+    fetch: &mut impl FnMut(&str) -> anyhow::Result<Vec<u8>>,
+) -> anyhow::Result<()> {
     let path = root.join(MANIFEST);
     let text =
         fs::read_to_string(&path).with_context(|| format!("could not read {}", path.display()))?;
-    let pinned = pin_each(&text, None, out, &mut download)?;
+    let pinned = pin_each(&text, None, out, fetch)?;
     fs::write(&path, &pinned.text)
         .with_context(|| format!("could not write {}", path.display()))?;
     pinned.result()
@@ -2574,6 +2578,21 @@ targets.aarch64-unknown-linux-gnu = {{ platform = "linux-arm64", sha256 = "{sha2
             "{out}"
         );
         assert!(!out.contains("other 1.2.3 aarch64-apple-darwin"), "{out}");
+        // `cargo xtask pin` writes those pins to the tool list, then fails.
+        let root = tempfile::tempdir().unwrap();
+        let manifest = root.path().join(super::MANIFEST);
+        fs::create_dir_all(manifest.parent().unwrap()).unwrap();
+        fs::write(&manifest, &text).unwrap();
+        let failed = super::pin(root.path(), &mut Vec::new(), &mut fetch).unwrap_err();
+        assert!(
+            format!("{failed:#}").starts_with("could not pin 1 of the tools"),
+            "{failed:#}"
+        );
+        assert_eq!(
+            fs::read_to_string(&manifest).unwrap(),
+            pinned.text,
+            "the pins computed are kept"
+        );
     }
 
     #[test]

@@ -786,3 +786,49 @@ fn send_plan(
 fn no_downloads(url: &str) -> anyhow::Result<Vec<u8>> {
     anyhow::bail!("no download expected: {url}")
 }
+
+/// Main moved on files the pull request does not change: nothing to warn about, unless GitHub's
+/// lists stop at their cap, which may hide a shared file.
+#[test]
+fn checks_warn_only_on_shared_files_or_a_capped_list() {
+    let warned = |main_files: Value| {
+        let mut send = |request: &Request| -> anyhow::Result<Value> {
+            Ok(match (request.method, request.path.as_str()) {
+                ("GET", "/repos/o/r/pulls/25") => {
+                    json!({"state": "open", "base": {"ref": "main"}, "head": {"sha": "abc"}})
+                }
+                ("GET", "/repos/o/r/compare/abc...main") => {
+                    json!({"ahead_by": 4, "files": main_files.clone()})
+                }
+                ("GET", "/repos/o/r/compare/main...abc") => {
+                    json!({"ahead_by": 1, "files": [{"filename": "mine.rs"}]})
+                }
+                ("GET", path) if path.starts_with("/repos/o/r/actions/runs") => {
+                    json!({"workflow_runs": []})
+                }
+                ("POST", "/graphql") => {
+                    json!({"data": {"repository": {"pullRequest": {"commits": {"nodes": [
+                        {"commit": {"oid": "1111111111111111111111111111111111111111", "checkSuites": {"nodes": []}}}
+                    ]}}}}})
+                }
+                other => anyhow::bail!("unexpected call {other:?}"),
+            })
+        };
+        let mut out = String::new();
+        send_plan(Plan::Checks(25), &mut send, &mut out);
+        out
+    };
+    let elsewhere = warned(json!([{"filename": "theirs.rs"}]));
+    assert!(elsewhere.starts_with("#25 head at"), "{elsewhere}");
+    let many: Vec<Value> = (0..300)
+        .map(|n| json!({"filename": format!("f{n}.rs")}))
+        .collect();
+    let capped = warned(Value::Array(many));
+    assert!(
+        capped.starts_with(
+            "pr: warning: main moved on by 4 commit(s) since #25's branch left it, changing 0 \
+             file(s) #25 changes too, or more: GitHub lists at most 300 files of a comparison:"
+        ),
+        "{capped}"
+    );
+}

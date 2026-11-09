@@ -486,7 +486,7 @@ fn perform(
             tools: only,
         } => tools::doctor(home, &only, for_tests, &mut io::stdout().lock()),
         Task::Pin => {
-            tools::pin(home, &mut io::stdout().lock())?;
+            tools::pin(home, &mut io::stdout().lock(), &mut tools::download)?;
             Ok(ExitCode::SUCCESS)
         }
         Task::Tool { name, args } => tools::run(&tool(&name)?, root, &args),
