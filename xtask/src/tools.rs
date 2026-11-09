@@ -2,11 +2,12 @@
 //! running them from there. Nothing here runs a tool from `PATH`.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fmt::Write as _;
 use std::fs::{self, Permissions};
 use std::io::{Read, Write};
+use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, ExitCode, ExitStatus, Stdio};
@@ -1093,6 +1094,17 @@ pub(crate) fn for_tests(tree: &Path, name: &str) -> anyhow::Result<PathBuf> {
         .for_tests(tree, name)
 }
 
+/// `cargo` run in the checkout at `checkout`, to build and run that checkout's own xtask with its
+/// own toolchain: the one its rust-toolchain.toml chooses, not the one running here.
+pub(crate) fn own_xtask(cargo: &Path, checkout: &Path) -> Command {
+    let mut command = Command::new(cargo);
+    command
+        .current_dir(checkout)
+        .env_remove("RUSTUP_TOOLCHAIN")
+        .env_remove("CARGO");
+    command
+}
+
 /// The cargo arguments that run a tree's own xtask, before its subcommand, as its `cargo xtask`
 /// alias does.
 const TREE_XTASK: [&str; 6] = [
@@ -1111,38 +1123,43 @@ const TREE_XTASK: [&str; 6] = [
 /// the tree's xtask is the tree's code, which already runs the tree's tests; the gate's verdict
 /// stays with its own programs.
 pub(crate) fn of_tree(cargo: &Path, tree: &Path, name: &str) -> anyhow::Result<PathBuf> {
-    let output = Command::new(cargo)
+    let output = own_xtask(cargo, tree)
         .args(TREE_XTASK)
         .args(["test-tool", name])
-        .current_dir(tree)
-        // Let the tree's rust-toolchain.toml choose the toolchain, not the one running here.
-        .env_remove("RUSTUP_TOOLCHAIN")
-        .env_remove("CARGO")
         .stdin(Stdio::null())
         .output()
         .with_context(|| format!("could not run cargo in {}", tree.display()))?;
     let stderr = String::from_utf8_lossy(&output.stderr);
+    let stderr = stderr.trim();
     ensure!(
         output.status.success(),
-        "{}: its tests run {name}, and its own `cargo xtask test-tool {name}` failed ({}): {}\n\
-         a tree whose xtask has no `test-tool` predates it: merge the default branch into it",
+        "{}: its tests run {name}, and its own `cargo xtask test-tool {name}` failed ({}): \
+         {stderr}{}",
         tree.display(),
         output.status,
-        stderr.trim()
+        if stderr.contains("unrecognized subcommand 'test-tool'") {
+            "\nits xtask predates `test-tool`: merge the default branch into it"
+        } else {
+            ""
+        }
     );
-    let stdout = String::from_utf8(output.stdout).with_context(|| {
-        format!(
-            "{}: `cargo xtask test-tool {name}` printed non-UTF-8",
-            tree.display()
-        )
-    })?;
-    let path = PathBuf::from(stdout.trim_end_matches('\n'));
+    // A path is bytes, not text: it comes back exactly as the tree's xtask wrote it.
+    let printed = output.stdout.strip_suffix(b"\n").unwrap_or(&output.stdout);
+    let path = PathBuf::from(OsStr::from_bytes(printed));
     ensure!(
         path.is_absolute() && path.is_file(),
-        "{}: `cargo xtask test-tool {name}` printed {stdout:?}, not the path of a file",
-        tree.display()
+        "{}: `cargo xtask test-tool {name}` printed {:?}, not the path of a file",
+        tree.display(),
+        String::from_utf8_lossy(&output.stdout)
     );
     Ok(path)
+}
+
+/// Writes `path` and a newline to `out`, as the bytes it is, for [`of_tree`] to read.
+pub(crate) fn print_path(path: &Path, out: &mut impl Write) -> anyhow::Result<()> {
+    out.write_all(path.as_os_str().as_bytes())?;
+    out.write_all(b"\n")?;
+    Ok(())
 }
 
 /// `cargo xtask tool`: runs a pinned tool's `executable` with the given arguments in `root`.
@@ -2178,6 +2195,8 @@ targets.aarch64-unknown-linux-gnu = {{ platform = "linux-arm64", sha256 = "{sha2
 
     #[test]
     fn another_trees_own_xtask_names_its_tests_tools() {
+        use std::os::unix::ffi::OsStrExt as _;
+
         let temp = tempfile::tempdir().unwrap();
         let tree = temp.path().join("tree");
         fs::create_dir_all(&tree).unwrap();
@@ -2185,15 +2204,20 @@ targets.aarch64-unknown-linux-gnu = {{ platform = "linux-arm64", sha256 = "{sha2
         write_executable(&postgres, b"");
         let cargo = temp.path().join("cargo");
         // The fake cargo answers only as the tree's own xtask would be run: in the tree, with
-        // the tree free to choose its toolchain.
+        // the tree free to choose its toolchain. An xtask without `test-tool` answers as clap
+        // does.
         write_executable(
             &cargo,
             format!(
                 "#!/bin/sh\n\
-                 [ \"$*\" = 'run --quiet --locked --manifest-path xtask/Cargo.toml -- test-tool postgresql' ] || {{ echo \"error: unrecognized subcommand in $*\" >&2; exit 2; }}\n\
+                 run='run --quiet --locked --manifest-path xtask/Cargo.toml -- test-tool'\n\
                  [ \"$(pwd -P)\" = '{}' ] || exit 3\n\
                  [ -z \"${{RUSTUP_TOOLCHAIN+set}}${{CARGO+set}}\" ] || exit 4\n\
-                 echo \"${{ANSWER-{}}}\"\n",
+                 case \"$*\" in\n\
+                 \"$run postgresql\") if [ -n \"$ANSWER_FILE\" ]; then cat \"$ANSWER_FILE\"; else echo \"${{ANSWER-{}}}\"; fi ;;\n\
+                 \"$run jre\") echo 'error: jre is not installed: run setup' >&2; exit 1 ;;\n\
+                 *) echo \"error: unrecognized subcommand 'test-tool'\" >&2; exit 2 ;;\n\
+                 esac\n",
                 tree.canonicalize().unwrap().display(),
                 postgres.display()
             )
@@ -2205,37 +2229,62 @@ targets.aarch64-unknown-linux-gnu = {{ platform = "linux-arm64", sha256 = "{sha2
             "the path the tree's xtask prints"
         );
 
-        let predates = format!("{:#}", super::of_tree(&cargo, &tree, "jre").unwrap_err());
-        assert!(
-            predates.starts_with(&format!(
-                "{}: its tests run jre, and its own `cargo xtask test-tool jre` failed (exit status: 2): error: unrecognized subcommand in run --quiet --locked --manifest-path xtask/Cargo.toml -- test-tool jre\n",
+        let failed = format!("{:#}", super::of_tree(&cargo, &tree, "jre").unwrap_err());
+        assert_eq!(
+            failed,
+            format!(
+                "{}: its tests run jre, and its own `cargo xtask test-tool jre` failed (exit \
+                 status: 1): error: jre is not installed: run setup",
                 tree.display()
-            )) && predates.ends_with("merge the default branch into it"),
-            "{predates}"
+            ),
+            "the tree's own reason, and no hint to merge, which would not fix it"
+        );
+        let predates = format!("{:#}", super::of_tree(&cargo, &tree, "quint").unwrap_err());
+        assert_eq!(
+            predates,
+            format!(
+                "{}: its tests run quint, and its own `cargo xtask test-tool quint` failed (exit \
+                 status: 2): error: unrecognized subcommand 'test-tool'\nits xtask predates \
+                 `test-tool`: merge the default branch into it",
+                tree.display()
+            )
         );
 
-        let answer = |printed: &str| {
-            let fake = temp.path().join(format!("answers-{}", printed.len()));
+        let fake_with = |variable: &str, value: &Path| {
+            let fake = temp.path().join("fake-with");
             write_executable(
                 &fake,
                 format!(
-                    "#!/bin/sh\nANSWER='{printed}' exec '{}' \"$@\"\n",
+                    "#!/bin/sh\n{variable}='{}' exec '{}' \"$@\"\n",
+                    value.display(),
                     cargo.display()
                 )
                 .as_bytes(),
             );
-            format!(
-                "{:#}",
-                super::of_tree(&fake, &tree, "postgresql").unwrap_err()
-            )
+            super::of_tree(&fake, &tree, "postgresql")
         };
         for printed in ["bin/postgres", "/no/such/postgres", ""] {
-            let error = answer(printed);
+            let error = format!("{:#}", fake_with("ANSWER", Path::new(printed)).unwrap_err());
             assert!(
                 error.contains(&format!("printed \"{printed}\\n\", not the path of a file")),
                 "{error}"
             );
         }
+
+        // A path that is not UTF-8 comes back byte for byte.
+        let odd = tree.join(std::ffi::OsStr::from_bytes(b"post\xffgres"));
+        write_executable(&odd, b"");
+        let mut printed = Vec::new();
+        super::print_path(&odd, &mut printed).unwrap();
+        assert_eq!(
+            printed,
+            [odd.as_os_str().as_bytes(), b"\n"].concat(),
+            "the path's bytes and a newline"
+        );
+        let answer_file = temp.path().join("answer");
+        fs::write(&answer_file, &printed).unwrap();
+        assert_eq!(fake_with("ANSWER_FILE", &answer_file).unwrap(), odd);
+
         assert!(
             format!(
                 "{:#}",
