@@ -89,7 +89,7 @@ mod tests {
 
     #[test]
     fn usage_errors_answer_nothing_and_commands_report_their_errors() {
-        for args in [&["no-such-command"][..], &["hook", "post-tool-use"]] {
+        for args in [&["no-such-command"][..], &["hook", "pre-compact"]] {
             // A usage error exits before reading its input, so it is given none.
             let unknown = xtask(args, "", &[]);
             assert_ne!(unknown.status.code(), Some(0), "{args:?}");

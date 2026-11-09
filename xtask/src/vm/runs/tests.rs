@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Output};
 
 use super::outcome::{
-    Cause, MAX_ATTEMPTS, MAX_OUTAGE, Next, Outage, Outcome, Verdict, after_attempt, classify,
-    network_down, reset,
+    Cause, MAX_ATTEMPTS, MAX_OUTAGE, Next, Outage, Outcome, Verdict, after_attempt, classify, down,
+    reset,
 };
 use super::service::{Manager, Services};
 use super::{Clock, Run, Runs, Status, Supervisor};
@@ -189,7 +189,7 @@ fn each_kind_of_stop_has_its_restart_rule() {
         }
     );
     assert_eq!(
-        network_down(first, MORNING + 35),
+        down(first, MORNING + 35, Cause::Network),
         Next::Wait {
             until: MORNING + 95,
             cause: Cause::Network,
@@ -201,12 +201,13 @@ fn each_kind_of_stop_has_its_restart_rule() {
         "each failed probe doubles the wait"
     );
     assert_eq!(
-        network_down(
+        down(
             Outage {
                 since: MORNING,
                 tries: 30
             },
-            MORNING + 100
+            MORNING + 100,
+            Cause::Network
         ),
         Next::Wait {
             until: MORNING + 1000,
@@ -219,7 +220,7 @@ fn each_kind_of_stop_has_its_restart_rule() {
         "up to 15 minutes"
     );
     assert!(
-        matches!(network_down(first, MORNING + MAX_OUTAGE), Next::GiveUp(reason)
+        matches!(down(first, MORNING + MAX_OUTAGE, Cause::Network), Next::GiveUp(reason)
             if reason.contains("unreachable since 2026-11-10 08:00 UTC, 24 hours")),
         "a day without the API ends the run"
     );
@@ -733,19 +734,67 @@ fn an_attempt_starts_the_vm_when_it_is_not_running() {
 }
 
 #[test]
-fn a_session_that_cannot_start_is_a_failed_attempt() {
+fn a_session_that_cannot_start_is_retried_with_a_growing_wait() {
     let services = FakeServices::default();
     let (world, mut local) = briefed();
     local.fake.running = false;
-    local.fake.ready = false;
+    // After a reboot the keychain may still be locked: no token comes out of it.
+    std::fs::write(world.root.join("security"), "#!/bin/sh\nexit 44\n").unwrap();
     fake_claude(&local.bin, &[HANDOFF]);
     let run = started(&world, &services);
-    let status = supervise(&world, &local, &services, &FakeClock::at(MORNING), &run.id);
+    let clock = FakeClock::at(MORNING);
+    let status = supervise(&world, &local, &services, &clock, &run.id);
     assert!(
-        matches!(&status, Status::GaveUp { reason } if reason.contains("the session could not start: abc-w did not get ready")),
+        matches!(&status, Status::GaveUp { reason } if reason.starts_with("40 attempts, the most a run makes; the last ended with the session could not start: no Claude Code subscription token")),
         "{status:?}"
     );
+    let slept = clock.slept.borrow().clone();
+    // Each attempt takes the fake clock two seconds.
+    assert_eq!(slept[2] - slept[1], 62, "the wait doubles: {slept:?}");
+    assert_eq!(slept[3] - slept[2], 122, "{slept:?}");
+    assert_eq!(slept[39] - slept[38], 902, "up to 15 minutes: {slept:?}");
     assert!(!local.bin.join("calls").exists(), "claude never ran");
+    let state = runs(&world).load(&run.id).unwrap();
+    assert!(matches!(
+        &state.attempts[0].outcome,
+        Some(Outcome::Unstarted { message }) if message.starts_with("no Claude Code subscription token")
+    ));
+    assert_eq!(
+        down(first_outage(), MORNING + MAX_OUTAGE, Cause::Unstarted),
+        Next::GiveUp("the session has not started since 2026-11-10 08:00 UTC, 24 hours".to_owned())
+    );
+}
+
+fn first_outage() -> Outage {
+    Outage {
+        since: MORNING,
+        tries: 1,
+    }
+}
+
+/// A run whose worktree is gone cannot carry on, whatever restarts its supervisor: it gives up
+/// at once rather than fail and be restarted by its service for ever.
+#[test]
+fn a_run_whose_worktree_is_gone_gives_up() {
+    let (world, local) = briefed();
+    let services = FakeServices::default();
+    let run = started(&world, &services);
+    std::fs::remove_dir_all(&world.worktree).unwrap();
+    let status = supervise(&world, &local, &services, &FakeClock::at(MORNING), &run.id);
+    assert!(
+        matches!(&status, Status::GaveUp { reason } if reason.starts_with("its session cannot be opened: ")),
+        "{status:?}"
+    );
+    assert_eq!(
+        services.calls.borrow().last().unwrap(),
+        &format!("retire {}", run.id)
+    );
+    assert_eq!(runs(&world).load(&run.id).unwrap().status, status);
+    let listed = runs(&world).load(&run.id).unwrap().status.describe();
+    assert!(
+        listed.starts_with("gave up: its session cannot be opened"),
+        "{listed}"
+    );
 }
 
 /// The supervisor of a test run in a child process: runs only when a parent test sets

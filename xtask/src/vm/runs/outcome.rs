@@ -71,6 +71,8 @@ pub(crate) enum Outcome {
     Limit { reset: Option<i64>, message: String },
     /// The API could not be reached.
     Network { message: String },
+    /// The session's VM could not be started, as after a reboot before the host is ready.
+    Unstarted { message: String },
     /// The session ended without an error and without a handoff.
     Unfinished { message: String },
     /// Any other error, or no result at all.
@@ -91,6 +93,7 @@ impl Outcome {
             }
             Self::Limit { reset: None, .. } => "a usage limit".to_owned(),
             Self::Network { message } => format!("a network failure: {message}"),
+            Self::Unstarted { message } => format!("the session could not start: {message}"),
             Self::Unfinished { message } => {
                 format!("the session ended without a handoff: {message}")
             }
@@ -242,9 +245,11 @@ pub(crate) enum Cause {
     Limit,
     /// The network is down; the supervisor probes the API before the next attempt.
     Network,
+    /// The session could not start; the next attempt starts it again.
+    Unstarted,
 }
 
-/// A network outage the run is waiting out.
+/// An outage the run is waiting out: the network's, or the session's that could not start.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Outage {
     /// When the attempt that met it started, in seconds since the Unix epoch.
@@ -310,12 +315,17 @@ pub(crate) fn after_attempt(
             cause: Cause::Limit,
             outage: None,
         },
-        Outcome::Network { .. } => {
+        Outcome::Network { .. } | Outcome::Unstarted { .. } => {
             let outage = outage.unwrap_or(Outage {
                 since: started,
                 tries: 0,
             });
-            network_down(outage, now)
+            let cause = if matches!(outcome, Outcome::Network { .. }) {
+                Cause::Network
+            } else {
+                Cause::Unstarted
+            };
+            down(outage, now, cause)
         }
         Outcome::Unfinished { .. } | Outcome::Error { .. } => {
             let failures = earlier
@@ -341,23 +351,29 @@ pub(crate) fn after_attempt(
     }
 }
 
-/// What follows finding the network down once more during `outage`, at `now`: a wait that
-/// doubles each time, or giving up once it has been down for [`MAX_OUTAGE`].
-pub(crate) fn network_down(outage: Outage, now: i64) -> Next {
+/// What follows finding the network down, or the session unable to start (`cause`), once more
+/// during `outage`, at `now`: a wait that doubles each time, or giving up once the outage has
+/// lasted [`MAX_OUTAGE`].
+pub(crate) fn down(outage: Outage, now: i64, cause: Cause) -> Next {
     let outage = Outage {
         since: outage.since,
         tries: outage.tries.saturating_add(1),
     };
     if now.saturating_sub(outage.since) >= MAX_OUTAGE {
+        let what = if cause == Cause::Network {
+            "the API has been unreachable"
+        } else {
+            "the session has not started"
+        };
         return Next::GiveUp(format!(
-            "the API has been unreachable since {}, {} hours",
+            "{what} since {}, {} hours",
             crate::progress::utc(outage.since),
             MAX_OUTAGE / 3600
         ));
     }
     Next::Wait {
         until: now.saturating_add(backoff(outage.tries)),
-        cause: Cause::Network,
+        cause,
         outage: Some(outage),
     }
 }

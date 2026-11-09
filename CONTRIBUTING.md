@@ -249,7 +249,8 @@ hands off PASS, FAIL or BLOCKED, with no one to restart it:
   keychain as `vm start` hands it over, when it is not running) and reads how each session ended
   from its stream-json result. After a usage limit it waits until the reset the message names
   (in UTC, the VMs' zone); after a network or DNS failure it backs off from 30 s to 15 minutes,
-  probing `api.anthropic.com` from inside the VM; after any other stop it retries.
+  probing `api.anthropic.com` from inside the VM; when the VM will not start (after a reboot, the
+  keychain may still be locked) it backs off the same way; after any other stop it retries.
 - Every restart is a **fresh** `claude -p` on the brief and the checkpoint `.abc/progress.md`,
   which the hooks keep as the agent works, never `--resume`: resuming a huge transcript burns a
   usage window in minutes.

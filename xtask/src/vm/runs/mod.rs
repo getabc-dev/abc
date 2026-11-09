@@ -90,6 +90,13 @@ impl Status {
                 until,
                 cause: Cause::Network,
             } => format!("network down; probing at {}", crate::progress::utc(*until)),
+            Self::Waiting {
+                until,
+                cause: Cause::Unstarted,
+            } => format!(
+                "the session could not start; starting it again at {}",
+                crate::progress::utc(*until)
+            ),
             Self::Running => "running".to_owned(),
             Self::Done { verdict } => format!("done: {}", verdict.word()),
             Self::GaveUp { reason } => format!("gave up: {reason}"),
@@ -645,7 +652,20 @@ impl Supervisor<'_> {
     /// the next queued run. Returns the final status.
     pub(crate) fn supervise(&self, id: &str) -> anyhow::Result<Status> {
         let mut run = self.runs.load(id)?;
-        let session = Session::open(&run.worktree, &self.host.repo, &self.host.state)?;
+        let session = match Session::open(&run.worktree, &self.host.repo, &self.host.state) {
+            Ok(session) => session,
+            Err(error) => {
+                // Its worktree is gone or no longer a worktree of the main clone: nothing a
+                // restart of the supervisor would change, so the run ends.
+                run.status = Status::GaveUp {
+                    reason: format!("its session cannot be opened: {error:#}"),
+                };
+                self.runs.save(&run)?;
+                self.services.retire(id)?;
+                start_next(self.runs, self.services, self.clock.now())?;
+                return Ok(run.status);
+            }
+        };
         let mut log = File::options()
             .create(true)
             .append(true)
@@ -681,7 +701,7 @@ impl Supervisor<'_> {
                             "--- abc run {id}: the API is still unreachable at {}",
                             crate::progress::utc(now)
                         )?;
-                        run.follow(outcome::network_down(outage, now));
+                        run.follow(outcome::down(outage, now, Cause::Network));
                     } else {
                         self.attempt(&mut run, &session, &mut log)?;
                     }
@@ -717,8 +737,8 @@ impl Supervisor<'_> {
             crate::progress::utc(self.clock.now())
         )?;
         let outcome = if let Err(error) = self.prepare(session, log) {
-            Outcome::Error {
-                message: format!("the session could not start: {error:#}"),
+            Outcome::Unstarted {
+                message: format!("{error:#}"),
             }
         } else {
             let runs = self.runs;

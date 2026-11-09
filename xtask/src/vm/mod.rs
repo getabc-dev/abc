@@ -52,7 +52,7 @@ pub(crate) enum Action {
         action: Option<QueueAction>,
     },
     /// List every run with its status, attempts, brief and log (in
-    /// ~/.local/state/abc/runs/<run>/); --json prints each run's state file.
+    /// `~/.local/state/abc/runs/<run>/`); --json prints each run's state file.
     Runs {
         #[arg(long)]
         json: bool,
