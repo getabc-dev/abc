@@ -21,6 +21,7 @@ mod release;
 mod review;
 mod rulesets;
 mod shell;
+mod spec;
 mod stop;
 mod task;
 #[cfg(test)]
@@ -173,6 +174,14 @@ enum Task {
         /// How long to fuzz, in seconds.
         #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u64).range(1..))]
         seconds: u64,
+    },
+    /// Check the formal specs in spec/ with the pinned Quint, Apalache and JRE: typecheck them,
+    /// run their tests, have TLC explore every state of each model and find each seeded bug.
+    Spec {
+        /// Also write ITF traces of each model's simulations into DIR, the input the runner's
+        /// trace replay reads; docs/spec/runner.md describes them.
+        #[arg(long, value_name = "DIR")]
+        traces: Option<PathBuf>,
     },
     /// Report deleted, skipped or weakened tests and changed gate files since the merge base.
     Integrity {
@@ -337,6 +346,8 @@ struct Invocation<'a> {
     root: PathBuf,
     /// A pinned tool's executable, by name: one of the gates' own programs, from `home`.
     tool: &'a dyn Fn(&str) -> anyhow::Result<PathBuf>,
+    /// The executable of the runtime a pinned tool runs on, by the tool's name, if it has one.
+    runtime: &'a dyn Fn(&str) -> anyhow::Result<Option<PathBuf>>,
     /// A tool the tests of a tree run, by the tree and the tool's name: from that tree, as
     /// [`tree_test_tool`] finds it.
     test_tool: &'a dyn Fn(&Path, &str) -> anyhow::Result<PathBuf>,
@@ -356,6 +367,7 @@ impl Invocation<'static> {
             home,
             root,
             tool: &pinned_tool,
+            runtime: &pinned_runtime,
             test_tool: &test_tool_here,
             env: &env_var,
         })
@@ -365,6 +377,11 @@ impl Invocation<'static> {
 /// A tool pinned in the repository xtask was built from.
 fn pinned_tool(name: &str) -> anyhow::Result<PathBuf> {
     tools::pinned(&repo_root()?, name)
+}
+
+/// The runtime of a tool pinned in the repository xtask was built from.
+fn pinned_runtime(name: &str) -> anyhow::Result<Option<PathBuf>> {
+    tools::runtime(&repo_root()?, name)
 }
 
 /// A tool the tests of the tree at `tree` run, as [`tree_test_tool`] finds it from this checkout
@@ -457,6 +474,7 @@ fn perform(
             &mutants::Tools::pinned(tool, postgres()?)?,
             report,
         )?)),
+        Task::Spec { traces } => run_spec(root, traces.as_deref(), tool, report),
         Task::Fuzz { seconds } => Ok(verdict(fuzz::run(
             root,
             &check::cargo(),
@@ -523,7 +541,7 @@ fn perform(
             tools::pin(home, &mut io::stdout().lock())?;
             Ok(ExitCode::SUCCESS)
         }
-        Task::Tool { name, args } => tools::run(&tool(&name)?, root, &args),
+        Task::Tool { name, args } => run_tool(invocation, &name, &args),
         Task::TestTool { name } => test_tool(invocation, &name),
         Task::Build => run_web(WebTask::Build, root, tool, report),
         Task::Pnpm { args } => run_web(WebTask::Pnpm(args), root, tool, report),
@@ -553,6 +571,7 @@ const fn gate_of(task: &Task) -> Option<(gate::Gate, gate::Wait)> {
         Task::Coverage { .. } => Some((gate::Gate::Coverage, gate::Wait::Yes)),
         Task::Mutants { .. } => Some((gate::Gate::Mutants, gate::Wait::Yes)),
         Task::Fuzz { .. } => Some((gate::Gate::Fuzz, gate::Wait::Yes)),
+        Task::Spec { .. } => Some((gate::Gate::Spec, gate::Wait::Yes)),
         Task::E2e => Some((gate::Gate::E2e, gate::Wait::Yes)),
         Task::Integrity { .. }
         | Task::GitCredential { .. }
@@ -573,6 +592,38 @@ const fn gate_of(task: &Task) -> Option<(gate::Gate, gate::Wait)> {
         | Task::TestTool { .. }
         | Task::Hook { .. } => None,
     }
+}
+
+/// `cargo xtask tool NAME ARGS`: runs the pinned tool `name` in the tree, with its runtime first
+/// on `PATH` if it has one.
+fn run_tool(
+    invocation: &Invocation<'_>,
+    name: &str,
+    args: &[OsString],
+) -> anyhow::Result<ExitCode> {
+    tools::run(
+        &(invocation.tool)(name)?,
+        (invocation.runtime)(name)?.as_deref(),
+        &invocation.root,
+        args,
+    )
+}
+
+/// `cargo xtask spec`: the specs' gate on `root`, with the pinned tools `tool` finds, writing
+/// traces into `traces` when given.
+fn run_spec(
+    root: &Path,
+    traces: Option<&Path>,
+    tool: &dyn Fn(&str) -> anyhow::Result<PathBuf>,
+    report: &mut impl Write,
+) -> anyhow::Result<ExitCode> {
+    Ok(verdict(spec::run(
+        root,
+        &spec::RUNNER,
+        &|| spec::Tools::pinned(tool),
+        spec::Options { traces },
+        report,
+    )?))
 }
 
 /// `cargo xtask release ACTION`: the release workflow's steps.
@@ -717,11 +768,13 @@ fn check(
         warm: &postgres::warm,
         sqlx: &|| tool("cargo-sqlx"),
     };
+    let spec = || spec::Tools::pinned(tool);
     let tools = check::Tools {
         nextest: tool("cargo-nextest")?,
         shellcheck: tool("shellcheck")?,
         postgres: postgres_bin,
         web: Some(web::Toolchain::pinned(tool)?),
+        spec: Some(&spec),
     };
     check::run(
         root,
@@ -968,6 +1021,7 @@ mod tests {
             home: home.to_path_buf(),
             root: root.to_path_buf(),
             tool: &tool,
+            runtime: &|_| Ok(None),
             test_tool,
             env,
         };
@@ -1472,6 +1526,7 @@ mod tests {
             ),
             ("coverage", Task::Coverage { base: base() }),
             ("fuzz", Task::Fuzz { seconds: 1 }),
+            ("spec", Task::Spec { traces: None }),
             (
                 "mutants",
                 Task::Mutants {
@@ -1670,6 +1725,10 @@ mod tests {
         assert!(
             (here.tool)("no-such-tool").is_err(),
             "only pinned tools resolve"
+        );
+        assert!(
+            (here.runtime)("no-such-tool").is_err(),
+            "and only their runtimes"
         );
         let temp = tempfile::tempdir().unwrap();
         let elsewhere = Invocation::new(Some(temp.path().to_path_buf())).unwrap();
