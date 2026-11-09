@@ -12,7 +12,7 @@ FROM docker.io/library/debian:trixie-slim@sha256:f6b08b09a05725f9431502d3b5714f5
 ARG CLAUDE_CODE_VERSION=2.1.316
 ARG RUSTUP_VERSION=1.28.2
 # The `@playwright/test` web/package.json pins; an xtask test keeps the two equal.
-ARG PLAYWRIGHT_VERSION=1.64.1
+ARG PLAYWRIGHT_VERSION=1.65.0
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
