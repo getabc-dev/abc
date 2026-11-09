@@ -142,11 +142,18 @@ watchdog compares the diff with that task and the rules above, and keeps it work
 | `cargo xtask rulesets check` | Checks `.github/rulesets/main.json` against the CI workflows: every job that runs on pull requests and in the merge queue is a required check. |
 | `cargo xtask rulesets apply` | For the maintainer only, with their own gh login: puts `.github/rulesets/` on GitHub (`main`, the `agent/*` branch limit and the tag rule), replacing the rulesets they supersede. Agents never run it. |
 | `cargo xtask tool <name> [args]` | Runs a pinned tool from `.tools/`, such as `cargo xtask tool cargo-deny check`. Never run these tools from `PATH`. |
+| `cargo xtask test-tool <name>` | Prints the path of a tool this tree's tests run, marked `for-tests` in `xtask/tools.toml`, once it matches its pin in `.tools/`; when it is missing, names `cargo xtask setup --for-tests`. A gate run with `--root` asks the tree's own xtask this (below). |
 | `cargo xtask pin` | After a version changes in `xtask/tools.toml`, records each target's archive sha256 and its executable's, or a crate's sha256 from the crates.io index, downloading as `setup` does. A tool is pinned whole or not at all, and one whose downloads fail costs the others nothing: the list is written with every pin computed, then the command fails naming the tools left on their old pins. To add a tool, write zeros and run it. |
 | `cargo fmt --all && cargo fmt --all --manifest-path xtask/Cargo.toml` | Fixes formatting in both workspaces; `cargo fmt --all` alone formats only the main one. |
 
 The gates take `--root <path>` to check another tree with the pinned tools of the checkout xtask
-was built from.
+was built from, so a tree cannot change the programs that judge it, the ones that run its tests
+(nextest, cargo-llvm-cov, cargo-mutants, node and pnpm) included. What a gate hands the tests to
+run themselves, today Postgres's programs as `ABC_TEST_POSTGRES_BIN`, comes from the tree itself:
+its own xtask names it (`cargo xtask test-tool`), as marked `for-tests` in its `xtask/tools.toml`
+and installed in its `.tools/` by its own `cargo xtask setup --for-tests`, so a tree's tool list,
+its schema and its install layout are judged with the tree that changes them. That is the tree's
+code running the tree's tests, so it opens no new trust boundary.
 
 Database tests get a fresh, uniquely named database each (`abc_store::testing::TestDatabase`) on
 the server `ABC_TEST_DATABASE_URL` names. `.cargo/config.toml` sets it to one warm Postgres 18
