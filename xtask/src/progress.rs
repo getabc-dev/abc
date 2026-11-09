@@ -9,7 +9,8 @@
 //!   ([`gate_passed`], from every lock gate that passes on its own checkout, the stop hook's
 //!   check included);
 //! - the agent's next step ([`set_next`], `cargo xtask task next`);
-//! - the message the agent last stopped with ([`stopped`], from the Stop and SubagentStop hooks);
+//! - the message the agent last stopped with ([`stopped`], from the `Stop` and `SubagentStop`
+//!   hooks);
 //! - the task, the commits since the merge base with the default branch and the uncommitted
 //!   files, read at rendering.
 //!
@@ -186,7 +187,11 @@ fn update(root: &Path, now: i64, change: impl FnOnce(&mut State, &Tree)) -> anyh
         STATE,
         &format!("{}\n", serde_json::to_string_pretty(&state)?),
     )?;
-    write(root, PROGRESS, &render(&state, &tree, task.as_deref(), now))
+    write(
+        root,
+        PROGRESS,
+        &render(&state, &tree, task.as_deref(), now)?,
+    )
 }
 
 /// The state recorded in `root`; none yet, or one that cannot be read, is a fresh one, since the
@@ -230,28 +235,33 @@ fn short(commit: &str) -> &str {
 }
 
 /// The checkpoint's Markdown.
-fn render(state: &State, tree: &Tree, task: Option<&str>, now: i64) -> String {
+fn render(
+    state: &State,
+    tree: &Tree,
+    task: Option<&str>,
+    now: i64,
+) -> Result<String, std::fmt::Error> {
     let mut out = String::new();
-    let _ = writeln!(
+    writeln!(
         out,
         "# Progress checkpoint\n\nWritten by xtask's hooks at {}. A fresh session carries on from \
          this file and the brief: read both, then do the next step. Record a new next step with \
          `cargo xtask task next \"<step>\"` at each milestone.\n",
         utc(now)
-    );
-    let _ = writeln!(
+    )?;
+    writeln!(
         out,
         "## Task\n\n{}\n",
         task.unwrap_or("None recorded (`cargo xtask task set \"<the task>\"`).")
-    );
-    let _ = writeln!(
+    )?;
+    writeln!(
         out,
         "## Next step\n\n{}\n",
         state
             .next
             .as_deref()
             .unwrap_or("None recorded (`cargo xtask task next \"<step>\"`).")
-    );
+    )?;
     out.push_str("## Gates passed\n\n");
     if state.gates.is_empty() {
         out.push_str("None yet.\n");
@@ -264,7 +274,7 @@ fn render(state: &State, tree: &Tree, task: Option<&str>, now: i64) -> String {
         } else {
             "an earlier commit"
         };
-        let _ = writeln!(
+        writeln!(
             out,
             "- `cargo xtask {gate}` passed at {} ({at}){}, {}",
             short(&pass.commit),
@@ -274,31 +284,31 @@ fn render(state: &State, tree: &Tree, task: Option<&str>, now: i64) -> String {
                 " with uncommitted changes"
             },
             utc(pass.at)
-        );
+        )?;
     }
-    let _ = writeln!(
+    writeln!(
         out,
         "\n## Commits\n\nHEAD: {} on {}.",
         tree.head.as_deref().map_or("no commit", short),
         tree.branch.as_deref().unwrap_or("no branch")
-    );
+    )?;
     match &tree.commits {
         Ok(lines) => {
             let mut lines = lines.iter();
             if let Some(since) = lines.next() {
-                let _ = writeln!(out, "Commits {since}, newest first:\n");
+                writeln!(out, "Commits {since}, newest first:\n")?;
             }
             let mut any = false;
             for line in lines {
                 any = true;
-                let _ = writeln!(out, "- {line}");
+                writeln!(out, "- {line}")?;
             }
             if !any {
                 out.push_str("- none\n");
             }
         }
         Err(error) => {
-            let _ = writeln!(out, "The commits could not be listed: {error}");
+            writeln!(out, "The commits could not be listed: {error}")?;
         }
     }
     out.push_str("\n## Uncommitted\n\n");
@@ -306,15 +316,15 @@ fn render(state: &State, tree: &Tree, task: Option<&str>, now: i64) -> String {
         out.push_str("Nothing.\n");
     }
     for line in &tree.uncommitted {
-        let _ = writeln!(out, "    {line}");
+        writeln!(out, "    {line}")?;
     }
     if let Some(message) = &state.last_message {
         out.push_str("\n## Last message\n\nThe agent last stopped saying:\n\n");
         for line in message.lines() {
-            let _ = writeln!(out, "> {line}");
+            writeln!(out, "> {line}")?;
         }
     }
-    out
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -356,7 +366,7 @@ mod tests {
             "## Next step\n\nwrite the queue\n",
             &format!(
                 "- `cargo xtask check --changed` passed at {} (HEAD), 2025-11-09 14:53 UTC",
-                &head[..12]
+                head.get(..12).unwrap()
             ),
             "- `cargo xtask coverage --base origin/main` passed at ",
             "(HEAD) with uncommitted changes, ",
@@ -375,22 +385,22 @@ mod tests {
         std::fs::remove_file(root.join("b.txt")).unwrap();
         git(&root, &["commit", "-qm", "Empty", "--allow-empty"]);
         assert!(observed(&root, 200).unwrap(), "a commit renders again");
-        let text = progress(&root);
+        let after = progress(&root);
         assert!(
-            text.contains("(an earlier commit), 2025-11-09 14:53 UTC"),
-            "{text}"
+            after.contains("(an earlier commit), 2025-11-09 14:53 UTC"),
+            "{after}"
         );
-        assert!(text.contains(" Empty\n"), "{text}");
-        assert!(text.contains("## Uncommitted\n\nNothing.\n"), "{text}");
+        assert!(after.contains(" Empty\n"), "{after}");
+        assert!(after.contains("## Uncommitted\n\nNothing.\n"), "{after}");
 
         new_task(&root, 300).unwrap();
-        let text = progress(&root);
+        let fresh = progress(&root);
         assert!(
-            text.contains("None recorded (`cargo xtask task next"),
-            "{text}"
+            fresh.contains("None recorded (`cargo xtask task next"),
+            "{fresh}"
         );
-        assert!(!text.contains("## Last message"), "{text}");
-        assert!(text.contains("check --changed"), "passes stay:\n{text}");
+        assert!(!fresh.contains("## Last message"), "{fresh}");
+        assert!(fresh.contains("check --changed"), "passes stay:\n{fresh}");
     }
 
     #[test]

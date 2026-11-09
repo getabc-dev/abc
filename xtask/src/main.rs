@@ -433,9 +433,10 @@ fn run(
     let Some((gate, wait)) = gate_of(&task) else {
         return perform(task, invocation, report);
     };
-    let label = match &task {
-        Task::Check { changed: true, .. } => format!("{} --changed", gate.name()),
-        _ => gate.name().to_owned(),
+    let label = if matches!(task, Task::Check { changed: true, .. }) {
+        format!("{} --changed", gate.name())
+    } else {
+        gate.name().to_owned()
     };
     match gate::take(&invocation.root, gate, wait, report)? {
         gate::Taken::Held(held) => {
@@ -952,7 +953,8 @@ fn run_vm(
     let host = vm::Host::this(repo, &home, env)?;
     vm::require_kvm(host.os, Path::new("/dev/kvm"))?;
     let msb = vm::microsandbox(tools::pinned(repo, "msb")?, &home, env)?;
-    vm::run(action, &host, &msb, env, report)
+    let services = vm::runs::service::Manager::of(host.os, &home, &host.runs, env)?;
+    vm::run(action, &host, &msb, &services, env, report)
 }
 
 /// The repository root: the checkout xtask was built from, the directory around xtask's own,

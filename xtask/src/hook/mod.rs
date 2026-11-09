@@ -331,10 +331,10 @@ pub(crate) fn run(event: Event, input: &str, context: &Context, log: &mut Vec<u8
             Ok(answer) => answer,
             Err(error) => guard_unavailable(&format!("{error:#}"), input),
         },
-        // The watchdog's own session stops without a check, so it never starts another watchdog.
-        Event::Stop if context.inside_watchdog => Answer::Allow,
+        // The watchdog's own session stops without a check, so it never starts another watchdog,
+        // and keeps no checkpoint.
+        Event::Stop | Event::PostToolUse if context.inside_watchdog => Answer::Allow,
         Event::Stop => stop_hook(input, context, log),
-        Event::PostToolUse if context.inside_watchdog => Answer::Allow,
         Event::PostToolUse => match checkpoint_where(input, context) {
             Ok(answer) => answer,
             Err(error) => note(

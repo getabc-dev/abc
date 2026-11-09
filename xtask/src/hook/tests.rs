@@ -1654,15 +1654,15 @@ fn stops_and_commits_keep_the_checkpoint() {
 
     fs::remove_dir_all(repo.join(".abc")).unwrap();
     fs::write(repo.join(".abc"), "a file where the directory goes").unwrap();
-    let mut log = Vec::new();
+    let mut unwritten = Vec::new();
     super::stop_with(
         &repo,
         &fields,
         &mut Fake::new(Ok(CheckResult::Passed)),
-        &mut log,
+        &mut unwritten,
     );
-    let noted = String::from_utf8(log).unwrap();
-    assert!(noted.contains("the checkpoint was not written"), "{noted}");
+    let said = String::from_utf8(unwritten).unwrap();
+    assert!(said.contains("the checkpoint was not written"), "{said}");
 }
 
 #[test]
