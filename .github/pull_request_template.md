@@ -13,3 +13,9 @@
 Leave "None" when no tests changed. A test changed only to make code pass is not a reason. -->
 
 None
+
+## Review findings
+
+<!-- What `/code-review high` and `/security-review` found on this branch before it opened (B1); `cargo xtask pr open` refuses a description without this section:
+- the finding: fixed (with the test that failed first), or not a defect and why
+Write "None" when they found nothing. -->

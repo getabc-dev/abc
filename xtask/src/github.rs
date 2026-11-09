@@ -54,6 +54,11 @@ impl Repo {
         Self::parse(crate::git::git(root, &["remote", "get-url", "origin"])?.trim())
     }
 
+    /// Its HTTPS URL, as git clones it.
+    pub(crate) fn https_url(&self) -> String {
+        format!("https://github.com/{}/{}.git", self.owner, self.name)
+    }
+
     /// A REST path under this repository, such as `pulls/7`.
     pub(crate) fn path(&self, rest: &str) -> String {
         format!("/repos/{}/{}/{rest}", self.owner, self.name)
@@ -267,7 +272,7 @@ fn push(item: &Value, what: &str) -> anyhow::Result<Push> {
 /// did. A revocation that fails is reported, not fatal: the token expires within the hour.
 pub(crate) fn with_token<T>(
     mint: impl FnOnce() -> anyhow::Result<String>,
-    revoke: impl FnOnce(&str) -> anyhow::Result<()>,
+    revoke: impl FnOnce(&str) -> anyhow::Result<crate::app::Revoked>,
     report: &mut impl std::io::Write,
     work: impl FnOnce(&str) -> anyhow::Result<T>,
 ) -> anyhow::Result<T> {

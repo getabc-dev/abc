@@ -49,22 +49,57 @@ pub(crate) fn default_branch(root: &Path) -> anyhow::Result<String> {
     )
 }
 
-/// How long a fetch the gates make for themselves may take: a minute, ample for one branch of a
-/// repository this size, so a stalled network fails the fetch rather than hanging the command.
-pub(crate) const FETCH_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long a fetch or push xtask makes for itself may take: a minute, ample for one branch of a
+/// repository this size, so a stalled network fails it rather than hanging the command.
+pub(crate) const REMOTE_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// Fetches `branch` from `remote` in `root`, never waiting on a person: git gets no stdin, no
-/// terminal prompt (`GIT_TERMINAL_PROMPT=0`) and no askpass program, which git would still run
-/// with terminal prompts off, so a remote that wants credentials the configured helpers do not
-/// have fails at once; and git is stopped after `timeout`.
+/// Fetches `branch` from `remote` in `root`, never waiting on a person (see [`remote`]), and stops
+/// git after `timeout`.
 pub(crate) fn fetch(
     root: &Path,
     remote: &str,
     branch: &str,
     timeout: Duration,
 ) -> anyhow::Result<()> {
+    self::remote(root, &["fetch", "--quiet", remote, branch], timeout)
+}
+
+/// Pushes `commit` to `branch` on `remote` from `root`, never waiting on a person (see
+/// [`remote`]), and stops git after `timeout`. A branch that exists and does not lead to `commit`
+/// is refused, never forced.
+pub(crate) fn push(
+    root: &Path,
+    remote: &str,
+    commit: &str,
+    branch: &str,
+    timeout: Duration,
+) -> anyhow::Result<()> {
+    self::remote(
+        root,
+        &[
+            "push",
+            "--quiet",
+            remote,
+            &format!("{commit}:refs/heads/{branch}"),
+        ],
+        timeout,
+    )
+}
+
+/// Runs git with `args`, a command that talks to a remote, in `root`, never waiting on a person:
+/// git gets no stdin, no terminal prompt (`GIT_TERMINAL_PROMPT=0`) and no askpass program, which
+/// git would still run with terminal prompts off, so a remote that wants credentials the
+/// configured helpers do not have fails at once; and git is stopped after `timeout`.
+fn remote(root: &Path, args: &[&str], timeout: Duration) -> anyhow::Result<()> {
+    let command = args
+        .iter()
+        .copied()
+        .filter(|arg| *arg != "--quiet")
+        .collect::<Vec<_>>()
+        .join(" ");
     let mut child = Command::new("git")
-        .args(["-c", "core.askPass=", "fetch", "--quiet", remote, branch])
+        .args(["-c", "core.askPass="])
+        .args(args)
         .current_dir(root)
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_ASKPASS", "")
@@ -86,14 +121,21 @@ pub(crate) fn fetch(
     });
     let started = Instant::now();
     let status = loop {
-        if let Some(status) = child.try_wait().context("could not wait for git fetch")? {
+        if let Some(status) = child
+            .try_wait()
+            .with_context(|| format!("could not wait for git {command}"))?
+        {
             break status;
         }
         if started.elapsed() >= timeout {
-            child.kill().context("could not stop git fetch")?;
-            child.wait().context("could not reap git fetch")?;
+            child
+                .kill()
+                .with_context(|| format!("could not stop git {command}"))?;
+            child
+                .wait()
+                .with_context(|| format!("could not reap git {command}"))?;
             bail!(
-                "git fetch {remote} {branch} took longer than {} seconds and was stopped",
+                "git {command} took longer than {} seconds and was stopped",
                 timeout.as_secs()
             );
         }
@@ -102,12 +144,13 @@ pub(crate) fn fetch(
     let message = heard
         .recv_timeout(Duration::from_secs(1))
         .unwrap_or_default();
-    ensure!(
-        status.success(),
-        "git fetch {remote} {branch} failed: {}",
-        message.trim()
-    );
+    ensure!(status.success(), "git {command} failed: {}", message.trim());
     Ok(())
+}
+
+/// The first twelve characters of a commit's name.
+pub(crate) fn short(commit: &str) -> &str {
+    commit.get(..12).unwrap_or(commit)
 }
 
 /// The commit where `HEAD` left `base`.
@@ -325,7 +368,8 @@ pub(crate) fn blobs(
     Ok(read)
 }
 
-/// The content of `path` at `revision`, or `None` when the file did not exist there.
+/// The content of `path` at `revision`, or `None` when the file did not exist there. A revision
+/// git does not have is an error, never a missing file.
 pub(crate) fn show(root: &Path, revision: &str, path: &str) -> anyhow::Result<Option<String>> {
     let output = Command::new("git")
         .args(["show", &format!("{revision}:{path}")])
@@ -333,12 +377,15 @@ pub(crate) fn show(root: &Path, revision: &str, path: &str) -> anyhow::Result<Op
         .output()
         .context("could not run git")?;
     if output.status.success() {
-        Ok(Some(String::from_utf8(output.stdout).with_context(
-            || format!("{path} at {revision} is not UTF-8"),
-        )?))
-    } else {
-        Ok(None)
+        return Ok(Some(
+            String::from_utf8(output.stdout)
+                .with_context(|| format!("{path} at {revision} is not UTF-8"))?,
+        ));
     }
+    // git show fails alike for a file the revision lacks and a revision git lacks.
+    git(root, &["cat-file", "-e", &format!("{revision}^{{tree}}")])
+        .with_context(|| format!("git has no {revision} to read {path} at"))?;
+    Ok(None)
 }
 
 /// One changed file between a commit and the working tree.
@@ -764,6 +811,12 @@ mod tests {
             "the old content"
         );
         assert_eq!(show(&repo, &base, "new.txt").unwrap(), None, "absent then");
+        let unknown = "1111111111111111111111111111111111111111";
+        assert!(
+            format!("{:#}", show(&repo, unknown, "new.txt").unwrap_err())
+                .starts_with(&format!("git has no {unknown} to read new.txt at")),
+            "a commit git lacks is an error, never a missing file"
+        );
         assert!(
             merge_base(&repo, "nowhere").is_err(),
             "an unknown base fails"

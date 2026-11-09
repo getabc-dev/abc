@@ -28,8 +28,9 @@ fn checkout(temp: &Path) -> PathBuf {
     work
 }
 
-const REASONED: &str =
-    "Drops t.\n\n## Test changes\n\n- `src/t.rs`: the parser it covered is gone.\n";
+const REASONED: &str = "Drops t.\n\n## Test changes\n\n- `src/t.rs`: the parser it covered is \
+                        gone.\n\n## Review findings\n\nNone: `/code-review high` and \
+                        `/security-review` found nothing.\n";
 
 /// The description `text`, in a file under `dir`.
 fn body(dir: &Path, text: &str) -> PathBuf {
@@ -86,7 +87,11 @@ fn opens_only_what_integrity_the_review_and_the_rulesets_would_pass() {
             "t",
             body(
                 temp.path(),
-                &format!("{REASONED}- `src/u.rs::tests::gone`: from an earlier push.\n"),
+                &REASONED.replacen(
+                    "gone.\n",
+                    "gone.\n- `src/u.rs::tests::gone`: from an earlier push.\n",
+                    1,
+                ),
             ),
         ),
         &work,
@@ -155,6 +160,53 @@ fn opens_only_what_integrity_the_review_and_the_rulesets_would_pass() {
     assert!(detached.starts_with("HEAD is on no branch"), "{detached}");
 }
 
+/// #33: the B1 reviews found a data-loss bug and 8 more issues every gate passed, after the pull
+/// request opened. They run before it opens, and its description says what they found.
+#[test]
+fn opens_only_with_the_review_findings() {
+    let temp = tempfile::tempdir().unwrap();
+    let work = checkout(temp.path());
+    let unreviewed_text = REASONED.split("## Review findings").next().unwrap();
+    let unreviewed = refusal(open("t", body(temp.path(), unreviewed_text)), &work);
+    assert!(
+        unreviewed.contains("## Review findings")
+            && unreviewed.contains("/code-review high")
+            && unreviewed.contains("/security-review"),
+        "{unreviewed}"
+    );
+    let blank = refusal(
+        open(
+            "t",
+            body(
+                temp.path(),
+                &format!(
+                    "{unreviewed_text}## Review findings\n\n<!-- what they found -->\n\n## After\n\nx\n"
+                ),
+            ),
+        ),
+        &work,
+    );
+    assert!(blank.contains("## Review findings"), "{blank}");
+    for (text, why) in [
+        (
+            format!("{unreviewed_text}## Review findings\n## After\n\nx\n"),
+            "a heading right after the heading",
+        ),
+        (
+            format!("{unreviewed_text}### Review findings\n\nNone.\n"),
+            "another heading level",
+        ),
+    ] {
+        let refused = refusal(open("t", body(temp.path(), &text)), &work);
+        assert!(refused.contains("## Review findings"), "{why}: {refused}");
+    }
+    let crlf = REASONED.replace('\n', "\r\n");
+    assert!(
+        super::reviewed(&crlf),
+        "CRLF line endings, as a browser may send"
+    );
+}
+
 #[test]
 fn opens_through_the_rest_api() {
     let temp = tempfile::tempdir().unwrap();
@@ -170,7 +222,17 @@ fn opens_through_the_rest_api() {
         branch: "agent/x".to_owned(),
         base: "main".to_owned(),
     };
-    assert!(send(plan, temp.path(), &repo(), &mut reply, &mut out).unwrap());
+    assert!(
+        send(
+            plan,
+            temp.path(),
+            &repo(),
+            &mut reply,
+            &mut no_downloads,
+            &mut out
+        )
+        .unwrap()
+    );
     assert_eq!(out, "pr: opened #31 https://github.com/o/r/pull/31\n");
     assert_eq!(
         sent,
@@ -261,7 +323,7 @@ fn update(
         Ok(answer(request))
     };
     let mut out = String::new();
-    let result = send(plan, work, &repo(), &mut reply, &mut out);
+    let result = send(plan, work, &repo(), &mut reply, &mut no_downloads, &mut out);
     (result, out, sent)
 }
 
@@ -635,4 +697,138 @@ fn of_two_runs_in_one_second_the_first_listed_counts() {
     .unwrap()
     .unwrap();
     assert_eq!(push.pusher, APP_LOGIN);
+}
+
+/// #33 broke once #38 merged, and nothing said so before the merge. `pr checks` warns when the
+/// default branch moved, since the pull request's branch left it, on files the pull request
+/// changes, from GitHub's compare API.
+#[test]
+fn checks_warn_when_main_moved_on_the_pull_requests_files() {
+    let answer = |behind: u64, state: &'static str| {
+        move |request: &Request| -> Value {
+            match (request.method, request.path.as_str()) {
+                ("GET", "/repos/o/r/pulls/25") => {
+                    json!({"state": state, "base": {"ref": "main"}, "head": {"sha": "abc"}})
+                }
+                ("GET", "/repos/o/r/compare/abc...main") => json!({
+                    "ahead_by": behind,
+                    "files": [{"filename": "b.rs"}, {"filename": "c.rs", "previous_filename": "a.rs"}]
+                }),
+                ("GET", "/repos/o/r/compare/main...abc") => json!({
+                    "ahead_by": 3,
+                    "files": [{"filename": "a.rs"}, {"filename": "b.rs"}, {"filename": "d.rs"}]
+                }),
+                ("GET", path) if path.starts_with("/repos/o/r/actions/runs") => {
+                    json!({"workflow_runs": []})
+                }
+                ("POST", "/graphql") => {
+                    json!({"data": {"repository": {"pullRequest": {"commits": {"nodes": [
+                        {"commit": {"oid": "1111111111111111111111111111111111111111", "checkSuites": {"nodes": []}}}
+                    ]}}}}})
+                }
+                other => panic!("unexpected call {other:?}"),
+            }
+        }
+    };
+    let run = |behind: u64, state: &'static str| {
+        let reply = answer(behind, state);
+        let mut send = |request: &Request| Ok(reply(request));
+        let mut out = String::new();
+        let passed = send_plan(Plan::Checks(25), &mut send, &mut out);
+        (passed, out)
+    };
+    let (passed, out) = run(2, "open");
+    assert!(passed, "a warning, not a failure: {out}");
+    assert!(
+        out.starts_with(
+            "pr: warning: main moved on by 2 commit(s) since #25's branch left it, changing 2 \
+             file(s) #25 changes too:\n  a.rs\n  b.rs\npr: merge it into the branch (`git merge \
+             origin/main`), check again and push before #25 merges; never rebase a pushed \
+             branch\n#25 head at 111111111111"
+        ),
+        "{out}"
+    );
+    let (_, current) = run(0, "open");
+    let mut failing = |request: &Request| -> anyhow::Result<Value> {
+        if request.path.contains("/compare/") {
+            anyhow::bail!("GitHub answered 500: the diff is taking too long")
+        }
+        Ok(answer(2, "open")(request))
+    };
+    let mut unknown = String::new();
+    assert!(
+        send_plan(Plan::Checks(25), &mut failing, &mut unknown),
+        "a comparison that fails hides no check: {unknown}"
+    );
+    assert!(
+        unknown.starts_with(
+            "pr: could not compare #25 with its base branch, so whether it moved on is unknown: \
+             GitHub answered 500"
+        ) && unknown.contains("\n#25 head at 111111111111"),
+        "{unknown}"
+    );
+    assert!(current.starts_with("#25 head at"), "not behind: {current}");
+    let (_, merged) = run(2, "closed");
+    assert!(merged.starts_with("#25 head at"), "closed: {merged}");
+}
+
+/// Carries out `plan` for `o/r` through `send` in a checkout that is not used.
+fn send_plan(
+    plan: Plan,
+    send: &mut impl FnMut(&Request) -> anyhow::Result<Value>,
+    out: &mut String,
+) -> bool {
+    let temp = tempfile::tempdir().unwrap();
+    super::send(plan, temp.path(), &repo(), send, &mut no_downloads, out).unwrap()
+}
+
+/// A download where none is expected.
+fn no_downloads(url: &str) -> anyhow::Result<Vec<u8>> {
+    anyhow::bail!("no download expected: {url}")
+}
+
+/// Main moved on files the pull request does not change: nothing to warn about, unless GitHub's
+/// lists stop at their cap, which may hide a shared file.
+#[test]
+fn checks_warn_only_on_shared_files_or_a_capped_list() {
+    let warned = |main_files: Value| {
+        let mut send = |request: &Request| -> anyhow::Result<Value> {
+            Ok(match (request.method, request.path.as_str()) {
+                ("GET", "/repos/o/r/pulls/25") => {
+                    json!({"state": "open", "base": {"ref": "main"}, "head": {"sha": "abc"}})
+                }
+                ("GET", "/repos/o/r/compare/abc...main") => {
+                    json!({"ahead_by": 4, "files": main_files.clone()})
+                }
+                ("GET", "/repos/o/r/compare/main...abc") => {
+                    json!({"ahead_by": 1, "files": [{"filename": "mine.rs"}]})
+                }
+                ("GET", path) if path.starts_with("/repos/o/r/actions/runs") => {
+                    json!({"workflow_runs": []})
+                }
+                ("POST", "/graphql") => {
+                    json!({"data": {"repository": {"pullRequest": {"commits": {"nodes": [
+                        {"commit": {"oid": "1111111111111111111111111111111111111111", "checkSuites": {"nodes": []}}}
+                    ]}}}}})
+                }
+                other => anyhow::bail!("unexpected call {other:?}"),
+            })
+        };
+        let mut out = String::new();
+        send_plan(Plan::Checks(25), &mut send, &mut out);
+        out
+    };
+    let elsewhere = warned(json!([{"filename": "theirs.rs"}]));
+    assert!(elsewhere.starts_with("#25 head at"), "{elsewhere}");
+    let many: Vec<Value> = (0..300)
+        .map(|n| json!({"filename": format!("f{n}.rs")}))
+        .collect();
+    let capped = warned(Value::Array(many));
+    assert!(
+        capped.starts_with(
+            "pr: warning: main moved on by 4 commit(s) since #25's branch left it, changing 0 \
+             file(s) #25 changes too, or more: GitHub lists at most 300 files of a comparison:"
+        ),
+        "{capped}"
+    );
 }

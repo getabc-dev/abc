@@ -202,14 +202,14 @@ targets.aarch64-unknown-linux-gnu = { platform = "linux-arm64", sha256 = "439e9c
 [[tool]]
 name = "pnpm"
 for-tests = true
-version = "12.17.0"
+version = "12.18.0"
 url = "https://github.com/pnpm/pnpm/releases/download/v{version}/pnpm-{platform}.tar.gz"
 attestations = "pnpm/pnpm"
 binary = "pnpm"
 tree = true
-targets.aarch64-apple-darwin = { platform = "darwin-arm64", sha256 = "446c334d493bdfc6cc2db693764d1812fca06456f6a4be7996a13d7008780239", binary-sha256 = "be145d57690a2cabc1f770a62446c7b39a52af72ff2348fb9eaa69f1809bf250", tree-sha256 = "2f2889a8bc310ceee09fcf4058088da83c6e7d6a8e2fa8d211f2d8be7fbc21fb" }
-targets.x86_64-unknown-linux-gnu = { platform = "linux-x64", sha256 = "2c58959fd5df5cb9f4e72784c08a60ffc7ee558fed9b04b22254e29112203a51", binary-sha256 = "46e1d356cdef24c2f8a202de1b00e111fb95f2ded50f80f026ca5bcc0b8d6693", tree-sha256 = "58eb36f07771f4a0e2a48c67c442e424562c24f6ab2de5aef9deaf6b77e645c1" }
-targets.aarch64-unknown-linux-gnu = { platform = "linux-arm64", sha256 = "ce5a5b95a9974a0bbd713a5ef74416dbcd0e3fdf11f69ea92c5995b9c18ccb47", binary-sha256 = "cd5359326a79f3d24de2f6e1080581221737234fc201d8b5f660dc930966c264", tree-sha256 = "3da4057f5234394562bbb3787a6dada0a1fd6452d2017158bdede1b9ca66f648" }
+targets.aarch64-apple-darwin = { platform = "darwin-arm64", sha256 = "9b647f634d7e8f23162c9d3d1d0e0950d1152402ca0f4c331583ed7c75cd3706", binary-sha256 = "eff3e14790ea5d22613f1d87d02ce944c6e6ca75c9191480e9ca29bfceebc6bd", tree-sha256 = "42b78bcb462cb757102a81f191e2551077c11c08a61f6747d26b42b414fc915c" }
+targets.x86_64-unknown-linux-gnu = { platform = "linux-x64", sha256 = "3726060e236c0db3e7124c0a5af123c840ba0cb76682149b63ea0baf290017c2", binary-sha256 = "1664993489436fe2e357dca0dd5e7aed06791c5825dd08bee7aca93c33be96ee", tree-sha256 = "dcbe190f4fe0c259ee1e0f92c6e9bc4aa36344aad2d1a4b4e13180ad6ac38b83" }
+targets.aarch64-unknown-linux-gnu = { platform = "linux-arm64", sha256 = "700bd1aa4028465b80e62b7c5bec8455be60bbafaf53a3262a4ab8e2057712ac", binary-sha256 = "9f9690a716d4d676e0b81aef839c6d58536f6ac6ce554ab5143d55bada0e8a9d", tree-sha256 = "afb5ac40395eef9c00570b9c560ed830780895c64969581ba6338b9900b0bf42" }
 
 # The graph runner's spec (spec/): `cargo xtask spec` checks it with Quint and TLC. The JRE runs
 # Apalache and TLC; Quint transpiles a spec to TLA+ through Apalache's server and runs TLC from

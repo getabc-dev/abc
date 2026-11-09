@@ -156,8 +156,6 @@ pub(crate) fn repository_with_change(path: &Path, files: &[(&str, &str)]) -> Pat
     repo
 }
 
-/// The file at `path` in this repository, for a test that checks it. Read at run time from
-/// [`crate::repo_root`], never with `include_str!`, so the tests build in a copy of xtask/ alone.
 /// The checkout the tests read around xtask: the one xtask was built from, or, when xtask's tests
 /// run in a copy of `xtask/` alone, as `cargo xtask mutants` runs them, the checkout that names
 /// at run time in [`crate::mutants::TEST_REPOSITORY`]. Only tests read it; the shipped binary
@@ -167,6 +165,8 @@ pub(crate) fn checkout() -> PathBuf {
         .map_or_else(|| crate::repo_root().unwrap(), PathBuf::from)
 }
 
+/// The file at `path` in this repository, for a test that checks it. Read at run time from
+/// [`checkout`], never with `include_str!`, so the tests build in a copy of xtask/ alone.
 pub(crate) fn read_in_repository(path: &str) -> String {
     let file = checkout().join(path);
     fs::read_to_string(&file).unwrap_or_else(|error| panic!("{}: {error}", file.display()))

@@ -31,11 +31,11 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard, mpsc};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context as _, anyhow, bail};
 
-use crate::app::Scope;
+use crate::app::{Revoked, Scope};
 
 /// The brokers' sockets, relative to the home directory.
 pub(crate) const DIR: &str = ".config/abc/agent-broker";
@@ -190,11 +190,26 @@ fn exchange(
     }
 }
 
+/// How long an installation token lives: GitHub expires it an hour after it is minted.
+const TOKEN_LIFE: Duration = Duration::from_secs(3600);
+
+/// How many revocations a stopping broker sends at once.
+const REVOKERS: usize = 8;
+
+/// A token a broker minted, and when.
+#[derive(Debug)]
+struct Minted {
+    token: String,
+    at: Instant,
+    /// When it expires, for the user.
+    expires: SystemTime,
+}
+
 /// The tokens a broker minted: when, to keep to its hourly limit, and which, to revoke them.
 #[derive(Debug, Default)]
 struct Ledger {
     recent: VecDeque<Instant>,
-    minted: Vec<String>,
+    minted: Vec<Minted>,
 }
 
 impl Ledger {
@@ -286,7 +301,7 @@ pub(crate) fn serve(
     session: &str,
     files: &Files,
     mint: impl Fn(Scope) -> anyhow::Result<String> + Sync,
-    revoke: impl Fn(&str) -> anyhow::Result<()>,
+    revoke: impl Fn(&str) -> anyhow::Result<Revoked> + Sync,
     limit: usize,
     log: &mut (impl Write + Send),
 ) -> anyhow::Result<()> {
@@ -313,7 +328,13 @@ pub(crate) fn serve(
         // A token minted while the broker stops is still recorded, and so revoked: the broker
         // revokes only once every client's thread has ended.
         let token = mint(scope)?;
-        shared.ledger()?.minted.push(token.clone());
+        shared.ledger()?.minted.push(Minted {
+            token: token.clone(),
+            at: Instant::now(),
+            expires: SystemTime::now()
+                .checked_add(TOKEN_LIFE)
+                .unwrap_or(SystemTime::UNIX_EPOCH),
+        });
         Ok(token)
     };
     let (sender, stops) = mpsc::channel();
@@ -345,8 +366,7 @@ pub(crate) fn serve(
     })
     .context("the broker's stop channel closed")?;
     let minted = std::mem::take(&mut shared.ledger()?.minted);
-    let revoked = minted.iter().filter(|token| revoke(token).is_ok()).count();
-    let summary = format!("revoked {revoked} of {} tokens", minted.len());
+    let summary = revoke_all(&minted, &revoke, Instant::now()).to_string();
     let how = match &stop {
         Stop::Asked(_) => String::new(),
         Stop::Signal(signal) => format!(
@@ -366,6 +386,116 @@ pub(crate) fn serve(
             .and_then(|()| writeln!(asker, "stopped {summary}"));
     }
     Ok(())
+}
+
+/// What a stopping broker's revocations came to.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Revocations {
+    /// The tokens minted.
+    minted: usize,
+    /// Revoked now.
+    revoked: usize,
+    /// Already revoked by the command that used them, or expired between the check and the call.
+    already: usize,
+    /// Expired an hour after they were minted, so not sent.
+    expired: usize,
+    /// Could not be revoked: the latest of their expiries, and the first error.
+    failed: Vec<(SystemTime, String)>,
+}
+
+impl std::fmt::Display for Revocations {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "revoked {} of {} tokens", self.revoked, self.minted)?;
+        if self.already > 0 {
+            write!(
+                f,
+                "; {} already revoked by the command that used them",
+                self.already
+            )?;
+        }
+        if self.expired > 0 {
+            write!(f, "; {} expired", self.expired)?;
+        }
+        if let Some(latest) = self.failed.iter().map(|(expires, _)| *expires).max() {
+            let first = self
+                .failed
+                .first()
+                .map(|(_, error)| error.as_str())
+                .unwrap_or_default();
+            write!(
+                f,
+                "; WARNING: {} could not be revoked and stay valid until {} ({first})",
+                self.failed.len(),
+                clock(latest)
+            )?;
+        }
+        Ok(())
+    }
+}
+
+/// `when` as an hour and minute in UTC, rounded up, so a token is never said to expire before it
+/// does.
+fn clock(when: SystemTime) -> String {
+    let seconds = when
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs())
+        .saturating_add(59);
+    let minutes = seconds / 60;
+    format!("{:02}:{:02} UTC", (minutes / 60) % 24, minutes % 60)
+}
+
+/// Revokes every token of `minted` that has not expired by `now` with `revoke`, a few at a time.
+fn revoke_all(
+    minted: &[Minted],
+    revoke: &(impl Fn(&str) -> anyhow::Result<Revoked> + Sync),
+    now: Instant,
+) -> Revocations {
+    let (live, expired): (Vec<&Minted>, Vec<&Minted>) = minted
+        .iter()
+        .partition(|token| now.saturating_duration_since(token.at) < TOKEN_LIFE);
+    let size = live.len().div_ceil(REVOKERS).max(1);
+    let outcomes: Vec<(&Minted, anyhow::Result<Revoked>)> = std::thread::scope(|scope| {
+        #[expect(
+            clippy::needless_collect,
+            reason = "every worker starts before the first is joined"
+        )]
+        let workers: Vec<_> = live
+            .chunks(size)
+            .map(|chunk| {
+                let worker = scope.spawn(move || {
+                    chunk
+                        .iter()
+                        .map(|token| (*token, revoke(&token.token)))
+                        .collect::<Vec<_>>()
+                });
+                (chunk, worker)
+            })
+            .collect();
+        workers
+            .into_iter()
+            .flat_map(|(chunk, worker)| {
+                worker.join().unwrap_or_else(|_| {
+                    chunk
+                        .iter()
+                        .map(|token| (*token, Err(anyhow!("the revocation panicked"))))
+                        .collect()
+                })
+            })
+            .collect()
+    });
+    let mut done = Revocations {
+        minted: minted.len(),
+        expired: expired.len(),
+        ..Revocations::default()
+    };
+    for (token, outcome) in outcomes {
+        match outcome {
+            Ok(Revoked::Now) => done.revoked = done.revoked.saturating_add(1),
+            Ok(Revoked::Already) => done.already = done.already.saturating_add(1),
+            Err(error) => done.failed.push((token.expires, format!("{error:#}"))),
+        }
+    }
+    done
 }
 
 /// The clients `listener` accepts until `stopping` is set.
@@ -908,13 +1038,13 @@ mod tests {
     use std::os::unix::net::UnixStream;
     use std::path::Path;
     use std::sync::Mutex;
-    use std::time::Duration;
+    use std::time::{Duration, Instant, SystemTime};
 
     use super::{
-        DIR, Files, Ledger, STOP_PATIENCE, answer, answer_all, check_session, exchange, files,
-        request, serve, stop_at,
+        DIR, Files, Ledger, Minted, STOP_PATIENCE, answer, answer_all, check_session, clock,
+        exchange, files, request, revoke_all, serve, stop_at,
     };
-    use crate::app::Scope;
+    use crate::app::{Revoked, Scope};
 
     /// The broker's answer to `request`, with `mint` minting, and the scope it reports.
     fn ask(request: &[u8], mint: impl Fn(Scope) -> anyhow::Result<String>) -> (String, String) {
@@ -1242,7 +1372,7 @@ mod tests {
     #[test]
     fn keeps_to_its_hourly_limit() {
         let mut ledger = Ledger::default();
-        let start = std::time::Instant::now();
+        let start = Instant::now();
         ledger.admit(start, 2).unwrap();
         ledger.admit(start, 2).unwrap();
         let error = format!("{:#}", ledger.admit(start, 2).unwrap_err());
@@ -1255,6 +1385,88 @@ mod tests {
         let later = start + Duration::from_secs(3600);
         ledger.admit(later, 2).unwrap();
         assert_eq!(ledger.recent.len(), 1, "the old ones aged out");
+    }
+
+    /// A minted token for [`revoke_all`]: minted `ago` before `now`, expiring an hour after.
+    fn minted(token: &str, now: Instant, ago: Duration) -> Minted {
+        Minted {
+            token: token.to_owned(),
+            at: now.checked_sub(ago).unwrap(),
+            // 15:30 UTC, less `ago`.
+            expires: SystemTime::UNIX_EPOCH
+                .checked_add(Duration::from_mins(930))
+                .and_then(|at| at.checked_sub(ago))
+                .unwrap(),
+        }
+    }
+
+    /// `vm stop` said "revoked 0 of 20 tokens" though every token was harmless: `cargo xtask gh`
+    /// and `pr` had revoked their own, so GitHub answered 401 to the broker's second revocation,
+    /// which counted as a failure. Now a token GitHub no longer takes is already revoked, an
+    /// expired one is not sent, and only a real failure is a warning naming how long the tokens
+    /// it left stay valid.
+    #[test]
+    fn revocation_tells_revoked_already_revoked_expired_and_failed_apart() {
+        let now = Instant::now();
+        let tokens = [
+            minted("ghs_live", now, Duration::from_secs(60)),
+            minted("ghs_used", now, Duration::from_secs(120)),
+            minted("ghs_old", now, Duration::from_secs(3_600)),
+            minted("ghs_down", now, Duration::from_secs(30)),
+            minted("ghs_down2", now, Duration::from_secs(600)),
+        ];
+        let asked = Mutex::new(Vec::new());
+        let done = revoke_all(
+            &tokens,
+            &|token: &str| {
+                asked.lock().unwrap().push(token.to_owned());
+                match token {
+                    "ghs_live" => Ok(Revoked::Now),
+                    "ghs_used" => Ok(Revoked::Already),
+                    _ => anyhow::bail!("GitHub answered 502"),
+                }
+            },
+            now,
+        );
+        let mut asked = asked.into_inner().unwrap();
+        asked.sort();
+        assert_eq!(
+            asked,
+            ["ghs_down", "ghs_down2", "ghs_live", "ghs_used"],
+            "an expired token is not sent"
+        );
+        assert_eq!(
+            (
+                done.minted,
+                done.revoked,
+                done.already,
+                done.expired,
+                done.failed.len()
+            ),
+            (5, 1, 1, 1, 2)
+        );
+        assert_eq!(
+            done.to_string(),
+            "revoked 1 of 5 tokens; 1 already revoked by the command that used them; 1 expired; \
+             WARNING: 2 could not be revoked and stay valid until 15:30 UTC (GitHub answered 502)",
+            "the latest expiry of the failed ones, rounded up to the minute"
+        );
+        let clean = revoke_all(&tokens[..1], &|_: &str| Ok(Revoked::Now), now);
+        assert_eq!(clean.to_string(), "revoked 1 of 1 tokens");
+        assert_eq!(
+            revoke_all(&[], &|_: &str| Ok(Revoked::Now), now).to_string(),
+            "revoked 0 of 0 tokens"
+        );
+    }
+
+    #[test]
+    fn a_time_is_said_in_utc_rounded_up_to_the_minute() {
+        let at = |seconds: u64| SystemTime::UNIX_EPOCH + Duration::from_secs(seconds);
+        assert_eq!(clock(at(0)), "00:00 UTC");
+        assert_eq!(clock(at(1)), "00:01 UTC");
+        assert_eq!(clock(at(60)), "00:01 UTC");
+        assert_eq!(clock(at(86_400 + 3_600 * 23 + 59 * 60 + 1)), "00:00 UTC");
+        assert_eq!(clock(at(3_600 * 13 + 60 * 7)), "13:07 UTC");
     }
 
     /// A broker for session `abc-w` under `dir`, minting `ghs_<scope><n>` at most `limit` an
@@ -1286,8 +1498,11 @@ mod tests {
                 },
                 |token| {
                     record.lock().unwrap().push(token.to_owned());
-                    anyhow::ensure!(token != "ghs_git1", "already gone");
-                    Ok(())
+                    Ok(if token == "ghs_git1" {
+                        Revoked::Already
+                    } else {
+                        Revoked::Now
+                    })
                 },
                 limit,
                 &mut log,
@@ -1338,13 +1553,15 @@ mod tests {
         assert!(said.starts_with("error "), "{said}");
         assert_eq!(
             stop_at(&sockets.control, STOP_PATIENCE).unwrap(),
-            "revoked 1 of 2 tokens"
+            "revoked 1 of 2 tokens; 1 already revoked by the command that used them"
         );
         let log = thread.join().unwrap();
-        assert_eq!(*revoked.lock().unwrap(), ["ghs_git0", "ghs_git1"]);
+        let mut asked = revoked.lock().unwrap().clone();
+        asked.sort();
+        assert_eq!(asked, ["ghs_git0", "ghs_git1"]);
         assert!(log.contains("broker abc-w: minted a git token"), "{log}");
         assert!(
-            log.contains("broker abc-w: stopped; revoked 1 of 2 tokens"),
+            log.contains("broker abc-w: stopped; revoked 1 of 2 tokens; 1 already revoked"),
             "{log}"
         );
         assert!(!log.contains("ghs_"), "no token is logged: {log}");
@@ -1373,7 +1590,7 @@ mod tests {
                 "abc-w",
                 &sockets,
                 |_| Ok(String::new()),
-                |_| Ok(()),
+                |_| Ok(Revoked::Now),
                 1,
                 &mut std::io::sink()
             )
@@ -1462,7 +1679,7 @@ mod tests {
         assert_eq!(request(&sockets.tokens, Scope::Git).unwrap(), "ghs_git0");
         let trickler = trickle(&sockets.tokens);
         std::thread::sleep(Duration::from_millis(200));
-        let started = std::time::Instant::now();
+        let started = Instant::now();
         assert_eq!(
             stop_at(&sockets.control, Duration::from_secs(3)).unwrap(),
             "revoked 1 of 1 tokens"
@@ -1510,8 +1727,8 @@ mod tests {
         let (_client, server) = UnixStream::pair().unwrap();
         let mut timed = super::Timed {
             stream: &server,
-            deadline: std::time::Instant::now() + Duration::from_millis(100),
-            now: std::time::Instant::now,
+            deadline: Instant::now() + Duration::from_millis(100),
+            now: Instant::now,
         };
         let read = std::io::Read::read(&mut timed, &mut [0; 8]);
         assert_eq!(
@@ -1531,7 +1748,7 @@ mod tests {
     fn a_client_has_its_patience_in_all_not_per_read() {
         /// A client that sends one byte 50 ms after each read starts, on `clock`.
         struct Trickler<'a> {
-            clock: &'a std::cell::Cell<std::time::Instant>,
+            clock: &'a std::cell::Cell<Instant>,
             waits: Vec<Duration>,
         }
         impl super::Patient for &mut Trickler<'_> {
@@ -1557,7 +1774,7 @@ mod tests {
         }
 
         for (millis, bytes, last_wait) in [(400, 8, None), (420, 8, Some(20))] {
-            let started = std::time::Instant::now();
+            let started = Instant::now();
             let clock = std::cell::Cell::new(started);
             let mut trickler = Trickler {
                 clock: &clock,
@@ -1786,7 +2003,7 @@ mod tests {
 
     #[test]
     fn waits_as_long_as_its_patience_and_no_longer() {
-        let started = std::time::Instant::now();
+        let started = Instant::now();
         let mut asked = 0;
         assert!(!super::within(Duration::from_millis(600), || {
             asked += 1;
