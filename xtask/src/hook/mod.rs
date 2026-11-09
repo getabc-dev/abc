@@ -875,13 +875,9 @@ fn git_in(dir: &Path) -> Command {
 /// Hands the hook to the checkout at `root`, which builds and runs its own xtask with its own
 /// toolchain, and reads its answer. An xtask that cannot start there is an error.
 fn delegate(cargo: &Path, root: &Path, event: Event, input: &str) -> anyhow::Result<Answer> {
-    let mut child = Command::new(cargo)
+    let mut child = tools::own_xtask(cargo, root)
         .args(XTASK_HOOK)
         .arg(event.name())
-        .current_dir(root)
-        // Let the checkout's rust-toolchain.toml choose the toolchain, not the one running here.
-        .env_remove("RUSTUP_TOOLCHAIN")
-        .env_remove("CARGO")
         .env(DELEGATED, OsStr::new("1"))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
