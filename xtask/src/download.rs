@@ -7,8 +7,10 @@
 //! [`Patience::window`], ends the attempt. A failed attempt that may pass on its own (a timeout, a
 //! reset, a body that ended early, or a 408, 429 or 5xx answer) is tried again after the next
 //! delay of [`Patience::retries`], resuming from the bytes already received with a `Range`
-//! request. An answer that does not resume where asked starts over. Any other failure, such as a
-//! 404, ends the download at once.
+//! request whose `If-Range` names the file they came from, so a file replaced since comes whole. An answer that does not resume where asked, or a 416 to that request (nothing lies
+//! past the bytes kept), starts over. Any other failure, such as a 404 or a 416 to a request for
+//! the whole file, ends the download at once. Starting over is not progress: the retries in a
+//! row are counted again only once the body grows past the most bytes it has held.
 
 use std::io::Write;
 use std::time::{Duration, Instant};
@@ -68,19 +70,23 @@ pub(crate) fn fetch(
         .build()
         .into();
     let mut body = Vec::new();
-    // Retries in a row that brought nothing new: an attempt that adds to the bytes kept starts
-    // the count again, so a long download on a network that resets often still finishes.
+    // Retries in a row that brought nothing new: an attempt that holds more bytes than any
+    // before it starts the count again, so a long download on a network that resets often still
+    // finishes, while one that starts over and refills only bytes it held before is no progress.
     let mut idle = 0_usize;
+    let mut most = 0_usize;
+    // What the server named the file the bytes kept came from, for `If-Range`.
+    let mut validator = None;
     loop {
-        let kept = body.len();
-        let error = match attempt(&agent, url, limit, patience, &mut body) {
+        let error = match attempt(&agent, url, limit, patience, &mut body, &mut validator) {
             Ok(()) => return Ok(body),
             Err(Failure::Final(error)) => {
                 return Err(error.context(format!("could not download {url}")));
             }
             Err(Failure::Transient(error)) => error,
         };
-        if body.len() > kept {
+        if body.len() > most {
+            most = body.len();
             idle = 0;
         }
         let Some(&delay) = patience.retries.get(idle) else {
@@ -102,26 +108,33 @@ pub(crate) fn fetch(
 }
 
 /// One attempt at `url`, adding to `body` what it receives: from the start when `body` is empty
-/// or the server does not resume, and from where `body` ends otherwise.
+/// or the server does not resume, and from where `body` ends otherwise. A resume carries
+/// `validator`, which a fresh answer replaces, as `If-Range`, so a server whose file changed
+/// answers it whole.
 fn attempt(
     agent: &ureq::Agent,
     url: &str,
     limit: u64,
     patience: &Patience,
     body: &mut Vec<u8>,
+    validator: &mut Option<String>,
 ) -> Result<(), Failure> {
     let mut request = agent.get(url).header("Accept-Encoding", "identity");
     let from = u64::try_from(body.len()).map_err(|error| Failure::Final(error.into()))?;
     if from > 0 {
         request = request.header("Range", &format!("bytes={from}-"));
+        if let Some(validator) = validator.as_deref() {
+            request = request.header("If-Range", validator);
+        }
     }
     let response = request.call().map_err(|error| {
         if from > 0 && matches!(error, ureq::Error::StatusCode(416)) {
-            // Every byte arrived before the last attempt broke off, so no range is left to ask
-            // for: the end of the body was never confirmed, so fetch it whole again.
+            // Nothing lies past the bytes kept: either every byte arrived before the last attempt
+            // broke off without confirming the end of the body, or the file changed and is now
+            // shorter. The bytes kept cannot be trusted in either case, so fetch it whole again.
             body.clear();
             return Failure::Transient(anyhow!(
-                "the server has nothing past byte {from}; starting over"
+                "the server has nothing past byte {from} (416); starting over"
             ));
         }
         // ureq's errors are non-exhaustive: any but these is final.
@@ -168,6 +181,7 @@ fn attempt(
         }
         200 => {
             body.clear();
+            *validator = range_validator(response.headers());
             response.body().content_length()
         }
         status => {
@@ -191,6 +205,15 @@ fn attempt(
         patience,
         body,
     )
+}
+
+/// What names a file's version for `If-Range`: its `ETag` when strong, since a weak one may not
+/// validate a range (RFC 9110, 13.1.5), else its `Last-Modified`.
+fn range_validator(headers: &ureq::http::HeaderMap) -> Option<String> {
+    let value = |name| headers.get(name)?.to_str().ok().map(str::to_owned);
+    value("ETag")
+        .filter(|tag| !tag.starts_with("W/"))
+        .or_else(|| value("Last-Modified"))
 }
 
 /// Reads `reader` to its end onto `body`, which must stay within `limit` bytes and come to
@@ -380,9 +403,13 @@ mod tests {
     }
 
     fn range_header(head: &str) -> Option<&str> {
+        header(head, "range")
+    }
+
+    fn header<'a>(head: &'a str, wanted: &str) -> Option<&'a str> {
         head.lines().find_map(|line| {
             let (name, value) = line.split_once(':')?;
-            name.eq_ignore_ascii_case("range").then(|| value.trim())
+            name.eq_ignore_ascii_case(wanted).then(|| value.trim())
         })
     }
 
@@ -534,7 +561,47 @@ mod tests {
         assert_eq!(range_header(&requests[2]), None, "starts over");
     }
 
-    /// A missing file does not appear by asking again.
+    /// A resume names the file it continues with `If-Range`, the strong `ETag` it first came
+    /// with, else its `Last-Modified`, so a file replaced since answers whole with 200 and is
+    /// never spliced onto the old one's first bytes.
+    #[test]
+    fn a_resume_names_the_file_it_continues() {
+        let whole = body();
+        let length = LENGTH;
+        let replaced: Vec<u8> = whole.iter().map(|byte| byte ^ 0xff).collect();
+        let (url, server) = server(vec![
+            Serve::Stall(
+                format!("Content-Length: {length}\r\nETag: \"v1\"\r\n"),
+                whole[..1000].to_vec(),
+                Duration::from_secs(1),
+            ),
+            Serve::Stall(
+                format!(
+                    "Content-Length: {length}\r\nETag: W/\"weak\"\r\n\
+                     Last-Modified: Mon, 09 Nov 2026 10:00:00 GMT\r\n"
+                ),
+                replaced[..1000].to_vec(),
+                Duration::from_secs(1),
+            ),
+            Serve::Whole(
+                "200 OK",
+                format!("Content-Length: {length}\r\n"),
+                replaced.clone(),
+            ),
+        ]);
+        let got = fetch(&url, 1 << 20, &quick(), &mut |_| {}, &mut Vec::new()).unwrap();
+        assert!(got == replaced, "the replaced file whole, not spliced");
+        let requests = server.join().unwrap();
+        assert_eq!(header(&requests[0], "if-range"), None, "a fresh request");
+        assert_eq!(header(&requests[1], "if-range"), Some("\"v1\""));
+        assert_eq!(range_header(&requests[1]), Some("bytes=1000-"));
+        assert_eq!(
+            header(&requests[2], "if-range"),
+            Some("Mon, 09 Nov 2026 10:00:00 GMT"),
+            "a weak ETag cannot validate a range"
+        );
+    }
+
     /// A body without a length that broke off after its last byte leaves nothing to resume: the
     /// server answers the range with 416, and the download starts over, since the end of the
     /// body was never confirmed.
@@ -565,11 +632,48 @@ mod tests {
         assert_eq!(range_header(&requests[2]), None, "the whole again");
         let notes = String::from_utf8(notes).unwrap();
         assert!(
-            notes.contains("the server has nothing past byte 7; starting over"),
+            notes.contains("the server has nothing past byte 7 (416); starting over"),
             "{notes}"
         );
     }
 
+    /// A body that keeps breaking off after its last byte keeps being started over, and each
+    /// start over brings back only bytes held before: that is no progress, so the download gives
+    /// up once the retries are spent rather than looping forever.
+    #[test]
+    fn starting_over_is_not_progress() {
+        let broken = || {
+            Serve::Whole(
+                "200 OK",
+                "Transfer-Encoding: chunked\r\n".to_owned(),
+                b"7\r\narchive\r\n".to_vec(),
+            )
+        };
+        let refused = || {
+            Serve::Whole(
+                "416 Range Not Satisfiable",
+                "Content-Range: bytes */7\r\nContent-Length: 0\r\n".to_owned(),
+                Vec::new(),
+            )
+        };
+        let (url, server) = server(vec![broken(), refused(), broken(), refused()]);
+        let mut slept = 0;
+        let error = fetch(
+            &url,
+            1 << 20,
+            &quick(),
+            &mut |_| slept += 1,
+            &mut Vec::new(),
+        )
+        .unwrap_err();
+        let error = format!("{error:#}");
+        assert!(error.contains("gave up after 4 attempts"), "{error}");
+        assert!(error.contains("nothing past byte 7"), "{error}");
+        assert_eq!(slept, 3);
+        assert_eq!(server.join().unwrap().len(), 4);
+    }
+
+    /// A missing file does not appear by asking again.
     #[test]
     fn a_not_found_fails_at_once() {
         let (url, server) = server(vec![Serve::Whole(

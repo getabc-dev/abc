@@ -1154,17 +1154,18 @@ fn pins_of(
         return Ok(vec![Pin::Crate(sha256)]);
     }
     let mut pins = Vec::new();
-    // One archive may serve every target, as Apalache's does: fetch each URL once.
-    let mut archives: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+    // One archive may serve every target, as Apalache's does: it is fetched and its attestation
+    // checked once. Only the last archive is held, so targets with archives of their own never
+    // hold more than one in memory.
+    let mut last: Option<(String, Vec<u8>)> = None;
+    let mut attested = BTreeSet::new();
     for target in Target::ALL {
         let asset = tool.asset(target)?;
         let url = tool.download_url(target)?;
-        if !archives.contains_key(&url) {
-            archives.insert(url.clone(), fetch(&url)?);
-        }
-        let archive: &[u8] = archives
-            .get(&url)
-            .context("the archive was fetched above")?;
+        let archive: &[u8] = match &mut last {
+            Some((held, archive)) if *held == url => archive,
+            slot => &slot.insert((url.clone(), fetch(&url)?)).1,
+        };
         let sha256 = sha256_hex(archive);
         let mut sources = Vec::new();
         if let Some(template) = &tool.checksums {
@@ -1174,8 +1175,11 @@ fn pins_of(
             sources.push("matches the published checksum".to_owned());
         }
         if let Some(repository) = &tool.attestations {
-            check_attested(repository, &sha256, fetch)
-                .with_context(|| format!("{} {} on {target}", tool.name, tool.version))?;
+            if !attested.contains(&sha256) {
+                check_attested(repository, &sha256, fetch)
+                    .with_context(|| format!("{} {} on {target}", tool.name, tool.version))?;
+                attested.insert(sha256.clone());
+            }
             sources.push(format!("attested on GitHub by {repository}"));
         }
         if let Some(template) = &tool.release_digests {
@@ -3058,20 +3062,28 @@ targets.aarch64-unknown-linux-gnu = {{ platform = "linux-arm64", sha256 = "{sha2
     /// One archive that serves every target, as Apalache's does, is downloaded once and pinned
     /// for each target.
     #[test]
-    fn an_archive_every_target_shares_is_fetched_once() {
+    fn an_archive_every_target_shares_is_fetched_and_checked_once() {
         let archive = tarball(&[("fake-1.2.3/fake", SCRIPT, 0o755)]);
         let text = manifest_text(SHA_A, SHA_B).replace("-{platform}.tar.gz", ".tar.gz");
         let mut serve = serving(&archive);
-        let mut archives = Vec::new();
+        let mut fetched = Vec::new();
         let mut fetch = |url: &str| {
-            if !url.contains("/attestations/") {
-                archives.push(url.to_owned());
-            }
+            fetched.push(url.to_owned());
             serve(url)
         };
         let pinned = pin_each(&text, None, &mut Vec::new(), &mut fetch).unwrap();
         pinned.result().unwrap();
-        assert_eq!(archives, ["https://example.com/fake-1.2.3.tar.gz"]);
+        assert_eq!(
+            fetched,
+            [
+                "https://example.com/fake-1.2.3.tar.gz".to_owned(),
+                format!(
+                    "https://api.github.com/repos/example/fake/attestations/sha256:{}",
+                    sha256_hex(&archive)
+                ),
+            ],
+            "the archive is fetched and checked once"
+        );
         assert_eq!(
             pinned.text.matches(&sha256_hex(&archive)).count(),
             3,
