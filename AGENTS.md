@@ -187,8 +187,8 @@ fuzz/deny.toml --locked check`, `cargo xtask tool cargo-shear --deny-warnings --
 on xtask's (`cargo xtask tool cargo-deny --manifest-path xtask/Cargo.toml --config xtask/deny.toml
 --locked check`, `cargo xtask tool cargo-shear --deny-warnings --locked xtask`), `cargo xtask tool
 osv-scanner scan source --lockfile Cargo.lock --lockfile fuzz/Cargo.lock --lockfile
-xtask/Cargo.lock --lockfile web/pnpm-lock.yaml` (which reads `web/osv-scanner.toml` for the web
-lockfile: each ignored advisory there names its reason and an `ignoreUntil` date, after which the
+xtask/Cargo.lock --lockfile web/pnpm-lock.yaml` (which reads `osv-scanner.toml` for `Cargo.lock` and `web/osv-scanner.toml` for the web
+lockfile: each ignored advisory in them names its reason and an `ignoreUntil` date, after which the
 scan fails again unless someone renews it on purpose), `cargo xtask tool zizmor --pedantic .github`, `cargo xtask tool pinact run --check --verify-comment` and
 `cargo xtask tool gitleaks git --redact --no-banner --verbose .`. Every job is a required check on
 `main`. The release itself (`release.yml`) runs only on a tag `v*` the maintainer pushes, one
@@ -222,7 +222,7 @@ changes no tests.
 
 The gate files are the files that decide what passes: CI and rulesets (`.github/`), cargo, lint,
 toolchain and tool configuration, `Cargo.toml` and `Cargo.lock` (the fuzz workspace's too, with
-`fuzz/deny.toml`), the web app's manifest, lockfile, pnpm, TypeScript, Vite, Biome, Oxlint, knip, Playwright and
+`fuzz/deny.toml`), osv-scanner's configuration for `Cargo.lock`, the web app's manifest, lockfile, pnpm, TypeScript, Vite, Biome, Oxlint, knip, Playwright and
 osv-scanner configuration, the agent settings, this file and `CLAUDE.md`, all of `xtask/`, its
 workspace's manifest, lockfile and `deny.toml` included, and the formal specs in `spec/` (brief
 decision 68): a spec's properties judge the code as tests do, and integrity does not read Quint. `GATES` in

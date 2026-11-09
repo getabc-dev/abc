@@ -16,6 +16,7 @@
 /fuzz/Cargo.lock          @snehilvj
 /fuzz/Cargo.toml          @snehilvj
 /fuzz/deny.toml           @snehilvj
+/osv-scanner.toml         @snehilvj
 /rust-toolchain.toml      @snehilvj
 /rustfmt.toml             @snehilvj
 /spec/                    @snehilvj

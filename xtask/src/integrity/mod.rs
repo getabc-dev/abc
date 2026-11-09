@@ -35,7 +35,7 @@ use crate::git;
 /// The gate files: whatever decides what passes. CODEOWNERS patterns, the single list both the
 /// check and `.github/CODEOWNERS` follow: a trailing `/` covers a directory, anything else is one
 /// file, both from the repository root.
-pub(crate) const GATES: [&str; 31] = [
+pub(crate) const GATES: [&str; 32] = [
     "/.cargo/",
     "/.claude/settings.json",
     "/.config/",
@@ -51,6 +51,7 @@ pub(crate) const GATES: [&str; 31] = [
     "/fuzz/Cargo.lock",
     "/fuzz/Cargo.toml",
     "/fuzz/deny.toml",
+    "/osv-scanner.toml",
     "/rust-toolchain.toml",
     "/rustfmt.toml",
     "/spec/",
@@ -652,6 +653,7 @@ mod tests {
             "xtask/src/tools.rs",
             "xtask/Cargo.toml",
             ".claude/settings.json",
+            "osv-scanner.toml",
             "web/osv-scanner.toml",
             "spec/runner/runner.qnt",
         ] {
@@ -675,27 +677,34 @@ mod tests {
     /// it on purpose.
     #[test]
     fn every_osv_ignore_names_its_reason_and_expires() {
-        let config: toml_edit::DocumentMut =
-            crate::testing::read_in_repository("web/osv-scanner.toml")
-                .parse()
-                .unwrap();
-        let ignores = config["IgnoredVulns"].as_array_of_tables().unwrap();
-        assert!(!ignores.is_empty(), "the config ignores something");
-        for ignore in ignores {
-            let id = ignore["id"].as_str().unwrap();
-            assert!(id.starts_with("GHSA-"), "{id} is one advisory");
-            assert!(
-                ignore["ignoreUntil"].as_datetime().is_some(),
-                "{id} has an ignoreUntil date"
-            );
-            assert!(
-                ignore["reason"]
-                    .as_str()
-                    .is_some_and(|reason| reason.len() > 40),
-                "{id} says why"
-            );
-            let keys: Vec<&str> = ignore.iter().map(|(key, _)| key).collect();
-            assert_eq!(keys, ["id", "ignoreUntil", "reason"], "{id}'s fields");
+        for file in ["osv-scanner.toml", "web/osv-scanner.toml"] {
+            let config: toml_edit::DocumentMut =
+                crate::testing::read_in_repository(file).parse().unwrap();
+            let ignores = config["IgnoredVulns"].as_array_of_tables().unwrap();
+            assert!(!ignores.is_empty(), "{file} ignores something");
+            for ignore in ignores {
+                let id = ignore["id"].as_str().unwrap();
+                assert!(
+                    id.starts_with("GHSA-") || id.starts_with("RUSTSEC-"),
+                    "{file}: {id} is one advisory"
+                );
+                assert!(
+                    ignore["ignoreUntil"].as_datetime().is_some(),
+                    "{file}: {id} has an ignoreUntil date"
+                );
+                assert!(
+                    ignore["reason"]
+                        .as_str()
+                        .is_some_and(|reason| reason.len() > 40),
+                    "{file}: {id} says why"
+                );
+                let keys: Vec<&str> = ignore.iter().map(|(key, _)| key).collect();
+                assert_eq!(
+                    keys,
+                    ["id", "ignoreUntil", "reason"],
+                    "{file}: {id}'s fields"
+                );
+            }
         }
     }
 
