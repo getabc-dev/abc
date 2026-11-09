@@ -10,16 +10,21 @@ describe the design being built, not features you can use today.
 ## Install
 
 From its first release, Homebrew installs abc on macOS 12 or newer and on Linux with glibc 2.28 or
-newer (RHEL 8, Debian 10, Ubuntu 20.04 and later), on arm64 or x86_64:
+newer (RHEL 8, Debian 10, Ubuntu 20.04 and later), on arm64 or x86_64, and one command makes the
+machine abc's server:
 
 ```sh
 brew install getabc-dev/tap/abc
+abc server setup
 ```
 
-That installs the `abc` binary, Postgres 18, and abc's own private `tailscaled`, which stays in
-abc's directory and off your `PATH`, so your own `tailscale` command is never shadowed. Setting up
-a server from there, with one command that runs them for you, is the next step being built; until
-it lands, an install gives you the binary alone.
+Homebrew installs the `abc` binary, Postgres 18, and abc's own private `tailscaled` and `tailscale`,
+which stay in abc's directory and off your `PATH`, so your own `tailscale` command is never
+shadowed. Setup runs a private Postgres and abc's own Tailscale node, asks for your password once
+(Tailscale lets only root point Serve at abc), installs the services that keep them running, and
+opens the claim page in your browser with a setup code filled in. It never touches the Tailscale
+you already run. [Running abc's server](docs/server.md) covers what it sets up,
+`abc server status`, upgrades, backups and uninstalling.
 
 ## How a change moves
 
@@ -53,6 +58,7 @@ code follows.
 
 ## Links
 
+- [Running abc's server](docs/server.md)
 - [Contributing](CONTRIBUTING.md), including the AI policy
 - [Security policy](SECURITY.md) and the [threat model](docs/threat-model.md)
 - [Code of conduct](CODE_OF_CONDUCT.md)

@@ -1,0 +1,14 @@
+#!/bin/sh
+# A stand-in for abc's tailscaled: records how it was started and runs until stopped.
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
+# shellcheck source-path=SCRIPTDIR source=../bin/lib.sh
+. "$ROOT/bin/lib.sh"
+record tailscaled "$@"
+# Without TS_LOGS_DIR, tailscaled keeps its log state in the system's Tailscale directory
+# (/var/db/tailscale, /var/lib/tailscale) when it exists, beside the user's own Tailscale.
+if [ -z "${TS_LOGS_DIR:-}" ] || [ ! -d "$TS_LOGS_DIR" ]; then
+	echo "logpolicy: using system state directory \"/var/lib/tailscale\"" >&2
+	exit 1
+fi
+echo "$$" >"$STATE/tailscaled.daemon"
+exec sleep 86400

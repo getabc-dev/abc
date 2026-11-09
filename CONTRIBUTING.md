@@ -54,7 +54,35 @@ cargo xtask build    # web/dist with the pinned pnpm, then target/release/abc wi
 ```
 
 A plain `cargo build` of the `abc` crate without a web build fails and names `cargo xtask build`.
-`abc server` serves the app on its sidecar socket beside the API, behind the Tailscale sidecar.
+`abc server` serves the app on its sidecar socket beside the API, behind Tailscale Serve.
+
+### abc's server stack
+
+`abc server setup` (crate `abc-host`) runs the server the way a user's machine does: a private
+Postgres 18, abc's own unprivileged tailscaled as the tailnet node `abc`, and abc server, as
+launchd agents (`~/Library/LaunchAgents/dev.getabc.{postgres,tailscaled,server}.plist`) or
+systemd user units (`~/.config/systemd/user/abc-{postgres,tailscaled,server}.service`), all under
+one private home (`~/Library/Application Support/abc/server`, or `~/.local/share/abc/server`).
+[docs/server.md](docs/server.md) shows the layout and the commands. A build outside Homebrew has
+no `libexec/` beside it, so name the programs in the home's `config.toml` before the first
+`abc server setup`:
+
+```toml
+format = 1
+ops_addr = "127.0.0.1:7071"
+
+[programs]
+abc = "/path/to/abc/target/release/abc"
+tailscaled = "/path/to/tailscaled"
+tailscale = "/path/to/tailscale"
+postgres = "/opt/homebrew/opt/postgresql@18/bin"
+```
+
+Its tests run against fakes of launchctl, systemctl, loginctl, sudo, the browser, tailscaled and
+the tailscale CLI (`crates/abc-host/tests/fakes`), which record every call and run what each
+service definition says. `crates/abc/tests/server_setup.rs` runs the real abc server on a real
+Postgres 18 under them: the pinned `postgresql` tool's, which `cargo xtask setup` installs
+and `cargo xtask check` hands the test as `ABC_TEST_POSTGRES_BIN`.
 
 To work on the web app with Vite's dev server and its instant reloads:
 
@@ -274,10 +302,6 @@ Every pull request that changes what a release builds from (the workspace, the w
 `packaging/`, xtask or the two release workflows) runs the same builds, formula and installs, with
 Rust caches, as the `Release dry run` check (`.github/workflows/release-dry-run.yml`), publishing
 nothing; any other pull request skips them, and the check passes. A release never reads a cache.
-
-**No tag `v*` is pushed before I2 lands.** The formula already installs Postgres 18 and abc's
-tailscaled and tailscale, the foundation `abc server setup` (I2) builds on, but until I2 an install
-gives a binary that sets nothing up.
 
 1. **Bump the version.** In a pull request, set `[workspace.package] version` in `Cargo.toml` to
    the new release number, then update both lockfiles that name the workspace's crates, since

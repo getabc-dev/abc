@@ -12,12 +12,14 @@ type RouterContext = {
   readonly queryClient: QueryClient;
   /** The origin the app was loaded from: the server's public URL. */
   readonly origin: string;
+  /** The setup code the claim link carried (`claim/link.ts`), or "". */
+  readonly setupCode: string;
 };
 
 function Root() {
-  const { api, origin } = Route.useRouteContext();
+  const { api, origin, setupCode } = Route.useRouteContext();
   return (
-    <SessionGate api={api} origin={origin}>
+    <SessionGate api={api} origin={origin} setupCode={setupCode}>
       <Outlet />
     </SessionGate>
   );

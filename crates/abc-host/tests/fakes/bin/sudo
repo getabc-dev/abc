@@ -1,0 +1,19 @@
+#!/bin/sh
+# A stand-in for sudo: records the command, then runs it as "root", which the fakes read from
+# FAKE_ROOT. With state/sudo-refuses it fails as a wrong password does, and with
+# state/sudo-does-nothing it succeeds without running anything.
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
+# shellcheck source-path=SCRIPTDIR source=lib.sh
+. "$ROOT/bin/lib.sh"
+record sudo "$@"
+if [ -f "$STATE/sudo-refuses" ]; then
+	echo "sudo: 3 incorrect password attempts" >&2
+	exit 1
+fi
+if [ -f "$STATE/sudo-does-nothing" ]; then
+	exit 0
+fi
+if [ "$1" = -- ]; then
+	shift
+fi
+FAKE_ROOT=1 exec "$@"

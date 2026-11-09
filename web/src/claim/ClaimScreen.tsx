@@ -15,10 +15,14 @@ import type { TailnetLogin } from "../generated/TailnetLogin";
 import { Centered } from "../session/Centered";
 import { type Effect, init, type Message, type Model, update } from "./claim";
 
-/** The claim program, claiming over `api` and going home through `goHome`. */
-function claiming(api: ApiClient, goHome: () => void): Program<Model, Message, Effect> {
+/** The claim program, starting from `code`, claiming over `api` and going home through `goHome`. */
+function claiming(
+  api: ApiClient,
+  code: string,
+  goHome: () => void,
+): Program<Model, Message, Effect> {
   return {
-    init,
+    init: () => init(code),
     update,
     perform: (effect, dispatch, signal) => {
       switch (effect.type) {
@@ -50,14 +54,17 @@ function CommandText({ children }: { readonly children: string }) {
 export function ClaimScreen({
   api,
   login,
+  setupCode,
 }: {
   readonly api: ApiClient;
   readonly login: TailnetLogin;
+  /** The code the claim link carried, or "". */
+  readonly setupCode: string;
 }) {
   const router = useRouter();
   const queryClient = useQueryClient();
   const [model, dispatch] = useProgram(
-    claiming(api, () => {
+    claiming(api, setupCode, () => {
       // Home first: once the session says "member", this screen goes and the app shows the route.
       void router.navigate({ to: "/" }).then(() => queryClient.invalidateQueries());
     }),

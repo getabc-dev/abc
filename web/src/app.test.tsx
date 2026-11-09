@@ -77,10 +77,10 @@ function server(answer: (request: Request) => Response | Promise<Response>) {
   return { fetcher, requests };
 }
 
-function mount(path: string, fetcher: Fetch) {
+function mount(path: string, fetcher: Fetch, setupCode = "") {
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   const router = createAppRouter(
-    { api: apiClient(fetcher), queryClient, origin: ORIGIN },
+    { api: apiClient(fetcher), queryClient, origin: ORIGIN, setupCode },
     createMemoryHistory({ initialEntries: [path] }),
   );
   render(<App router={router} queryClient={queryClient} />);
@@ -115,6 +115,14 @@ test("an unclaimed server sends every route to the claim, which lands on home", 
   );
   live.send({ type: "snapshot", head: 4, machines: [] });
   await screen.findByRole("heading", { name: "Enrol your first machine" });
+});
+
+test("the claim link's setup code is filled in", async () => {
+  const { fetcher } = server(() => json(200, { state: "unclaimed", login: "ada@example.com" }));
+  mount("/", fetcher, "ABCDE-FGHJK-MNPQR-STVWX");
+  await screen.findByRole("heading", { level: 1, name: "Claim this server" });
+  const code = screen.getByRole("textbox", { name: "Setup code" });
+  expect(code).toHaveProperty("value", "ABCDE-FGHJK-MNPQR-STVWX");
 });
 
 test("a wrong code is said on the code field, and an expired one has its own screen", async () => {

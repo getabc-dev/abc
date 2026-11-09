@@ -105,7 +105,7 @@ const FIRST_RETRY_PAUSE: Duration = Duration::from_millis(250);
 const MAX_RETRY_PAUSE: Duration = Duration::from_secs(5);
 
 /// Connects to Postgres, retrying with capped backoff for up to `patience` while the database
-/// starts (compose start order, P4). Logs each failed attempt without the URL.
+/// starts: launchd starts abc server and Postgres at once (P4). Logs each failed attempt without the URL.
 ///
 /// # Errors
 ///

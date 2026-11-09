@@ -1,0 +1,18 @@
+#!/bin/sh
+# A stand-in for loginctl: show-user's Linger, and enable-linger, which only root may run: the fake
+# sudo's FAKE_ROOT, or the machine's own sudo in the real-Tailscale test.
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
+# shellcheck source-path=SCRIPTDIR source=lib.sh
+. "$ROOT/bin/lib.sh"
+record loginctl "$@"
+case "$1" in
+show-user) cat "$STATE/linger" 2>/dev/null || echo no ;;
+enable-linger)
+	if [ "${FAKE_ROOT:-}" != 1 ] && [ "$(id -u)" != 0 ]; then
+		echo "Could not enable linger: Access denied" >&2
+		exit 1
+	fi
+	echo yes >"$STATE/linger"
+	;;
+*) exit 64 ;;
+esac

@@ -1,0 +1,73 @@
+#!/bin/sh
+# A stand-in for abc's tailscale CLI, answering for the fake daemon: status, up (which waits for
+# the person to follow the login link the fake browser opens), serve (only as root), serve
+# status and logout. Switches in state/: up-fails (up is refused), needs-approval (the tailnet
+# approves new devices; the first status that says so approves it), no-dns (the node runs with
+# no DNS name, as without MagicDNS), garbled (status answers something that is not JSON) and
+# garbled-once-up (the same, once up has started).
+# A waiting up leaves its process id in state/up.pid.
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
+# shellcheck source-path=SCRIPTDIR source=../bin/lib.sh
+. "$ROOT/bin/lib.sh"
+record tailscale "$@"
+case "$1" in
+--socket=*) shift ;;
+*)
+	echo "the fake tailscale needs --socket first" >&2
+	exit 2
+	;;
+esac
+if ! { [ -f "$STATE/tailscaled.daemon" ] && kill -0 "$(cat "$STATE/tailscaled.daemon")" 2>/dev/null; }; then
+	echo "failed to connect to local tailscaled; it doesn't appear to be running" >&2
+	exit 1
+fi
+NAME=abc.tailfake.ts.net
+case "$1 ${2:-}" in
+"status --json")
+	if [ -f "$STATE/garbled" ] || { [ -f "$STATE/garbled-once-up" ] && [ -f "$STATE/up-started" ]; }; then
+		echo "not json"
+	elif [ -f "$STATE/logged-in" ] && [ -f "$STATE/needs-approval" ]; then
+		rm -f "$STATE/needs-approval"
+		printf '{"BackendState":"NeedsMachineAuth","AuthURL":"","Self":{"DNSName":""}}\n'
+	elif [ -f "$STATE/logged-in" ] && [ -f "$STATE/no-dns" ]; then
+		printf '{"BackendState":"Running","AuthURL":"","Self":{"DNSName":""}}\n'
+	elif [ -f "$STATE/logged-in" ]; then
+		printf '{"BackendState":"Running","AuthURL":"","Self":{"DNSName":"%s."}}\n' "$NAME"
+	elif [ -f "$STATE/up-started" ]; then
+		printf '{"BackendState":"NeedsLogin","AuthURL":"https://login.tailscale.com/a/fake","Self":{"DNSName":""}}\n'
+	else
+		printf '{"BackendState":"NeedsLogin","AuthURL":"","Self":{"DNSName":""}}\n'
+	fi
+	;;
+"up --hostname=abc")
+	case "${3:-}" in
+	--auth-key=file:*)
+		touch "$STATE/logged-in"
+		exit 0
+		;;
+	esac
+	if [ -f "$STATE/up-fails" ]; then
+		echo "backend error: invalid key: unable to validate API key" >&2
+		exit 1
+	fi
+	touch "$STATE/up-started"
+	echo "$$" >"$STATE/up.pid"
+	while [ ! -f "$STATE/logged-in" ]; do
+		sleep 0.05
+	done
+	;;
+"serve --bg")
+	if [ "${FAKE_ROOT:-}" != 1 ]; then
+		echo "Access denied: serve config denied" >&2
+		exit 1
+	fi
+	printf '{"TCP":{"443":{"HTTPS":true}},"Web":{"%s:443":{"Handlers":{"/":{"Proxy":"%s"}}}}}\n' \
+		"$NAME" "$3" >"$STATE/serve.json"
+	;;
+"serve status") cat "$STATE/serve.json" 2>/dev/null || echo '{}' ;;
+"logout ") rm -f "$STATE/logged-in" "$STATE/up-started" ;;
+*)
+	echo "the fake tailscale does not know $*" >&2
+	exit 64
+	;;
+esac

@@ -3,6 +3,12 @@
 Status: agreed on 1 Nov 2026 and implemented in PR 3. The sections below are the design as agreed;
 "Implementation notes" at the end records where the code differs and why.
 
+**Superseded deployment.** The Docker Compose deployment below (abc, `postgres:18` and the
+`tailscale/tailscale` container sharing a socket volume) is gone: decision 51 replaced it with
+`abc server setup`, which runs a private Postgres, abc's own unprivileged tailscaled and abc
+server as the user's services ([Running abc's server](../server.md)). The trust model is the
+same: identity is believed only on the Unix socket, which only abc's own node can reach.
+
 ## Problem
 
 PR 3 builds the server's spine: Postgres 18 migrations on start, an append-only event log with
