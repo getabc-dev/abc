@@ -674,7 +674,13 @@ mod tests {
         ]);
         let got = fetch(&url, 1 << 20, &quick(), &mut |_| {}, &mut Vec::new()).unwrap();
         assert_eq!(got, vec![2; 20]);
-        assert_eq!(server.join().unwrap().len(), 2, "asked again");
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 2, "asked again");
+        assert_eq!(
+            range_header(&requests[1]),
+            None,
+            "from the start: the partial answer kept nothing"
+        );
     }
 
     /// The body must come to the length announced: short is a break to resume from, long is
