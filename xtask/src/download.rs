@@ -273,7 +273,7 @@ mod tests {
     use std::thread::JoinHandle;
     use std::time::Duration;
 
-    use super::{Patience, content_range, fetch, retried_status};
+    use super::{Failure, Patience, content_range, fetch, patience, read_body, retried_status};
 
     /// What the test server does on one connection.
     enum Serve {
@@ -638,6 +638,102 @@ mod tests {
             "{error}"
         );
         server.join().unwrap();
+    }
+
+    /// A body of exactly the limit, announced or not, is a whole download.
+    #[test]
+    fn a_body_of_exactly_the_limit_passes() {
+        let (url, announced) = server(vec![Serve::Whole(
+            "200 OK",
+            "Content-Length: 1000\r\n".to_owned(),
+            vec![7; 1000],
+        )]);
+        assert_eq!(
+            fetch(&url, 1000, &quick(), &mut |_| {}, &mut Vec::new()).unwrap(),
+            vec![7; 1000]
+        );
+        announced.join().unwrap();
+        let mut body = Vec::new();
+        let read = read_body(&[7_u8; 1000][..], 1000, None, &quick(), &mut body);
+        assert!(
+            read.is_ok() && body.len() == 1000,
+            "unannounced, at the limit"
+        );
+    }
+
+    /// A 206 to a request that asked for no range is no resume: the download starts over.
+    #[test]
+    fn a_partial_answer_to_a_fresh_request_starts_over() {
+        let (url, server) = server(vec![
+            Serve::Whole(
+                "206 Partial Content",
+                "Content-Length: 10\r\nContent-Range: bytes 0-9/20\r\n".to_owned(),
+                vec![1; 10],
+            ),
+            Serve::Whole("200 OK", "Content-Length: 20\r\n".to_owned(), vec![2; 20]),
+        ]);
+        let got = fetch(&url, 1 << 20, &quick(), &mut |_| {}, &mut Vec::new()).unwrap();
+        assert_eq!(got, vec![2; 20]);
+        assert_eq!(server.join().unwrap().len(), 2, "asked again");
+    }
+
+    /// The body must come to the length announced: short is a break to resume from, long is
+    /// a body to start over, and exact is whole.
+    #[test]
+    fn a_body_must_come_to_its_announced_length() {
+        let read = |total: u64| {
+            let mut body = vec![9; 5];
+            let outcome = read_body(&[1_u8; 10][..], 1 << 20, Some(total), &quick(), &mut body);
+            (outcome, body.len())
+        };
+        let (whole, whole_kept) = read(15);
+        assert!(whole.is_ok() && whole_kept == 15, "exact: {whole_kept}");
+        let (short, short_kept) = read(16);
+        assert!(
+            matches!(short, Err(Failure::Transient(ref error)) if error.to_string() == "the download ended at 15 of 16 bytes"),
+            "short keeps its bytes"
+        );
+        assert_eq!(short_kept, 15);
+        let (long, long_kept) = read(14);
+        assert!(matches!(long, Err(Failure::Transient(_))), "long");
+        assert_eq!(long_kept, 0, "a body longer than announced is dropped");
+    }
+
+    /// Each window must bring at least the floor: exactly the floor passes, one byte less is a
+    /// stall.
+    #[test]
+    fn a_window_must_bring_the_floor() {
+        let every_read = Patience {
+            floor: 10,
+            window: Duration::ZERO,
+            ..quick()
+        };
+        let mut body = Vec::new();
+        assert!(
+            read_body(&[1_u8; 10][..], 1 << 20, None, &every_read, &mut body).is_ok(),
+            "the floor exactly"
+        );
+        let mut short = Vec::new();
+        let stalled = read_body(&[1_u8; 9][..], 1 << 20, None, &every_read, &mut short);
+        assert!(
+            matches!(stalled, Err(Failure::Transient(ref error)) if error.to_string().starts_with("the download stalled: 9 bytes")),
+            "one byte short of the floor"
+        );
+    }
+
+    /// The real patience, as AGENTS.md states it.
+    #[test]
+    fn real_downloads_wait_as_documented() {
+        let real = patience();
+        assert_eq!(real.connect, Duration::from_secs(15));
+        assert_eq!(real.stall, Duration::from_secs(30));
+        assert_eq!(real.floor, 16_384, "16 KiB");
+        assert_eq!(real.window, Duration::from_secs(60));
+        assert_eq!(
+            real.retries,
+            [2, 4, 8, 16, 32].map(Duration::from_secs),
+            "five retries, doubling from 2 s"
+        );
     }
 
     #[test]
