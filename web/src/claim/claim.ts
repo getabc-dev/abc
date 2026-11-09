@@ -1,6 +1,7 @@
-// Claiming an unclaimed server: the person enters the setup code `abc server setup-code` printed on
-// the server's host, their name and their first workspace's name, and becomes the owner
-// (`POST /api/owner/claim`). Each refusal the claim can meet has a state of its own.
+// Claiming an unclaimed server: the person enters the setup code (filled in when `abc server setup`
+// opened the page, else printed by `abc server setup-code` on the server's host), their name and
+// their first workspace's name, and becomes the owner (`POST /api/owner/claim`). Each refusal the
+// claim can meet has a state of its own.
 
 import type { ApiError } from "../api/client";
 import type { Step } from "../elm";
@@ -53,8 +54,9 @@ export type Effect =
 
 const editing: Phase = { state: "editing", errors: {}, problem: null };
 
-export function init(): Step<Model, Effect> {
-  return [{ fields: { code: "", displayName: "", workspaceName: "" }, phase: editing }, []];
+/** The form, with `code` filled in when the claim link carried one. */
+export function init(code = ""): Step<Model, Effect> {
+  return [{ fields: { code, displayName: "", workspaceName: "" }, phase: editing }, []];
 }
 
 /** What is wrong with `fields`, before asking the server. */

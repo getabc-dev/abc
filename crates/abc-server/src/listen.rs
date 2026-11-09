@@ -9,12 +9,11 @@
 //!    TCP: `Router::with_state` erases the state type, so the newtype is what keeps the
 //!    distinction.)
 //! 2. **Only the sidecar can reach the socket.** [`SidecarSocket::bind`] refuses a parent directory
-//!    with any "other" permission bit, removes a stale socket file, binds, and sets the socket to
-//!    0660. In the compose file the directory is a volume mounted into exactly two containers: abc
-//!    and `tailscale/tailscale`, whose serve config proxies `https://<name>.<tailnet>.ts.net/` to
-//!    `unix:/run/abc-sidecar/abc.sock`.
-//! 3. **There is no TCP listener with identity**, so a stray `ports:` mapping or a `0.0.0.0` bind
-//!    exposes health checks at most, never forgeable identity.
+//!    with any permission bit for its group or others, removes a stale socket file, binds, and sets
+//!    the socket to 0600. `abc server setup` puts it in its private `run/`, which only abc's own tailscaled, run
+//!    as the same user, reaches: Serve proxies the node's `https://` URL to it.
+//! 3. **There is no TCP listener with identity**, so an ops address bound to `0.0.0.0` exposes
+//!    health checks at most, never forgeable identity.
 //! 4. **Defence in depth.** `TailnetCaller` is `FromRequestParts<SidecarState>` only, so identity
 //!    handlers cannot be mounted on the ops router. The ops router is built inside `ops::serve`.
 //!    `clippy.toml` disallows `axum::serve`, so the two functions here are the only places that
@@ -32,8 +31,9 @@ use tokio::net::{TcpListener, UnixListener};
 
 use crate::ServeError;
 
-/// The permission bits of the sidecar socket: the abc user and its group (the sidecar's).
-const SOCKET_MODE: u32 = 0o660;
+/// The permission bits of the sidecar socket: the user's alone, as abc's tailscaled runs as the
+/// user.
+const SOCKET_MODE: u32 = 0o600;
 
 /// The bound sidecar Unix socket. Constructed only through [`SidecarSocket::bind`].
 #[derive(Debug)]
@@ -42,9 +42,9 @@ pub(crate) struct SidecarSocket {
 }
 
 impl SidecarSocket {
-    /// Checks that the directory exists, gives "other" users no access and belongs to this
-    /// process's user; refuses a socket another server is listening on and removes a stale one;
-    /// binds, and sets the socket's mode to 0660.
+    /// Checks that the directory exists, gives its group and other users no access and belongs to
+    /// this process's user; refuses a socket another server is listening on and removes a stale
+    /// one; binds, and sets the socket's mode to 0600.
     pub(crate) fn bind(path: &Path) -> Result<Self, ServeError> {
         let refuse = |reason| ServeError::SocketPath {
             path: path.to_owned(),
@@ -69,7 +69,7 @@ impl SidecarSocket {
             return Err(refuse("its parent is not a directory"));
         }
         let mode = dir_meta.permissions().mode() & 0o777;
-        if mode & 0o007 != 0 {
+        if mode & 0o077 != 0 {
             return Err(ServeError::SocketDirTooOpen {
                 path: dir.to_owned(),
                 mode,

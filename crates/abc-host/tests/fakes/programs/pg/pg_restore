@@ -1,0 +1,27 @@
+#!/bin/sh
+# A stand-in for pg_restore: --list reads a fake dump, and a load puts its content into --dbname,
+# unless the dump holds a line BROKEN, which fails to load.
+ROOT=$(cd "$(dirname "$0")/../.." && pwd)
+# shellcheck source-path=SCRIPTDIR source=../../bin/lib.sh
+. "$ROOT/bin/lib.sh"
+record pg_restore "$@"
+for file; do :; done
+if [ "$(head -n 1 "$file" 2>/dev/null)" != "FAKE DUMP" ]; then
+	echo "pg_restore: error: input file does not appear to be a valid archive" >&2
+	exit 1
+fi
+if [ "$1" = --list ]; then
+	exit 0
+fi
+if grep -qx BROKEN "$file"; then
+	echo "pg_restore: error: could not execute query: ERROR:  syntax error" >&2
+	exit 1
+fi
+while [ "$#" -gt 0 ]; do
+	if [ "$1" = --dbname ]; then
+		tail -n +2 "$file" >"$STATE/db-$2"
+		exit 0
+	fi
+	shift
+done
+exit 1

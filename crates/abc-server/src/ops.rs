@@ -4,7 +4,7 @@
 //! * `GET /healthz` returns 200 `{"status":"alive"}` whenever the process can answer (liveness).
 //! * `GET /readyz` returns 200 `{"status":"ready"}` only when serving and `Store::ready` passes,
 //!   else 503 with `{"status":"starting"|"migrating"|"draining"|"degraded","reason":…}`. The phase
-//!   tells a stranger why their container is not serving yet (P4).
+//!   tells a stranger why their server is not serving yet (P4).
 
 use std::future::Future;
 use std::sync::Arc;

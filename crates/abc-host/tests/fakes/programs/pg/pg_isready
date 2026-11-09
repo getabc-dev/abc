@@ -1,0 +1,6 @@
+#!/bin/sh
+# A stand-in for pg_isready: ready while the fake server runs.
+ROOT=$(cd "$(dirname "$0")/../.." && pwd)
+# shellcheck source-path=SCRIPTDIR source=../../bin/lib.sh
+. "$ROOT/bin/lib.sh"
+[ -f "$STATE/postgres.daemon" ] && kill -0 "$(cat "$STATE/postgres.daemon")" 2>/dev/null

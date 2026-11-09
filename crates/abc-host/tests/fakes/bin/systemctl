@@ -1,0 +1,73 @@
+#!/bin/sh
+# A stand-in for systemctl --user: daemon-reload, enable, disable, start, stop, restart and
+# is-active. It runs each unit's ExecStart with its Environment, read from the unit file the way
+# systemd quotes them, and stops it with the unit's KillSignal.
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
+# shellcheck source-path=SCRIPTDIR source=lib.sh
+. "$ROOT/bin/lib.sh"
+SERVICES="$ROOT/services"
+if [ "$1" != --user ]; then
+	echo "the fake systemctl runs user units only" >&2
+	exit 2
+fi
+shift
+record systemctl --user "$@"
+
+# words LINE: a systemd command line, one word a line: quoted words, with %% and $$ undoubled.
+words() {
+	unquoted=$(printf '%s\n' "$1" | sed -e 's/%%/%/g' -e 's/\$\$/\\$/g')
+	eval "set -- $unquoted"
+	printf '%s\n' "$@"
+}
+
+# read_unit UNIT: the unit's command and environment into state/UNIT.args and .env.
+read_unit() {
+	: >"$STATE/$1.args"
+	: >"$STATE/$1.env"
+	while IFS= read -r line; do
+		case "$line" in
+		ExecStart=*) words "${line#ExecStart=}" >"$STATE/$1.args" ;;
+		Environment=*) words "${line#Environment=}" >>"$STATE/$1.env" ;;
+		esac
+	done <"$SERVICES/$1"
+}
+
+kill_signal() {
+	signal=$(sed -n 's/^KillSignal=SIG//p' "$SERVICES/$1" 2>/dev/null)
+	printf '%s\n' "${signal:-TERM}"
+}
+
+case "$1" in
+daemon-reload) ;;
+enable) touch "$STATE/$2.enabled" ;;
+disable)
+	if [ "$2" = --now ]; then
+		stop "$3" "$(kill_signal "$3")"
+		rm -f "$STATE/$3.enabled"
+	else
+		rm -f "$STATE/$2.enabled"
+	fi
+	;;
+start)
+	read_unit "$2"
+	start "$2"
+	;;
+restart)
+	stop "$2" "$(kill_signal "$2")"
+	read_unit "$2"
+	start "$2"
+	;;
+stop) stop "$2" "$(kill_signal "$2")" ;;
+is-active)
+	if running "$2"; then
+		echo active
+	else
+		echo inactive
+		exit 3
+	fi
+	;;
+*)
+	echo "the fake systemctl does not know $1" >&2
+	exit 64
+	;;
+esac

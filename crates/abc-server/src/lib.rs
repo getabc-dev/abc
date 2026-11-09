@@ -2,7 +2,7 @@
 //!
 //! | Listener | Transport | Routes | Identity |
 //! | --- | --- | --- | --- |
-//! | sidecar | Unix socket shared only with the Tailscale sidecar | the whole API, the worker WebSocket, SSE, the web app | `Tailscale-User-Login`, trusted |
+//! | sidecar | Unix socket that only abc's own tailscaled, through Serve, reaches | the whole API, the worker WebSocket, SSE, the web app | `Tailscale-User-Login`, trusted |
 //! | ops | TCP, loopback by default | `/healthz`, `/readyz` | none, and no data |
 //!
 //! The public webhook listener (later) will be a third, with its own router and no identity.
@@ -52,8 +52,8 @@ pub struct ServerConfig {
     pub database_url: Secret<DatabaseUrl>,
     /// How long to keep retrying while Postgres starts.
     pub database_wait: Duration,
-    /// `ABC_SIDECAR_SOCKET`, default `/run/abc-sidecar/abc.sock`. Its directory is the volume shared
-    /// with the Tailscale container; the server refuses a directory others can reach.
+    /// `ABC_SIDECAR_SOCKET`: the socket Tailscale Serve proxies to, `<home>/run/abc.sock` under
+    /// `abc server setup`. The server refuses a directory others can reach.
     pub sidecar_socket: PathBuf,
     /// `ABC_OPS_ADDR`, default `127.0.0.1:7071`.
     pub ops_addr: SocketAddr,
@@ -200,8 +200,8 @@ async fn boot_sweep(store: &Store) -> Result<(), ServeError> {
 pub enum ServeError {
     /// The sidecar socket's directory is reachable by others, so anyone could forge identity.
     #[error(
-        "{path} has mode {mode:o}; the sidecar socket directory must not be accessible to other \
-         users (use 0750 or 0770, shared only with the Tailscale container)"
+        "{path} has mode {mode:o}, but anyone who can reach the sidecar socket can claim any \
+         tailnet identity: chmod 700 it, as abc server setup does (abc's tailscaled runs as you)"
     )]
     SocketDirTooOpen {
         /// The directory.
