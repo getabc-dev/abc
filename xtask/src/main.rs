@@ -1634,16 +1634,15 @@ mod tests {
             )),
             "the tree at --root names its tests' tools with its own xtask, which it lacks: {error}"
         );
+        // In a copy of `xtask/` alone, as `cargo xtask mutants` builds, there is no tool list.
         let unpinned = format!(
             "{:#}",
             (here.test_tool)(&here.root, "no-such-tool").unwrap_err()
         );
         assert!(
-            unpinned.starts_with(&format!(
-                "{}: its tests run no-such-tool: ",
-                here.root.display()
-            )),
-            "xtask reads its own checkout's list itself: {unpinned}"
+            unpinned.starts_with(&format!("{}: its tests run ", here.root.display()))
+                && !unpinned.contains("cargo xtask test-tool"),
+            "xtask reads its own checkout's list itself, asking no other xtask: {unpinned}"
         );
         assert!(
             Invocation::new(Some(temp.path().join("absent"))).is_err(),
