@@ -60,6 +60,7 @@ pub(crate) enum Gate {
     Mutants,
     Fuzz,
     E2e,
+    Spec,
 }
 
 impl Gate {
@@ -71,6 +72,7 @@ impl Gate {
             Self::Mutants => "mutants",
             Self::Fuzz => "fuzz",
             Self::E2e => "e2e",
+            Self::Spec => "spec",
         }
     }
 }

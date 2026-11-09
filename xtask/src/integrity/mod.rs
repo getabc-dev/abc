@@ -35,7 +35,7 @@ use crate::git;
 /// The gate files: whatever decides what passes. CODEOWNERS patterns, the single list both the
 /// check and `.github/CODEOWNERS` follow: a trailing `/` covers a directory, anything else is one
 /// file, both from the repository root.
-pub(crate) const GATES: [&str; 31] = [
+pub(crate) const GATES: [&str; 32] = [
     "/.cargo/",
     "/.claude/settings.json",
     "/.config/",
@@ -54,6 +54,7 @@ pub(crate) const GATES: [&str; 31] = [
     "/osv-scanner.toml",
     "/rust-toolchain.toml",
     "/rustfmt.toml",
+    "/spec/",
     "/web/.oxlintrc.json",
     "/web/biome.json",
     "/web/knip.jsonc",
@@ -652,7 +653,9 @@ mod tests {
             "xtask/src/tools.rs",
             "xtask/Cargo.toml",
             ".claude/settings.json",
+            "osv-scanner.toml",
             "web/osv-scanner.toml",
+            "spec/runner/runner.qnt",
         ] {
             assert!(is_gate_file(path), "{path} is a gate file");
         }
@@ -662,6 +665,7 @@ mod tests {
             "README.md",
             ".claude/settings.local.json",
             "docs/AGENTS.md",
+            "docs/spec/runner.md",
             "xtask",
         ] {
             assert!(!is_gate_file(path), "{path} is not a gate file");
@@ -683,20 +687,24 @@ mod tests {
                 let id = ignore["id"].as_str().unwrap();
                 assert!(
                     id.starts_with("GHSA-") || id.starts_with("RUSTSEC-"),
-                    "{id} is one advisory"
+                    "{file}: {id} is one advisory"
                 );
                 assert!(
                     ignore["ignoreUntil"].as_datetime().is_some(),
-                    "{id} has an ignoreUntil date"
+                    "{file}: {id} has an ignoreUntil date"
                 );
                 assert!(
                     ignore["reason"]
                         .as_str()
                         .is_some_and(|reason| reason.len() > 40),
-                    "{id} says why"
+                    "{file}: {id} says why"
                 );
                 let keys: Vec<&str> = ignore.iter().map(|(key, _)| key).collect();
-                assert_eq!(keys, ["id", "ignoreUntil", "reason"], "{id}'s fields");
+                assert_eq!(
+                    keys,
+                    ["id", "ignoreUntil", "reason"],
+                    "{file}: {id}'s fields"
+                );
             }
         }
     }

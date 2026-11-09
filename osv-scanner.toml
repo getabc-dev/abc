@@ -1,11 +1,11 @@
 # osv-scanner reads this file for Cargo.lock, the lockfile beside it, both in CI and in
 # `cargo xtask tool osv-scanner scan source --lockfile Cargo.lock`. It is a gate file.
 #
-# Each ignore names one advisory, says why it cannot reach abc, and expires: on its
+# Each ignore names one advisory, says why it cannot reach the binary, and expires: on its
 # `ignoreUntil` date the scan fails again unless someone renews it on purpose. The packages stay
 # in the lockfile and stay scanned; any other advisory, in them or elsewhere, still fails.
 
 [[IgnoredVulns]]
 id = "RUSTSEC-2026-0459"
-ignoreUntil = 2027-01-05T00:00:00Z
-reason = "libsqlite3-sys 0.37.0 is fixed in 0.39.0, which sqlx-sqlite 0.9.0 (the newest) rejects (<0.38.0). It is in Cargo.lock only as sqlx's optional SQLite driver: no crate enables sqlx's sqlite feature, so cargo tree --all-features --target all finds no path to it and it is never compiled or shipped. deny.toml bans libsqlite3-sys below 0.39.0 from every build, so cargo-deny fails the moment anything builds it."
+ignoreUntil = 2027-01-09T00:00:00Z
+reason = "libsqlite3-sys 0.37.0 is fixed only in 0.39.0, which sqlx-sqlite 0.9.0, the newest, rejects. It is in Cargo.lock only because sqlx 0.9 lists sqlx-sqlite; abc enables only sqlx's postgres driver, so no crate of the workspace compiles or links SQLite (cargo tree -i libsqlite3-sys --target all finds no path). deny.toml bans libsqlite3-sys below 0.39.0 from every build, so cargo-deny fails the moment anything builds it."

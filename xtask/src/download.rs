@@ -116,6 +116,14 @@ fn attempt(
         request = request.header("Range", &format!("bytes={from}-"));
     }
     let response = request.call().map_err(|error| {
+        if from > 0 && matches!(error, ureq::Error::StatusCode(416)) {
+            // Every byte arrived before the last attempt broke off, so no range is left to ask
+            // for: the end of the body was never confirmed, so fetch it whole again.
+            body.clear();
+            return Failure::Transient(anyhow!(
+                "the server has nothing past byte {from}; starting over"
+            ));
+        }
         // ureq's errors are non-exhaustive: any but these is final.
         let transient = if let ureq::Error::StatusCode(code) = &error {
             retried_status(*code)
@@ -527,6 +535,41 @@ mod tests {
     }
 
     /// A missing file does not appear by asking again.
+    /// A body without a length that broke off after its last byte leaves nothing to resume: the
+    /// server answers the range with 416, and the download starts over, since the end of the
+    /// body was never confirmed.
+    #[test]
+    fn nothing_left_to_resume_starts_over() {
+        let (url, server) = server(vec![
+            Serve::Whole(
+                "200 OK",
+                "Transfer-Encoding: chunked\r\n".to_owned(),
+                b"7\r\narchive\r\n".to_vec(),
+            ),
+            Serve::Whole(
+                "416 Range Not Satisfiable",
+                "Content-Range: bytes */7\r\nContent-Length: 0\r\n".to_owned(),
+                Vec::new(),
+            ),
+            Serve::Whole(
+                "200 OK",
+                "Content-Length: 7\r\n".to_owned(),
+                b"archive".to_vec(),
+            ),
+        ]);
+        let mut notes = Vec::new();
+        let body = fetch(&url, 1 << 20, &quick(), &mut |_| {}, &mut notes).unwrap();
+        assert_eq!(body, b"archive");
+        let requests = server.join().unwrap();
+        assert_eq!(range_header(&requests[1]), Some("bytes=7-"));
+        assert_eq!(range_header(&requests[2]), None, "the whole again");
+        let notes = String::from_utf8(notes).unwrap();
+        assert!(
+            notes.contains("the server has nothing past byte 7; starting over"),
+            "{notes}"
+        );
+    }
+
     #[test]
     fn a_not_found_fails_at_once() {
         let (url, server) = server(vec![Serve::Whole(
