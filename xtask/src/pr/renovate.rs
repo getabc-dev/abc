@@ -925,6 +925,37 @@ targets.aarch64-unknown-linux-gnu = {{ platform = "linux-arm64", sha256 = "{sha2
         );
     }
 
+    /// A full page of a hundred open pull requests is followed by the next, so an earlier
+    /// replacement on page two still counts; a short page is the last one asked for.
+    #[test]
+    fn open_pulls_reads_every_page() {
+        let mut asked = Vec::new();
+        let mut answer = |request: &Request| {
+            asked.push(request.path.clone());
+            Ok(match request.path.as_str() {
+                "/repos/o/r/pulls?state=open&per_page=100&page=1" => Value::Array(
+                    (1..=100)
+                        .map(|number| open_from(number, "agent/other"))
+                        .collect(),
+                ),
+                "/repos/o/r/pulls?state=open&per_page=100&page=2" => {
+                    json!([open_from(146, "agent/renovate-29")])
+                }
+                other => anyhow::bail!("unexpected call {other}"),
+            })
+        };
+        let pulls = super::open_pulls(&mut answer, &repo()).unwrap();
+        assert_eq!(pulls.len(), 101);
+        assert_eq!(pulls[100], open_from(146, "agent/renovate-29"));
+        assert_eq!(
+            asked,
+            [
+                "/repos/o/r/pulls?state=open&per_page=100&page=1",
+                "/repos/o/r/pulls?state=open&per_page=100&page=2"
+            ]
+        );
+    }
+
     /// A run that failed after its push could not run again, since a new commit to the pushed
     /// branch was refused. A run again takes up the branch, the pull request and the linking
     /// comment when they hold the same change, and refuses a branch that holds another.
