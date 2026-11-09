@@ -15,7 +15,14 @@ pub(crate) fn postgres_bin() -> PathBuf {
     programs_dir(
         "ABC_TEST_POSTGRES_BIN",
         std::env::var_os("ABC_TEST_POSTGRES_BIN"),
-        "initdb",
+        &[
+            "postgres",
+            "initdb",
+            "pg_isready",
+            "psql",
+            "pg_dump",
+            "pg_restore",
+        ],
     )
     .unwrap_or_else(|wrong| {
         panic!(
@@ -28,11 +35,11 @@ pub(crate) fn postgres_bin() -> PathBuf {
 }
 
 /// The directory of programs the variable `name` holds, read from `value`, once it is checked to
-/// be an absolute path to a directory holding `program`.
+/// be an absolute path to a directory holding each of `programs`.
 pub(crate) fn programs_dir(
     name: &str,
     value: Option<std::ffi::OsString>,
-    program: &str,
+    programs: &[&str],
 ) -> Result<PathBuf, String> {
     let dir = PathBuf::from(value.ok_or_else(|| format!("{name} is not set"))?);
     let shown = dir.display();
@@ -45,8 +52,8 @@ pub(crate) fn programs_dir(
     if !dir.is_dir() {
         return Err(format!("{name} is `{shown}`, which is not a directory"));
     }
-    if !dir.join(program).is_file() {
-        return Err(format!("{name} is `{shown}`, which holds no `{program}`"));
+    if let Some(missing) = programs.iter().find(|program| !dir.join(program).is_file()) {
+        return Err(format!("{name} is `{shown}`, which holds no `{missing}`"));
     }
     Ok(dir)
 }

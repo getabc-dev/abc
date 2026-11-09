@@ -309,7 +309,7 @@ mod tests {
         let bin = programs_dir(
             "ABC_TAILSCALE_BIN",
             std::env::var_os("ABC_TAILSCALE_BIN"),
-            "tailscaled",
+            &["tailscaled", "tailscale"],
         )
         .unwrap_or_else(|wrong| {
             panic!("the real-tailnet check needs Tailscale's programs: {wrong} (see this file's header)")

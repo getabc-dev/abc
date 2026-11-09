@@ -282,7 +282,7 @@ mod tests {
     fn a_programs_directory_is_taken_when_it_holds_the_program() {
         let (_dir, path) = programs("initdb");
         assert_eq!(
-            programs_dir("BIN", Some(path.clone().into()), "initdb"),
+            programs_dir("BIN", Some(path.clone().into()), &["initdb"]),
             Ok(path.into())
         );
     }
@@ -290,7 +290,7 @@ mod tests {
     #[test]
     fn a_programs_directory_unset_is_named_unset() {
         assert_eq!(
-            programs_dir("BIN", None, "initdb"),
+            programs_dir("BIN", None, &["initdb"]),
             Err("BIN is not set".to_owned())
         );
     }
@@ -300,7 +300,7 @@ mod tests {
         // As the real-tailnet workflow once gave it: relative to the repository root, while the
         // tests run from their crate's directory.
         assert_eq!(
-            programs_dir("BIN", Some(".tools/postgresql/bin".into()), "initdb"),
+            programs_dir("BIN", Some(".tools/postgresql/bin".into()), &["initdb"]),
             Err(
                 "BIN is `.tools/postgresql/bin`, a relative path, and the tests run from their \
                  crate's directory: give an absolute one"
@@ -314,17 +314,21 @@ mod tests {
         let (dir, path) = programs("initdb");
         drop(dir);
         assert_eq!(
-            programs_dir("BIN", Some(path.clone().into()), "initdb"),
+            programs_dir("BIN", Some(path.clone().into()), &["initdb"]),
             Err(format!("BIN is `{path}`, which is not a directory"))
         );
     }
 
     #[test]
-    fn a_programs_directory_without_the_program_names_it() {
-        let (_dir, path) = programs("postgres");
+    fn a_programs_directory_without_a_program_names_it() {
+        let (_dir, path) = programs("tailscaled");
         assert_eq!(
-            programs_dir("BIN", Some(path.clone().into()), "initdb"),
-            Err(format!("BIN is `{path}`, which holds no `initdb`"))
+            programs_dir(
+                "BIN",
+                Some(path.clone().into()),
+                &["tailscaled", "tailscale"]
+            ),
+            Err(format!("BIN is `{path}`, which holds no `tailscale`"))
         );
     }
 }
