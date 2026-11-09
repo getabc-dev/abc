@@ -69,8 +69,8 @@ pub(super) fn run(
     );
     let open = open_pulls(send, repo)?;
     let ours = branch(number);
-    if let Some(other) = open.iter().find(|pull| {
-        let head = text(pull, "/head/ref");
+    if let Some(other) = open.iter().find(|listed| {
+        let head = text(listed, "/head/ref");
         head.starts_with(BRANCH_PREFIX) && head != ours
     }) {
         bail!(
@@ -87,29 +87,8 @@ pub(super) fn run(
     let folded = fold(number, &head, root, fetch, out)?;
     let title = format!("Fold Renovate's #{number}: {}", text(&pull, "/title"));
     let pushed = push_once(&folded, number, root, &title, out)?;
-    let updates = if folded.bumps.is_empty() {
-        String::new()
-    } else {
-        let moved: Vec<String> = folded.bumps.iter().map(ToString::to_string).collect();
-        format!(
-            " Renovate cannot run `cargo xtask pin`, and `cargo xtask setup` refuses an archive \
-             whose sha256 is not pinned, so the tool bumps ({}) are pinned here, each checksum \
-             checked against what its publisher vouches for.",
-            moved.join(", ")
-        )
-    };
-    let body = format!(
-        "## What and why\n\nFolds Renovate's #{number} into a branch the agent App can push: \
-         the same updates, re-applied on `{}` by a three-way merge.{updates}\n\nChanged: {}.\n\n\
-         ## Plan\n\n`cargo xtask pr renovate {number}`; read each update's release notes, and fix \
-         what an update breaks in this pull request.\n\n## Test changes\n\nNone\n\n\
-         ## Review findings\n\nNot run yet, so this pull request is a draft. Run `/code-review \
-         high` and `/security-review` on `{ours}`, fix what they find and what an update breaks, \
-         put what they found here with `cargo xtask pr update`, then mark it ready.\n",
-        folded.base_branch,
-        folded.files.join(", ")
-    );
-    let (opened, verb) = match open.iter().find(|pull| text(pull, "/head/ref") == ours) {
+    let body = description(number, &folded, &ours);
+    let (opened, verb) = match open.iter().find(|listed| text(listed, "/head/ref") == ours) {
         Some(found) => (found.clone(), "found"),
         None => (
             send(&github::Request {
@@ -138,6 +117,47 @@ pub(super) fn run(
             text(&opened, "/html_url")
         ),
     );
+    link_and_close(send, repo, number, replacement, &folded, &pushed, out)?;
+    Ok(true)
+}
+
+/// The replacement's description: what it folds, and that the B1 reviews come before it is ready.
+fn description(number: u64, folded: &Folded, ours: &str) -> String {
+    let updates = if folded.bumps.is_empty() {
+        String::new()
+    } else {
+        let moved: Vec<String> = folded.bumps.iter().map(ToString::to_string).collect();
+        format!(
+            " Renovate cannot run `cargo xtask pin`, and `cargo xtask setup` refuses an archive \
+             whose sha256 is not pinned, so the tool bumps ({}) are pinned here, each checksum \
+             checked against what its publisher vouches for.",
+            moved.join(", ")
+        )
+    };
+    format!(
+        "## What and why\n\nFolds Renovate's #{number} into a branch the agent App can push: \
+         the same updates, re-applied on `{}` by a three-way merge.{updates}\n\nChanged: {}.\n\n\
+         ## Plan\n\n`cargo xtask pr renovate {number}`; read each update's release notes, and fix \
+         what an update breaks in this pull request.\n\n## Test changes\n\nNone\n\n\
+         ## Review findings\n\nNot run yet, so this pull request is a draft. Run `/code-review \
+         high` and `/security-review` on `{ours}`, fix what they find and what an update breaks, \
+         put what they found here with `cargo xtask pr update`, then mark it ready.\n",
+        folded.base_branch,
+        folded.files.join(", ")
+    )
+}
+
+/// Links Renovate's pull request `number` to its replacement, unless a comment already does, and
+/// closes it.
+fn link_and_close(
+    send: &mut Send<'_>,
+    repo: &Repo,
+    number: u64,
+    replacement: u64,
+    folded: &Folded,
+    pushed: &str,
+    out: &mut String,
+) -> anyhow::Result<()> {
     let link = format!("Folded into #{replacement}");
     let comments = github::get(
         send,
@@ -157,7 +177,7 @@ pub(super) fn run(
                     "{link}, which carries these updates on `{}` with any tool bump pinned \
                      (`cargo xtask pr renovate {number}`, at {}).",
                     folded.base_branch,
-                    git::short(&pushed)
+                    git::short(pushed)
                 )
             })),
         })?;
@@ -171,7 +191,7 @@ pub(super) fn run(
         out,
         &format!("pr: closed #{number} with a link to #{replacement}"),
     );
-    Ok(true)
+    Ok(())
 }
 
 /// Every open pull request in `repo`, a page of a hundred at a time.
@@ -257,16 +277,63 @@ fn fold(
     let fork = git::git(root, &["merge-base", "--end-of-options", &parent, head])?
         .trim()
         .to_owned();
+    let mut tree = merge(root, number, &base_branch, &parent, head)?;
+    let bumps = retool(
+        root,
+        number,
+        &base_branch,
+        [&fork, &parent, head],
+        &mut tree,
+        fetch,
+        out,
+    )?;
+    let files: Vec<String> = git::git(root, &["diff", "--name-only", &parent, &tree, "--"])?
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    ensure!(
+        !files.is_empty(),
+        "#{number} changes nothing origin/{base_branch} does not already have"
+    );
+    let workflows: Vec<&str> = files
+        .iter()
+        .map(String::as_str)
+        .filter(|file| file.starts_with(WORKFLOWS))
+        .collect();
+    ensure!(
+        workflows.is_empty(),
+        "#{number} changes workflows ({}), which the agent App cannot push; GitHub Actions \
+         updates come in a group of their own (renovate.json), for the maintainer to merge",
+        workflows.join(", ")
+    );
+    Ok(Folded {
+        base_branch,
+        parent,
+        tree,
+        files,
+        bumps,
+    })
+}
+
+/// Merges Renovate's `head` onto the default branch's `parent` in git's object store and returns
+/// the tree. Fails on a conflict outside the tool list, which is replaced whole.
+fn merge(
+    root: &Path,
+    number: u64,
+    base_branch: &str,
+    parent: &str,
+    head: &str,
+) -> anyhow::Result<String> {
     let merged = Command::new("git")
         .args(["merge-tree", "--write-tree", "--name-only", "--no-messages"])
-        .args(["--end-of-options", &parent, head])
+        .args(["--end-of-options", parent, head])
         .current_dir(root)
         .stdin(Stdio::null())
         .output()
         .context("could not run git")?;
     let listed = String::from_utf8(merged.stdout).context("git printed text that is not UTF-8")?;
     let mut lines = listed.lines();
-    let mut tree = lines.next().unwrap_or_default().trim().to_owned();
+    let tree = lines.next().unwrap_or_default().trim().to_owned();
     match merged.status.code() {
         Some(0) => {}
         Some(1) => {
@@ -286,14 +353,29 @@ fn fold(
             String::from_utf8_lossy(&merged.stderr).trim()
         ),
     }
+    Ok(tree)
+}
+
+/// When Renovate's group changes the tool list from `fork` to `head`, sets it in `tree` to the
+/// default branch's at `parent` with the bumps it does not have yet, those tools pinned with
+/// downloads from `fetch`; returns those bumps.
+fn retool(
+    root: &Path,
+    number: u64,
+    base_branch: &str,
+    [fork, parent, head]: [&str; 3],
+    tree: &mut String,
+    fetch: &mut dyn FnMut(&str) -> anyhow::Result<Vec<u8>>,
+    out: &mut String,
+) -> anyhow::Result<Vec<tools::Bump>> {
     let tool_list = |commit: &str| git::show(root, commit, MANIFEST);
     let mut bumps = Vec::new();
-    let (before, after) = (tool_list(&fork)?, tool_list(head)?);
+    let (before, after) = (tool_list(fork)?, tool_list(head)?);
     if before != after {
         let (Some(before), Some(after)) = (before, after) else {
             bail!("#{number} adds or removes {MANIFEST}; only a version bump is taken");
         };
-        let current = tool_list(&parent)?
+        let current = tool_list(parent)?
             .with_context(|| format!("origin/{base_branch} has no {MANIFEST}"))?;
         let (to_apply, applied) = tools::outstanding(&current, tools::bumps(&before, &after)?)
             .with_context(|| format!("origin/{base_branch} moved a tool #{number} bumps"))?;
@@ -322,35 +404,10 @@ fn fold(
             out.push_str(&String::from_utf8_lossy(&said));
             pinned?
         };
-        tree = replace_file(root, &tree, MANIFEST, &list)?;
+        *tree = replace_file(root, tree, MANIFEST, &list)?;
         bumps = to_apply;
     }
-    let files: Vec<String> = git::git(root, &["diff", "--name-only", &parent, &tree, "--"])?
-        .lines()
-        .map(str::to_owned)
-        .collect();
-    ensure!(
-        !files.is_empty(),
-        "#{number} changes nothing origin/{base_branch} does not already have"
-    );
-    let workflows: Vec<&str> = files
-        .iter()
-        .map(String::as_str)
-        .filter(|file| file.starts_with(WORKFLOWS))
-        .collect();
-    ensure!(
-        workflows.is_empty(),
-        "#{number} changes workflows ({}), which the agent App cannot push; GitHub Actions \
-         updates come in a group of their own (renovate.json), for the maintainer to merge",
-        workflows.join(", ")
-    );
-    Ok(Folded {
-        base_branch,
-        parent,
-        tree,
-        files,
-        bumps,
-    })
+    Ok(bumps)
 }
 
 /// Commits `folded` on its parent with `title` and pushes it to origin's
@@ -772,12 +829,12 @@ targets.aarch64-unknown-linux-gnu = {{ platform = "linux-arm64", sha256 = "{sha2
         let moved_dir = tempfile::tempdir().unwrap();
         let elsewhere = tool_list("1.4.0", ZEROS);
         let moved = recorded(moved_dir.path(), &[], &[(MANIFEST, elsewhere)]);
-        let mut answer = github(&moved, "renovate[bot]", json!([]), json!([]), false);
+        let mut moved_answer = github(&moved, "renovate[bot]", json!([]), json!([]), false);
         let error = run(
             30,
             &moved.work,
             &repo(),
-            &mut answer,
+            &mut moved_answer,
             &mut offline,
             &mut String::new(),
         )
