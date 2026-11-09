@@ -188,9 +188,9 @@ fuzz/deny.toml --locked check`, `cargo xtask tool cargo-shear --deny-warnings --
 on xtask's (`cargo xtask tool cargo-deny --manifest-path xtask/Cargo.toml --config xtask/deny.toml
 --locked check`, `cargo xtask tool cargo-shear --deny-warnings --locked xtask`), `cargo xtask tool
 osv-scanner scan source --lockfile Cargo.lock --lockfile fuzz/Cargo.lock --lockfile
-xtask/Cargo.lock --lockfile web/pnpm-lock.yaml` (which reads `web/osv-scanner.toml` for the web
-lockfile: each ignored advisory there names its reason and an `ignoreUntil` date, after which the
-scan fails again unless someone renews it on purpose), `cargo xtask tool zizmor --pedantic .github`, `cargo xtask tool pinact run --check --verify-comment` and
+xtask/Cargo.lock --lockfile web/pnpm-lock.yaml` (which reads `osv-scanner.toml` for `Cargo.lock` and
+`web/osv-scanner.toml` for the web lockfile: each ignored advisory there names its reason and an
+`ignoreUntil` date, after which the scan fails again unless someone renews it on purpose), `cargo xtask tool zizmor --pedantic .github`, `cargo xtask tool pinact run --check --verify-comment` and
 `cargo xtask tool gitleaks git --redact --no-banner --verbose .`. Every job is a required check on
 `main`. The release itself (`release.yml`) runs only on a tag `v*` the maintainer pushes, one
 release at a time: the dry run's build, formula and install jobs without its caches, which an
