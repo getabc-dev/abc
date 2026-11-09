@@ -680,30 +680,25 @@ mod tests {
             let ignores = config["IgnoredVulns"].as_array_of_tables().unwrap();
             assert!(!ignores.is_empty(), "{file} ignores something");
             for ignore in ignores {
-                every_osv_ignore_is_scoped(ignore);
+                let id = ignore["id"].as_str().unwrap();
+                assert!(
+                    id.starts_with("GHSA-") || id.starts_with("RUSTSEC-"),
+                    "{id} is one advisory"
+                );
+                assert!(
+                    ignore["ignoreUntil"].as_datetime().is_some(),
+                    "{id} has an ignoreUntil date"
+                );
+                assert!(
+                    ignore["reason"]
+                        .as_str()
+                        .is_some_and(|reason| reason.len() > 40),
+                    "{id} says why"
+                );
+                let keys: Vec<&str> = ignore.iter().map(|(key, _)| key).collect();
+                assert_eq!(keys, ["id", "ignoreUntil", "reason"], "{id}'s fields");
             }
         }
-    }
-
-    /// One ignore: one advisory, an expiry and a reason, nothing else.
-    fn every_osv_ignore_is_scoped(ignore: &toml_edit::Table) {
-        let id = ignore["id"].as_str().unwrap();
-        assert!(
-            id.starts_with("GHSA-") || id.starts_with("RUSTSEC-"),
-            "{id} is one advisory"
-        );
-        assert!(
-            ignore["ignoreUntil"].as_datetime().is_some(),
-            "{id} has an ignoreUntil date"
-        );
-        assert!(
-            ignore["reason"]
-                .as_str()
-                .is_some_and(|reason| reason.len() > 40),
-            "{id} says why"
-        );
-        let keys: Vec<&str> = ignore.iter().map(|(key, _)| key).collect();
-        assert_eq!(keys, ["id", "ignoreUntil", "reason"], "{id}'s fields");
     }
 
     #[test]
