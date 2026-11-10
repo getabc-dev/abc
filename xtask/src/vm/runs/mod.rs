@@ -466,35 +466,53 @@ pub(crate) fn cancel(
     id: &str,
     now: i64,
 ) -> anyhow::Result<String> {
-    let mut run = runs.load(id)?;
-    {
+    let (run, had_session) = {
         let _lock = runs.lock()?;
+        let before = runs.load(id)?;
         ensure!(
-            run.status.active() || run.status == Status::Queued,
+            before.status.active() || before.status == Status::Queued,
             "run {id} has ended: {}",
-            run.status.describe()
+            before.status.describe()
         );
         services.remove(id)?;
-        // The supervisor is gone; the state is the one it left.
-        run = runs.load(id)?;
-        if run.status == Status::Running
-            && let Some(attempt) = run.attempts.last_mut()
-        {
+        // The supervisor is gone; the state is the one it left, which may be an end it reached
+        // meanwhile.
+        let mut run = runs.load(id)?;
+        if !(run.status.active() || run.status == Status::Queued) {
+            return Ok(format!(
+                "{id} ended before it was cancelled: {}",
+                run.status.describe()
+            ));
+        }
+        let had_session = run.status == Status::Running;
+        if had_session && let Some(attempt) = run.attempts.last_mut() {
             attempt.ended = Some(now);
             attempt.outcome = Some(Outcome::Interrupted);
         }
         run.status = Status::Cancelled;
         runs.save(&run)?;
-    }
-    let session = Session::open(&run.worktree, &host.repo, &host.state)?;
-    if backend.is_running(&session.name)? {
-        stop_claude(backend, &session.name)?;
-    }
+        (run, had_session)
+    };
+    // Only a run whose session ran has a claude of its own to stop; another in the same VM, such
+    // as a `vm shell` session, is left alone. The queue moves on whatever becomes of it.
+    let stopped = if had_session {
+        Session::open(&run.worktree, &host.repo, &host.state).and_then(|session| {
+            if backend.is_running(&session.name)? {
+                stop_claude(backend, &session.name)?;
+            }
+            Ok(())
+        })
+    } else {
+        Ok(())
+    };
     let next = start_next(runs, services, now)?;
-    Ok(match next {
+    let said = match next {
         Some(next) => format!("cancelled {id}; started {}", next.id),
         None => format!("cancelled {id}"),
-    })
+    };
+    stopped
+        .with_context(|| format!("{said}, but could not stop its claude"))
+        .map(|()| said)
 }
 
 /// `vm runs`: every run, oldest first, as a table or as JSON.

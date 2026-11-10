@@ -1003,13 +1003,13 @@ fn one_run_is_active_and_the_queue_starts_the_rest_in_order() {
         Status::Cancelled
     );
     assert!(
-        local
+        !local
             .fake
             .calls
             .borrow()
             .iter()
             .any(|call| call.starts_with("exec abc-w pkill")),
-        "its claude is stopped"
+        "a run waiting to start has no claude to stop"
     );
     let again = act(Action::Cancel {
         run: all[0].id.clone(),
@@ -1429,6 +1429,15 @@ fn cancelling_a_run_mid_attempt_ends_the_attempt_as_interrupted() {
     assert_eq!(state.status, Status::Cancelled);
     assert_eq!(state.attempts[0].outcome, Some(Outcome::Interrupted));
     assert_eq!(state.attempts[0].ended, Some(MORNING + 9));
+    assert!(
+        local
+            .fake
+            .calls
+            .borrow()
+            .iter()
+            .any(|call| call.contains("pkill")),
+        "its claude is stopped"
+    );
 
     let (other, other_local) = briefed();
     let queued = runs(&other)
@@ -1651,4 +1660,136 @@ fn an_interruption_does_not_reset_the_failures_in_a_row() {
         ),
         Next::GiveUp(reason) if reason.starts_with("3 attempts in a row failed")
     ));
+}
+
+/// Review finding: cancelling a queued run killed every claude in its VM, such as the active
+/// run's in the same worktree or the maintainer's own `vm shell` session.
+#[test]
+fn cancelling_a_run_with_no_session_stops_no_claude() {
+    let (world, local) = briefed();
+    let services = FakeServices::default();
+    let queued = runs(&world)
+        .create(&session(&world), ".abc/brief.md", MORNING, Status::Queued)
+        .unwrap();
+    super::cancel(
+        &runs(&world),
+        &services,
+        &local.fake,
+        &world.host,
+        &queued.id,
+        MORNING,
+    )
+    .unwrap();
+    assert!(
+        !local
+            .fake
+            .calls
+            .borrow()
+            .iter()
+            .any(|call| call.contains("pkill")),
+        "{:?}",
+        local.fake.calls.borrow()
+    );
+}
+
+/// Services whose removal finds the supervisor had just ended the run, as when it finished
+/// between `vm cancel`'s look at the run and its lock.
+struct FinishingServices {
+    runs: PathBuf,
+}
+
+impl Services for FinishingServices {
+    fn install(&self, _: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn remove(&self, run: &str) -> anyhow::Result<()> {
+        let all = Runs {
+            dir: self.runs.clone(),
+        };
+        let mut ended = all.load(run)?;
+        ended.status = Status::Done {
+            verdict: Verdict::Pass,
+        };
+        all.save(&ended)
+    }
+
+    fn retire(&self, _: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+/// Review finding: `vm cancel` checked the run before its lock and overwrote whatever the
+/// supervisor had saved meanwhile, losing a handoff.
+#[test]
+fn a_run_that_ended_while_being_cancelled_keeps_its_end() {
+    let (world, local) = briefed();
+    let run = started(&world, &FakeServices::default());
+    let services = FinishingServices {
+        runs: world.host.runs.clone(),
+    };
+    let said = super::cancel(
+        &runs(&world),
+        &services,
+        &local.fake,
+        &world.host,
+        &run.id,
+        MORNING,
+    )
+    .unwrap();
+    assert_eq!(
+        said,
+        format!("{} ended before it was cancelled: done: PASS", run.id)
+    );
+    assert_eq!(
+        runs(&world).load(&run.id).unwrap().status,
+        Status::Done {
+            verdict: Verdict::Pass
+        }
+    );
+}
+
+/// Review finding: a cancelled run whose worktree was gone, the usual reason to cancel one,
+/// failed before the next queued run started, so the queue stalled.
+#[test]
+fn cancelling_a_run_whose_worktree_is_gone_still_starts_the_next() {
+    let (world, local) = briefed();
+    let services = FakeServices::default();
+    let mut run = started(&world, &services);
+    run.status = Status::Running;
+    runs(&world).save(&run).unwrap();
+    let queued = runs(&world)
+        .create(
+            &session(&world),
+            ".abc/brief.md",
+            MORNING + 1,
+            Status::Queued,
+        )
+        .unwrap();
+    std::fs::remove_dir_all(&world.worktree).unwrap();
+    let error = super::cancel(
+        &runs(&world),
+        &services,
+        &local.fake,
+        &world.host,
+        &run.id,
+        MORNING,
+    )
+    .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("could not stop its claude"),
+        "{error:#}"
+    );
+    assert_eq!(
+        runs(&world).load(&run.id).unwrap().status,
+        Status::Cancelled
+    );
+    assert!(
+        services
+            .calls
+            .borrow()
+            .contains(&format!("install {}", queued.id)),
+        "the next run started: {:?}",
+        services.calls.borrow()
+    );
 }
