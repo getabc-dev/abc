@@ -5,15 +5,15 @@ use std::future::Future;
 
 use abc_core::actor::{Principal, Role};
 use abc_core::command::OpenSession;
+use abc_core::command::RequestRecord;
 use abc_core::event::Position;
 use abc_core::id::{EnrolmentTokenId, FromUuid as _, PersonId, SessionId, WorkerId, WorkspaceId};
 use abc_core::identity::{Arch, DisplayName, MachineLabel, Os, WorkspaceName};
 use abc_core::policy::{Authorized, authorize};
-use abc_core::command::RequestRecord;
 use abc_core::query::{
-    EnrolmentRequestStatus, RequestCard, RequestState, RequestStatus, ViewEnrolmentRequest,
-    InstallationState, InstallationStatus, ListEnrolmentTokens, ListMachines, MachineCard,
-    MachinesSince, MachinesSnapshot, OpenSessions, Query, SessionView, TokenStatus, TokenSummary,
+    EnrolmentRequestStatus, InstallationState, InstallationStatus, ListEnrolmentTokens,
+    ListMachines, MachineCard, MachinesSince, MachinesSnapshot, OpenSessions, Query, RequestCard,
+    RequestState, RequestStatus, SessionView, TokenStatus, TokenSummary, ViewEnrolmentRequest,
     WhoAmI, WorkerIdentity, WorkerSelf, WorkspaceSummary,
 };
 use abc_core::time::Timestamp;

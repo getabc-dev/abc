@@ -315,7 +315,10 @@ impl TryFrom<&RequestRow> for RequestRecord {
                 os: stored("enrolment_request.os", Os::parse(&row.os))?,
                 arch: stored("enrolment_request.arch", Arch::parse(&row.arch))?,
             },
-            build: stored("enrolment_request.build", semver::Version::parse(&row.build))?,
+            build: stored(
+                "enrolment_request.build",
+                semver::Version::parse(&row.build),
+            )?,
             code: stored("enrolment_request.code", ApprovalCode::parse(&row.code))?,
             expires_at: Timestamp::from_utc(row.expires_at),
             decision: match row.decision.as_deref() {

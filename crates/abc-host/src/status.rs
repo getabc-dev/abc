@@ -98,7 +98,12 @@ pub fn status(server: &Server) -> Result<Report, HostError> {
         Err(error) => Check::failing("programs", "missing".to_owned(), error.to_string()),
     }];
     checks.extend(Part::STACK.map(|part| {
-        service_check(part, host.os, services.state(part), &services.log_hint(part))
+        service_check(
+            part,
+            host.os,
+            services.state(part),
+            &services.log_hint(part),
+        )
     }));
     checks.push(postgres_check(server, &config, &services));
     checks.extend(tailnet_checks(server, &config, &services));

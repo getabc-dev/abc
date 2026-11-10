@@ -47,12 +47,7 @@ impl WorkerService {
         let user_home = service_path(&host.user_home)?;
         Ok(Service {
             part: Part::Worker,
-            command: vec![
-                abc.into(),
-                "worker".into(),
-                "--home".into(),
-                home.into(),
-            ],
+            command: vec![abc.into(), "worker".into(), "--home".into(), home.into()],
             env: vec![
                 ("HOME".to_owned(), user_home.to_owned()),
                 ("ABC_WORKER_HOME".to_owned(), home.to_owned()),
@@ -145,10 +140,7 @@ impl WorkerStatus {
     /// What to run to make it healthy, or `None` when it is.
     #[must_use]
     pub fn fix(&self) -> Option<String> {
-        self.report()
-            .checks
-            .into_iter()
-            .find_map(|check| check.fix)
+        self.report().checks.into_iter().find_map(|check| check.fix)
     }
 
     /// The status as the person reads it: the service, lingering on Linux, each with its fix

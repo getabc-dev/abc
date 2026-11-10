@@ -11,7 +11,9 @@ use axum::Json;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 
-use abc_core::command::{RevokeTokenRejection, RevokeWorkerRejection};
+use abc_core::command::{
+    DecideRequestRejection, RequestRejection, RevokeTokenRejection, RevokeWorkerRejection,
+};
 use abc_core::policy::{DenialReason, Denied};
 use abc_protocol::api::{ApiCode, ApiErrorBody, ApiErrorDetail};
 use abc_store::{AuthError, ExecuteError, QueryError, StoreError};
@@ -89,9 +91,10 @@ pub(crate) const fn status_of(code: ApiCode) -> StatusCode {
         | ApiCode::EnrolmentTokenRevoked
         | ApiCode::EnrolmentTokenUsed
         | ApiCode::EnrolmentTokenExpired => StatusCode::FORBIDDEN,
-        ApiCode::NotFound | ApiCode::EnrolmentTokenUnknown | ApiCode::UnknownWorker => {
-            StatusCode::NOT_FOUND
-        }
+        ApiCode::NotFound
+        | ApiCode::EnrolmentTokenUnknown
+        | ApiCode::EnrolmentRequestUnknown
+        | ApiCode::UnknownWorker => StatusCode::NOT_FOUND,
         ApiCode::MethodNotAllowed => StatusCode::METHOD_NOT_ALLOWED,
         ApiCode::TailnetIdentityRequired
         | ApiCode::InvalidWorkerKey
@@ -100,9 +103,14 @@ pub(crate) const fn status_of(code: ApiCode) -> StatusCode {
         | ApiCode::EnrolmentTokenRequired => StatusCode::UNAUTHORIZED,
         ApiCode::ServerAlreadyClaimed
         | ApiCode::EnrolmentTokenAlreadyRedeemed
+        | ApiCode::EnrolmentRequestExpired
+        | ApiCode::EnrolmentRequestDenied
+        | ApiCode::EnrolmentRequestApproved
         | ApiCode::WorkerKeyInUse => StatusCode::CONFLICT,
         ApiCode::RateLimited => StatusCode::TOO_MANY_REQUESTS,
-        ApiCode::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
+        ApiCode::Unavailable | ApiCode::ApprovalUnavailable | ApiCode::TailnetNodeUnknown => {
+            StatusCode::SERVICE_UNAVAILABLE
+        }
         ApiCode::Internal | ApiCode::ServerOnly => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
@@ -125,6 +133,7 @@ const fn denial_code(reason: DenialReason) -> ApiCode {
         DenialReason::EnrolmentTokenUsed => ApiCode::EnrolmentTokenUsed,
         DenialReason::WorkerKeyInUse => ApiCode::WorkerKeyInUse,
         DenialReason::WorkerRevoked => ApiCode::WorkerRevoked,
+        DenialReason::EnrolmentRequestUnknown => ApiCode::EnrolmentRequestUnknown,
     }
 }
 
@@ -160,6 +169,26 @@ impl RejectionCode for RevokeWorkerRejection {
     fn code(&self) -> ApiCode {
         match self {
             Self::NotFound => ApiCode::NotFound,
+        }
+    }
+}
+
+impl RejectionCode for RequestRejection {
+    fn code(&self) -> ApiCode {
+        match self {
+            Self::KeyInUse => ApiCode::WorkerKeyInUse,
+        }
+    }
+}
+
+impl RejectionCode for DecideRequestRejection {
+    fn code(&self) -> ApiCode {
+        match self {
+            Self::NotFound => ApiCode::EnrolmentRequestUnknown,
+            Self::Expired => ApiCode::EnrolmentRequestExpired,
+            Self::AlreadyDenied => ApiCode::EnrolmentRequestDenied,
+            Self::AlreadyApproved => ApiCode::EnrolmentRequestApproved,
+            Self::KeyInUse => ApiCode::WorkerKeyInUse,
         }
     }
 }
@@ -234,7 +263,11 @@ mod tests {
             let status = status_of(code);
             let server_side = matches!(
                 code,
-                ApiCode::Unavailable | ApiCode::Internal | ApiCode::ServerOnly
+                ApiCode::Unavailable
+                    | ApiCode::ApprovalUnavailable
+                    | ApiCode::TailnetNodeUnknown
+                    | ApiCode::Internal
+                    | ApiCode::ServerOnly
             );
             assert_eq!(
                 status.is_server_error(),

@@ -321,8 +321,8 @@ mod tests {
             Os::Linux => "/data/abc/server",
         };
         assert_eq!(server.home.dir(), Path::new(home), "home");
-        let set = Server::discover(env(&[("HOME", "/u/ada"), ("ABC_SERVER_HOME", "/srv/abc")]))
-            .unwrap();
+        let set =
+            Server::discover(env(&[("HOME", "/u/ada"), ("ABC_SERVER_HOME", "/srv/abc")])).unwrap();
         assert_eq!(set.home.dir(), Path::new("/srv/abc"), "ABC_SERVER_HOME");
         assert!(
             matches!(

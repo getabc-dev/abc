@@ -1073,9 +1073,12 @@ mod tests {
             let broken = machine.root().join("broken.dump");
             std::fs::write(&broken, "FAKE DUMP\nBROKEN\n").unwrap();
             let mut restoring = Vec::new();
-            let error =
-                abc_host::restore(&machine.server(), &broken, &mut Console::new(&mut restoring))
-                    .unwrap_err();
+            let error = abc_host::restore(
+                &machine.server(),
+                &broken,
+                &mut Console::new(&mut restoring),
+            )
+            .unwrap_err();
             assert!(
                 error.to_string().contains("abc's database is unchanged"),
                 "{error}"
@@ -1119,7 +1122,8 @@ mod tests {
             .status()
             .unwrap();
         let mut restoring = Vec::new();
-        let down = abc_host::restore(&server, &good, &mut Console::new(&mut restoring)).unwrap_err();
+        let down =
+            abc_host::restore(&server, &good, &mut Console::new(&mut restoring)).unwrap_err();
         assert!(
             down.to_string()
                 .contains("check abc's Postgres with abc server status"),
@@ -1133,7 +1137,12 @@ mod tests {
         let machine = Machine::set_up(Os::Linux);
         std::fs::remove_file(machine.programs().tailscale).unwrap();
         let mut uninstalling = Vec::new();
-        abc_host::uninstall(&machine.server(), true, &mut Console::new(&mut uninstalling)).unwrap();
+        abc_host::uninstall(
+            &machine.server(),
+            true,
+            &mut Console::new(&mut uninstalling),
+        )
+        .unwrap();
         let told = String::from_utf8(uninstalling).unwrap();
         assert!(
             told.contains("Could not log abc's node out (") && told.contains("admin console"),
@@ -1200,7 +1209,7 @@ mod tests {
         server.host.path = std::ffi::OsString::new();
         let mut said = Vec::new();
         abc_host::open_in_browser(
-            &server,
+            &server.host,
             &mut Console::new(&mut said),
             "https://x.example/#code=1",
         );
@@ -1212,7 +1221,7 @@ mod tests {
         replace_program(&machine, "bin/xdg-open", "#!/bin/sh\nexit 3\n");
         let mut failed = Vec::new();
         abc_host::open_in_browser(
-            &machine.server(),
+            &machine.server().host,
             &mut Console::new(&mut failed),
             "https://x.example/",
         );

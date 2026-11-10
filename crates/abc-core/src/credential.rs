@@ -388,6 +388,12 @@ impl ApprovalCode {
         }
     }
 
+    /// The code's 8 characters, without the dash: what the store keeps.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
     /// The code as people see it: two groups of four, joined by a dash.
     #[must_use]
     pub fn display_form(&self) -> String {

@@ -14,16 +14,25 @@
 //!
 //! The response carries no secret. Losing it costs a retry, not a token.
 
-use abc_core::credential::{EnrolmentToken, WorkerKeyDigest};
-use abc_core::id::{WorkerId, WorkspaceId};
+use abc_core::credential::{ApprovalCode, EnrolmentToken, WorkerKeyDigest};
+use abc_core::id::{EnrolmentRequestId, WorkerId, WorkspaceId};
 use abc_core::identity::{DisplayName, MachineInfo};
 use abc_core::secret::{Secret, serialize_exposed};
+use abc_core::time::Timestamp;
 use semver::Version;
 use serde::{Deserialize, Serialize};
 
 /// The enrolment endpoint, relative to the server's tailnet URL. Requests carry
 /// `Content-Type: application/json`.
 pub const ENROL_PATH: &str = "/api/enrol";
+
+/// The path of a workspace's enrolment requests, with `{workspace}` as the workspace's id:
+/// `POST` asks to enrol (an [`ApprovalRequest`], answered with an [`ApprovalRequested`]).
+pub const REQUESTS_PATH: &str = "/api/workspaces/{workspace}/enrolment-requests";
+
+/// The path a waiting machine polls, with `{request}` as the request's id. It answers an
+/// `abc_core::query::RequestState`, and only to the login and node that made the request.
+pub const REQUEST_STATUS_PATH: &str = "/api/enrolment-requests/{request}";
 
 /// The worker's enrolment request.
 #[derive(Debug, Serialize, Deserialize)]
@@ -37,6 +46,29 @@ pub struct EnrolRequest {
     pub machine: MachineInfo,
     /// The worker's abc release.
     pub build: Version,
+}
+
+/// A machine asking to be enrolled, to be approved in the browser. The key it generated stays on
+/// the machine: only its digest travels.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovalRequest {
+    /// The digest of the key the worker generated and already saved.
+    pub key: WorkerKeyDigest,
+    /// The machine.
+    pub machine: MachineInfo,
+    /// The worker's abc release.
+    pub build: Version,
+}
+
+/// What the machine shows while it waits for approval.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovalRequested {
+    /// The request, which the machine polls.
+    pub request: EnrolmentRequestId,
+    /// The code the Approve page shows too.
+    pub code: ApprovalCode,
+    /// When the request stops waiting.
+    pub expires_at: Timestamp,
 }
 
 /// A successful enrolment. Identical for the first call and for every retry with the same key.

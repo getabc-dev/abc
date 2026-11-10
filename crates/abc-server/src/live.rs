@@ -81,18 +81,30 @@ pub(crate) async fn stream(
     let caller = Caller::from(caller);
     let first = match last {
         None => {
-            let MachinesSnapshot { head, machines } =
-                app.store.query(&caller, ListMachines { workspace }).await?;
-            LiveUpdate::Snapshot { head, machines }
+            let MachinesSnapshot {
+                head,
+                machines,
+                requests,
+            } = app.store.query(&caller, ListMachines { workspace }).await?;
+            LiveUpdate::Snapshot {
+                head,
+                machines,
+                requests,
+            }
         }
         Some(after) => {
-            let MachinesSnapshot { head, machines } = app
+            let MachinesSnapshot {
+                head,
+                machines,
+                requests,
+            } = app
                 .store
                 .query(&caller, MachinesSince { workspace, after })
                 .await?;
             LiveUpdate::Machines {
                 head,
                 changed: machines,
+                requests,
             }
         }
     };
@@ -159,12 +171,17 @@ impl Follower {
             after: self.cursor,
         };
         match self.store.query(&self.caller, since).await {
-            Ok(MachinesSnapshot { head, machines }) => {
-                let sent = machines.is_empty()
+            Ok(MachinesSnapshot {
+                head,
+                machines,
+                requests,
+            }) => {
+                let sent = (machines.is_empty() && requests.is_empty())
                     || self
                         .send(&LiveUpdate::Machines {
                             head,
                             changed: machines,
+                            requests,
                         })
                         .await;
                 self.cursor = head;

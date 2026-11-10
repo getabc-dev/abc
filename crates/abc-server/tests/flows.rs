@@ -2,6 +2,10 @@
 //! socket by clients that play the Tailscale sidecar.
 
 #[cfg(test)]
+#[expect(
+    dead_code,
+    reason = "the shared harness; this file needs only part of it"
+)]
 mod common;
 
 #[cfg(test)]
