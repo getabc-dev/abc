@@ -331,7 +331,9 @@ fn render(
 mod tests {
     use std::path::Path;
 
-    use super::{PROGRESS, STATE, gate_passed, new_task, observed, set_next, stopped, utc};
+    use super::{
+        PROGRESS, STATE, gate_passed, load, new_task, now, observed, set_next, stopped, utc,
+    };
     use crate::testing::{clone_with_origin, git};
 
     fn progress(root: &Path) -> String {
@@ -431,6 +433,36 @@ mod tests {
         let state = std::fs::read_to_string(dir.path().join(STATE)).unwrap();
         assert!(state.contains(&"x".repeat(4000)), "kept");
         assert!(!state.contains(&"x".repeat(4001)), "cut");
+    }
+
+    #[test]
+    fn a_branch_without_commits_of_its_own_says_so() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = clone_with_origin(temp.path());
+        assert!(observed(&root, 0).unwrap());
+        let text = progress(&root);
+        assert!(
+            text.contains("Commits since origin/main, newest first:\n\n- none\n"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn only_a_missing_state_is_a_fresh_one() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(load(dir.path()).unwrap(), super::State::default());
+        std::fs::create_dir_all(dir.path().join(STATE)).unwrap();
+        assert!(load(dir.path()).is_err(), "a state that cannot be read");
+    }
+
+    #[test]
+    fn now_is_the_system_clock() {
+        let system = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let now = u64::try_from(now()).unwrap();
+        assert!(now.abs_diff(system) <= 5, "{now} vs {system}");
     }
 
     #[test]

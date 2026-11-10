@@ -1700,3 +1700,46 @@ fn the_launcher_lets_a_post_tool_use_stand_whatever_happens() {
         );
     }
 }
+
+/// In another worktree the checkpoint is that checkout's: its own xtask keeps it, and a checkout
+/// without the launcher keeps none.
+#[test]
+fn a_worktrees_checkpoint_is_kept_by_its_own_xtask() {
+    let (temp, main, worktree) = repository_with_nested_worktree();
+    let bin = temp.path().join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    let mut context = context(&main, None);
+    context.cargo = fake_cargo(&bin, "", 0);
+    let post = serde_json::json!({ "hook_event_name": "PostToolUse", "cwd": worktree }).to_string();
+    let mut log = Vec::new();
+    assert_eq!(
+        run(Event::PostToolUse, &post, &context, &mut log),
+        Answer::Allow
+    );
+    let args = fs::read_to_string(bin.join("args")).unwrap();
+    assert!(
+        args.trim_end().ends_with("hook post-tool-use"),
+        "handed over: {args}"
+    );
+    assert!(
+        !main.join(crate::progress::PROGRESS).exists(),
+        "the main checkout keeps no checkpoint for it"
+    );
+
+    context.delegated = true;
+    run(Event::PostToolUse, &post, &context, &mut log);
+    let noted = String::from_utf8(log).unwrap();
+    assert!(
+        noted.contains("was handed this hook"),
+        "never handed on: {noted}"
+    );
+
+    context.delegated = false;
+    fs::remove_file(bin.join("args")).unwrap();
+    fs::remove_file(worktree.join(LAUNCHER)).unwrap();
+    assert_eq!(
+        run(Event::PostToolUse, &post, &context, &mut Vec::new()),
+        Answer::Allow
+    );
+    assert!(!bin.join("args").exists(), "no xtask to hand it to");
+}

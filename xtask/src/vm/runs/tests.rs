@@ -745,7 +745,7 @@ fn a_session_that_cannot_start_is_retried_with_a_growing_wait() {
     let clock = FakeClock::at(MORNING);
     let status = supervise(&world, &local, &services, &clock, &run.id);
     assert!(
-        matches!(&status, Status::GaveUp { reason } if reason.starts_with("40 attempts, the most a run makes; the last ended with the session could not start: no Claude Code subscription token")),
+        matches!(&status, Status::GaveUp { reason } if reason == "the session has not started since 2026-11-10 08:00 UTC, 24 hours"),
         "{status:?}"
     );
     let slept = clock.slept.borrow().clone();
@@ -753,6 +753,11 @@ fn a_session_that_cannot_start_is_retried_with_a_growing_wait() {
     assert_eq!(slept[2] - slept[1], 62, "the wait doubles: {slept:?}");
     assert_eq!(slept[3] - slept[2], 122, "{slept:?}");
     assert_eq!(slept[39] - slept[38], 902, "up to 15 minutes: {slept:?}");
+    assert!(
+        slept.len() > 90,
+        "a day of tries, beyond the cap on sessions: {}",
+        slept.len()
+    );
     assert!(!local.bin.join("calls").exists(), "claude never ran");
     let state = runs(&world).load(&run.id).unwrap();
     assert!(matches!(
@@ -1207,7 +1212,7 @@ fn a_systemd_user_unit_runs_the_supervisor_until_its_run_ends() {
         "/runs/bin/xtask-",
         "\" \"vm\" \"supervise\" \"abc-w-1\"\n",
         "Environment=\"HOME=/Users/me & you\"\nEnvironment=\"PATH=/opt/homebrew/bin:/usr/bin:%%x\"\n",
-        "Restart=on-failure\nRestartSec=60\n\n[Install]\nWantedBy=default.target\n",
+        "KillMode=process\nRestart=on-failure\nRestartSec=60\n\n[Install]\nWantedBy=default.target\n",
         "/runs/abc-w-1/supervisor.log\n",
     ] {
         assert!(unit.contains(expected), "{expected} in:\n{unit}");
@@ -1255,4 +1260,247 @@ fn the_service_manager_is_the_hosts() {
     let mac = Manager::of(Os::MacOs, home, Path::new("/state/runs"), &env).unwrap();
     assert_eq!(mac.units, Path::new("/home/me/Library/LaunchAgents"));
     assert_eq!(mac.program, Path::new("launchctl"));
+}
+
+/// The host rebooted while the run waited out an outage: the VM is gone, and a probe in it could
+/// never answer. The attempt starts the VM instead.
+#[test]
+fn an_outage_wait_starts_a_vm_that_is_gone_instead_of_probing_it() {
+    let (world, mut local) = briefed();
+    local.fake.running = false;
+    fake_claude(&local.bin, &[DNS, HANDOFF]);
+    let services = FakeServices::default();
+    let run = started(&world, &services);
+    let status = supervise(&world, &local, &services, &FakeClock::at(MORNING), &run.id);
+    assert_eq!(
+        status,
+        Status::Done {
+            verdict: Verdict::Pass
+        }
+    );
+    assert!(
+        !local
+            .fake
+            .calls
+            .borrow()
+            .iter()
+            .any(|call| call.contains("curl")),
+        "{:?}",
+        local.fake.calls.borrow()
+    );
+    assert_eq!(
+        local.fake.started.borrow().len(),
+        2,
+        "started for each attempt"
+    );
+}
+
+/// The token broker stopped with an earlier supervisor while the VM ran on: an attempt makes
+/// sure one listens, and one that cannot be started is a session that could not start.
+#[test]
+fn an_attempt_in_a_running_vm_needs_its_token_broker() {
+    let (world, local) = briefed();
+    fake_claude(&local.bin, &[HANDOFF]);
+    let files = crate::broker::files(&world.host.home, "abc-w");
+    std::fs::remove_file(&files.control).unwrap();
+    let services = FakeServices::default();
+    let run = started(&world, &services);
+    let status = supervise(&world, &local, &services, &FakeClock::at(MORNING), &run.id);
+    assert!(matches!(status, Status::GaveUp { .. }), "{status:?}");
+    let state = runs(&world).load(&run.id).unwrap();
+    assert!(
+        matches!(&state.attempts[0].outcome, Some(Outcome::Unstarted { message }) if message.contains("the token broker is not installed")),
+        "{:?}",
+        state.attempts[0].outcome
+    );
+    assert!(
+        !local.bin.join("calls").exists(),
+        "claude never ran without a broker"
+    );
+}
+
+/// A log that cannot be flushed.
+struct Unflushable;
+impl std::io::Write for Unflushable {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Err(std::io::Error::other("disk gone"))
+    }
+}
+
+#[test]
+fn the_stream_reads_a_last_line_without_a_newline_and_names_each_session_once() {
+    let mut log = Vec::new();
+    let mut seen = Vec::new();
+    let mut record = |id: &str| {
+        seen.push(id.to_owned());
+        Ok(())
+    };
+    let mut stream = super::Stream::new(&mut log, &mut record);
+    std::io::Write::write_all(
+        &mut stream,
+        b"{\"type\":\"system\",\"session_id\":\"a\"}\nnot json\n{\"type\":\"result\",\"is_error\":false,\"result\":\"PASS\"}",
+    )
+    .unwrap();
+    std::io::Write::flush(&mut stream).unwrap();
+    let result = stream.finish().unwrap().unwrap();
+    assert_eq!(result["result"], "PASS");
+    assert_eq!(seen, ["a"]);
+    assert!(log.ends_with(b"\"PASS\"}"), "passed on whole");
+
+    let mut unflushable = Unflushable;
+    let mut failing = |_: &str| Err(anyhow::anyhow!("state not kept"));
+    let mut broken = super::Stream::new(&mut unflushable, &mut failing);
+    assert!(
+        std::io::Write::flush(&mut broken).is_err(),
+        "a flush reaches the log"
+    );
+    std::io::Write::write_all(&mut broken, b"{\"session_id\":\"b\"}\n").unwrap();
+    let error = broken.finish().unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "state not kept",
+        "a session id that was not kept fails"
+    );
+}
+
+/// The session id that a stream names on its init line and again on later lines is recorded
+/// once.
+#[test]
+fn an_attempt_records_each_session_once() {
+    let (world, local) = briefed();
+    let repeated = format!(
+        "{{\"type\":\"assistant\",\"session_id\":\"s1\"}}\n{}",
+        HANDOFF.replace(
+            "\"result\":\"**PASS**",
+            "\"session_id\":\"s1\",\"result\":\"**PASS**"
+        )
+    );
+    fake_claude(&local.bin, &[&repeated]);
+    let services = FakeServices::default();
+    let run = started(&world, &services);
+    supervise(&world, &local, &services, &FakeClock::at(MORNING), &run.id);
+    let state = runs(&world).load(&run.id).unwrap();
+    assert_eq!(state.attempts[0].sessions, ["s1"]);
+}
+
+#[test]
+fn cancelling_a_run_mid_attempt_ends_the_attempt_as_interrupted() {
+    let (world, local) = briefed();
+    let services = FakeServices::default();
+    let mut run = started(&world, &services);
+    run.status = Status::Running;
+    run.attempts.push(super::Attempt {
+        started: MORNING,
+        ended: None,
+        sessions: vec!["s1".to_owned()],
+        outcome: None,
+    });
+    runs(&world).save(&run).unwrap();
+    super::cancel(
+        &runs(&world),
+        &services,
+        &local.fake,
+        &world.host,
+        &run.id,
+        MORNING + 9,
+    )
+    .unwrap();
+    let state = runs(&world).load(&run.id).unwrap();
+    assert_eq!(state.status, Status::Cancelled);
+    assert_eq!(state.attempts[0].outcome, Some(Outcome::Interrupted));
+    assert_eq!(state.attempts[0].ended, Some(MORNING + 9));
+
+    let (other, other_local) = briefed();
+    let queued = runs(&other)
+        .create(&session(&other), ".abc/brief.md", MORNING, Status::Queued)
+        .unwrap();
+    super::cancel(
+        &runs(&other),
+        &services,
+        &other_local.fake,
+        &other.host,
+        &queued.id,
+        MORNING,
+    )
+    .unwrap();
+    let cancelled = runs(&other).load(&queued.id).unwrap();
+    assert_eq!(cancelled.status, Status::Cancelled);
+    assert!(
+        cancelled.attempts.is_empty(),
+        "a queued run has no attempt to end"
+    );
+}
+
+#[test]
+fn runs_are_none_before_the_first_and_a_runs_directory_that_cannot_be_read_is_an_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing = Runs {
+        dir: dir.path().join("runs"),
+    };
+    assert_eq!(missing.list().unwrap(), Vec::<Run>::new(), "no runs yet");
+    std::fs::write(dir.path().join("runs"), "a file").unwrap();
+    missing.list().unwrap_err();
+    let mut out = Vec::new();
+    super::list(
+        &Runs {
+            dir: dir.path().join("none"),
+        },
+        false,
+        &mut out,
+    )
+    .unwrap();
+    assert_eq!(String::from_utf8(out).unwrap(), "vm runs: none\n");
+}
+
+#[test]
+fn the_system_clock_sleeps_until_the_time_given() {
+    let clock = super::SystemClock;
+    let before = std::time::Instant::now();
+    clock.sleep_until(clock.now() - 5);
+    assert!(
+        before.elapsed() < std::time::Duration::from_millis(500),
+        "a time past returns at once"
+    );
+    let target = clock.now() + 2;
+    clock.sleep_until(target);
+    assert!(clock.now() >= target, "not before");
+}
+
+#[test]
+fn a_supervisor_shows_its_runs_directory() {
+    let (world, local) = briefed();
+    let all = runs(&world);
+    let shown = format!(
+        "{:?}",
+        Supervisor {
+            runs: &all,
+            host: &world.host,
+            backend: &local,
+            services: &FakeServices::default(),
+            clock: &super::SystemClock,
+        }
+    );
+    assert!(
+        shown.starts_with("Supervisor { runs: Runs { dir: "),
+        "{shown}"
+    );
+}
+
+#[test]
+fn each_build_of_xtask_gets_its_own_copy() {
+    let dir = tempfile::tempdir().unwrap();
+    let launchd = manager(Os::MacOs, dir.path());
+    launchd.install("abc-w-1").unwrap();
+    std::fs::write(&launchd.exe, "another build").unwrap();
+    launchd.install("abc-w-2").unwrap();
+    assert_eq!(
+        std::fs::read_dir(dir.path().join("runs/bin"))
+            .unwrap()
+            .count(),
+        2,
+        "a new build, a new copy"
+    );
 }

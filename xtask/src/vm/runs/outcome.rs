@@ -10,7 +10,7 @@
 
 use serde::{Deserialize, Serialize};
 
-/// The most attempts one run makes.
+/// The most sessions one run starts; attempts whose VM would not start do not count.
 pub(crate) const MAX_ATTEMPTS: usize = 40;
 
 /// The most attempts in a row that end in an error or without a handoff.
@@ -292,11 +292,18 @@ pub(crate) fn after_attempt(
     outage: Option<Outage>,
     now: i64,
 ) -> Next {
-    let attempts = earlier.len().saturating_add(1);
     if let Outcome::Done { verdict } = outcome {
         return Next::Done(*verdict);
     }
-    if attempts >= MAX_ATTEMPTS {
+    // Only sessions count toward the cap: a VM that would not start ran none, and is bounded by
+    // the outage's day instead.
+    let sessions = |each: &Outcome| !matches!(each, Outcome::Unstarted { .. });
+    let attempts = earlier
+        .iter()
+        .filter(|earlier| sessions(earlier))
+        .count()
+        .saturating_add(1);
+    if sessions(outcome) && attempts >= MAX_ATTEMPTS {
         return Next::GiveUp(format!(
             "{attempts} attempts, the most a run makes; the last ended with {}",
             outcome.describe()

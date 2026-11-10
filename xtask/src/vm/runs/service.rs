@@ -230,6 +230,9 @@ impl Manager {
                 for line in [
                     format!("StandardOutput=append:{output}"),
                     format!("StandardError=append:{output}"),
+                    // A restarted supervisor leaves the session's token broker running, as
+                    // launchd does; the VM it serves runs on.
+                    "KillMode=process".to_owned(),
                     "Restart=on-failure".to_owned(),
                     "RestartSec=60".to_owned(),
                     String::new(),

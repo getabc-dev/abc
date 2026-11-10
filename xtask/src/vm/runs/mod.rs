@@ -690,7 +690,12 @@ impl Supervisor<'_> {
                 }
                 Status::Waiting { until, cause } => {
                     self.clock.sleep_until(until);
-                    if cause == Cause::Network && !probe(self.backend, &session.name) {
+                    // The probe runs in the VM; a VM that is gone, as after a reboot, is started
+                    // by the attempt instead.
+                    if cause == Cause::Network
+                        && self.backend.is_running(&session.name)?
+                        && !probe(self.backend, &session.name)
+                    {
                         let outage = run.outage.unwrap_or(Outage {
                             since: until,
                             tries: 0,
@@ -777,9 +782,17 @@ impl Supervisor<'_> {
     }
 
     /// Readies `session` for an attempt: starts its VM when it is not running, handing it the
-    /// subscription token as `vm start` does, and stops any `claude` left running in it.
+    /// subscription token as `vm start` does, or else makes sure its token broker listens; and
+    /// stops any `claude` left running in it.
     fn prepare(&self, session: &Session, log: &mut File) -> anyhow::Result<()> {
-        if !self.backend.is_running(&session.name)? {
+        if self.backend.is_running(&session.name)? {
+            // The broker may have stopped with an earlier supervisor while the VM ran on.
+            super::ensure_broker(
+                self.host,
+                &session.name,
+                &crate::broker::files(&self.host.home, &session.name),
+            )?;
+        } else {
             super::start(session, self.host, self.backend, log)?;
         }
         stop_claude(self.backend, &session.name)

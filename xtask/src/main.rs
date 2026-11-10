@@ -1657,6 +1657,28 @@ mod tests {
                 "nothing to judge"
             );
         }
+        assert!(
+            !root.join(crate::progress::PROGRESS).exists(),
+            "a gate judging another tree (--root) keeps no checkpoint there"
+        );
+        // A gate on its own checkout records its pass in the checkpoint.
+        fake_tools(&{
+            let tools = root.join("tools");
+            fs::create_dir_all(&tools).unwrap();
+            tools
+        });
+        let coverage = Task::Coverage {
+            base: "base".to_owned(),
+        };
+        assert_eq!(
+            dispatch(coverage, &root, &root, &no_env).unwrap(),
+            ExitCode::SUCCESS
+        );
+        let checkpoint = fs::read_to_string(root.join(crate::progress::PROGRESS)).unwrap();
+        assert!(
+            checkpoint.contains("- `cargo xtask coverage` passed at "),
+            "{checkpoint}"
+        );
         assert_eq!(
             dispatch(
                 Task::Rulesets {

@@ -574,7 +574,11 @@ fn subscription_token(host: &Host) -> anyhow::Result<Vec<u8>> {
 
 /// Makes sure session `session`'s token broker listens on the sockets of `files`, starting the
 /// installed one when it does not.
-fn ensure_broker(host: &Host, session: &str, files: &crate::broker::Files) -> anyhow::Result<()> {
+pub(crate) fn ensure_broker(
+    host: &Host,
+    session: &str,
+    files: &crate::broker::Files,
+) -> anyhow::Result<()> {
     let listening = || std::os::unix::net::UnixStream::connect(&files.control).is_ok();
     if listening() {
         return Ok(());
