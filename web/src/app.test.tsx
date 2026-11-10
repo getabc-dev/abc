@@ -13,7 +13,7 @@ import { apiClient, type Fetch } from "./api/client";
 import { App, createAppRouter } from "./app";
 import type { LiveUpdate } from "./generated/LiveUpdate";
 import type { SessionView } from "./generated/SessionView";
-import { card, stubMatchMedia } from "./testing";
+import { card, enrolmentRequest, stubMatchMedia } from "./testing";
 
 // The router restores scroll positions, which jsdom cannot do.
 Reflect.set(window, "scrollTo", () => undefined);
@@ -113,7 +113,7 @@ test("an unclaimed server sends every route to the claim, which lands on home", 
   expect(claim?.init.body).toBe(
     JSON.stringify({ code: "abcd-efgh", display_name: "Ada Lovelace", workspace_name: "Home lab" }),
   );
-  live.send({ type: "snapshot", head: 4, machines: [] });
+  live.send({ type: "snapshot", requests: [], head: 4, machines: [] });
   await screen.findByRole("heading", { name: "Enrol your first machine" });
 });
 
@@ -213,7 +213,7 @@ test("a failed refetch of the session keeps the shell and its stream, with a not
     return live.response;
   });
   mount("/machines", fetcher);
-  live.send({ type: "snapshot", head: 1, machines: [card("lab box", "w1", true)] });
+  live.send({ type: "snapshot", requests: [], head: 1, machines: [card("lab box", "w1", true)] });
   await screen.findByRole("region", { name: "lab box" });
   // Coming back to the window asks again; this time the server fails.
   act(() => {
@@ -242,7 +242,7 @@ test("machines appear live in the shell and on their screen, and go offline", as
   mount("/", fetcher);
   await screen.findByText("Loading machines…");
   expect(screen.getByRole("banner").textContent).toContain("Home lab");
-  live.send({ type: "snapshot", head: 4, machines: [card("lab box", "w1", true)] });
+  live.send({ type: "snapshot", requests: [], head: 4, machines: [card("lab box", "w1", true)] });
   const region = await screen.findByRole("region", { name: "lab box" });
   expect(within(region).getByText("Online")).toBeDefined();
   expect(within(region).getByText("Linux on x86-64")).toBeDefined();
@@ -253,6 +253,7 @@ test("machines appear live in the shell and on their screen, and go offline", as
   expect(screen.getByText("Live")).toBeDefined();
   live.send({
     type: "machines",
+    requests: [],
     head: 6,
     changed: [{ ...card("lab box", "w1", false), last_seen_at: "2026-11-06T09:30:00Z" }],
   });
@@ -270,7 +271,7 @@ test("a dropped stream shows the page offline and resumes where it stopped", asy
     path === "/api/session" ? json(200, member) : (streams.shift() ?? stream()).response,
   );
   mount("/machines", fetcher);
-  first.send({ type: "snapshot", head: 4, machines: [card("lab box", "w1", true)] });
+  first.send({ type: "snapshot", requests: [], head: 4, machines: [card("lab box", "w1", true)] });
   await screen.findByRole("region", { name: "lab box" });
   act(() => {
     first.end();
@@ -278,7 +279,7 @@ test("a dropped stream shows the page offline and resumes where it stopped", asy
   await screen.findByText(/Offline: the connection to the server dropped/);
   expect(screen.getByText("Reconnecting")).toBeDefined();
   // The resume waits half a second.
-  second.send({ type: "machines", head: 7, changed: [card("laptop", "w2", true)] });
+  second.send({ type: "machines", requests: [], head: 7, changed: [card("laptop", "w2", true)] });
   await screen.findByRole("region", { name: "laptop" }, { timeout: 3000 });
   expect(screen.queryByText(/Offline: the connection/)).toBeNull();
   const resumed = requests.filter((request) => request.path.endsWith("/live"))[1];
@@ -296,7 +297,7 @@ test("a stream refused before any card is an error with a retry", async () => {
   expect(screen.getByText("you are not a member of this workspace")).toBeDefined();
   expect(screen.getByText("Stopped")).toBeDefined();
   await userEvent.click(screen.getByRole("button", { name: "Try again" }));
-  live.send({ type: "snapshot", head: 1, machines: [card("lab box", "w1", true)] });
+  live.send({ type: "snapshot", requests: [], head: 1, machines: [card("lab box", "w1", true)] });
   await screen.findByRole("region", { name: "lab box" });
 });
 
@@ -306,7 +307,7 @@ test("ended access keeps the cards, says so and offers a retry", async () => {
     "/machines",
     server(({ path }) => (path === "/api/session" ? json(200, member) : live.response)).fetcher,
   );
-  live.send({ type: "snapshot", head: 1, machines: [card("lab box", "w1", true)] });
+  live.send({ type: "snapshot", requests: [], head: 1, machines: [card("lab box", "w1", true)] });
   await screen.findByRole("region", { name: "lab box" });
   live.send({ type: "access_ended", head: 1 });
   const alert = await screen.findByRole("alert");
@@ -330,7 +331,7 @@ test("enrolling shows the commands with the server's URL and the token once", as
     return live.response;
   });
   mount("/machines", fetcher);
-  live.send({ type: "snapshot", head: 1, machines: [card("lab box", "w1", false)] });
+  live.send({ type: "snapshot", requests: [], head: 1, machines: [card("lab box", "w1", false)] });
   await userEvent.click(await screen.findByRole("button", { name: "Enrol a machine" }));
   await userEvent.type(screen.getByRole("textbox", { name: "Machine name" }), "laptop");
   await userEvent.click(screen.getByRole("button", { name: "Create enrolment token" }));
@@ -355,6 +356,7 @@ test("a revoked machine says so and leaves the shell's pills", async () => {
   );
   live.send({
     type: "snapshot",
+    requests: [],
     head: 1,
     machines: [{ ...card("old box", "w1", false), revoked: true }, card("mac", "w2", true)],
   });
@@ -391,10 +393,113 @@ test("a workspace with only revoked machines offers the first enrolment", async 
   );
   live.send({
     type: "snapshot",
+    requests: [],
     head: 1,
     machines: [{ ...card("old box", "w1", false), revoked: true }],
   });
   await screen.findByRole("heading", { name: "Enrol your first machine" });
   expect(screen.getByText("No machines")).toBeDefined();
   expect(screen.getByRole("region", { name: "old box" })).toBeDefined();
+});
+
+const REQUEST = "0190f5a2-0000-7000-8000-0000000000aa";
+
+test("Machines shows the setup command and a notice for each machine asking to join", async () => {
+  const live = stream();
+  const { fetcher } = server(({ path }) =>
+    path === "/api/session" ? json(200, member) : live.response,
+  );
+  const router = mount("/machines", fetcher);
+  live.send({
+    type: "snapshot",
+    head: 4,
+    machines: [card("lab box", "w1", true)],
+    requests: [
+      {
+        ...enrolmentRequest("mbp", REQUEST),
+        expires_at: new Date(Date.now() + 600_000).toISOString(),
+      },
+    ],
+  });
+  await screen.findByRole("region", { name: "lab box" });
+  const notice = await screen.findByRole("alert");
+  expect(within(notice).getByText("mbp wants to join")).toBeDefined();
+  expect(within(notice).getByText("K7QX-M2PD")).toBeDefined();
+  await userEvent.click(screen.getByRole("button", { name: "Enrol a machine" }));
+  expect(screen.getByText(`abc worker setup ${ORIGIN}`)).toBeDefined();
+  expect(screen.getByRole("button", { name: "Copy the setup command" })).toBeDefined();
+  await userEvent.click(within(notice).getByRole("link", { name: "Review request" }));
+  expect(router.state.location.pathname).toBe(`/machines/requests/${WORKSPACE}/${REQUEST}`);
+});
+
+test("a request that lapsed shows no notice", async () => {
+  const live = stream();
+  const { fetcher } = server(({ path }) =>
+    path === "/api/session" ? json(200, member) : live.response,
+  );
+  mount("/machines", fetcher);
+  live.send({
+    type: "snapshot",
+    head: 4,
+    machines: [card("lab box", "w1", true)],
+    requests: [enrolmentRequest("mbp", REQUEST)],
+  });
+  await screen.findByRole("region", { name: "lab box" });
+  expect(screen.queryByText("mbp wants to join")).toBeNull();
+});
+
+test("the Approve page shows who asks and the code, and Approve enrols", async () => {
+  const live = stream();
+  const base = `/api/workspaces/${WORKSPACE}/enrolment-requests/${REQUEST}`;
+  const { fetcher, requests } = server(({ method, path }) => {
+    if (path === "/api/session") {
+      return json(200, member);
+    }
+    if (path === base) {
+      return json(200, enrolmentRequest("mbp", REQUEST));
+    }
+    if (method === "POST" && path === `${base}/approve`) {
+      return new Response(null, { status: 204 });
+    }
+    return live.response;
+  });
+  mount(`/machines/requests/${WORKSPACE}/${REQUEST}`, fetcher);
+  await screen.findByRole("heading", { level: 1, name: "mbp wants to join" });
+  expect(screen.getByText("K7QX-M2PD")).toBeDefined();
+  expect(screen.getByText("alice@example.com")).toBeDefined();
+  expect(screen.getByText("alice-mbp.tail1234.ts.net")).toBeDefined();
+  expect(screen.getByText("macOS on ARM64")).toBeDefined();
+  expect(screen.getByText(/matches the code your terminal shows/)).toBeDefined();
+  await userEvent.click(screen.getByRole("button", { name: "Approve" }));
+  await screen.findByText("Approved");
+  expect(requests.some((entry) => entry.path === `${base}/approve`)).toBe(true);
+  expect(screen.getByRole("link", { name: "Back to Machines" })).toBeDefined();
+});
+
+test("the Approve page denies, and says when a request is not this workspace's", async () => {
+  const live = stream();
+  const base = `/api/workspaces/${WORKSPACE}/enrolment-requests`;
+  const { fetcher } = server(({ method, path }) => {
+    if (path === "/api/session") {
+      return json(200, member);
+    }
+    if (path === `${base}/${REQUEST}`) {
+      return json(200, enrolmentRequest("mbp", REQUEST));
+    }
+    if (method === "POST" && path === `${base}/${REQUEST}/deny`) {
+      return new Response(null, { status: 204 });
+    }
+    if (path.startsWith(base)) {
+      return refusal(404, "enrolment_request_unknown", "no such enrolment request");
+    }
+    return live.response;
+  });
+  mount(`/machines/requests/${WORKSPACE}/${REQUEST}`, fetcher);
+  await screen.findByRole("heading", { level: 1, name: "mbp wants to join" });
+  await userEvent.click(screen.getByRole("button", { name: "Deny" }));
+  await screen.findByText("Denied");
+  cleanup();
+  mount(`/machines/requests/${WORKSPACE}/0190f5a2-0000-7000-8000-0000000000cc`, fetcher);
+  await screen.findByRole("heading", { level: 1, name: "No such request" });
+  expect(screen.queryByRole("button", { name: "Try again" })).toBeNull();
 });

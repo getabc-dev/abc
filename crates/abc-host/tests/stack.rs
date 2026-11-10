@@ -296,8 +296,9 @@ mod tests {
         root_was_asked_once(machine, &calls, said);
         assert!(
             calls.contains(&format!(
-                "abc server --sidecar-socket {} --ops-addr {} --public-url https://abc.tailfake.ts.net",
+                "abc server --sidecar-socket {} --tailscaled-socket {} --ops-addr {} --public-url https://abc.tailfake.ts.net",
                 machine.socket("abc.sock"),
+                machine.socket("tailscaled.sock"),
                 machine.ops
             )),
             "the server's service: {calls:#?}"

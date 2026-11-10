@@ -338,6 +338,8 @@ fn server_service(
         "server".into(),
         "--sidecar-socket".into(),
         home.abc_socket().into_os_string(),
+        "--tailscaled-socket".into(),
+        home.tailscaled_socket().into_os_string(),
         "--ops-addr".into(),
         config.ops_addr.to_string().into(),
         "--public-url".into(),

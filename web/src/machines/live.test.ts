@@ -4,7 +4,7 @@ import { describe, expect, test, vi } from "vitest";
 
 import { type ApiClient, ApiError, apiClient } from "../api/client";
 import type { LiveUpdate } from "../generated/LiveUpdate";
-import { card } from "../testing";
+import { card, enrolmentRequest } from "../testing";
 import { backoff, init, liveMachines, type Message, type Model, update } from "./live";
 
 const WORKSPACE = "0190f5a2-0000-7000-8000-000000000001";
@@ -24,6 +24,7 @@ function replay(...messages: Message[]): Model {
 
 const snapshot = received({
   type: "snapshot",
+  requests: [],
   head: 5,
   machines: [card("zeta", "w2", true), card("alpha", "w1", false)],
 });
@@ -50,6 +51,7 @@ describe("live machines", () => {
       snapshot,
       received({
         type: "machines",
+        requests: [],
         head: 9,
         changed: [card("alpha", "w1", true), card("beta", "w3", true)],
       }),
@@ -66,6 +68,7 @@ describe("live machines", () => {
     const model = replay(
       received({
         type: "snapshot",
+        requests: [],
         head: 1,
         machines: [card("a", "w9", true), card("a", "w1", true)],
       }),
@@ -92,6 +95,7 @@ describe("live machines", () => {
       { type: "resume" },
       received({
         type: "machines",
+        requests: [],
         head: 6,
         changed: [],
       }),
@@ -186,7 +190,7 @@ async function perform(client: ApiClient): Promise<Message[]> {
 
 describe("its effects", () => {
   test("connect dispatches each update, then the end", async () => {
-    const live: LiveUpdate = { type: "snapshot", head: 1, machines: [] };
+    const live: LiveUpdate = { type: "snapshot", requests: [], head: 1, machines: [] };
     const response = new Response(`data: ${JSON.stringify(live)}\n\n`, { status: 200 });
     expect(await perform(api(response))).toEqual([received(live), { type: "ended" }]);
   });
@@ -243,5 +247,35 @@ describe("its effects", () => {
     vi.advanceTimersByTime(1);
     expect(seen).toEqual([{ type: "resume" }]);
     vi.useRealTimers();
+  });
+});
+
+describe("enrolment requests", () => {
+  const waiting = enrolmentRequest("mbp", "r1");
+  const later = { ...enrolmentRequest("pc", "r2"), requested_at: "2026-11-06T09:05:00Z" };
+
+  test("a snapshot shows the pending requests, oldest first", () => {
+    const model = replay(
+      received({ type: "snapshot", head: 5, machines: [], requests: [later, waiting] }),
+    );
+    expect(model.requests.map((entry) => entry.id)).toEqual(["r1", "r2"]);
+  });
+
+  test("a request that was decided or expired leaves, wherever the owner answered", () => {
+    const model = replay(
+      received({ type: "snapshot", head: 5, machines: [], requests: [waiting, later] }),
+      received({
+        type: "machines",
+        head: 8,
+        changed: [],
+        requests: [
+          { ...waiting, status: { status: "approved", worker: "w9" } },
+          { ...later, status: { status: "expired" } },
+          enrolmentRequest("new", "r3"),
+        ],
+      }),
+    );
+    expect(model.requests.map((entry) => entry.id)).toEqual(["r3"]);
+    expect(model.head).toBe(8);
   });
 });

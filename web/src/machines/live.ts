@@ -8,6 +8,7 @@ import { after, type Dispatch, type Program, type Step } from "../elm";
 import type { LiveUpdate } from "../generated/LiveUpdate";
 import type { MachineCard } from "../generated/MachineCard";
 import type { Position } from "../generated/Position";
+import type { RequestCard } from "../generated/RequestCard";
 import type { WorkspaceId } from "../generated/WorkspaceId";
 
 /** Why the stream stopped: the API's code, or that access ended, and words for the person. */
@@ -33,6 +34,8 @@ export type Model = {
   readonly head: Position | null;
   /** Every machine, in display order: by name, then id. */
   readonly machines: readonly MachineCard[];
+  /** The enrolment requests still waiting for the owner, oldest first. */
+  readonly requests: readonly RequestCard[];
 };
 
 export type Message =
@@ -86,9 +89,31 @@ function merge(
   return [...byWorker.values()].toSorted(byName);
 }
 
+/**
+ * `requests` with `changed` applied: a request that is pending is kept (or added), and one that
+ * was decided or expired leaves, so the notice goes once the owner has answered, on any device.
+ */
+function mergeRequests(
+  requests: readonly RequestCard[],
+  changed: readonly RequestCard[],
+): readonly RequestCard[] {
+  const byId = new Map(requests.map((request) => [request.id, request]));
+  for (const request of changed) {
+    if (request.status.status === "pending") {
+      byId.set(request.id, request);
+    } else {
+      byId.delete(request.id);
+    }
+  }
+  return [...byId.values()].toSorted(
+    (first, second) =>
+      first.requested_at.localeCompare(second.requested_at) || first.id.localeCompare(second.id),
+  );
+}
+
 export function init(workspace: WorkspaceId): Step<Model, Effect> {
   return [
-    { workspace, connection: { state: "connecting" }, head: null, machines: [] },
+    { workspace, connection: { state: "connecting" }, head: null, machines: [], requests: [] },
     [{ type: "connect", workspace, after: null }],
   ];
 }
@@ -112,6 +137,7 @@ function receive(model: Model, live: LiveUpdate): Step<Model, Effect> {
           connection: { state: "live" },
           head: live.head,
           machines: [...live.machines].toSorted(byName),
+          requests: mergeRequests([], live.requests),
         },
         [],
       ];
@@ -122,6 +148,7 @@ function receive(model: Model, live: LiveUpdate): Step<Model, Effect> {
           connection: { state: "live" },
           head: live.head,
           machines: merge(model.machines, live.changed),
+          requests: mergeRequests(model.requests, live.requests),
         },
         [],
       ];

@@ -118,6 +118,25 @@ impl WorkerHome {
             Err(TryLockError::Error(source)) => Err(HomeError::io(&path, source)),
         }
     }
+
+    /// Who this machine is enrolled as, and with which server, without taking the lock: a running
+    /// worker holds it, and the record is replaced atomically, so reading it is safe. `None` when
+    /// the home holds no enrolment in use.
+    ///
+    /// # Errors
+    ///
+    /// [`HomeError`] for a home or record that others can reach, or that cannot be read.
+    pub fn enrolment(&self) -> Result<Option<(PublicUrl, Enrolled)>, HomeError> {
+        match fs::symlink_metadata(&self.dir) {
+            Ok(_) => private(&self.dir)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(source) => return Err(HomeError::io(&self.dir, source)),
+        }
+        let record = load_record(&self.dir)?;
+        Ok(record
+            .and_then(|record| record.current)
+            .map(|current| (current.key.server, current.worker)))
+    }
 }
 
 /// Fails unless `path` belongs to this process's user and gives others no access.
@@ -215,26 +234,7 @@ impl Held {
     /// unparsable, or of another format is an error, never "absent": enrolling again over a
     /// damaged key would leave a worker behind on the server.
     pub(crate) fn load(&self) -> Result<Option<Record>, HomeError> {
-        let path = self.record_path();
-        match fs::symlink_metadata(&path) {
-            Ok(_) => private(&path)?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(source) => return Err(HomeError::io(&path, source)),
-        }
-        let text = zeroize::Zeroizing::new(
-            fs::read_to_string(&path).map_err(|source| HomeError::io(&path, source))?,
-        );
-        // The parser's message can quote the file, and the file holds the key: it is dropped.
-        let stored: Stored<Current, Slot> = toml_edit::de::from_str(&text)
-            .ok()
-            .ok_or_else(|| HomeError::Unreadable { path: path.clone() })?;
-        if stored.format != FORMAT {
-            return Err(HomeError::Unreadable { path });
-        }
-        Ok(Some(Record {
-            current: stored.current,
-            pending: stored.pending,
-        }))
+        load_record(&self.dir)
     }
 
     /// Replaces the record, atomically and durably: the new text goes to a fresh 0600 file, which
@@ -279,6 +279,30 @@ impl Held {
             .and_then(|dir| dir.sync_all())
             .map_err(|source| HomeError::io(&self.dir, source))
     }
+}
+
+/// The record in `dir`, or `None` when there is none. See [`Held::load`].
+fn load_record(dir: &Path) -> Result<Option<Record>, HomeError> {
+    let path = dir.join(RECORD);
+    match fs::symlink_metadata(&path) {
+        Ok(_) => private(&path)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => return Err(HomeError::io(&path, source)),
+    }
+    let text = zeroize::Zeroizing::new(
+        fs::read_to_string(&path).map_err(|source| HomeError::io(&path, source))?,
+    );
+    // The parser's message can quote the file, and the file holds the key: it is dropped.
+    let stored: Stored<Current, Slot> = toml_edit::de::from_str(&text)
+        .ok()
+        .ok_or_else(|| HomeError::Unreadable { path: path.clone() })?;
+    if stored.format != FORMAT {
+        return Err(HomeError::Unreadable { path });
+    }
+    Ok(Some(Record {
+        current: stored.current,
+        pending: stored.pending,
+    }))
 }
 
 /// The home could not be used. Each message says what to fix and never quotes the record.

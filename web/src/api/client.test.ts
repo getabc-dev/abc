@@ -141,8 +141,8 @@ async function all(updates: AsyncIterable<LiveUpdate>): Promise<LiveUpdate[]> {
 }
 
 describe("live", () => {
-  const snapshot: LiveUpdate = { type: "snapshot", head: 4, machines: [] };
-  const changed: LiveUpdate = { type: "machines", head: 6, changed: [] };
+  const snapshot: LiveUpdate = { type: "snapshot", requests: [], head: 4, machines: [] };
+  const changed: LiveUpdate = { type: "machines", requests: [], head: 6, changed: [] };
 
   test("asks for the stream without a position and yields each update until it ends", async () => {
     const server = answering(
