@@ -1087,4 +1087,73 @@ mod tests {
         );
         assert_views_replay(&pool).await;
     }
+
+    #[tokio::test]
+    async fn machines_lists_pending_requests_and_a_decided_one_leaves_by_the_delta() {
+        use abc_core::command::DenyEnrolment;
+        use abc_core::query::{ListMachines, MachinesSince, ViewEnrolmentRequest};
+        let database = TestDatabase::migrated().await;
+        let pool = database.pool();
+        let (fixture, claimed) = Fixture::claimed(pool.clone()).await;
+        let workspace = claimed.workspace;
+        let key = fixture.worker_key();
+        let asked = ask(&fixture, workspace, &key, "mbp.ts.net").await.unwrap();
+        let list = || async {
+            fixture
+                .store
+                .query(&Fixture::alice(), ListMachines { workspace })
+                .await
+                .unwrap()
+        };
+        let before = list().await;
+        assert_eq!(before.requests.len(), 1, "pending, listed");
+        assert_eq!(before.requests[0].id, asked.request);
+        let card = fixture
+            .store
+            .query(
+                &Fixture::alice(),
+                ViewEnrolmentRequest {
+                    workspace,
+                    request: asked.request,
+                },
+            )
+            .await
+            .unwrap()
+            .expect("the request's own page finds it");
+        assert_eq!(card.code, asked.code, "with the code the terminal shows");
+        fixture
+            .store
+            .execute(
+                &Fixture::alice(),
+                &fixture.origin(),
+                DenyEnrolment {
+                    workspace,
+                    request: asked.request,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            list().await.requests.is_empty(),
+            "a decided request is no longer pending"
+        );
+        let delta = fixture
+            .store
+            .query(
+                &Fixture::alice(),
+                MachinesSince {
+                    workspace,
+                    after: before.head,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            delta.requests.len(),
+            1,
+            "the delta carries the decided request, so it leaves the screen"
+        );
+        assert_eq!(delta.requests[0].id, asked.request);
+        assert_views_replay(&pool).await;
+    }
 }

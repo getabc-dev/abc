@@ -1543,6 +1543,10 @@ mod tests {
             "others can reach it"
         );
         assert!(
+            matches!(purge(&file.join("home")), Err(HostError::Io { .. })),
+            "a path through a file is an error, not an absent home"
+        );
+        assert!(
             open.is_dir() && target.is_dir() && file.is_file(),
             "nothing deleted"
         );
