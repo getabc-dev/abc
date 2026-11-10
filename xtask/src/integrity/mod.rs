@@ -678,6 +678,7 @@ mod tests {
     #[test]
     fn every_osv_ignore_names_its_reason_and_expires() {
         for file in ["osv-scanner.toml", "web/osv-scanner.toml"] {
+            assert!(is_gate_file(file), "{file} is a gate file");
             let config: toml_edit::DocumentMut =
                 crate::testing::read_in_repository(file).parse().unwrap();
             let ignores = config["IgnoredVulns"].as_array_of_tables().unwrap();

@@ -3,7 +3,8 @@
 // - at phone width, every control is at least 44 by 44 px;
 // - no navigation label overflows its entry or the rail;
 // - on the desktop, no form field is wider than a reading width;
-// - no code box clips its text: a command or token shows whole, wrapping inside its box;
+// - a code box shows its command or token on one line, never broken mid-word, and one wider than
+//   its box scrolls inside it rather than being clipped; no other code is clipped;
 // - the theme changes colours only: every element sits where it sat in the other theme.
 
 import type { Page } from "@playwright/test";
@@ -56,8 +57,25 @@ function problems(page: Page): Promise<string[]> {
           }
         }
       }
-      for (const code of document.querySelectorAll("pre, code")) {
-        if (shown(code) && code.scrollWidth > code.clientWidth) {
+      for (const box of document.querySelectorAll("pre")) {
+        if (!shown(box)) {
+          continue;
+        }
+        for (const code of box.querySelectorAll("code")) {
+          const lines = new Set([...code.getClientRects()].map((rect) => Math.round(rect.top)));
+          if (lines.size > 1) {
+            found.push(`the code ${named(code)} wraps onto ${lines.size} lines`);
+          }
+        }
+        const scrolls = ["auto", "scroll"].includes(getComputedStyle(box).overflowX);
+        if (box.scrollWidth > box.clientWidth && !scrolls) {
+          found.push(
+            `the code ${named(box)} is clipped: ${box.scrollWidth} px of text in ${box.clientWidth} px`,
+          );
+        }
+      }
+      for (const code of document.querySelectorAll("code")) {
+        if (shown(code) && code.closest("pre") === null && code.scrollWidth > code.clientWidth) {
           found.push(
             `the code ${named(code)} is clipped: ${code.scrollWidth} px of text in ${code.clientWidth} px`,
           );

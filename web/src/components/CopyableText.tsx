@@ -1,9 +1,11 @@
 // A command or secret a person pastes elsewhere, in a mono well with a Copy button, built from
 // shadcn's Button: shadcn's registry has no copy control but `code-block`, which brings the shiki
-// highlighter for what is plain text (decision 46). The whole value always shows: it wraps inside
-// its box at any width, never clipped. Copy puts exactly the value on the clipboard, with no prompt
-// or newline, then says "Copied" for a moment, which screen readers hear. Where the clipboard is
-// refused, the value is selected instead, for the person to copy with their keyboard.
+// highlighter for what is plain text (decision 46). The value shows on one line, as it is pasted:
+// a URL or token never breaks mid-word, and one wider than its box scrolls inside it, never
+// clipped, while the Copy button stays in view beside it. Copy puts exactly the value on the
+// clipboard, with no prompt or newline, then says "Copied" for a moment, which screen readers hear.
+// Where the clipboard is refused, the value is selected instead, for the person to copy with their
+// keyboard.
 
 import { CheckIcon, CopyIcon } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
@@ -57,8 +59,8 @@ export function CopyableText({
   };
 
   return (
-    <div className="mt-1.5 flex items-start gap-1 rounded-lg border bg-sunken py-1 pr-1 pl-3">
-      <pre className="min-w-0 flex-1 whitespace-pre-wrap py-1 font-mono text-foreground text-xs wrap-anywhere">
+    <div className="mt-1.5 flex items-center gap-1 rounded-lg border bg-sunken py-1 pr-1 pl-3">
+      <pre className="min-w-0 flex-1 overflow-x-auto whitespace-pre py-1 font-mono text-foreground text-xs">
         <code ref={text}>{value}</code>
       </pre>
       <Button

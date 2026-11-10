@@ -41,6 +41,7 @@ wildcards = "deny"
 # Path dependencies between workspace crates carry no version; every crate here is unpublished.
 allow-wildcard-paths = true
 deny = [
+    { crate = "libsqlite3-sys:<0.39.0", reason = "RUSTSEC-2026-0459, fixed in 0.39.0; sqlx-sqlite 0.9.0 still caps it below 0.38, so the worker's SQLite outbox waits for an sqlx that takes 0.39 (osv-scanner.toml ignores the advisory only while nothing builds it)" },
     { crate = "openssl-sys", reason = "abc uses rustls; OpenSSL drags in a system C library", use-instead = "rustls" },
 ]
 # Every skip names the crates holding the old version back:

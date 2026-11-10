@@ -93,7 +93,10 @@ jobs:
           ABC_TAILSCALE_TAILNET: ${{ secrets.ABC_TAILSCALE_TAILNET }}
       - name: Tailscale real-app check
         run: |
-          ABC_TEST_POSTGRES_BIN=$(dirname "$(find .tools/postgresql -path '*/bin/postgres' -type f)")
+          # The tree's own xtask names its pinned Postgres, as `check` does, with an absolute path:
+          # the test runs from its crate's directory. A failure here stops the step.
+          postgres=$(cargo xtask test-tool postgresql)
+          ABC_TEST_POSTGRES_BIN=$(dirname "$postgres")
           export ABC_TEST_POSTGRES_BIN
           cargo xtask tool cargo-nextest nextest run --locked -p abc --run-ignored only \
             -E 'test(abc_server_setup_serves_the_real_binaries_through_tailscale)'

@@ -12,3 +12,5 @@
 /web/coverage/
 /web/test-results/
 /web/playwright-report/
+# cargo-mutants run by hand writes its report here; `cargo xtask mutants` keeps its own under target/.
+/mutants.out*/

@@ -1,7 +1,12 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "description": [
+    "Every update in one pull request a week (group:all, schedule:weekly: Monday before 4 AM UTC), majors included (group:all sets separateMajorMinor false), each past the 3-day minimum release age, except GitHub Actions', which come in a weekly pull request of their own (below). An agent folds the week's pull request into one of ours with `cargo xtask pr renovate <number>`, which re-applies the whole group, pins what needs pins and fixes what breaks. Packages that must move together (the Rust toolchain and every rust-version, React and its types, Tailwind CSS and its Vite plugin, oxlint and oxlint-tsgolint, Vitest and its coverage provider, tailscaled and Go) move together because everything does; the Dependency Dashboard (config:best-practices) lists what is pending."
+  ],
   "extends": [
-    "config:best-practices"
+    "config:best-practices",
+    "group:all",
+    "schedule:weekly"
   ],
   "minimumReleaseAge": "3 days",
   "minimumReleaseAgeBehaviour": "timestamp-required",
@@ -14,25 +19,14 @@
   },
   "packageRules": [
     {
-      "description": "Bump the toolchain and every workspace's rust-version together; xtask tests require them equal.",
-      "matchDatasources": [
-        "rust-version"
-      ],
-      "matchDepNames": [
-        "rust"
-      ],
-      "groupName": "Rust toolchain"
-    },
-    {
-      "description": "axum and tokio-tungstenite move together. axum's ws feature depends on one tokio-tungstenite version and cargo-deny refuses two versions of a crate in the lockfile, so the worker's tokio-tungstenite can move only when axum's does: #18 (tokio-tungstenite 0.30) was closed because axum 0.8.9 still needs 0.29.",
+      "description": "Hold tokio-tungstenite at the version axum's ws feature depends on (0.29 for axum 0.8.9 in Cargo.lock): cargo-deny refuses two versions of a crate in the lockfile, and #18 and #26 proposed a tokio-tungstenite axum did not take yet. When an axum update needs a newer tokio-tungstenite, the weekly pull request fails cargo-deny's duplicate check: raise this bound to that version's successor and bump the workspace's tokio-tungstenite in the pull request that folds it.",
       "matchDatasources": [
         "crate"
       ],
       "matchPackageNames": [
-        "axum",
         "tokio-tungstenite"
       ],
-      "groupName": "axum and tokio-tungstenite"
+      "allowedVersions": "<0.30"
     },
     {
       "description": "The web app's npm packages (web/package.json, locked in web/pnpm-lock.yaml): exact versions, which pnpm-workspace.yaml's savePrefix keeps, past the same 3-day minimum release age that pnpm's minimumReleaseAge enforces at install.",
@@ -40,52 +34,6 @@
         "npm"
       ],
       "rangeStrategy": "pin"
-    },
-    {
-      "description": "React and its type definitions move together: @types/react and @types/react-dom describe one React release.",
-      "matchManagers": [
-        "npm"
-      ],
-      "matchPackageNames": [
-        "react",
-        "react-dom",
-        "@types/react",
-        "@types/react-dom"
-      ],
-      "groupName": "React"
-    },
-    {
-      "description": "Tailwind CSS and its Vite plugin are released together and must match.",
-      "matchManagers": [
-        "npm"
-      ],
-      "matchPackageNames": [
-        "tailwindcss",
-        "@tailwindcss/vite"
-      ],
-      "groupName": "Tailwind CSS"
-    },
-    {
-      "description": "oxlint's type-aware rules run in oxlint-tsgolint, which each oxlint release names a version of.",
-      "matchManagers": [
-        "npm"
-      ],
-      "matchPackageNames": [
-        "oxlint",
-        "oxlint-tsgolint"
-      ],
-      "groupName": "oxlint"
-    },
-    {
-      "description": "Vitest and its coverage provider must be the same version.",
-      "matchManagers": [
-        "npm"
-      ],
-      "matchPackageNames": [
-        "vitest",
-        "@vitest/coverage-v8"
-      ],
-      "groupName": "Vitest"
     },
     {
       "description": "node in xtask/tools.toml stays on an LTS line: Renovate proposes no odd-numbered, short-lived major.",
@@ -98,14 +46,21 @@
       "allowedVersions": "/^\\d*[02468]\\./"
     },
     {
-      "description": "tailscaled and the Go that builds it (packaging/tailscale.toml) move together: `cargo xtask release go` refuses a Go other than the one Tailscale's go.mod names. go.dev's archive sha256s are pinned beside the version, and Renovate cannot compute them.",
+      "description": "tailscaled and the Go that builds it (packaging/tailscale.toml) move together, as every update does here: `cargo xtask release go` refuses a Go other than the one Tailscale's go.mod names. go.dev's archive sha256s are pinned beside the version, and Renovate cannot compute them.",
       "matchFileNames": [
         "packaging/tailscale.toml"
       ],
-      "groupName": "tailscaled and Go",
       "prBodyNotes": [
         "When Go's version changes, copy the sha256 go.dev publishes for each of the three archives in `packaging/tailscale.toml` from https://go.dev/dl/ and commit them: the release workflow refuses any other archive."
       ]
+    },
+    {
+      "description": "GitHub Actions updates come in a weekly pull request of their own, which the maintainer reviews and merges as Renovate opened it: the agent App cannot push a workflow change, so `cargo xtask pr renovate` cannot fold one, and none needs a pin of ours (Renovate pins each action's digest itself, with its version in a comment, as pinact checks).",
+      "matchManagers": [
+        "github-actions"
+      ],
+      "groupName": "GitHub Actions",
+      "groupSlug": "github-actions"
     },
     {
       "description": "Pinned tools need new checksums with every version.",
@@ -113,7 +68,7 @@
         "xtask/tools.toml"
       ],
       "prBodyNotes": [
-        "Run `cargo xtask pin` on this branch and commit `xtask/tools.toml`: `cargo xtask setup` refuses archives whose sha256 is not pinned."
+        "Renovate cannot pin, and `cargo xtask setup` refuses archives whose sha256 is not pinned, so this pull request is not merged: an agent runs `cargo xtask pr renovate <number>`, which re-applies every update here on main, pins the bumped tools, opens a replacement and closes this one with a link to it."
       ]
     }
   ],

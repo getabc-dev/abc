@@ -239,7 +239,16 @@ cargo xtask vm gc                        # lists stopped sessions whose worktree
 
 `vm gc` keeps a finished session whose own repository holds commits that are on no branch of
 `origin` and in no merged pull request, naming them: the VM may have committed work nobody synced.
-Fetch them from the repository it names, delete that repository, and run `vm gc --yes` again.
+Fetch them from the repository it names, delete that repository, and run `vm gc --yes` again. An
+agent pushes from its VM, so a merged branch's worktree is often behind the merge: when the VM's
+branch is at the merged head, `vm gc` syncs the worktree forward, as `vm sync` does, and the
+session is finished. Every other session whose branch GitHub merged is listed as not finished,
+with why: the worktree has commits the VM's lacks, or the VM's branch is not at the merge.
+
+The VM's view of the worktree keeps file modes the host does not see: a script the VM sees as
+executable can read as `100644` on the host. A commit made on the host with `git add -A` or
+`git commit -a` would record that, so xtask's test `every_script_is_executable_in_the_index`
+fails on any script that is not `100755` in git's index, naming the fix.
 
 `vm shell` is the interactive way in. Unattended work is a **supervised run**: `vm run <worktree>
 <brief>` carries out the brief, a file in the worktree such as `.abc/brief.md`, until the agent
@@ -281,7 +290,10 @@ notices: every tool call and stop fails, naming the fix, until you run `cargo xt
 `vm stop` always stops the session's VM, and its token broker: one that does not answer within a
 minute gets SIGTERM, which makes it hang up on its clients, revoke its tokens and remove its
 sockets and pid file in `~/.config/abc/agent-broker/`, and SIGKILL a minute later if it is still
-the broker; its tokens then expire within the hour. When the broker may still run (it cannot be
+the broker; its tokens then expire within the hour. A broker that stops says how many tokens it
+revoked, how many the commands that used them had already revoked (`cargo xtask gh` and
+`cargo xtask pr` revoke their own), and how many had expired; any it could not revoke are a
+WARNING naming the time (UTC) until which they stay valid. When the broker may still run (it cannot be
 signalled, outlives SIGKILL, or listens without a pid file), `vm stop` leaves its files, stops the
 VM, and fails naming what to stop by hand.
 

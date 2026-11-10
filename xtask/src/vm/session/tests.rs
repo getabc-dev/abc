@@ -1,7 +1,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use super::{APPLY_PUSH, Id, Push, Session, branches, sealed, short, slug};
+use super::{APPLY_PUSH, Id, Push, Session, branches, sealed, slug};
+use crate::git::short;
 use crate::testing::{git, repository, script};
 
 /// A main clone with an `origin/main` and a linked worktree on branch `feature`; returns the main
@@ -203,6 +204,37 @@ fn the_session_repository_holds_the_branch_and_origin_main_only() {
     assert!(
         admin.join("index").exists(),
         "an index for the worktree's files"
+    );
+}
+
+/// The seal copied the host's `remote.origin.url` into the VM's repository. A maintainer whose
+/// origin is SSH gave the VM a remote it cannot use: no key there, egress is HTTPS only, and the
+/// App's credential helper answers only for `https://github.com`. The VM always gets the HTTPS URL.
+#[test]
+fn the_vm_always_gets_the_https_remote() {
+    let dir = tempfile::tempdir().unwrap();
+    let (main, session) = open(dir.path());
+    for origin in [
+        "git@github.com:getabc-dev/abc.git",
+        "ssh://git@github.com/getabc-dev/abc",
+        "https://github.com/getabc-dev/abc",
+    ] {
+        git(&main, &["remote", "set-url", "origin", origin]);
+        session.prepare_git().unwrap();
+        let config = fs::read_to_string(session.git_dir().join("config")).unwrap();
+        assert!(
+            config.contains("url = \"https://github.com/getabc-dev/abc.git\""),
+            "{origin}: {config}"
+        );
+    }
+    git(
+        &main,
+        &["remote", "set-url", "origin", "/somewhere/else.git"],
+    );
+    let error = format!("{:#}", session.prepare_git().unwrap_err());
+    assert!(
+        error.contains("origin is not a github.com repository: /somewhere/else.git"),
+        "{error}"
     );
 }
 

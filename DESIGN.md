@@ -198,10 +198,11 @@ look.
   - **TitledCard**: Card in a `section` named by its heading, with a Status beside the title.
   - **CopyableText**: a command or secret a person pastes elsewhere, in a mono well with a Copy
     Button. shadcn's only copy control is `code-block`, which brings the shiki highlighter for
-    plain text. The whole value always shows, wrapping inside its box at any width; Copy puts
-    exactly the value on the clipboard, says "Copied" for two seconds through a live region, and
-    selects the value instead where the clipboard is refused. The end-to-end checks fail on any
-    code box that clips its text.
+    plain text. The value shows on one line, as it is pasted, never broken mid-word; one wider
+    than its box scrolls inside it, and the Copy button stays in view beside it. Copy puts exactly
+    the value on the clipboard, says "Copied" for two seconds through a live region, and selects
+    the value instead where the clipboard is refused. The end-to-end checks fail on a code box
+    whose value wraps, or that clips it instead of scrolling.
   - **Status**: Badge with a dot and a word for a state (`success`, `warning`, `danger`,
     `neutral`). The word is always there: colour is never the only signal.
   - **Logo**: abc's name in mono on an ink tile. shadcn has no logo, and Avatar is a person's.

@@ -11,7 +11,6 @@ use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, ExitCode, ExitStatus, Stdio};
-use std::time::Duration;
 
 use anyhow::{Context, bail, ensure};
 use flate2::read::GzDecoder;
@@ -20,7 +19,7 @@ use sha2::{Digest, Sha256};
 use toml_edit::DocumentMut;
 
 /// The tool list, relative to the repository root.
-const MANIFEST: &str = "xtask/tools.toml";
+pub(crate) const MANIFEST: &str = "xtask/tools.toml";
 
 /// Where tools are installed, relative to the repository root.
 const TOOLS_DIR: &str = ".tools";
@@ -912,121 +911,329 @@ fn report(
     }
 }
 
-/// `cargo xtask pin`: downloads every tool for every target and records the sha256 of each
-/// archive and of the executable in it, keeping the tool list's layout and comments.
-pub(crate) fn pin(root: &Path, out: &mut impl Write) -> anyhow::Result<()> {
+/// `cargo xtask pin`: downloads every tool for every target with `fetch` and records the sha256 of each
+/// archive and of the executable in it, keeping the tool list's layout and comments. A tool whose
+/// downloads fail does not cost the others their pins: the tool list is written with every pin
+/// computed, then the command fails naming each tool it could not pin, for a second run.
+pub(crate) fn pin(
+    root: &Path,
+    out: &mut impl Write,
+    fetch: &mut impl FnMut(&str) -> anyhow::Result<Vec<u8>>,
+) -> anyhow::Result<()> {
     let path = root.join(MANIFEST);
     let text =
         fs::read_to_string(&path).with_context(|| format!("could not read {}", path.display()))?;
-    let pinned = pin_text(&text, out, &mut download)?;
-    fs::write(&path, pinned).with_context(|| format!("could not write {}", path.display()))
+    let pinned = pin_each(&text, None, out, fetch)?;
+    fs::write(&path, &pinned.text)
+        .with_context(|| format!("could not write {}", path.display()))?;
+    pinned.result()
 }
 
-/// The tool list `text` with every sha256 recomputed from downloads by `fetch`. Where a tool
-/// publishes checksums, each download must match them.
-fn pin_text(
+/// What [`pin_each`] did: the tool list with every pin it computed, and each tool it could not
+/// pin, with why.
+#[derive(Debug)]
+struct Pinned {
+    text: String,
+    failed: Vec<(String, anyhow::Error)>,
+}
+
+impl Pinned {
+    /// Fails, naming every tool left unpinned, unless all were pinned.
+    fn result(&self) -> anyhow::Result<()> {
+        if self.failed.is_empty() {
+            return Ok(());
+        }
+        let failures: Vec<String> = self
+            .failed
+            .iter()
+            .map(|(tool, error)| format!("{tool}: {error:#}"))
+            .collect();
+        bail!(
+            "could not pin {} of the tools; {MANIFEST} keeps the pins computed, and those tools keep \
+             their old ones until `cargo xtask pin` runs again:\n{}",
+            failures.len(),
+            failures.join("\n")
+        )
+    }
+}
+
+/// The tool list `text` with the sha256s of every tool, or of those named in `only`, recomputed
+/// from downloads by `fetch`. Where a tool publishes checksums, each download must match them. A
+/// tool is pinned whole or not at all, and one that fails is recorded, not fatal.
+fn pin_each(
     text: &str,
+    only: Option<&[String]>,
     out: &mut impl Write,
     fetch: &mut impl FnMut(&str) -> anyhow::Result<Vec<u8>>,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<Pinned> {
     let manifest = Manifest::parse(text).with_context(|| format!("{MANIFEST} is invalid"))?;
     let mut document: DocumentMut = text.parse()?;
     let mut published: BTreeMap<String, String> = BTreeMap::new();
-    for tool in &manifest.tools {
-        if let Source::Crate {
-            name,
-            sha256: pinned,
-        } = tool.source()?
-        {
-            let sha256 = sha256_hex(&fetch(&tool.download_url(Target::MacArm64)?)?);
-            check_indexed(name, &tool.version, &sha256, fetch)
-                .with_context(|| format!("{} {}", tool.name, tool.version))?;
-            let state = if sha256 == pinned { "same" } else { "changed" };
-            writeln!(
-                out,
-                "{state:<8} {} {}: matches the crates.io index",
-                tool.name, tool.version
-            )?;
-            set_crate_pin(&mut document, &tool.name, &sha256)?;
-            continue;
-        }
-        // One archive may serve every target, as Apalache's does: fetch each URL once.
-        let mut archives: BTreeMap<String, Vec<u8>> = BTreeMap::new();
-        for target in Target::ALL {
-            let asset = tool.asset(target)?;
-            let url = tool.download_url(target)?;
-            if !archives.contains_key(&url) {
-                archives.insert(url.clone(), fetch(&url)?);
+    let mut failed = Vec::new();
+    for tool in manifest
+        .tools
+        .iter()
+        .filter(|tool| only.is_none_or(|names| names.contains(&tool.name)))
+    {
+        let mut lines = Vec::new();
+        match pins_of(tool, &mut lines, &mut published, fetch) {
+            Ok(pins) => {
+                for line in lines {
+                    writeln!(out, "{line}")?;
+                }
+                for pin in pins {
+                    match pin {
+                        Pin::Crate(sha256) => set_crate_pin(&mut document, &tool.name, &sha256)?,
+                        Pin::Target {
+                            target,
+                            key,
+                            sha256,
+                        } => {
+                            set_pin(&mut document, &tool.name, target, key, &sha256)?;
+                        }
+                    }
+                }
             }
-            let archive: &[u8] = archives
-                .get(&url)
-                .context("the archive was fetched above")?;
-            let sha256 = sha256_hex(archive);
-            let mut sources = Vec::new();
-            if let Some(template) = &tool.checksums {
-                let checksums_url = tool.render(template, asset);
-                check_published(&checksums_url, &url, &sha256, &mut published, fetch)
-                    .with_context(|| format!("{} {} on {target}", tool.name, tool.version))?;
-                sources.push("matches the published checksum".to_owned());
-            }
-            if let Some(repository) = &tool.attestations {
-                check_attested(repository, &sha256, fetch)
-                    .with_context(|| format!("{} {} on {target}", tool.name, tool.version))?;
-                sources.push(format!("attested on GitHub by {repository}"));
-            }
-            if let Some(template) = &tool.release_digests {
-                let release_url = tool.render(template, asset);
-                check_release_digest(&release_url, &url, &sha256, &mut published, fetch)
-                    .with_context(|| format!("{} {} on {target}", tool.name, tool.version))?;
-                sources.push("matches the digest GitHub recorded on upload".to_owned());
-            }
-            let binary_sha256 = sha256_hex(&tool.executable_in(archive, asset)?);
-            let tree_same = !tool.tree
-                || asset.tree_sha256.as_deref()
-                    == Some(Tree::of_archive(archive)?.sha256().as_str());
-            let state =
-                if sha256 == asset.sha256 && binary_sha256 == asset.binary_sha256 && tree_same {
-                    "same"
-                } else {
-                    "changed"
-                };
-            writeln!(
-                out,
-                "{state:<8} {} {} {target}: {}",
-                tool.name,
-                tool.version,
-                sources.join("; ")
-            )?;
-            set_pin(&mut document, &tool.name, target, "sha256", &sha256)?;
-            set_pin(
-                &mut document,
-                &tool.name,
-                target,
-                "binary-sha256",
-                &binary_sha256,
-            )?;
-            if tool.tree {
-                set_pin(
-                    &mut document,
-                    &tool.name,
-                    target,
-                    "tree-sha256",
-                    &Tree::of_archive(archive)?.sha256(),
-                )?;
-            }
-            if let Some(member) = tool.library_member(asset) {
-                let library_sha256 = sha256_hex(&extract(archive, &member)?);
-                set_pin(
-                    &mut document,
-                    &tool.name,
-                    target,
-                    "library-sha256",
-                    &library_sha256,
-                )?;
+            Err(error) => {
+                writeln!(out, "failed   {} {}: {error:#}", tool.name, tool.version)?;
+                failed.push((format!("{} {}", tool.name, tool.version), error));
             }
         }
     }
+    Ok(Pinned {
+        text: document.to_string(),
+        failed,
+    })
+}
+
+/// One tool's version moving, as a tool-list change makes it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Bump {
+    pub(crate) tool: String,
+    pub(crate) from: String,
+    pub(crate) to: String,
+}
+
+impl fmt::Display for Bump {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} {} -> {}", self.tool, self.from, self.to)
+    }
+}
+
+/// The versions that moved from the tool list `before` to `after`. Fails when `after` adds or
+/// removes a tool: only a version moves in a bump.
+pub(crate) fn bumps(before: &str, after: &str) -> anyhow::Result<Vec<Bump>> {
+    let before =
+        Manifest::parse(before).with_context(|| format!("{MANIFEST} before is invalid"))?;
+    let after = Manifest::parse(after).with_context(|| format!("{MANIFEST} after is invalid"))?;
+    let names = |manifest: &Manifest| -> BTreeSet<String> {
+        manifest
+            .tools
+            .iter()
+            .map(|tool| tool.name.clone())
+            .collect()
+    };
+    ensure!(
+        names(&before) == names(&after),
+        "the change adds or removes a tool; only a version bump is taken"
+    );
+    Ok(after
+        .tools
+        .iter()
+        .filter_map(|tool| {
+            let old = before.tool(&tool.name).ok()?;
+            (old.version != tool.version).then(|| Bump {
+                tool: tool.name.clone(),
+                from: old.version.clone(),
+                to: tool.version.clone(),
+            })
+        })
+        .collect())
+}
+
+/// The tool list `text` with each of `bumps` applied, keeping its layout. Fails when a tool is
+/// not at the version a bump moves it from.
+pub(crate) fn bumped(text: &str, bumps: &[Bump]) -> anyhow::Result<String> {
+    let manifest = Manifest::parse(text).with_context(|| format!("{MANIFEST} is invalid"))?;
+    let mut document: DocumentMut = text.parse()?;
+    for bump in bumps {
+        let current = &manifest.tool(&bump.tool)?.version;
+        ensure!(
+            *current == bump.from,
+            "{} is at {current} here, not {}, which the bump moves from",
+            bump.tool,
+            bump.from
+        );
+        let value = document
+            .get_mut("tool")
+            .and_then(toml_edit::Item::as_array_of_tables_mut)
+            .context("the tool list has no [[tool]] tables")?
+            .iter_mut()
+            .find(|tool| tool.get("name").and_then(toml_edit::Item::as_str) == Some(&bump.tool))
+            .and_then(|tool| tool.get_mut("version"))
+            .and_then(toml_edit::Item::as_value_mut)
+            .with_context(|| format!("the tool list has no version for {}", bump.tool))?;
+        let decor = value.decor().clone();
+        *value = bump.to.as_str().into();
+        *value.decor_mut() = decor;
+    }
     Ok(document.to_string())
+}
+
+/// Splits `bumps`, made against an older tool list, by where the tool list `text` stands: the
+/// ones still to apply (the tool is at the version the bump moves from), then the ones `text`
+/// already has (the tool is at the version it moves to). Fails on a tool at neither version.
+pub(crate) fn outstanding(text: &str, bumps: Vec<Bump>) -> anyhow::Result<(Vec<Bump>, Vec<Bump>)> {
+    let manifest = Manifest::parse(text).with_context(|| format!("{MANIFEST} is invalid"))?;
+    let mut to_apply = Vec::new();
+    let mut applied = Vec::new();
+    for bump in bumps {
+        let current = &manifest.tool(&bump.tool)?.version;
+        if *current == bump.from {
+            to_apply.push(bump);
+        } else if *current == bump.to {
+            applied.push(bump);
+        } else {
+            bail!(
+                "{} is at {current} here, neither {} nor {}, which the bump moves between",
+                bump.tool,
+                bump.from,
+                bump.to
+            );
+        }
+    }
+    Ok((to_apply, applied))
+}
+
+/// The tool list `text` with the pins of the tools named in `only`, or of every tool, recomputed
+/// from downloads by `fetch`, as `cargo xtask pin` does; fails unless each was pinned.
+pub(crate) fn repin(
+    text: &str,
+    only: Option<&[String]>,
+    out: &mut impl Write,
+    fetch: &mut impl FnMut(&str) -> anyhow::Result<Vec<u8>>,
+) -> anyhow::Result<String> {
+    let pinned = pin_each(text, only, out, fetch)?;
+    pinned.result()?;
+    Ok(pinned.text)
+}
+
+/// One pin [`pins_of`] computed.
+enum Pin {
+    /// A crate's `sha256`.
+    Crate(String),
+    /// A target's `key` (`sha256`, `binary-sha256`, `tree-sha256` or `library-sha256`).
+    Target {
+        target: Target,
+        key: &'static str,
+        sha256: String,
+    },
+}
+
+/// Every pin of `tool`, from downloads by `fetch`, each checked against what its publisher
+/// vouches for; what it found goes to `lines`, to print once the whole tool is pinned.
+fn pins_of(
+    tool: &Tool,
+    lines: &mut Vec<String>,
+    published: &mut BTreeMap<String, String>,
+    fetch: &mut impl FnMut(&str) -> anyhow::Result<Vec<u8>>,
+) -> anyhow::Result<Vec<Pin>> {
+    if let Source::Crate {
+        name,
+        sha256: pinned,
+    } = tool.source()?
+    {
+        let sha256 = sha256_hex(&fetch(&tool.download_url(Target::MacArm64)?)?);
+        check_indexed(name, &tool.version, &sha256, fetch)
+            .with_context(|| format!("{} {}", tool.name, tool.version))?;
+        let state = if sha256 == pinned { "same" } else { "changed" };
+        lines.push(format!(
+            "{state:<8} {} {}: matches the crates.io index",
+            tool.name, tool.version
+        ));
+        return Ok(vec![Pin::Crate(sha256)]);
+    }
+    let mut pins = Vec::new();
+    // One archive may serve every target, as Apalache's does: it is fetched and its attestation
+    // checked once. Only the last archive is held, so targets with archives of their own never
+    // hold more than one in memory.
+    let mut last: Option<(String, Vec<u8>)> = None;
+    let mut attested = BTreeSet::new();
+    for target in Target::ALL {
+        let asset = tool.asset(target)?;
+        let url = tool.download_url(target)?;
+        let archive: &[u8] = match &mut last {
+            Some((held, archive)) if *held == url => archive,
+            slot => &slot.insert((url.clone(), fetch(&url)?)).1,
+        };
+        let sha256 = sha256_hex(archive);
+        let mut sources = Vec::new();
+        if let Some(template) = &tool.checksums {
+            let checksums_url = tool.render(template, asset);
+            check_published(&checksums_url, &url, &sha256, published, fetch)
+                .with_context(|| format!("{} {} on {target}", tool.name, tool.version))?;
+            sources.push("matches the published checksum".to_owned());
+        }
+        if let Some(repository) = &tool.attestations {
+            if !attested.contains(&sha256) {
+                check_attested(repository, &sha256, fetch)
+                    .with_context(|| format!("{} {} on {target}", tool.name, tool.version))?;
+                attested.insert(sha256.clone());
+            }
+            sources.push(format!("attested on GitHub by {repository}"));
+        }
+        if let Some(template) = &tool.release_digests {
+            let release_url = tool.render(template, asset);
+            check_release_digest(&release_url, &url, &sha256, published, fetch)
+                .with_context(|| format!("{} {} on {target}", tool.name, tool.version))?;
+            sources.push("matches the digest GitHub recorded on upload".to_owned());
+        }
+        let binary_sha256 = sha256_hex(&tool.executable_in(archive, asset)?);
+        let tree_sha256 = if tool.tree {
+            Some(Tree::of_archive(archive)?.sha256())
+        } else {
+            None
+        };
+        let state = if sha256 == asset.sha256
+            && binary_sha256 == asset.binary_sha256
+            && tree_sha256.as_deref() == asset.tree_sha256.as_deref().filter(|_| tool.tree)
+        {
+            "same"
+        } else {
+            "changed"
+        };
+        lines.push(format!(
+            "{state:<8} {} {} {target}: {}",
+            tool.name,
+            tool.version,
+            sources.join("; ")
+        ));
+        pins.push(Pin::Target {
+            target,
+            key: "sha256",
+            sha256,
+        });
+        pins.push(Pin::Target {
+            target,
+            key: "binary-sha256",
+            sha256: binary_sha256,
+        });
+        if let Some(tree) = tree_sha256 {
+            pins.push(Pin::Target {
+                target,
+                key: "tree-sha256",
+                sha256: tree,
+            });
+        }
+        if let Some(member) = tool.library_member(asset) {
+            pins.push(Pin::Target {
+                target,
+                key: "library-sha256",
+                sha256: sha256_hex(&extract(archive, &member)?),
+            });
+        }
+    }
+    Ok(pins)
 }
 
 /// Requires the checksums file at `checksums_url`, fetched once into `published`, to list
@@ -1307,161 +1514,16 @@ pub(crate) fn feed(child: &mut Child, input: &mut dyn Read) -> std::io::Result<b
     }
 }
 
-/// How many tries in a row may fail without receiving anything before a download gives up.
-const DOWNLOAD_ATTEMPTS: u32 = 4;
-
-/// Downloads `url`, up to [`MAX_ARCHIVE_BYTES`]. `pin` and `setup` download hundreds of
-/// megabytes, which one reset or stall should not throw away: a connection that fails, breaks
-/// off or stalls ([`DOWNLOAD_TIMEOUTS`]) is tried again after a pause, five seconds longer after
-/// each try in a row that received nothing, asking only for the bytes still missing, until
-/// [`DOWNLOAD_ATTEMPTS`] tries in a row receive nothing. An answer with an
-/// HTTP error status is final.
+/// Downloads `url`, up to [`MAX_ARCHIVE_BYTES`], with timeouts, stall detection and resuming
+/// retries ([`crate::download`]), saying each retry on stderr.
 pub(crate) fn download(url: &str) -> anyhow::Result<Vec<u8>> {
-    download_with(
+    crate::download::fetch(
         url,
-        DOWNLOAD_ATTEMPTS,
-        DOWNLOAD_TIMEOUTS,
-        &mut |fruitless| {
-            std::thread::sleep(Duration::from_secs(
-                5_u64.saturating_mul(u64::from(fruitless)),
-            ));
-        },
+        MAX_ARCHIVE_BYTES,
+        &crate::download::patience(),
+        &mut std::thread::sleep,
+        &mut std::io::stderr(),
     )
-}
-
-/// [`download`], giving up after `attempts` tries in a row that receive nothing, each within
-/// `timeouts` (as [`DOWNLOAD_TIMEOUTS`]), with `pause` called before each new try with the
-/// number of fruitless tries so far.
-fn download_with(
-    url: &str,
-    attempts: u32,
-    timeouts: [Duration; 3],
-    pause: &mut dyn FnMut(u32),
-) -> anyhow::Result<Vec<u8>> {
-    let mut bytes = Vec::new();
-    let mut tries: u32 = 0;
-    let mut fruitless: u32 = 0;
-    loop {
-        tries = tries.saturating_add(1);
-        let before = bytes.len();
-        let Err(error) = download_once(url, timeouts, &mut bytes) else {
-            return Ok(bytes);
-        };
-        fruitless = if bytes.len() > before {
-            0
-        } else {
-            fruitless.saturating_add(1)
-        };
-        if !error.transient || fruitless >= attempts {
-            return Err(error.cause).with_context(|| {
-                format!(
-                    "could not download {url} (try {tries}, {fruitless} in a row receiving \
-                     nothing, {} bytes received)",
-                    bytes.len()
-                )
-            });
-        }
-        pause(fruitless);
-    }
-}
-
-/// A download that failed, and whether trying again may help.
-struct Failed {
-    cause: anyhow::Error,
-    transient: bool,
-}
-
-impl Failed {
-    /// A failure that trying again may mend: anything but an HTTP error status or a body over
-    /// the limit.
-    fn of(cause: ureq::Error) -> Self {
-        let transient = !matches!(
-            cause,
-            ureq::Error::StatusCode(_) | ureq::Error::BodyExceedsLimit(_)
-        );
-        Self {
-            cause: cause.into(),
-            transient,
-        }
-    }
-}
-
-/// How long a download may take to connect, to answer, and to deliver its body: a connection
-/// that stalls fails, and is tried again for the rest, rather than hang the command.
-const DOWNLOAD_TIMEOUTS: [Duration; 3] = [
-    Duration::from_secs(30),
-    Duration::from_secs(60),
-    Duration::from_secs(600),
-];
-
-/// One try at downloading the rest of `url` into `bytes`, which holds what earlier tries
-/// received, within `timeouts`. What arrives stays in `bytes` when the try fails.
-fn download_once(url: &str, timeouts: [Duration; 3], bytes: &mut Vec<u8>) -> Result<(), Failed> {
-    let [connect, answer, body] = timeouts;
-    let agent: ureq::Agent = ureq::Agent::config_builder()
-        .timeout_connect(Some(connect))
-        .timeout_recv_response(Some(answer))
-        .timeout_recv_body(Some(body))
-        .build()
-        .into();
-    let mut request = agent.get(url);
-    if !bytes.is_empty() {
-        request = request.header("Range", format!("bytes={}-", bytes.len()));
-    }
-    let mut response = match request.call() {
-        Ok(response) => response,
-        Err(ureq::Error::StatusCode(416)) if !bytes.is_empty() => {
-            // Every byte arrived before the last try broke off, so no range is left to ask for:
-            // fetch the whole again, as the end of the body was never confirmed.
-            bytes.clear();
-            return Err(Failed {
-                cause: anyhow::anyhow!("{url} has no bytes past those received"),
-                transient: true,
-            });
-        }
-        Err(error) => return Err(Failed::of(error)),
-    };
-    if response.status() != 206 {
-        // A whole body: the server ignored the range, or none was asked for.
-        bytes.clear();
-    } else if !resumes_at(&response, bytes.len()) {
-        bytes.clear();
-        return Err(Failed {
-            cause: anyhow::anyhow!("{url} answered a range other than the one asked for"),
-            transient: true,
-        });
-    }
-    let remaining =
-        MAX_ARCHIVE_BYTES.saturating_sub(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
-    let mut reader = response.body_mut().with_config().limit(remaining).reader();
-    let mut chunk = vec![0_u8; 65_536];
-    loop {
-        match reader.read(&mut chunk) {
-            Ok(0) => return Ok(()),
-            Ok(read) => bytes.extend_from_slice(chunk.get(..read).unwrap_or_default()),
-            Err(error) => {
-                let over_limit = error
-                    .get_ref()
-                    .and_then(|inner| inner.downcast_ref::<ureq::Error>())
-                    .is_some_and(|inner| matches!(inner, ureq::Error::BodyExceedsLimit(_)));
-                return Err(Failed {
-                    cause: anyhow::Error::new(error),
-                    transient: !over_limit,
-                });
-            }
-        }
-    }
-}
-
-/// Whether a partial answer starts where `received` bytes end, as its `Content-Range` says.
-fn resumes_at<B>(response: &ureq::http::Response<B>, received: usize) -> bool {
-    response
-        .headers()
-        .get("content-range")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("bytes "))
-        .and_then(|range| range.split_once('-'))
-        .is_some_and(|(start, _)| start.parse::<usize>().ok() == Some(received))
 }
 
 /// The sha256 a published checksums file gives for `file_name`. The file either lists
@@ -1991,7 +2053,7 @@ mod tests {
     use flate2::write::GzEncoder;
 
     use super::{
-        Manifest, Status, Target, Tool, Tree, doctor, extract, install, install_unready, pin_text,
+        Manifest, Status, Target, Tool, Tree, doctor, extract, install, install_unready, pin_each,
         published_sha256, remove_other_versions, report, reports_version, set_pin, setup,
         sha256_hex,
     };
@@ -2094,178 +2156,6 @@ targets.aarch64-unknown-linux-gnu = {{ platform = "linux-arm64", sha256 = "{sha2
         )
         .unwrap();
         downloads.get()
-    }
-
-    /// What a scripted server does with one connection: writes `reply`, then holds the
-    /// connection open (a stall) or closes it.
-    struct Turn {
-        reply: &'static [u8],
-        hold: bool,
-    }
-
-    /// Serves one connection per turn on a local port, in order, and returns the URL and a
-    /// handle that yields each request's head.
-    fn scripted(turns: Vec<Turn>) -> (String, std::thread::JoinHandle<Vec<String>>) {
-        use std::io::{Read as _, Write as _};
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let url = format!("http://{}/tool.tar.gz", listener.local_addr().unwrap());
-        let server = std::thread::spawn(move || {
-            let mut requests = Vec::new();
-            let mut held = Vec::new();
-            for turn in turns {
-                let (mut stream, _) = listener.accept().unwrap();
-                let mut request = [0_u8; 4096];
-                let read = stream.read(&mut request).unwrap();
-                requests.push(String::from_utf8_lossy(&request[..read]).into_owned());
-                stream.write_all(turn.reply).unwrap();
-                if turn.hold {
-                    held.push(stream);
-                }
-            }
-            requests
-        });
-        (url, server)
-    }
-
-    const WHOLE: &[u8] =
-        b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\nConnection: close\r\n\r\narchive";
-    const BROKEN_OFF: &[u8] =
-        b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\nConnection: close\r\n\r\nar";
-    const REST: &[u8] = b"HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 2-6/7\r\nContent-Length: 5\r\nConnection: close\r\n\r\nchive";
-
-    fn turn(reply: &'static [u8]) -> Turn {
-        Turn { reply, hold: false }
-    }
-
-    /// Downloads `url` with short timeouts, and returns the result and the pauses it took.
-    fn fetch(url: &str, attempts: u32) -> (anyhow::Result<Vec<u8>>, Vec<u32>) {
-        let short = std::time::Duration::from_millis(300);
-        let mut pauses = Vec::new();
-        let result = super::download_with(url, attempts, [short, short, short], &mut |fruitless| {
-            pauses.push(fruitless);
-        });
-        (result, pauses)
-    }
-
-    #[test]
-    fn a_download_that_breaks_off_resumes_where_it_stopped() {
-        let (url, server) = scripted(vec![turn(BROKEN_OFF), turn(REST)]);
-        let (bytes, pauses) = fetch(&url, 2);
-        assert_eq!(bytes.unwrap(), b"archive", "the rest is appended");
-        assert_eq!(
-            pauses,
-            [0],
-            "a try that received something is not fruitless"
-        );
-        let requests = server.join().unwrap();
-        assert!(!requests[0].contains("Range"), "{}", requests[0]);
-        assert!(
-            requests[1].contains("\r\nrange: bytes=2-\r\n"),
-            "{}",
-            requests[1]
-        );
-    }
-
-    #[test]
-    fn a_download_starts_again_when_the_range_is_ignored_or_wrong() {
-        let (ignored, ignoring) = scripted(vec![turn(BROKEN_OFF), turn(WHOLE)]);
-        assert_eq!(
-            fetch(&ignored, 2).0.unwrap(),
-            b"archive",
-            "a whole answer replaces"
-        );
-        ignoring.join().unwrap();
-
-        let wrong: &[u8] = b"HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-6/7\r\nContent-Length: 7\r\nConnection: close\r\n\r\narchive";
-        let (url, server) = scripted(vec![turn(BROKEN_OFF), turn(wrong), turn(WHOLE)]);
-        let (bytes, pauses) = fetch(&url, 2);
-        assert_eq!(bytes.unwrap(), b"archive");
-        assert_eq!(pauses, [0, 1], "a wrong range throws the bytes away");
-        let requests = server.join().unwrap();
-        assert!(
-            !requests[2].contains("range:"),
-            "asked whole again: {}",
-            requests[2]
-        );
-    }
-
-    #[test]
-    fn a_download_that_stalls_times_out_and_resumes() {
-        let (url, server) = scripted(vec![
-            Turn {
-                reply: b"",
-                hold: true,
-            },
-            Turn {
-                reply: BROKEN_OFF,
-                hold: true,
-            },
-            turn(REST),
-        ]);
-        let (bytes, pauses) = fetch(&url, 2);
-        assert_eq!(bytes.unwrap(), b"archive");
-        assert_eq!(
-            pauses,
-            [1, 0],
-            "no answer, then a body that stops, each timed out"
-        );
-        assert_eq!(server.join().unwrap().len(), 3, "three connections");
-    }
-
-    #[test]
-    fn a_download_that_received_everything_before_it_broke_off_is_fetched_again() {
-        let unfinished: &[u8] = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n7\r\narchive\r\n";
-        let unsatisfiable: &[u8] = b"HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */7\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-        let (url, server) = scripted(vec![turn(unfinished), turn(unsatisfiable), turn(WHOLE)]);
-        let (bytes, pauses) = fetch(&url, 3);
-        assert_eq!(bytes.unwrap(), b"archive");
-        assert_eq!(pauses, [0, 1], "nothing left to ask for: the whole again");
-        let requests = server.join().unwrap();
-        assert!(requests[1].contains("range: bytes=7-"), "{}", requests[1]);
-        assert!(!requests[2].contains("range:"), "{}", requests[2]);
-    }
-
-    #[test]
-    fn a_download_gives_up_after_tries_in_a_row_that_receive_nothing() {
-        let (url, server) = scripted(vec![turn(b""), turn(b"")]);
-        let (result, pauses) = fetch(&url, 2);
-        let error = format!("{:#}", result.unwrap_err());
-        assert!(
-            error.contains("(try 2, 2 in a row receiving nothing, 0 bytes received)"),
-            "{error}"
-        );
-        assert_eq!(pauses, [1], "no pause after the last try");
-        server.join().unwrap();
-    }
-
-    #[test]
-    fn a_download_is_the_whole_body() {
-        let (url, server) = scripted(vec![turn(WHOLE)]);
-        assert_eq!(super::download(&url).unwrap(), b"archive");
-        server.join().unwrap();
-    }
-
-    #[test]
-    fn an_http_error_is_final() {
-        let (url, server) = scripted(vec![turn(
-            b"HTTP/1.1 404 Not Found\r\nContent-Length: 4\r\nConnection: close\r\n\r\ngone",
-        )]);
-        let (result, pauses) = fetch(&url, 4);
-        let error = format!("{:#}", result.unwrap_err());
-        assert!(error.contains("(try 1, 1 in a row"), "{error}");
-        assert!(error.contains("404"), "{error}");
-        assert!(pauses.is_empty(), "never tried again");
-        assert_eq!(server.join().unwrap().len(), 1, "one connection");
-        let (whole, refusing) = scripted(vec![turn(
-            b"HTTP/1.1 416 Range Not Satisfiable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-        )]);
-        let (refused, none) = fetch(&whole, 4);
-        assert!(
-            format!("{:#}", refused.unwrap_err()).contains("416"),
-            "a 416 to a request for the whole is final too"
-        );
-        assert!(none.is_empty(), "never tried again");
-        refusing.join().unwrap();
     }
 
     #[test]
@@ -3043,6 +2933,174 @@ targets.aarch64-unknown-linux-gnu = {{ platform = "linux-arm64", sha256 = "{sha2
                 "{why}"
             );
         }
+    }
+
+    /// The tool list `text` repinned from `fetch`, or why a tool could not be.
+    fn pin_text(
+        text: &str,
+        out: &mut impl std::io::Write,
+        fetch: &mut impl FnMut(&str) -> anyhow::Result<Vec<u8>>,
+    ) -> anyhow::Result<String> {
+        super::repin(text, None, out, fetch)
+    }
+
+    /// Renovate moves a version in the tool list; `pr renovate` reads which ones moved and moves
+    /// them the same way in main's tool list, keeping its layout.
+    #[test]
+    fn reads_and_applies_version_bumps() {
+        let before = manifest_text(SHA_A, SHA_B);
+        let after = before.replace("version = \"1.2.3\"", "version = \"1.3.0\"");
+        let moved = super::bumps(&before, &after).unwrap();
+        assert_eq!(
+            moved,
+            [super::Bump {
+                tool: "fake".to_owned(),
+                from: "1.2.3".to_owned(),
+                to: "1.3.0".to_owned()
+            }]
+        );
+        assert_eq!(moved[0].to_string(), "fake 1.2.3 -> 1.3.0");
+        assert_eq!(
+            super::bumped(&before, &moved).unwrap(),
+            after,
+            "only the version moves"
+        );
+        assert_eq!(super::bumps(&before, &before).unwrap(), [], "nothing moved");
+        let stale = format!("{:#}", super::bumped(&after, &moved).unwrap_err());
+        assert!(
+            stale.contains("fake is at 1.3.0 here, not 1.2.3"),
+            "{stale}"
+        );
+        let renamed = before.replace("name = \"fake\"", "name = \"other\"");
+        let added = format!("{:#}", super::bumps(&before, &renamed).unwrap_err());
+        assert!(added.contains("adds or removes a tool"), "{added}");
+    }
+
+    /// Renovate's group is made against main as it once stood. A bump main already made by
+    /// itself is not made again, and a tool main moved elsewhere is refused, never moved back.
+    #[test]
+    fn bumps_main_already_has_are_set_apart() {
+        let before = manifest_text(SHA_A, SHA_B);
+        let after = before.replace("version = \"1.2.3\"", "version = \"1.3.0\"");
+        let moved = super::bumps(&before, &after).unwrap();
+        assert_eq!(
+            super::outstanding(&before, moved.clone()).unwrap(),
+            (moved.clone(), vec![]),
+            "still to apply"
+        );
+        assert_eq!(
+            super::outstanding(&after, moved.clone()).unwrap(),
+            (vec![], moved.clone()),
+            "already applied"
+        );
+        let elsewhere = before.replace("version = \"1.2.3\"", "version = \"1.4.0\"");
+        assert_eq!(
+            format!("{:#}", super::outstanding(&elsewhere, moved).unwrap_err()),
+            "fake is at 1.4.0 here, neither 1.2.3 nor 1.3.0, which the bump moves between"
+        );
+    }
+
+    /// A VM's network reset one download, and `pin` wrote nothing: every pin computed was lost.
+    /// Now a tool that fails keeps its old pins and the others get their new ones.
+    #[test]
+    fn a_tool_that_fails_to_download_costs_the_others_nothing() {
+        let archive = tarball(&[("fake-1.2.3/fake", SCRIPT, 0o755)]);
+        let one = manifest_text(SHA_A, SHA_B);
+        let other = one
+            .replace("# The tools.\n", "")
+            .replace("name = \"fake\"", "name = \"other\"")
+            .replace("example.com/fake-", "example.com/other/fake-");
+        let text = format!("{one}\n{other}");
+        let mut serve = serving(&archive);
+        let mut fetch = |url: &str| {
+            if url.contains("/other/") && url.contains("linux-arm64") {
+                anyhow::bail!("the connection was reset")
+            }
+            serve(url)
+        };
+        let mut out = Vec::new();
+        let pinned = pin_each(&text, None, &mut out, &mut fetch).unwrap();
+        let (fake, rest) = pinned.text.split_once("name = \"other\"").unwrap();
+        assert!(
+            fake.contains(&sha256_hex(&archive)) && !fake.contains(SHA_A),
+            "fake is pinned: {fake}"
+        );
+        assert!(
+            rest.contains(SHA_A) && !rest.contains(&sha256_hex(&archive)),
+            "other is pinned whole or not at all, so it keeps every old pin: {rest}"
+        );
+        let error = format!("{:#}", pinned.result().unwrap_err());
+        assert_eq!(
+            error,
+            "could not pin 1 of the tools; xtask/tools.toml keeps the pins computed, and those \
+             tools keep their old ones until `cargo xtask pin` runs again:\nother 1.2.3: the \
+             connection was reset"
+        );
+        let out = String::from_utf8(out).unwrap();
+        assert!(
+            out.contains("failed   other 1.2.3: the connection was reset"),
+            "{out}"
+        );
+        assert!(!out.contains("other 1.2.3 aarch64-apple-darwin"), "{out}");
+        // `cargo xtask pin` writes those pins to the tool list, then fails.
+        let root = tempfile::tempdir().unwrap();
+        let manifest = root.path().join(super::MANIFEST);
+        fs::create_dir_all(manifest.parent().unwrap()).unwrap();
+        fs::write(&manifest, &text).unwrap();
+        let failed = super::pin(root.path(), &mut Vec::new(), &mut fetch).unwrap_err();
+        assert!(
+            format!("{failed:#}").starts_with("could not pin 1 of the tools"),
+            "{failed:#}"
+        );
+        assert_eq!(
+            fs::read_to_string(&manifest).unwrap(),
+            pinned.text,
+            "the pins computed are kept"
+        );
+    }
+
+    /// One archive that serves every target, as Apalache's does, is downloaded once and pinned
+    /// for each target.
+    #[test]
+    fn an_archive_every_target_shares_is_fetched_and_checked_once() {
+        let archive = tarball(&[("fake-1.2.3/fake", SCRIPT, 0o755)]);
+        let text = manifest_text(SHA_A, SHA_B).replace("-{platform}.tar.gz", ".tar.gz");
+        let mut serve = serving(&archive);
+        let mut fetched = Vec::new();
+        let mut fetch = |url: &str| {
+            fetched.push(url.to_owned());
+            serve(url)
+        };
+        let pinned = pin_each(&text, None, &mut Vec::new(), &mut fetch).unwrap();
+        pinned.result().unwrap();
+        assert_eq!(
+            fetched,
+            [
+                "https://example.com/fake-1.2.3.tar.gz".to_owned(),
+                format!(
+                    "https://api.github.com/repos/example/fake/attestations/sha256:{}",
+                    sha256_hex(&archive)
+                ),
+            ],
+            "the archive is fetched and checked once"
+        );
+        assert_eq!(
+            pinned.text.matches(&sha256_hex(&archive)).count(),
+            3,
+            "every target is pinned: {}",
+            pinned.text
+        );
+    }
+
+    /// `setup` and `pin` download through the patient fetch, up to the archive limit.
+    #[test]
+    fn downloads_through_the_patient_fetch() {
+        let (url, server) = crate::testing::serve_once("200 OK", "the archive");
+        assert_eq!(
+            super::download(&format!("{url}/tool.tar.gz")).unwrap(),
+            b"the archive"
+        );
+        assert!(server.join().unwrap().starts_with("GET /tool.tar.gz "));
     }
 
     #[test]

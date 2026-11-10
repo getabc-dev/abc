@@ -807,9 +807,14 @@ fn gc_keeps_running_and_unmerged_sessions_and_commits_made_after_the_merge() {
         &world,
         "[{\"number\":7,\"headRefOid\":\"0123456789012345678901234567890123456789\"}]",
     );
+    let short = |full: &str| crate::git::short(full).to_owned();
     assert_eq!(
         gc(&world, &backend, true),
-        none,
+        format!(
+            "abc-w\tnot finished: feature merged in #7 at 012345678901, but the VM's feature is \
+             at {}, so what it holds is not all merged\n{none}",
+            short(&commit)
+        ),
         "merged at another commit: the worktree has commits since"
     );
     github_merged(
@@ -852,7 +857,12 @@ fn gc_keeps_running_and_unmerged_sessions_and_commits_made_after_the_merge() {
     assert!(updated.success());
     assert_eq!(
         gc(&world, &backend, true),
-        none,
+        format!(
+            "abc-w\tnot finished: feature merged in #7 at {}, but the VM's feature is at {}, so \
+             what it holds is not all merged\n{none}",
+            short(&commit),
+            short(later.trim())
+        ),
         "the VM's commits after the merge are kept"
     );
     script(&world.host.github_cli, "echo 'not logged in' >&2\nexit 4\n");
@@ -1245,7 +1255,7 @@ fn gc_keeps_a_gone_sessions_commits_that_are_nowhere_else() {
     let kept = format!(
         "abc-gone\t0.0 GB\tkept: its worktree is gone, but its repository has commits on neither \
          origin nor a merged pull request: {} only in the VM\n",
-        super::session::short(&lost)
+        crate::git::short(&lost)
     );
     assert!(
         listed.contains("abc-done\t0.0 GB\tits worktree is gone\n"),
@@ -1286,6 +1296,115 @@ fn gc_needs_the_sessions_branch_at_the_merged_commit() {
     };
     assert_eq!(
         gc(&world, &backend, true),
-        "vm gc: no finished session to purge\n"
+        format!(
+            "abc-w\tnot finished: feature merged in #32 at {}, but the session's repository has \
+             no feature, so nothing shows its commits are merged\n\
+             vm gc: no finished session to purge\n",
+            crate::git::short(&head(&world.worktree))
+        )
+    );
+}
+
+/// The agent pushed from its VM and the pull request merged, but the host's worktree was never
+/// synced, so it lagged behind the merge, and `vm gc` said only "no finished session". When the
+/// session's branch is at the merge, `gc` syncs the worktree forward and finds it finished; when
+/// the worktree cannot be synced, it says why.
+#[test]
+fn gc_syncs_a_worktree_behind_the_merge_its_vm_pushed() {
+    let world = world("t");
+    let backend = Fake {
+        volumes: vec![("abc-w-target".to_owned(), 1_000_000_000)],
+        ..subscribed()
+    };
+    start_ok(&world, &backend);
+    let before = head(&world.worktree);
+    let repo = world.root.join("state/w/git");
+    let made = std::process::Command::new("git")
+        .arg("--git-dir")
+        .arg(&repo)
+        .args([
+            "commit-tree",
+            "-m",
+            "pushed from the VM",
+            "-p",
+            "refs/heads/feature",
+            "refs/heads/feature^{tree}",
+        ])
+        .env("GIT_AUTHOR_NAME", "a")
+        .env("GIT_AUTHOR_EMAIL", "a@example.com")
+        .env("GIT_COMMITTER_NAME", "a")
+        .env("GIT_COMMITTER_EMAIL", "a@example.com")
+        .output()
+        .unwrap();
+    assert!(made.status.success(), "{made:?}");
+    let pushed = String::from_utf8(made.stdout).unwrap().trim().to_owned();
+    let moved = std::process::Command::new("git")
+        .arg("--git-dir")
+        .arg(&repo)
+        .args(["update-ref", "refs/heads/feature", &pushed])
+        .status()
+        .unwrap();
+    assert!(moved.success());
+    github_merged(
+        &world,
+        &format!("[{{\"number\":9,\"headRefOid\":\"{pushed}\"}}]"),
+    );
+    // A commit on the host after the VM's push: the worktree cannot be synced.
+    git(
+        &world.worktree,
+        &[
+            "-c",
+            "user.name=m",
+            "-c",
+            "user.email=m@example.com",
+            "commit",
+            "--quiet",
+            "--allow-empty",
+            "-m",
+            "made on the host",
+        ],
+    );
+    let diverged = gc(&world, &backend, false);
+    assert!(
+        diverged.starts_with(&format!(
+            "abc-w\tnot finished: feature merged in #9 at {}, which the VM's feature is at, but \
+             the worktree's is at ",
+            crate::git::short(&pushed)
+        )) && diverged.contains("which the merge does not hold")
+            && diverged.ends_with("vm gc: no finished session to purge\n"),
+        "{diverged}"
+    );
+    assert!(
+        gc(&world, &backend, true).contains(
+            "could not be synced: the worktree's feature has \
+             commits the VM's lacks; merge them by hand\n"
+        ),
+        "--yes tries, and says why it cannot"
+    );
+    git(&world.worktree, &["reset", "--quiet", "--hard", &before]);
+    let listed = gc(&world, &backend, false);
+    assert_eq!(
+        listed,
+        format!(
+            "vm gc: the worktree's feature is behind the merge at {}; --yes syncs it first\n\
+             abc-w\t1.0 GB\tfeature merged in #9\n\
+             vm gc: 1 finished sessions hold 1.0 GB; `cargo xtask vm gc --yes` purges them\n",
+            crate::git::short(&before)
+        )
+    );
+    assert_eq!(head(&world.worktree), before, "listing changes nothing");
+    let purged = gc(&world, &backend, true);
+    assert!(
+        purged.starts_with(&format!(
+            "vm gc: synced the worktree's feature: {} -> {}\n",
+            crate::git::short(&before),
+            crate::git::short(&pushed)
+        )) && purged.contains("vm gc: purged abc-w; "),
+        "{purged}"
+    );
+    assert_eq!(
+        head(&world.worktree),
+        pushed,
+        "the worktree's branch moved forward"
     );
 }

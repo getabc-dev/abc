@@ -17,7 +17,8 @@
 //! * `ABC_TAILSCALE_AUTHKEY`: an ephemeral auth key owned by a user (not tagged: tagged devices
 //!   carry no identity), approved in advance, on a tailnet with `MagicDNS` and HTTPS certificates.
 //!   Ephemeral, so a node a killed run leaves behind disappears by itself;
-//! * `ABC_TAILSCALE_BIN`: a directory holding the `tailscaled` and `tailscale` to run;
+//! * `ABC_TAILSCALE_BIN`: the absolute path of a directory holding the `tailscaled` and
+//!   `tailscale` to run;
 //! * `ABC_TEST_POSTGRES_BIN`, as for every test that runs Postgres (`cargo xtask setup
 //!   --for-tests` installs it).
 //!
@@ -52,7 +53,7 @@ mod tests {
     use tokio_rustls::TlsConnector;
     use tokio_rustls::client::TlsStream;
 
-    use crate::common::{Machine, Tailscale};
+    use crate::common::{Machine, Tailscale, programs_dir};
 
     /// The text a process wrote to the file `log`, its last 8000 bytes at most.
     fn tail(log: &Path) -> String {
@@ -302,16 +303,18 @@ mod tests {
     #[tokio::test]
     #[ignore = "needs a tailnet this machine is on: ABC_TAILSCALE_AUTHKEY and ABC_TAILSCALE_BIN; run with --run-ignored only"]
     async fn abc_server_setup_serves_the_real_binaries_through_tailscale() {
-        let (Ok(key), Some(bin)) = (
-            std::env::var("ABC_TAILSCALE_AUTHKEY"),
-            std::env::var_os("ABC_TAILSCALE_BIN"),
-        ) else {
-            panic!(
-                "the real-tailnet check needs ABC_TAILSCALE_AUTHKEY and ABC_TAILSCALE_BIN (see \
-                 this file's header)"
-            );
+        let Ok(key) = std::env::var("ABC_TAILSCALE_AUTHKEY") else {
+            panic!("the real-tailnet check needs ABC_TAILSCALE_AUTHKEY (see this file's header)");
         };
-        let machine = Machine::new(&Tailscale::Real(PathBuf::from(bin)));
+        let bin = programs_dir(
+            "ABC_TAILSCALE_BIN",
+            std::env::var_os("ABC_TAILSCALE_BIN"),
+            &["tailscaled", "tailscale"],
+        )
+        .unwrap_or_else(|wrong| {
+            panic!("the real-tailnet check needs Tailscale's programs: {wrong} (see this file's header)")
+        });
+        let machine = Machine::new(&Tailscale::Real(bin));
         let key_file = machine.root().join("authkey");
         std::fs::write(&key_file, key).unwrap();
         std::fs::set_permissions(&key_file, std::fs::Permissions::from_mode(0o600)).unwrap();

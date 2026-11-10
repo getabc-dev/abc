@@ -535,7 +535,7 @@ fn stop_with(root: &Path, fields: &HookInput, steps: &mut impl Steps, log: &mut 
             "{said}check: PASS. {kept}; this stop is allowed, and the drift watchdog did not run."
         )),
         CheckResult::Failed => Answer::Held(format!("{said}check: FAIL. {kept}.")),
-        CheckResult::GateBusy => Answer::Held(format!("{said}check: NOT RUN. {kept}. {WAIT}")),
+        CheckResult::GateBusy => Answer::Held(format!("{said}check: NOT RUN. {kept}. {}", wait())),
     }
 }
 
@@ -700,9 +700,19 @@ fn run_bounded(
 }
 
 /// What an agent whose stop found another gate running does.
-const WAIT: &str = "Another gate held the gate lock (gate.lock in the checkout's git directory) \
-                    all the while the hook waited, so check did not start: wait for that gate to \
-                    finish, starting no other gate, then stop again.";
+fn wait() -> String {
+    format!(
+        "Another gate held the gate lock (gate.lock in the checkout's git directory) all the while \
+         the hook waited, so check did not start: wait for that gate to finish inside this turn, starting no \
+         other gate: run a foreground command that returns when it ends, such as `while kill -0 \
+         <pid> 2>/dev/null; do sleep 30; done` with the pid named above, or follow its log to \
+         the end. Then run check yourself or stop. Do not stop while the gate runs: each such \
+         stop waits {} s, is sent back, and counts toward the {} blocked stops after which the \
+         hook lets a stop through with no handoff.",
+        GATE_WAIT.as_secs(),
+        stop::MAX_BLOCKED_STOPS
+    )
+}
 
 /// How to declare a task BLOCKED, for the main agent.
 const DECLARE: &str = "If what stops you is outside your control, declare it: cargo xtask task \
@@ -789,7 +799,9 @@ fn conclude(
                 format!("{said}xtask stop hook: the check did not pass; keep working.")
             }
         }),
-        Decision::Block(Block::GateBusy) => Answer::Block(format!("{said}xtask stop hook: {WAIT}")),
+        Decision::Block(Block::GateBusy) => {
+            Answer::Block(format!("{said}xtask stop hook: {}", wait()))
+        }
         Decision::Block(Block::SentBack {
             declaration,
             reason,

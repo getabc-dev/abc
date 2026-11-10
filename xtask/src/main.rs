@@ -5,6 +5,7 @@ mod app;
 mod broker;
 mod check;
 mod coverage;
+mod download;
 mod e2e;
 mod fuzz;
 mod gate;
@@ -559,7 +560,7 @@ fn perform(
             tools: only,
         } => tools::doctor(home, &only, for_tests, &mut io::stdout().lock()),
         Task::Pin => {
-            tools::pin(home, &mut io::stdout().lock())?;
+            tools::pin(home, &mut io::stdout().lock(), &mut tools::download)?;
             Ok(ExitCode::SUCCESS)
         }
         Task::Tool { name, args } => run_tool(invocation, &name, &args),
@@ -857,6 +858,7 @@ fn run_pr(
                 root,
                 &repo,
                 &mut github::http(app::GITHUB_API, token),
+                &mut tools::download,
                 &mut done,
             )
         },
