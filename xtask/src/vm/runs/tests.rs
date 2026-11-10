@@ -972,7 +972,7 @@ fn one_run_is_active_and_the_queue_starts_the_rest_in_order() {
         refused.contains(" is active, and runs share one usage window"),
         "{refused}"
     );
-    let all = runs(&world).list().unwrap();
+    let all = runs(&world).list().unwrap().runs;
     assert_eq!(all.len(), 2);
     let queue = act(Action::Queue { action: None }).unwrap();
     assert!(
@@ -1077,7 +1077,7 @@ fn a_brief_is_a_file_inside_the_worktree_and_a_failed_install_is_recorded() {
         format!("{error:#}").contains("did not start: launchctl said no"),
         "{error:#}"
     );
-    let all = runs(&other).list().unwrap();
+    let all = runs(&other).list().unwrap().runs;
     assert!(
         matches!(&all[0].status, Status::GaveUp { reason } if reason.contains("its service could not be installed")),
         "{:?}",
@@ -1087,6 +1087,7 @@ fn a_brief_is_a_file_inside_the_worktree_and_a_failed_install_is_recorded() {
         runs(&other)
             .list()
             .unwrap()
+            .runs
             .iter()
             .all(|each| !each.status.active()),
         "so it holds no place"
@@ -1108,8 +1109,9 @@ fn runs_started_together_do_not_share_a_directory() {
     assert_eq!(second.id, format!("{}-2", first.id));
     drop(services);
     std::fs::write(all.dir.join(&first.id).join("state.json"), "{").unwrap();
-    assert!(
-        all.list().is_err(),
+    assert_eq!(
+        all.list().unwrap().unreadable[0].0,
+        first.id,
         "a broken state file is reported, not skipped"
     );
 }
@@ -1466,7 +1468,11 @@ fn runs_are_none_before_the_first_and_a_runs_directory_that_cannot_be_read_is_an
     let missing = Runs {
         dir: dir.path().join("runs"),
     };
-    assert_eq!(missing.list().unwrap(), Vec::<Run>::new(), "no runs yet");
+    assert_eq!(
+        missing.list().unwrap().runs,
+        Vec::<Run>::new(),
+        "no runs yet"
+    );
     std::fs::write(dir.path().join("runs"), "a file").unwrap();
     missing.list().unwrap_err();
     let mut out = Vec::new();
@@ -1792,4 +1798,129 @@ fn cancelling_a_run_whose_worktree_is_gone_still_starts_the_next() {
         "the next run started: {:?}",
         services.calls.borrow()
     );
+}
+
+/// Review finding: launchd kills a job's process group when the job exits, so a supervisor that
+/// ended or restarted took the session's token broker with it.
+#[test]
+fn launchd_leaves_the_supervisors_broker_running() {
+    let dir = tempfile::tempdir().unwrap();
+    let plist = manager(Os::MacOs, dir.path()).render("abc-w-1", Path::new("/x"));
+    assert!(
+        plist.contains("<key>AbandonProcessGroup</key><true/>"),
+        "{plist}"
+    );
+}
+
+/// Review finding: a unit file whose loading failed was left behind, for the service manager to
+/// start at the next login although its run had given up.
+#[test]
+fn a_service_that_does_not_load_leaves_no_unit_file() {
+    for os in [Os::MacOs, Os::Linux] {
+        let dir = tempfile::tempdir().unwrap();
+        let failing = manager(os, dir.path());
+        script(&failing.program, "echo 'no GUI session' >&2\nexit 5\n");
+        failing.install("abc-w-1").unwrap_err();
+        let left: Vec<_> = std::fs::read_dir(dir.path().join("units"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert!(left.is_empty(), "{os:?}: {left:?}");
+    }
+}
+
+/// Review finding: each build that started a run left a copy of xtask in runs/bin for ever.
+/// Installing a service removes the copies no unit file runs.
+#[test]
+fn copies_of_xtask_no_service_runs_are_removed() {
+    let dir = tempfile::tempdir().unwrap();
+    let launchd = manager(Os::MacOs, dir.path());
+    launchd.install("abc-w-1").unwrap();
+    launchd.retire("abc-w-1").unwrap();
+    std::fs::write(&launchd.exe, "another build").unwrap();
+    launchd.install("abc-w-2").unwrap();
+    std::fs::write(&launchd.exe, "a third build").unwrap();
+    launchd.install("abc-w-3").unwrap();
+    let mut copies: Vec<String> = std::fs::read_dir(dir.path().join("runs/bin"))
+        .unwrap()
+        .map(|entry| std::fs::read_to_string(entry.unwrap().path()).unwrap())
+        .collect();
+    copies.sort();
+    assert_eq!(
+        copies,
+        ["a third build", "another build"],
+        "the first build's copy runs no service any more"
+    );
+}
+
+/// Review finding: one state file that a run's xtask could not read, as one written by another
+/// build, made every listing fail, and with it the queue.
+#[test]
+fn a_state_that_cannot_be_read_is_shown_and_holds_up_no_queue() {
+    let (world, _local) = briefed();
+    let services = FakeServices::default();
+    let all = runs(&world);
+    let broken = all
+        .create(&session(&world), ".abc/brief.md", MORNING, Status::Queued)
+        .unwrap();
+    std::fs::write(
+        all.dir.join(&broken.id).join("state.json"),
+        "{\"status\": \"from-a-newer-build\"}",
+    )
+    .unwrap();
+    let queued = all
+        .create(
+            &session(&world),
+            ".abc/brief.md",
+            MORNING + 1,
+            Status::Queued,
+        )
+        .unwrap();
+    let started = super::start_next(&all, &services, MORNING)
+        .unwrap()
+        .unwrap();
+    assert_eq!(started.id, queued.id);
+    let mut out = Vec::new();
+    super::list(&all, false, &mut out).unwrap();
+    let listed = String::from_utf8(out).unwrap();
+    assert!(
+        listed.contains(&format!("{}\tunreadable: ", broken.id)),
+        "{listed}"
+    );
+}
+
+/// Review finding: ended runs' directories, with every session's log, were never removed.
+/// `vm gc` lists them and purges them with --yes.
+#[test]
+fn gc_purges_ended_runs_only_when_told() {
+    let (world, _local) = briefed();
+    let all = runs(&world);
+    let ended = all
+        .create(
+            &session(&world),
+            ".abc/brief.md",
+            MORNING,
+            Status::Cancelled,
+        )
+        .unwrap();
+    std::fs::write(all.log(&ended.id), "x".repeat(2_000)).unwrap();
+    let queued = all
+        .create(&session(&world), ".abc/brief.md", MORNING, Status::Queued)
+        .unwrap();
+    let mut out = Vec::new();
+    super::gc(&all, false, &mut out).unwrap();
+    let listed = String::from_utf8(out).unwrap();
+    assert!(
+        listed.contains(&format!("{}\tcancelled\t", ended.id)),
+        "{listed}"
+    );
+    assert!(
+        listed.contains("`cargo xtask vm gc --yes` purges them"),
+        "{listed}"
+    );
+    assert!(all.dir.join(&ended.id).exists(), "nothing purged yet");
+    let mut purged = Vec::new();
+    super::gc(&all, true, &mut purged).unwrap();
+    assert!(!all.dir.join(&ended.id).exists());
+    assert!(all.dir.join(&queued.id).exists(), "only ended runs go");
 }

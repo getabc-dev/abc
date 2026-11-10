@@ -804,7 +804,8 @@ struct Candidate {
     kept: Option<String>,
 }
 
-/// `vm gc`: lists the sessions that are not running and are finished, with the disk their
+/// `vm gc`: lists the ended supervised runs ([`runs::gc`]), then the sessions that are not running
+/// and are finished, with the disk their
 /// volumes take, and purges them with `yes`.
 ///
 /// "Merged" is GitHub's merged state of a pull request from the worktree's branch, not ancestry
@@ -815,6 +816,13 @@ struct Candidate {
 /// `origin` nor a merged pull request has is kept, naming them, and `--yes` then fails after
 /// purging the others.
 fn gc(host: &Host, backend: &dyn Backend, yes: bool, out: &mut impl Write) -> anyhow::Result<()> {
+    runs::gc(
+        &runs::Runs {
+            dir: host.runs.clone(),
+        },
+        yes,
+        out,
+    )?;
     let (candidates, unfinished) = finished(host, backend, yes, out)?;
     for (name, why) in &unfinished {
         writeln!(out, "{name}\tnot finished: {why}")?;

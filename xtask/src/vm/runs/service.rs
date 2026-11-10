@@ -154,6 +154,30 @@ impl Manager {
         Ok(copy)
     }
 
+    /// Removes the copies of xtask that no unit file runs, but `keep`, the one just installed.
+    fn prune(&self, keep: &Path) -> anyhow::Result<()> {
+        let mut units = String::new();
+        if let Ok(entries) = std::fs::read_dir(&self.units) {
+            for entry in entries.filter_map(Result::ok) {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if name.starts_with(LABEL) || name.starts_with("abc-run-") {
+                    units.push_str(&std::fs::read_to_string(entry.path()).unwrap_or_default());
+                }
+            }
+        }
+        for entry in std::fs::read_dir(&self.bin)
+            .with_context(|| format!("could not read {}", self.bin.display()))?
+            .filter_map(Result::ok)
+        {
+            let path = entry.path();
+            if path != keep && !units.contains(&path.display().to_string()) {
+                std::fs::remove_file(&path)
+                    .with_context(|| format!("could not remove {}", path.display()))?;
+            }
+        }
+        Ok(())
+    }
+
     /// The unit file of run `run`'s supervisor, running `exe`.
     pub(crate) fn render(&self, run: &str, exe: &Path) -> String {
         let args = [
@@ -202,6 +226,9 @@ impl Manager {
                     ),
                 );
                 key("RunAtLoad", "<true/>");
+                // launchd kills the job's process group when it exits, and the token broker the
+                // supervisor starts is in it; the broker serves the VM, which runs on.
+                key("AbandonProcessGroup", "<true/>");
                 key(
                     "KeepAlive",
                     "<dict><key>SuccessfulExit</key><false/></dict>",
@@ -281,18 +308,25 @@ impl Services for Manager {
         std::fs::write(&unit, self.render(run, &exe))
             .with_context(|| format!("could not write {}", unit.display()))?;
         let shown = unit.display().to_string();
-        match self.os {
-            Os::MacOs => self.manage(&["bootstrap", &Self::domain()?, &shown]),
-            Os::Linux => {
-                self.manage(&["--user", "daemon-reload"])?;
+        let loaded = match self.os {
+            Os::MacOs => {
+                Self::domain().and_then(|domain| self.manage(&["bootstrap", &domain, &shown]))
+            }
+            Os::Linux => self.manage(&["--user", "daemon-reload"]).and_then(|()| {
                 self.manage(&[
                     "--user",
                     "enable",
                     "--now",
                     &format!("abc-run-{run}.service"),
                 ])
-            }
+            }),
+        };
+        if let Err(error) = loaded {
+            // A unit that did not load is never left for the service manager to start later.
+            let _removed = std::fs::remove_file(&unit);
+            return Err(error);
         }
+        self.prune(&exe)
     }
 
     fn remove(&self, run: &str) -> anyhow::Result<()> {

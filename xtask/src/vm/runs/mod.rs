@@ -70,6 +70,14 @@ impl Status {
         matches!(self, Self::Waiting { .. } | Self::Running)
     }
 
+    /// Whether the run has ended.
+    const fn ended(&self) -> bool {
+        matches!(
+            self,
+            Self::Done { .. } | Self::GaveUp { .. } | Self::Cancelled
+        )
+    }
+
     /// The status in a few words.
     pub(crate) fn describe(&self) -> String {
         match self {
@@ -112,9 +120,9 @@ impl Status {
     }
 }
 
-/// One `claude -p` session of a run.
+/// One `claude -p` session of a run. Unknown fields are read past, so a supervisor of an older
+/// build reads what a newer one added.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub(crate) struct Attempt {
     /// When it started, in seconds since the Unix epoch.
     pub(crate) started: i64,
@@ -211,6 +219,15 @@ impl Run {
     }
 }
 
+/// The runs [`Runs::list`] finds.
+#[derive(Debug)]
+pub(crate) struct Listing {
+    /// Oldest first.
+    pub(crate) runs: Vec<Run>,
+    /// Each run whose state cannot be read, with why.
+    pub(crate) unreadable: Vec<(String, String)>,
+}
+
 /// The runs directory.
 #[derive(Debug)]
 pub(crate) struct Runs {
@@ -254,27 +271,39 @@ impl Runs {
             .with_context(|| format!("could not move {} into place", path.display()))
     }
 
-    /// Every run, oldest first.
-    pub(crate) fn list(&self) -> anyhow::Result<Vec<Run>> {
+    /// Every run, oldest first, and apart those whose state cannot be read, as one a build of
+    /// xtask other than this one wrote: they are shown, and hold up nothing.
+    pub(crate) fn list(&self) -> anyhow::Result<Listing> {
+        let mut listing = Listing {
+            runs: Vec::new(),
+            unreadable: Vec::new(),
+        };
         let entries = match std::fs::read_dir(&self.dir) {
             Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(listing),
             Err(error) => {
                 return Err(error)
                     .with_context(|| format!("could not read {}", self.dir.display()));
             }
         };
-        let mut runs = Vec::new();
         for entry in entries {
             let entry = entry?;
             if entry.path().join(STATE).is_file()
                 && let Some(id) = entry.file_name().to_str()
             {
-                runs.push(self.load(id)?);
+                match self.load(id) {
+                    Ok(run) => listing.runs.push(run),
+                    Err(error) => listing
+                        .unreadable
+                        .push((id.to_owned(), format!("{error:#}"))),
+                }
             }
         }
-        runs.sort_by(|a, b| (a.created, &a.id).cmp(&(b.created, &b.id)));
-        Ok(runs)
+        listing
+            .runs
+            .sort_by(|a, b| (a.created, &a.id).cmp(&(b.created, &b.id)));
+        listing.unreadable.sort();
+        Ok(listing)
     }
 
     /// Takes the lock that serialises which run is active, until the returned file is dropped.
@@ -384,7 +413,7 @@ pub(crate) fn start(
     now: i64,
 ) -> anyhow::Result<Run> {
     let _lock = runs.lock()?;
-    if let Some(other) = active(&runs.list()?) {
+    if let Some(other) = active(&runs.list()?.runs) {
         bail!(
             "run {} is active, and runs share one usage window; queue this brief with `cargo \
              xtask vm queue add`, or cancel that run with `cargo xtask vm cancel {}`",
@@ -441,7 +470,7 @@ pub(crate) fn start_next(
     now: i64,
 ) -> anyhow::Result<Option<Run>> {
     let _lock = runs.lock()?;
-    let all = runs.list()?;
+    let all = runs.list()?.runs;
     if active(&all).is_some() {
         return Ok(None);
     }
@@ -517,12 +546,15 @@ pub(crate) fn cancel(
 
 /// `vm runs`: every run, oldest first, as a table or as JSON.
 pub(crate) fn list(runs: &Runs, json: bool, out: &mut dyn Write) -> anyhow::Result<()> {
-    let all = runs.list()?;
+    let Listing {
+        runs: all,
+        unreadable,
+    } = runs.list()?;
     if json {
         writeln!(out, "{}", serde_json::to_string_pretty(&all)?)?;
         return Ok(());
     }
-    if all.is_empty() {
+    if all.is_empty() && unreadable.is_empty() {
         writeln!(out, "vm runs: none")?;
     }
     for run in &all {
@@ -536,12 +568,68 @@ pub(crate) fn list(runs: &Runs, json: bool, out: &mut dyn Write) -> anyhow::Resu
             runs.log(&run.id).display()
         )?;
     }
+    for (id, error) in &unreadable {
+        writeln!(out, "{id}\tunreadable: {error}")?;
+    }
     Ok(())
+}
+
+/// `vm gc`'s part for runs: lists the ended runs, with the disk their directories take, and
+/// purges them with `yes`.
+pub(crate) fn gc(runs: &Runs, yes: bool, out: &mut dyn Write) -> anyhow::Result<()> {
+    let ended: Vec<Run> = runs
+        .list()?
+        .runs
+        .into_iter()
+        .filter(|run| run.status.ended())
+        .collect();
+    if ended.is_empty() {
+        return Ok(());
+    }
+    let mut total = 0_u64;
+    for run in &ended {
+        let bytes = size_of(&runs.path(&run.id));
+        total = total.saturating_add(bytes);
+        writeln!(
+            out,
+            "{}\t{}\t{}",
+            run.id,
+            run.status.describe(),
+            super::size(bytes)
+        )?;
+    }
+    if !yes {
+        writeln!(
+            out,
+            "vm gc: {} ended runs hold {}; `cargo xtask vm gc --yes` purges them",
+            ended.len(),
+            super::size(total)
+        )?;
+        return Ok(());
+    }
+    for run in &ended {
+        let dir = runs.path(&run.id);
+        std::fs::remove_dir_all(&dir)
+            .with_context(|| format!("could not delete {}", dir.display()))?;
+        writeln!(out, "vm gc: purged run {}", run.id)?;
+    }
+    Ok(())
+}
+
+/// The bytes the files directly in `dir` take.
+fn size_of(dir: &Path) -> u64 {
+    std::fs::read_dir(dir).map_or(0, |entries| {
+        entries
+            .filter_map(Result::ok)
+            .filter_map(|entry| entry.metadata().ok())
+            .map(|meta| meta.len())
+            .fold(0, u64::saturating_add)
+    })
 }
 
 /// `vm queue`: the queued runs, in the order they start.
 pub(crate) fn queued(runs: &Runs, out: &mut dyn Write) -> anyhow::Result<()> {
-    let all = runs.list()?;
+    let all = runs.list()?.runs;
     if let Some(run) = active(&all) {
         writeln!(out, "active\t{}\t{}", run.id, run.status.describe())?;
     }
