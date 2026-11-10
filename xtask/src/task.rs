@@ -14,30 +14,16 @@ use crate::stop;
 /// The task file, relative to the worktree root; `.abc/` is ignored by git.
 pub(crate) const TASK: &str = ".abc/task.md";
 
-/// Writes `text` to `file` atomically: a temporary file beside it, renamed over it, so a reader
-/// never sees half a file and two writers never mix theirs.
-fn write(root: &Path, file: &str, text: &str) -> anyhow::Result<()> {
-    let path = root.join(file);
-    if let Some(dir) = path.parent() {
-        fs::create_dir_all(dir).with_context(|| format!("could not create {}", dir.display()))?;
-    }
-    let temporary = root.join(format!("{file}.{}.tmp", std::process::id()));
-    fs::write(&temporary, text)
-        .with_context(|| format!("could not write {}", temporary.display()))?;
-    fs::rename(&temporary, &path)
-        .with_context(|| format!("could not move {} into place", temporary.display()))
-}
-
 /// Records `text` as the current task. A new task starts every stop record afresh: no BLOCKED
-/// declaration and no blocked stops counted. What the state's IO says goes to `note`.
+/// declaration and no blocked stops counted; and the checkpoint too: no next step. What the state's IO says goes to `note`.
 pub(crate) fn set(root: &Path, text: &str, note: &mut dyn std::io::Write) -> anyhow::Result<()> {
     ensure!(
         !text.trim().is_empty(),
         "describe the task; an empty one guides nothing"
     );
-    write(root, TASK, &format!("{}\n", text.trim()))?;
+    crate::files::replace(&root.join(TASK), &format!("{}\n", text.trim()))?;
     stop::apply(root, stop::Event::TaskSet, note)?;
-    Ok(())
+    crate::progress::new_task(root, crate::progress::now())
 }
 
 /// Declares the task BLOCKED: what is missing and what was tried. The main agent's next stop

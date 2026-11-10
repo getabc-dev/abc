@@ -150,34 +150,54 @@ impl Backend for Msb {
         command: &[OsString],
         log: &mut dyn Write,
     ) -> anyhow::Result<ExitStatus> {
-        let (reader, writer) = std::io::pipe().context("could not make a pipe")?;
         let mut exec = self.command();
         exec.args(["exec", "--stream", "--no-stdin"])
             .arg(name)
             .arg("--")
             .args(command)
             .stdin(Stdio::null())
-            .stdout(writer.try_clone().context("could not share the pipe")?)
-            .stderr(writer);
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
         let mut child = exec
             .spawn()
             .with_context(|| format!("could not run {}", self.exe.display()))?;
-        // The command holds the pipe's write end until it is dropped, and the reader ends with it.
-        drop(exec);
-        let mut lines = BufReader::new(reader);
-        let mut line = Vec::new();
-        loop {
-            line.clear();
-            let read = lines
-                .read_until(b'\n', &mut line)
-                .context("could not read the command's output")?;
-            if read == 0 {
-                break;
+        let stdout = child.stdout.take().context("the command has no stdout")?;
+        let stderr = child.stderr.take().context("the command has no stderr")?;
+        // Each stream in its own pipe, read a whole line at a time: a line of one is never cut by
+        // the other, as when stderr is written while a long stream-json line is on its way.
+        let (lines, received) = std::sync::mpsc::channel::<std::io::Result<Vec<u8>>>();
+        std::thread::scope(|scope| -> anyhow::Result<()> {
+            let streams: [Box<dyn Read + Send>; 2] = [Box::new(stdout), Box::new(stderr)];
+            for stream in streams {
+                let lines = lines.clone();
+                scope.spawn(move || {
+                    let mut reader = BufReader::new(stream);
+                    loop {
+                        let mut line = Vec::new();
+                        match reader.read_until(b'\n', &mut line) {
+                            Ok(0) => return,
+                            Ok(_) => {
+                                if lines.send(Ok(line)).is_err() {
+                                    return;
+                                }
+                            }
+                            Err(error) => {
+                                let _sent = lines.send(Err(error));
+                                return;
+                            }
+                        }
+                    }
+                });
             }
-            log.write_all(&line)
-                .and_then(|()| log.flush())
-                .context("could not write the log")?;
-        }
+            drop(lines);
+            for line in received {
+                let line = line.context("could not read the command's output")?;
+                log.write_all(&line)
+                    .and_then(|()| log.flush())
+                    .context("could not write the log")?;
+            }
+            Ok(())
+        })?;
         child
             .wait()
             .context("could not wait for the command in the VM")
@@ -472,6 +492,26 @@ mod tests {
             log.contains("exec abc-w -- claude -p\n"),
             "no --tty without a terminal: {log}"
         );
+    }
+
+    #[test]
+    /// Review finding: stdout and stderr shared one pipe, so stderr written while a long
+    /// stdout line was on its way landed inside it, and the run's stream-json result no longer
+    /// parsed. Each stream's lines reach the log whole.
+    fn a_line_of_stdout_is_never_cut_by_stderr() {
+        let dir = tempfile::tempdir().unwrap();
+        let msb = fake(
+            dir.path(),
+            "printf '{\"result\":\"'\nhead -c 100000 /dev/zero | tr '\\0' a\necho oops >&2\nprintf '\"}\\n'\n",
+        );
+        let mut log = Vec::new();
+        msb.stream("abc-w", &[OsString::from("claude")], &mut log)
+            .unwrap();
+        let text = String::from_utf8(log).unwrap();
+        let line = format!("{{\"result\":\"{}\"}}\n", "a".repeat(100_000));
+        assert!(text.contains(&line), "the stdout line is whole");
+        assert!(text.contains("oops\n"), "stderr reaches the log too");
+        assert_eq!(text.len(), line.len() + "oops\n".len());
     }
 
     /// A session driven from a script once sat for hours with an empty log: without `--stream`

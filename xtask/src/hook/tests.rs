@@ -1462,7 +1462,7 @@ fn the_own_disks_check_names_a_worktree_that_is_not_there() {
 fn the_launcher_refuses_an_unknown_event() {
     let temp = tempfile::tempdir().unwrap();
     fake_cargo(temp.path(), "", 101);
-    let launched = launch("sh", "post-tool-use", temp.path(), temp.path(), "{}", false);
+    let launched = launch("sh", "pre-compact", temp.path(), temp.path(), "{}", false);
     assert_eq!(launched.code, Some(1), "{launched:?}");
     assert!(launched.stdout.is_empty(), "no answer: {launched:?}");
     assert!(launched.stderr.contains("unknown event"), "{launched:?}");
@@ -1508,6 +1508,17 @@ fn settings_wire_every_hook_to_the_launcher() {
         "the guard runs the launcher"
     );
     assert_eq!(guard["timeout"], 300, "the guard is time-boxed");
+    assert_eq!(
+        hooks["PostToolUse"][0]["matcher"], "Bash",
+        "a commit is made with a shell command"
+    );
+    let checkpoint = &hooks["PostToolUse"][0]["hooks"][0];
+    assert_eq!(
+        checkpoint["command"],
+        "if [ -f \"$CLAUDE_PROJECT_DIR/xtask/hooks/hook.sh\" ]; then sh \"$CLAUDE_PROJECT_DIR/xtask/hooks/hook.sh\" post-tool-use; else echo \"xtask hook: $CLAUDE_PROJECT_DIR has no xtask/hooks/hook.sh; no checkpoint is kept\" >&2; fi",
+        "the checkpoint runs the launcher"
+    );
+    assert_eq!(checkpoint["timeout"], 300, "the checkpoint is time-boxed");
     let stop_command = "if [ -f \"$CLAUDE_PROJECT_DIR/xtask/hooks/hook.sh\" ]; then sh \"$CLAUDE_PROJECT_DIR/xtask/hooks/hook.sh\" stop; else echo \"xtask hook: $CLAUDE_PROJECT_DIR has no xtask/hooks/hook.sh; no checks run\" >&2; fi";
     for event in ["Stop", "SubagentStop"] {
         let stop = &hooks[event][0]["hooks"][0];
@@ -1531,8 +1542,8 @@ fn hook_commands_note_a_checkout_without_the_launcher_and_let_it_be() {
     let commands = hook_commands();
     assert_eq!(
         commands.len(),
-        3,
-        "PreToolUse, Stop and SubagentStop: {commands:?}"
+        4,
+        "PreToolUse, PostToolUse, Stop and SubagentStop: {commands:?}"
     );
     for (event, command) in commands {
         for shell in SHELLS {
@@ -1609,4 +1620,190 @@ fn the_real_watch_step_hands_on_the_watchdogs_verdict() {
         .expect("a drift is handed on");
     assert!(drift.contains("Rewrote the README instead (S1)"), "{drift}");
     assert_eq!(answer(r#"{"on_track": true, "reasons": []}"#), None);
+}
+
+/// Class 2 of the /correct report: a session that ended without a handoff left nothing to carry
+/// on from. Every stop records what the agent last said, and a commit, seen after the Bash call
+/// that made it, renders the checkpoint again.
+#[test]
+fn stops_and_commits_keep_the_checkpoint() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo = crate::testing::clone_with_origin(temp.path());
+    let context = context(&repo, None);
+    let progress = || fs::read_to_string(repo.join(crate::progress::PROGRESS)).unwrap();
+    let post = serde_json::json!({
+        "hook_event_name": "PostToolUse", "cwd": repo, "tool_name": "Bash",
+        "tool_input": { "command": "git commit -m one" },
+    })
+    .to_string();
+
+    git(
+        &repo,
+        &["commit", "--quiet", "--allow-empty", "-m", "Made one"],
+    );
+    let mut log = Vec::new();
+    assert_eq!(
+        run(Event::PostToolUse, &post, &context, &mut log),
+        Answer::Allow
+    );
+    assert!(log.is_empty(), "{}", String::from_utf8_lossy(&log));
+    assert!(progress().contains(" Made one\n"), "{}", progress());
+
+    let mut steps = Fake::new(Ok(CheckResult::Passed));
+    let stop = serde_json::json!({
+        "hook_event_name": "Stop", "cwd": repo,
+        "last_assistant_message": "Next: the queue.",
+    });
+    let fields: HookInput = serde_json::from_value(stop).unwrap();
+    super::stop_with(&repo, &fields, &mut steps, &mut log);
+    assert!(
+        progress().contains("> Next: the queue.\n"),
+        "{}",
+        progress()
+    );
+
+    let broken = serde_json::json!({ "hook_event_name": "PostToolUse", "cwd": "/nonexistent" });
+    let answer = run(Event::PostToolUse, &broken.to_string(), &context, &mut log);
+    assert_eq!(answer, Answer::Allow, "a checkpoint never blocks");
+    let noted = String::from_utf8(log).unwrap();
+    assert!(noted.contains("the checkpoint was not rendered"), "{noted}");
+    assert_eq!(
+        run(Event::PostToolUse, "not json", &context, &mut Vec::new()),
+        Answer::Allow
+    );
+
+    fs::remove_dir_all(repo.join(".abc")).unwrap();
+    fs::write(repo.join(".abc"), "a file where the directory goes").unwrap();
+    let mut unwritten = Vec::new();
+    super::stop_with(
+        &repo,
+        &fields,
+        &mut Fake::new(Ok(CheckResult::Passed)),
+        &mut unwritten,
+    );
+    let said = String::from_utf8(unwritten).unwrap();
+    assert!(said.contains("the checkpoint was not written"), "{said}");
+}
+
+#[test]
+fn the_launcher_lets_a_post_tool_use_stand_whatever_happens() {
+    for shell in SHELLS {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path();
+        fake_cargo(project, "", 101);
+        let failed = launch(shell, "post-tool-use", project, project, "{}", false);
+        assert_eq!(failed.code, Some(0), "{shell}: {failed:?}");
+        assert!(failed.stdout.is_empty(), "{shell}: {failed:?}");
+        assert!(
+            failed
+                .stderr
+                .contains("the checkpoint .abc/progress.md was not updated"),
+            "{shell}: {failed:?}"
+        );
+        fake_cargo(project, "", 0);
+        let ran = launch(shell, "post-tool-use", project, project, "{}", false);
+        assert_eq!(ran.answer(Event::PostToolUse), Answer::Allow, "{shell}");
+        assert_eq!(
+            fs::read_to_string(project.join("args")).unwrap().trim_end(),
+            format!("{} post-tool-use", XTASK_HOOK.join(" ")),
+            "{shell}"
+        );
+        fs::remove_file(project.join("args")).unwrap();
+        script(&project.join("abc-xtask"), "exit 0\n");
+        fs::create_dir(project.join("target")).unwrap();
+        let vm = launch(shell, "post-tool-use", project, project, "{}", true);
+        assert_eq!(vm.code, Some(0), "{shell}: {vm:?}");
+        assert!(vm.stdout.is_empty(), "{shell}: {vm:?}");
+        assert!(
+            !project.join("args").exists(),
+            "{shell}: with a disk not its own, xtask is never built"
+        );
+    }
+}
+
+/// In another worktree the checkpoint is that checkout's: its own xtask keeps it, and a checkout
+/// without the launcher keeps none.
+#[test]
+fn a_worktrees_checkpoint_is_kept_by_its_own_xtask() {
+    let (temp, main, worktree) = repository_with_nested_worktree();
+    let bin = temp.path().join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    let mut context = context(&main, None);
+    context.cargo = fake_cargo(&bin, "", 0);
+    let post = serde_json::json!({ "hook_event_name": "PostToolUse", "cwd": worktree }).to_string();
+    let mut log = Vec::new();
+    assert_eq!(
+        run(Event::PostToolUse, &post, &context, &mut log),
+        Answer::Allow
+    );
+    let args = fs::read_to_string(bin.join("args")).unwrap();
+    assert!(
+        args.trim_end().ends_with("hook post-tool-use"),
+        "handed over: {args}"
+    );
+    assert!(
+        !main.join(crate::progress::PROGRESS).exists(),
+        "the main checkout keeps no checkpoint for it"
+    );
+
+    context.delegated = true;
+    run(Event::PostToolUse, &post, &context, &mut log);
+    let noted = String::from_utf8(log).unwrap();
+    assert!(
+        noted.contains("was handed this hook"),
+        "never handed on: {noted}"
+    );
+
+    context.delegated = false;
+    fs::remove_file(bin.join("args")).unwrap();
+    fs::remove_file(worktree.join(LAUNCHER)).unwrap();
+    assert_eq!(
+        run(Event::PostToolUse, &post, &context, &mut Vec::new()),
+        Answer::Allow
+    );
+    assert!(!bin.join("args").exists(), "no xtask to hand it to");
+}
+
+/// Review finding: a subagent's stop recorded its report as the agent's last message, so a fresh
+/// session resumed from a subagent's words.
+#[test]
+fn only_the_main_agents_stop_records_its_last_message() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo = crate::testing::clone_with_origin(temp.path());
+    let stop = |input: serde_json::Value| {
+        let fields: HookInput = serde_json::from_value(input).unwrap();
+        super::stop_with(
+            &repo,
+            &fields,
+            &mut Fake::new(Ok(CheckResult::Passed)),
+            &mut Vec::new(),
+        );
+    };
+    stop(
+        serde_json::json!({ "hook_event_name": "Stop", "cwd": repo, "last_assistant_message": "Main: next, the queue." }),
+    );
+    stop(
+        serde_json::json!({ "hook_event_name": "SubagentStop", "agent_id": "a1", "cwd": repo, "last_assistant_message": "Explore: found 3 files." }),
+    );
+    let progress = fs::read_to_string(repo.join(crate::progress::PROGRESS)).unwrap();
+    assert!(
+        progress.contains("> Main: next, the queue.\n"),
+        "{progress}"
+    );
+    assert!(!progress.contains("Explore"), "{progress}");
+}
+
+/// Review finding: a `PostToolUse` answer could block, against the contract that the checkpoint
+/// never decides anything; a hand-over that answers so is refused.
+#[test]
+fn a_post_tool_use_answer_never_blocks() {
+    assert!(
+        Answer::parse(Event::PostToolUse, r#"{"decision":"block","reason":"no"}"#).is_err(),
+        "a block is not a PostToolUse answer"
+    );
+    assert_eq!(
+        Answer::parse(Event::PostToolUse, r#"{"systemMessage":"noted"}"#).unwrap(),
+        Answer::Notify("noted".to_owned())
+    );
+    assert_eq!(Answer::Block("x".to_owned()).json(Event::PostToolUse), None);
 }

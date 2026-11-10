@@ -1,6 +1,7 @@
 #!/bin/sh
 # The launcher of every Claude Code hook in .claude/settings.json: `sh xtask/hooks/hook.sh EVENT`,
-# with EVENT pre-tool-use (PreToolUse on Bash and Monitor) or stop (Stop and SubagentStop).
+# with EVENT pre-tool-use (PreToolUse on Bash and Monitor), post-tool-use (PostToolUse on Bash,
+# which keeps the checkpoint .abc/progress.md) or stop (Stop and SubagentStop).
 #
 # It builds and runs this checkout's own xtask, `cargo xtask hook EVENT` (xtask/src/hook.rs).
 # xtask is a Cargo workspace of its own, so no crate of the main workspace can keep it from
@@ -13,7 +14,8 @@
 # Only when xtask cannot start, because it does not build or exits with any status but 0, does
 # this script answer itself, also in JSON: for pre-tool-use it denies a command that names git or
 # gh and lets any other run; for stop it holds the stop and lets the sixth in a row through,
-# recording that in .abc/stop-backstop.md. The holds are counted per agent, in .abc/hook-holds for
+# recording that in .abc/stop-backstop.md; for post-tool-use it says so on stderr and lets the
+# action stand, since a checkpoint never decides anything. The holds are counted per agent, in .abc/hook-holds for
 # the main agent and .abc/hook-holds.<agent_id> for each subagent, and cleared only by a stop that
 # xtask let through. Exit status 3 is xtask's one other word: it ran the check, which failed, but
 # could not keep its state to count the hold, so its output is the reason and this script counts
@@ -95,12 +97,14 @@ worktree."
     case $event in
       pre-tool-use) deny "$broken" ;;
       stop) hold "$broken" "$broken After 5 stops held like this one, the next is let through." ;;
+      post-tool-use) exit 0 ;;
     esac
   fi
   if ! broken=$(abc-own-disks "${ABC_WORKTREE:-$CLAUDE_PROJECT_DIR}" 2>&1); then
     case $event in
       pre-tool-use) deny "$broken" ;;
       stop) hold "$broken" "$broken After 5 stops held like this one, the next is let through." ;;
+      post-tool-use) exit 0 ;;
     esac
   fi
 fi
@@ -171,6 +175,10 @@ case $event in
     fi
     hold "$why" "$why, so the check cannot pass. Make xtask build again (cargo build --manifest-path xtask/Cargo.toml). A BLOCKED declaration is judged once it does; after 5 stops held like this one, the next is let through."
     ;;
+  post-tool-use)
+    echo "xtask hook: $why; the checkpoint .abc/progress.md was not updated" >&2
+    exit 0
+    ;;
 esac
-echo "xtask hook: unknown event '$event'; use pre-tool-use or stop" >&2
+echo "xtask hook: unknown event '$event'; use pre-tool-use, post-tool-use or stop" >&2
 exit 1

@@ -223,9 +223,12 @@ Per session:
 git worktree add ../abc-my-change -b agent/my-change origin/main
 cargo xtask vm start ../abc-my-change    # starts the broker if needed; a few seconds
 cargo xtask vm shell ../abc-my-change    # Claude Code as the agent; add `bash` for a shell
-cargo xtask vm run ../abc-my-change --log run.log -- claude -p "..."
-                                         # no terminal needed: the output reaches run.log line by
-                                         # line while it runs, and it exits with the command's status
+cargo xtask vm run ../abc-my-change .abc/brief.md
+                                         # a supervised run of the brief, as a host service (below)
+cargo xtask vm queue add ../abc-other .abc/brief.md
+                                         # runs it once the active run ends; `vm queue` lists them
+cargo xtask vm runs                      # every run: status, attempts, brief, log; --json for scripts
+cargo xtask vm cancel abc-my-change-20261110T080000
 cargo xtask vm auth ../abc-my-change     # how Claude Code is signed in, without secrets
 cargo xtask vm sync ../abc-my-change     # move the worktree's branch to the VM's commits
 cargo xtask vm push ../abc-my-change     # bring commits made on the host into the running VM
@@ -247,11 +250,38 @@ executable can read as `100644` on the host. A commit made on the host with `git
 `git commit -a` would record that, so xtask's test `every_script_is_executable_in_the_index`
 fails on any script that is not `100755` in git's index, naming the fix.
 
-`vm shell` is the interactive way in. To drive a session from a script or another agent, use
-`vm run`: it needs no pseudo-terminal, so no `script` wrapper, and writes stdout and stderr to the
-log as they come (microsandbox holds back the output of a command without a terminal unless asked
-to stream it, which `vm run` does). The log must be outside the worktree, which the VM can write,
-and `vm run` refuses a symbolic link there rather than follow it.
+`vm shell` is the interactive way in. Unattended work is a **supervised run**: `vm run <worktree>
+<brief>` carries out the brief, a file in the worktree such as `.abc/brief.md`, until the agent
+hands off PASS, FAIL or BLOCKED, with no one to restart it:
+
+- Its supervisor runs `claude -p` in the session's VM (starting the VM, with your token from the
+  keychain as `vm start` hands it over, when it is not running) and reads how each session ended
+  from its stream-json result. After a usage limit it waits until the reset the message names
+  (in UTC, the VMs' zone); after a network or DNS failure it backs off from 30 s to 15 minutes,
+  probing `api.anthropic.com` from inside the VM; when the VM will not start (after a reboot, the
+  keychain may still be locked) it backs off the same way; after any other stop it retries.
+- Every restart is a **fresh** `claude -p` on the brief and the checkpoint `.abc/progress.md`,
+  which the hooks keep as the agent works, never `--resume`: resuming a huge transcript burns a
+  usage window in minutes.
+- It is bounded: 40 sessions, 3 failed ones in a row, or a day without the API end the run as
+  `gave-up`, with the reason.
+- The supervisor is a launchd agent (`~/Library/LaunchAgents/dev.getabc.run.<run>.plist`) or a
+  systemd user unit (`abc-run-<run>.service`) running a copy of the xtask that started it, kept in
+  `~/.local/state/abc/runs/bin/`, so rebuilding the main clone never breaks a run. After a reboot it
+  starts again when you log in, starts the VM and carries on from the checkpoint. The VM needs
+  your token from the keychain (the Secret Service on Linux), which unlocks only when you log in:
+  until then each try to start the VM fails and the supervisor backs off, then carries on once
+  you have logged in, within a day. `loginctl enable-linger` starts Linux supervisors at boot,
+  but they still wait for that login.
+- Each run's `state.json` (status, reason, next attempt, every session's ids and outcome) and `log`
+  (every session's stream-json) live in `~/.local/state/abc/runs/<run>/`, on the host.
+- One run is active at a time, since every session shares your subscription's usage window: `vm
+  run` refuses while one is, and `vm queue add <worktree> <brief>` queues a brief to start when it
+  ends. `vm cancel <run>` stops a run's supervisor and its `claude` and starts the next.
+
+To move a run you started by hand onto this, stop its `claude` (or let it end), put its brief in
+the worktree, and `vm run` (or `vm queue add`) it: the first session reads the brief, and the
+checkpoint fills in as it works.
 
 The session's `target/` and `.tools/` are disks of the VM's own, mounted over those directories of
 the worktree. **Never delete or move `target/` or `.tools/` in a worktree while its VM runs**:

@@ -14,6 +14,7 @@
 mod billing;
 mod egress;
 mod msb;
+pub(crate) mod runs;
 mod session;
 
 use std::ffi::OsString;
@@ -34,24 +35,33 @@ pub(crate) enum Action {
     /// subscription token from the keychain, and a check that Claude Code uses only that.
     Start { worktree: PathBuf },
     /// Run COMMAND in the session as the agent; Claude Code when none is given. With a terminal
-    /// this is the interactive way in; `vm run` drives a session from a script.
+    /// this is the interactive way in; `vm run` drives a supervised run of a brief.
     Shell {
         worktree: PathBuf,
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<OsString>,
     },
-    /// Run COMMAND in the session as the agent with no pseudo-terminal, writing its stdout and
-    /// stderr to LOG line by line while it runs, and exit with its status:
-    /// `vm run <worktree> --log run.log -- claude -p "..."`.
-    Run {
-        worktree: PathBuf,
-        /// The file the output goes to, replaced if it exists; never in the worktree, and never a
-        /// symbolic link.
-        #[arg(long)]
-        log: PathBuf,
-        #[arg(last = true, required = true)]
-        command: Vec<OsString>,
+    /// Start a supervised run of BRIEF (a file in the worktree, such as .abc/brief.md) in the
+    /// session for WORKTREE, as a host service that survives reboots: fresh `claude -p` sessions
+    /// carry the brief on from the checkpoint .abc/progress.md across usage limits and outages
+    /// until the agent hands off PASS, FAIL or BLOCKED. Refuses while another run is active.
+    Run { worktree: PathBuf, brief: String },
+    /// List the queued runs; `vm queue add` queues one, to start when the active run ends.
+    Queue {
+        #[command(subcommand)]
+        action: Option<QueueAction>,
     },
+    /// List every run with its status, attempts, brief and log (in
+    /// `~/.local/state/abc/runs/<run>/`); --json prints each run's state file.
+    Runs {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Cancel run RUN: stop its supervisor and its claude, and start the next queued run.
+    Cancel { run: String },
+    /// The supervisor of run RUN, which its host service runs.
+    #[command(hide = true)]
+    Supervise { run: String },
     /// Show how Claude Code in the session is signed in, without secrets.
     Auth { worktree: PathBuf },
     /// Move the worktree's branch to the commits made in the session.
@@ -79,6 +89,14 @@ pub(crate) enum Action {
     /// Inside an agent VM: fail unless Claude Code can use only the subscription token.
     #[command(hide = true)]
     Billing,
+}
+
+/// What `cargo xtask vm queue` does besides listing the queue.
+#[derive(Debug, Subcommand)]
+pub(crate) enum QueueAction {
+    /// Queue a supervised run of BRIEF in the session for WORKTREE, as `vm run` starts one; it
+    /// starts at once when no run is active.
+    Add { worktree: PathBuf, brief: String },
 }
 
 /// The GitHub CLI, which `vm gc` asks which branches GitHub merged.
@@ -230,6 +248,8 @@ pub(crate) struct Host {
     pub(crate) repo: PathBuf,
     /// Where sessions keep their state.
     pub(crate) state: PathBuf,
+    /// Where supervised runs keep their state and logs.
+    pub(crate) runs: PathBuf,
     /// The user's home directory, under which each session's broker listens.
     pub(crate) home: PathBuf,
     /// The installed broker, started when none is listening.
@@ -269,6 +289,7 @@ impl Host {
             os,
             repo: repo.to_path_buf(),
             state: dir("XDG_STATE_HOME", ".local/state").join("abc/vm"),
+            runs: dir("XDG_STATE_HOME", ".local/state").join("abc/runs"),
             home: home.to_path_buf(),
             broker_exe: dir("XDG_DATA_HOME", ".local/share").join(BROKER_EXE),
             secret: (PathBuf::from(program), args),
@@ -336,14 +357,20 @@ pub(crate) fn require_kvm(os: Os, kvm: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Runs `action` on `host` with `backend`, reporting to `out`.
+/// Runs `action` on `host` with `backend`, installing supervisors with `services`, reporting to
+/// `out`.
 pub(crate) fn run(
     action: Action,
     host: &Host,
     backend: &dyn Backend,
+    services: &dyn runs::service::Services,
     env: &dyn Fn(&str) -> Option<OsString>,
     out: &mut impl Write,
 ) -> anyhow::Result<ExitCode> {
+    let all = runs::Runs {
+        dir: host.runs.clone(),
+    };
+    let now = crate::progress::now();
     match action {
         Action::Start { worktree } => {
             start(
@@ -369,13 +396,42 @@ pub(crate) fn run(
             let session = Session::open(&worktree, &host.repo, &host.state)?;
             writeln!(out, "vm: {}", push(&session, backend)?)?;
         }
-        Action::Run {
-            worktree,
-            log,
-            command,
+        Action::Run { worktree, brief } => {
+            let session = Session::open(&worktree, &host.repo, &host.state)?;
+            let run = runs::start(&all, services, &session, &brief, now)?;
+            writeln!(
+                out,
+                "vm: started run {}; `cargo xtask vm runs` shows it, its log is {}",
+                run.id,
+                all.log(&run.id).display()
+            )?;
+        }
+        Action::Queue { action: None } => runs::queued(&all, out)?,
+        Action::Queue {
+            action: Some(QueueAction::Add { worktree, brief }),
         } => {
             let session = Session::open(&worktree, &host.repo, &host.state)?;
-            return run_logged(&session, backend, command, &log);
+            let run = runs::enqueue(&all, services, &session, &brief, now)?;
+            writeln!(out, "vm: run {}: {}", run.id, run.status.describe())?;
+        }
+        Action::Runs { json } => runs::list(&all, json, out)?,
+        Action::Cancel { run } => {
+            writeln!(
+                out,
+                "vm: {}",
+                runs::cancel(&all, services, backend, host, &run, now)?
+            )?;
+        }
+        Action::Supervise { run } => {
+            let status = runs::Supervisor {
+                runs: &all,
+                host,
+                backend,
+                services,
+                clock: &runs::SystemClock,
+            }
+            .supervise(&run)?;
+            writeln!(out, "vm: run {run}: {}", status.describe())?;
         }
         Action::Stop { worktree, purge } => {
             let session = Session::open(&worktree, &host.repo, &host.state)?;
@@ -484,6 +540,9 @@ fn spec(session: &Session, broker: &Path, egress: Vec<String>) -> Spec {
                 "postgres://abc_test@127.0.0.1:5432/postgres".to_owned(),
             ),
             ("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1".to_owned()),
+            // Claude Code names a usage limit's reset in its time zone, which the supervisor
+            // reads as UTC (`runs::outcome::reset`).
+            ("TZ", "UTC".to_owned()),
             ("DISABLE_AUTOUPDATER", "1".to_owned()),
         ]
         .into_iter()
@@ -515,7 +574,11 @@ fn subscription_token(host: &Host) -> anyhow::Result<Vec<u8>> {
 
 /// Makes sure session `session`'s token broker listens on the sockets of `files`, starting the
 /// installed one when it does not.
-fn ensure_broker(host: &Host, session: &str, files: &crate::broker::Files) -> anyhow::Result<()> {
+pub(crate) fn ensure_broker(
+    host: &Host,
+    session: &str,
+    files: &crate::broker::Files,
+) -> anyhow::Result<()> {
     let listening = || std::os::unix::net::UnixStream::connect(&files.control).is_ok();
     if listening() {
         return Ok(());
@@ -647,64 +710,6 @@ fn shell(
     Ok(ExitCode::from(crate::tools::status_code(status)))
 }
 
-/// `vm run`: runs `command` in `session` as the agent with no pseudo-terminal, its output going to
-/// the file `log` a line at a time while it runs; exits with its status.
-fn run_logged(
-    session: &Session,
-    backend: &dyn Backend,
-    command: Vec<OsString>,
-    log: &Path,
-) -> anyhow::Result<ExitCode> {
-    let mut file = open_log(log, &session.worktree)?;
-    let mut full = vec![OsString::from("agent-exec")];
-    full.extend(command);
-    let status = backend.stream(&session.name, &full, &mut file)?;
-    Ok(ExitCode::from(crate::tools::status_code(status)))
-}
-
-/// Creates the log `log` of a run in the session whose worktree is `worktree`, replacing a file
-/// there. The VM can write the worktree, so the log may not be in it, through a link or not; and
-/// a link at `log` is refused, never followed: the file is created anew (`O_EXCL`), which fails
-/// rather than follow one put there meanwhile.
-fn open_log(log: &Path, worktree: &Path) -> anyhow::Result<std::fs::File> {
-    let shown = log.display();
-    let name = log
-        .file_name()
-        .with_context(|| format!("could not create {shown}: it names no file"))?;
-    let parent = log
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    let dir = std::fs::canonicalize(parent).with_context(|| {
-        format!(
-            "could not create {shown}: no directory {}",
-            parent.display()
-        )
-    })?;
-    ensure!(
-        !dir.starts_with(worktree),
-        "{shown} is inside the worktree {}, which the VM can write; put the log outside it",
-        worktree.display()
-    );
-    let path = dir.join(name);
-    match std::fs::symlink_metadata(&path) {
-        Ok(meta) if meta.file_type().is_symlink() => {
-            bail!("{shown} is a symbolic link, which `vm run` does not follow; remove it")
-        }
-        Ok(meta) if meta.is_file() => {
-            std::fs::remove_file(&path).with_context(|| format!("could not replace {shown}"))?;
-        }
-        Ok(_) => bail!("{shown} is not a file"),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error).with_context(|| format!("could not inspect {shown}")),
-    }
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&path)
-        .with_context(|| format!("could not create {shown}"))
-}
-
 /// Brings the worktree branch's new commits into the running VM of `session`: the VM's own git
 /// fetches them from a bundle piped in, so the host never runs git in the repository the VM is
 /// writing. Returns what changed, for the user.
@@ -799,7 +804,8 @@ struct Candidate {
     kept: Option<String>,
 }
 
-/// `vm gc`: lists the sessions that are not running and are finished, with the disk their
+/// `vm gc`: lists the ended supervised runs ([`runs::gc`]), then the sessions that are not running
+/// and are finished, with the disk their
 /// volumes take, and purges them with `yes`.
 ///
 /// "Merged" is GitHub's merged state of a pull request from the worktree's branch, not ancestry
@@ -810,6 +816,13 @@ struct Candidate {
 /// `origin` nor a merged pull request has is kept, naming them, and `--yes` then fails after
 /// purging the others.
 fn gc(host: &Host, backend: &dyn Backend, yes: bool, out: &mut impl Write) -> anyhow::Result<()> {
+    runs::gc(
+        &runs::Runs {
+            dir: host.runs.clone(),
+        },
+        yes,
+        out,
+    )?;
     let (candidates, unfinished) = finished(host, backend, yes, out)?;
     for (name, why) in &unfinished {
         writeln!(out, "{name}\tnot finished: {why}")?;
