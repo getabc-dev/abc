@@ -4,7 +4,7 @@
 // The service managers, root and browser are fakes that run what the service definition says
 // (crates/abc-host/tests/fakes); a real reboot is the maintainer's check on a real machine.
 
-import { expect, test } from "./abc.ts";
+import { expect, ORIGIN, test } from "./abc.ts";
 import { capture } from "./look.ts";
 
 /** Long enough for a worker to connect after being (re)started. */
@@ -20,10 +20,14 @@ test("a machine is approved in the browser, runs as a service and survives a res
   // The one command, with a Copy button, for any machine.
   await page.getByRole("button", { name: "Enrol a machine" }).click();
   await expect(page.getByText("abc worker setup https://", { exact: false })).toBeVisible();
+  await page.context().grantPermissions(["clipboard-read", "clipboard-write"], { origin: ORIGIN });
   await page.getByRole("button", { name: "Copy the setup command" }).click();
   await expect(
     page.getByRole("status").filter({ hasText: "Copied the setup command" }),
   ).toBeAttached();
+  expect(await page.evaluate(() => navigator.clipboard.readText())).toBe(
+    `abc worker setup ${ORIGIN}`,
+  );
 
   const machine = makeMachine("setup-host");
   const setup = machine.setup();
