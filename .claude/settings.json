@@ -12,6 +12,18 @@
         ]
       }
     ],
+    "PostToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "if [ -f \"$CLAUDE_PROJECT_DIR/xtask/hooks/hook.sh\" ]; then sh \"$CLAUDE_PROJECT_DIR/xtask/hooks/hook.sh\" post-tool-use; else echo \"xtask hook: $CLAUDE_PROJECT_DIR has no xtask/hooks/hook.sh; no checkpoint is kept\" >&2; fi",
+            "timeout": 300
+          }
+        ]
+      }
+    ],
     "Stop": [
       {
         "hooks": [

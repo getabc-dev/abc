@@ -286,15 +286,37 @@ pub(crate) fn run_gh(
     code
 }
 
-/// Revokes the installation `token` at `api`.
-pub(crate) fn revoke(api: &str, token: &str) -> anyhow::Result<()> {
-    ureq::delete(&format!("{api}/installation/token"))
+/// What GitHub said to a revocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Revoked {
+    /// The token was valid and is revoked now.
+    Now,
+    /// GitHub no longer took the token (401): it was revoked before, as `cargo xtask gh` and
+    /// `cargo xtask pr` revoke theirs when they finish, or it expired.
+    Already,
+}
+
+/// How long one revocation may take, so a broker that stops is never held by GitHub.
+const REVOKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Revokes the installation `token` at `api`. A token GitHub no longer takes is
+/// [`Revoked::Already`]: nothing is left to revoke.
+pub(crate) fn revoke(api: &str, token: &str) -> anyhow::Result<Revoked> {
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(REVOKE_TIMEOUT))
+        .build()
+        .into();
+    match agent
+        .delete(&format!("{api}/installation/token"))
         .header("Authorization", &format!("Bearer {token}"))
         .header("Accept", "application/vnd.github+json")
         .header("X-GitHub-Api-Version", "2022-11-28")
         .call()
-        .context("GitHub refused to revoke the token")?;
-    Ok(())
+    {
+        Ok(_) => Ok(Revoked::Now),
+        Err(ureq::Error::StatusCode(401)) => Ok(Revoked::Already),
+        Err(error) => Err(error).context("GitHub refused to revoke the token"),
+    }
 }
 
 /// Runs `gh` (the user's GitHub CLI, from `PATH`) with `args`, acting as the App through
@@ -318,7 +340,7 @@ mod tests {
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use ring::signature::{RSA_PKCS1_2048_8192_SHA256, UnparsedPublicKey};
 
-    use super::{App, Scope, config_dir_from, credential, gh, parse_key, run_gh};
+    use super::{App, Revoked, Scope, config_dir_from, credential, gh, parse_key, revoke, run_gh};
     use crate::testing::{script, serve, serve_once};
 
     const KEY: &str = include_str!("../testdata/agent-app-test-key.pem");
@@ -543,6 +565,25 @@ mod tests {
             serde_json::json!({"contents": "write"}),
             "git pushes contents alone: no pull requests, no workflow files"
         );
+    }
+
+    /// GitHub answers 401 to a token that was revoked before or expired: there is nothing left
+    /// to revoke, which is not a failure.
+    #[test]
+    fn a_token_github_no_longer_takes_is_already_revoked() {
+        let (url, server) = serve(vec![
+            ("204 No Content", ""),
+            ("401 Unauthorized", r#"{"message": "Bad credentials"}"#),
+            ("502 Bad Gateway", "{}"),
+        ]);
+        assert_eq!(revoke(&url, "ghs_a").unwrap(), Revoked::Now);
+        assert_eq!(revoke(&url, "ghs_a").unwrap(), Revoked::Already);
+        let failed = format!("{:#}", revoke(&url, "ghs_a").unwrap_err());
+        assert!(
+            failed.starts_with("GitHub refused to revoke the token") && failed.contains("502"),
+            "{failed}"
+        );
+        server.join().unwrap();
     }
 
     #[test]

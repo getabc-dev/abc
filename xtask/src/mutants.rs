@@ -90,6 +90,13 @@ impl Shard {
     }
 }
 
+impl std::fmt::Display for Shard {
+    /// `k/n`, as cargo-mutants takes it.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}/{}", self.index, self.count)
+    }
+}
+
 /// How to run cargo-mutants.
 #[derive(Debug)]
 pub(crate) struct Options {
@@ -307,7 +314,7 @@ impl Run<'_> {
                     .map(|shard| {
                         vec![
                             "--shard".to_owned(),
-                            format!("{}/{}", shard.index, shard.count),
+                            shard.to_string(),
                         ]
                     })
                     .unwrap_or_default(),

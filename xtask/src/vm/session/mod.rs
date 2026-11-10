@@ -351,12 +351,18 @@ impl Session {
 
     /// Puts the session repository's config back to the host's, empties its hooks and drops its
     /// alternates and any per-worktree config, so nothing the VM wrote there runs on the host.
+    /// Its origin is always the HTTPS URL of the main clone's GitHub repository, whatever URL the
+    /// host uses: the VM has no SSH key, reaches the network only over HTTPS, and its credential
+    /// helper answers only for `https://github.com`.
     fn seal(&self, repo: &Path) -> anyhow::Result<()> {
-        let origin = git_main(&self.common, &["config", "remote.origin.url"]).unwrap_or_default();
+        // `remote get-url` applies `url.<base>.insteadOf`, as git would to reach origin.
+        let origin = git_main(&self.common, &["remote", "get-url", "origin"])
+            .context("the main clone has no origin")?;
+        let origin = crate::github::Repo::parse(origin.trim())?.https_url();
         let mut config = format!(
             "[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n\tbare = true\n\
              [remote \"origin\"]\n\turl = {}\n\tfetch = +refs/heads/*:refs/remotes/origin/*\n",
-            quoted(origin.trim())
+            quoted(&origin)
         );
         let identity: Vec<(&str, String)> = ["name", "email"]
             .into_iter()
@@ -415,7 +421,10 @@ impl Session {
         ]);
         let theirs = run(parse, "rev-parse")?.trim().to_owned();
         if theirs == ours {
-            return Ok(format!("{branch} is already at {}", short(&ours)));
+            return Ok(format!(
+                "{branch} is already at {}",
+                crate::git::short(&ours)
+            ));
         }
         let mut fetch = sealed(&self.worktree);
         fetch
@@ -434,7 +443,11 @@ impl Session {
         let mut reset = self.worktree_git();
         reset.args(["reset", "--quiet", "--mixed", &theirs]);
         run(reset, "reset")?;
-        Ok(format!("{branch}: {} -> {}", short(&ours), short(&theirs)))
+        Ok(format!(
+            "{branch}: {} -> {}",
+            crate::git::short(&ours),
+            crate::git::short(&theirs)
+        ))
     }
 
     /// The commits the worktree's branch has and the VM's lacks, as a bundle for a running VM,
@@ -468,7 +481,7 @@ impl Session {
         if theirs == ours {
             return Ok(Push::Current(format!(
                 "the VM's {branch} is already at {}",
-                short(&ours)
+                crate::git::short(&ours)
             )));
         }
         let mut known = self.worktree_git();
@@ -488,8 +501,8 @@ impl Session {
             ancestor.status().context("could not run git")?.success(),
             "the VM's {branch} ({}) is not behind the worktree's ({}): the branches diverged; \
              merge them by hand",
-            short(&theirs),
-            short(&ours)
+            crate::git::short(&theirs),
+            crate::git::short(&ours)
         );
         let mut bundle = self.worktree_git();
         bundle.args([
@@ -597,6 +610,8 @@ fn slug(name: &str) -> String {
 /// A worktree of the main clone, as `vm gc` sees it.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct Worktree {
+    /// Its directory.
+    pub(crate) path: PathBuf,
     /// Its session.
     pub(crate) session: Id,
     /// The branch checked out in it, without `refs/heads/`; none when its HEAD is detached.
@@ -617,11 +632,13 @@ pub(crate) fn worktrees(main: &Path) -> anyhow::Result<Vec<Worktree>> {
     let mut worktrees = Vec::new();
     // The first entry is the main clone itself.
     for entry in listing.split("\n\n").skip(1) {
+        let mut place = None;
         let mut session = None;
         let mut branch = None;
         let mut commit = None;
         for line in entry.lines() {
             if let Some(path) = line.strip_prefix("worktree ") {
+                place = Some(PathBuf::from(path));
                 session = Path::new(path)
                     .file_name()
                     .and_then(OsStr::to_str)
@@ -632,8 +649,9 @@ pub(crate) fn worktrees(main: &Path) -> anyhow::Result<Vec<Worktree>> {
                 commit = Some(head.to_owned());
             }
         }
-        if let (Some(session), Some(commit)) = (session, commit) {
+        if let (Some(path), Some(session), Some(commit)) = (place, session, commit) {
             worktrees.push(Worktree {
+                path,
                 session,
                 branch,
                 commit,
@@ -706,14 +724,32 @@ pub(crate) fn unshared(state: &Path, elsewhere: &[String]) -> anyhow::Result<Vec
         .lines()
         .map(|line| {
             let (commit, subject) = line.split_once(' ').unwrap_or((line, ""));
-            format!("{} {subject}", short(commit))
+            format!("{} {subject}", crate::git::short(commit))
         })
         .collect())
 }
 
-/// The first twelve characters of a commit's name.
-pub(crate) fn short(commit: &str) -> &str {
-    commit.get(..12).unwrap_or(commit)
+/// Whether the session repository under `state` holds `ancestor` and `of`, and `ancestor` is an
+/// ancestor of `of` or `of` itself. Read only through [`sealed`] git.
+pub(crate) fn is_ancestor(state: &Path, ancestor: &str, of: &str) -> anyhow::Result<bool> {
+    let mut check = sealed(&state.join("git"));
+    check.args([
+        "merge-base",
+        "--is-ancestor",
+        "--end-of-options",
+        ancestor,
+        of,
+    ]);
+    let output = check.output().context("could not run git")?;
+    match output.status.code() {
+        Some(0) => Ok(true),
+        // 1: not an ancestor; 128: a commit the repository lacks, which it cannot show either.
+        Some(1 | 128) => Ok(false),
+        _ => bail!(
+            "git merge-base failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ),
+    }
 }
 
 #[cfg(test)]

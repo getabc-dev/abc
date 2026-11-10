@@ -5,7 +5,9 @@ mod app;
 mod broker;
 mod check;
 mod coverage;
+mod download;
 mod e2e;
+mod files;
 mod fuzz;
 mod gate;
 mod git;
@@ -17,10 +19,12 @@ mod junit;
 mod mutants;
 mod postgres;
 mod pr;
+mod progress;
 mod release;
 mod review;
 mod rulesets;
 mod shell;
+mod spec;
 mod stop;
 mod task;
 #[cfg(test)]
@@ -125,6 +129,12 @@ enum TaskAction {
     Show,
     /// Forget the recorded task.
     Clear,
+    /// Record your next step in the checkpoint, .abc/progress.md, which a fresh session carries
+    /// on from after a limit, an outage or a reboot. Run it at each milestone.
+    Next {
+        /// The next step, in a sentence or two.
+        text: String,
+    },
     /// Declare the task BLOCKED when what stops it is outside your control. The main agent's next
     /// stop asks the watchdog once whether it is, then lets the stop through with this handoff.
     Blocked {
@@ -173,6 +183,14 @@ enum Task {
         /// How long to fuzz, in seconds.
         #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u64).range(1..))]
         seconds: u64,
+    },
+    /// Check the formal specs in spec/ with the pinned Quint, Apalache and JRE: typecheck them,
+    /// run their tests, have TLC explore every state of each model and find each seeded bug.
+    Spec {
+        /// Also write ITF traces of each model's simulations into DIR, the input the runner's
+        /// trace replay reads; docs/spec/runner.md describes them.
+        #[arg(long, value_name = "DIR")]
+        traces: Option<PathBuf>,
     },
     /// Report deleted, skipped or weakened tests and changed gate files since the merge base.
     Integrity {
@@ -337,6 +355,8 @@ struct Invocation<'a> {
     root: PathBuf,
     /// A pinned tool's executable, by name: one of the gates' own programs, from `home`.
     tool: &'a dyn Fn(&str) -> anyhow::Result<PathBuf>,
+    /// The executable of the runtime a pinned tool runs on, by the tool's name, if it has one.
+    runtime: &'a dyn Fn(&str) -> anyhow::Result<Option<PathBuf>>,
     /// A tool the tests of a tree run, by the tree and the tool's name: from that tree, as
     /// [`tree_test_tool`] finds it.
     test_tool: &'a dyn Fn(&Path, &str) -> anyhow::Result<PathBuf>,
@@ -356,6 +376,7 @@ impl Invocation<'static> {
             home,
             root,
             tool: &pinned_tool,
+            runtime: &pinned_runtime,
             test_tool: &test_tool_here,
             env: &env_var,
         })
@@ -365,6 +386,11 @@ impl Invocation<'static> {
 /// A tool pinned in the repository xtask was built from.
 fn pinned_tool(name: &str) -> anyhow::Result<PathBuf> {
     tools::pinned(&repo_root()?, name)
+}
+
+/// The runtime of a tool pinned in the repository xtask was built from.
+fn pinned_runtime(name: &str) -> anyhow::Result<Option<PathBuf>> {
+    tools::runtime(&repo_root()?, name)
 }
 
 /// A tool the tests of the tree at `tree` run, as [`tree_test_tool`] finds it from this checkout
@@ -400,6 +426,28 @@ fn verdict(passed: bool) -> ExitCode {
     }
 }
 
+/// The command after `cargo xtask` that a gate's pass is recorded under in the checkpoint, with
+/// what limits what it covered: `check --changed`, `mutants --base <rev> --shard k/n`.
+fn gate_label(task: &Task) -> String {
+    let name = gate_of(task).map_or("", |(gate, _)| gate.name());
+    if let Task::Check { changed: true, .. } = task {
+        return format!("{name} --changed");
+    }
+    if let Task::Coverage { base } = task {
+        return format!("{name} --base {base}");
+    }
+    if let Task::Mutants { base, shard, .. } = task {
+        return shard.map_or_else(
+            || format!("{name} --base {base}"),
+            |shard| format!("{name} --base {base} --shard {shard}"),
+        );
+    }
+    if let Task::Fuzz { seconds } = task {
+        return format!("{name} --seconds {seconds}");
+    }
+    name.to_owned()
+}
+
 /// Runs `task`; a heavy gate holds the gate lock while it runs, so gates run one at a time.
 fn run(
     task: Task,
@@ -409,10 +457,20 @@ fn run(
     let Some((gate, wait)) = gate_of(&task) else {
         return perform(task, invocation, report);
     };
+    let label = gate_label(&task);
     match gate::take(&invocation.root, gate, wait, report)? {
         gate::Taken::Held(held) => {
             let result = perform(task, invocation, report);
             drop(held);
+            if matches!(result, Ok(code) if code == ExitCode::SUCCESS)
+                && invocation.root == invocation.home
+                && let Err(error) = progress::gate_passed(&invocation.root, &label, progress::now())
+            {
+                writeln!(
+                    report,
+                    "{label}: passed, but the checkpoint was not written: {error:#}"
+                )?;
+            }
             result
         }
         gate::Taken::Busy(holder) => {
@@ -457,6 +515,7 @@ fn perform(
             &mutants::Tools::pinned(tool, postgres()?)?,
             report,
         )?)),
+        Task::Spec { traces } => run_spec(root, traces.as_deref(), tool, report),
         Task::Fuzz { seconds } => Ok(verdict(fuzz::run(
             root,
             &check::cargo(),
@@ -520,10 +579,10 @@ fn perform(
             tools: only,
         } => tools::doctor(home, &only, for_tests, &mut io::stdout().lock()),
         Task::Pin => {
-            tools::pin(home, &mut io::stdout().lock())?;
+            tools::pin(home, &mut io::stdout().lock(), &mut tools::download)?;
             Ok(ExitCode::SUCCESS)
         }
-        Task::Tool { name, args } => tools::run(&tool(&name)?, root, &args),
+        Task::Tool { name, args } => run_tool(invocation, &name, &args),
         Task::TestTool { name } => test_tool(invocation, &name),
         Task::Build => run_web(WebTask::Build, root, tool, report),
         Task::Pnpm { args } => run_web(WebTask::Pnpm(args), root, tool, report),
@@ -553,6 +612,7 @@ const fn gate_of(task: &Task) -> Option<(gate::Gate, gate::Wait)> {
         Task::Coverage { .. } => Some((gate::Gate::Coverage, gate::Wait::Yes)),
         Task::Mutants { .. } => Some((gate::Gate::Mutants, gate::Wait::Yes)),
         Task::Fuzz { .. } => Some((gate::Gate::Fuzz, gate::Wait::Yes)),
+        Task::Spec { .. } => Some((gate::Gate::Spec, gate::Wait::Yes)),
         Task::E2e => Some((gate::Gate::E2e, gate::Wait::Yes)),
         Task::Integrity { .. }
         | Task::GitCredential { .. }
@@ -573,6 +633,38 @@ const fn gate_of(task: &Task) -> Option<(gate::Gate, gate::Wait)> {
         | Task::TestTool { .. }
         | Task::Hook { .. } => None,
     }
+}
+
+/// `cargo xtask tool NAME ARGS`: runs the pinned tool `name` in the tree, with its runtime first
+/// on `PATH` if it has one.
+fn run_tool(
+    invocation: &Invocation<'_>,
+    name: &str,
+    args: &[OsString],
+) -> anyhow::Result<ExitCode> {
+    tools::run(
+        &(invocation.tool)(name)?,
+        (invocation.runtime)(name)?.as_deref(),
+        &invocation.root,
+        args,
+    )
+}
+
+/// `cargo xtask spec`: the specs' gate on `root`, with the pinned tools `tool` finds, writing
+/// traces into `traces` when given.
+fn run_spec(
+    root: &Path,
+    traces: Option<&Path>,
+    tool: &dyn Fn(&str) -> anyhow::Result<PathBuf>,
+    report: &mut impl Write,
+) -> anyhow::Result<ExitCode> {
+    Ok(verdict(spec::run(
+        root,
+        &spec::RUNNER,
+        &|| spec::Tools::pinned(tool),
+        spec::Options { traces },
+        report,
+    )?))
 }
 
 /// `cargo xtask release ACTION`: the release workflow's steps.
@@ -717,11 +809,13 @@ fn check(
         warm: &postgres::warm,
         sqlx: &|| tool("cargo-sqlx"),
     };
+    let spec = || spec::Tools::pinned(tool);
     let tools = check::Tools {
         nextest: tool("cargo-nextest")?,
         shellcheck: tool("shellcheck")?,
         postgres: postgres_bin,
         web: Some(web::Toolchain::pinned(tool)?),
+        spec: Some(&spec),
     };
     check::run(
         root,
@@ -783,6 +877,7 @@ fn run_pr(
                 root,
                 &repo,
                 &mut github::http(app::GITHUB_API, token),
+                &mut tools::download,
                 &mut done,
             )
         },
@@ -819,6 +914,7 @@ fn run_task(action: TaskAction, root: &Path, report: &mut impl Write) -> anyhow:
             None => writeln!(report, "no task recorded")?,
         },
         TaskAction::Clear => task::clear(root)?,
+        TaskAction::Next { text } => progress::set_next(root, &text, progress::now())?,
         TaskAction::Blocked { text } => task::block(root, &text, report)?,
     }
     Ok(ExitCode::SUCCESS)
@@ -878,7 +974,8 @@ fn run_vm(
     let host = vm::Host::this(repo, &home, env)?;
     vm::require_kvm(host.os, Path::new("/dev/kvm"))?;
     let msb = vm::microsandbox(tools::pinned(repo, "msb")?, &home, env)?;
-    vm::run(action, &host, &msb, env, report)
+    let services = vm::runs::service::Manager::of(host.os, &home, &host.runs, env)?;
+    vm::run(action, &host, &msb, &services, env, report)
 }
 
 /// The repository root: the checkout xtask was built from, the directory around xtask's own,
@@ -909,6 +1006,31 @@ mod tests {
         serve_tokens, user_home, verdict,
     };
     use crate::testing::{git, repository_with_change, script};
+
+    /// Review finding: a pass was recorded under the gate's name alone, so one shard of the
+    /// mutants, or a run against another base, read as the whole gate passing.
+    #[test]
+    fn a_gate_pass_is_recorded_with_what_it_covered() {
+        let label = |args: &[&str]| {
+            let cli =
+                Cli::try_parse_from(std::iter::once("xtask").chain(args.iter().copied())).unwrap();
+            super::gate_label(&cli.command)
+        };
+        assert_eq!(label(&["check"]), "check");
+        assert_eq!(label(&["check", "--changed"]), "check --changed");
+        assert_eq!(
+            label(&["mutants", "--base", "origin/main", "--shard", "1/8"]),
+            "mutants --base origin/main --shard 1/8"
+        );
+        assert_eq!(
+            label(&["mutants", "--base", "origin/main"]),
+            "mutants --base origin/main"
+        );
+        assert_eq!(label(&["coverage", "--base", "b"]), "coverage --base b");
+        assert_eq!(label(&["fuzz", "--seconds", "5"]), "fuzz --seconds 5");
+        assert_eq!(label(&["spec"]), "spec");
+        assert_eq!(label(&["e2e"]), "e2e");
+    }
 
     #[test]
     fn cli_is_well_formed() {
@@ -968,6 +1090,7 @@ mod tests {
             home: home.to_path_buf(),
             root: root.to_path_buf(),
             tool: &tool,
+            runtime: &|_| Ok(None),
             test_tool,
             env,
         };
@@ -1472,6 +1595,7 @@ mod tests {
             ),
             ("coverage", Task::Coverage { base: base() }),
             ("fuzz", Task::Fuzz { seconds: 1 }),
+            ("spec", Task::Spec { traces: None }),
             (
                 "mutants",
                 Task::Mutants {
@@ -1579,6 +1703,28 @@ mod tests {
                 "nothing to judge"
             );
         }
+        assert!(
+            !root.join(crate::progress::PROGRESS).exists(),
+            "a gate judging another tree (--root) keeps no checkpoint there"
+        );
+        // A gate on its own checkout records its pass in the checkpoint.
+        fake_tools(&{
+            let tools = root.join("tools");
+            fs::create_dir_all(&tools).unwrap();
+            tools
+        });
+        let coverage = Task::Coverage {
+            base: "base".to_owned(),
+        };
+        assert_eq!(
+            dispatch(coverage, &root, &root, &no_env).unwrap(),
+            ExitCode::SUCCESS
+        );
+        let checkpoint = fs::read_to_string(root.join(crate::progress::PROGRESS)).unwrap();
+        assert!(
+            checkpoint.contains("- `cargo xtask coverage --base base` passed at "),
+            "{checkpoint}"
+        );
         assert_eq!(
             dispatch(
                 Task::Rulesets {
@@ -1670,6 +1816,10 @@ mod tests {
         assert!(
             (here.tool)("no-such-tool").is_err(),
             "only pinned tools resolve"
+        );
+        assert!(
+            (here.runtime)("no-such-tool").is_err(),
+            "and only their runtimes"
         );
         let temp = tempfile::tempdir().unwrap();
         let elsewhere = Invocation::new(Some(temp.path().to_path_buf())).unwrap();

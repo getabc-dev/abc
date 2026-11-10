@@ -24,7 +24,7 @@ mod tests {
     use abc_store::testing::Fixture;
     use sqlx::PgPool;
 
-    use crate::common::{Machine, Tailscale};
+    use crate::common::{Machine, Tailscale, programs_dir};
 
     fn text(bytes: &[u8]) -> String {
         String::from_utf8_lossy(bytes).into_owned()
@@ -267,6 +267,68 @@ mod tests {
             text(&named.stderr).contains("ABC_SIDECAR_SOCKET is required to run the server"),
             "{}",
             text(&named.stderr)
+        );
+    }
+
+    /// A directory holding `program`, and its path as a string.
+    fn programs(program: &str) -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(program), "").unwrap();
+        let path = dir.path().to_str().unwrap().to_owned();
+        (dir, path)
+    }
+
+    #[test]
+    fn a_programs_directory_is_taken_when_it_holds_the_program() {
+        let (_dir, path) = programs("initdb");
+        assert_eq!(
+            programs_dir("BIN", Some(path.clone().into()), &["initdb"]),
+            Ok(path.into())
+        );
+    }
+
+    #[test]
+    fn a_programs_directory_unset_is_named_unset() {
+        assert_eq!(
+            programs_dir("BIN", None, &["initdb"]),
+            Err("BIN is not set".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_relative_programs_directory_is_named_relative() {
+        // As the real-tailnet workflow once gave it: relative to the repository root, while the
+        // tests run from their crate's directory.
+        assert_eq!(
+            programs_dir("BIN", Some(".tools/postgresql/bin".into()), &["initdb"]),
+            Err(
+                "BIN is `.tools/postgresql/bin`, a relative path, and the tests run from their \
+                 crate's directory: give an absolute one"
+                    .to_owned()
+            )
+        );
+    }
+
+    #[test]
+    fn a_programs_directory_that_does_not_exist_is_named_missing() {
+        let (dir, path) = programs("initdb");
+        drop(dir);
+        assert_eq!(
+            programs_dir("BIN", Some(path.clone().into()), &["initdb"]),
+            Err(format!("BIN is `{path}`, which is not a directory"))
+        );
+    }
+
+    #[test]
+    fn a_programs_directory_without_a_program_names_it() {
+        let (_dir, path) = programs("tailscaled");
+        assert_eq!(
+            programs_dir(
+                "BIN",
+                Some(path.clone().into()),
+                &["tailscaled", "tailscale"]
+            ),
+            Err(format!("BIN is `{path}`, which holds no `tailscale`"))
         );
     }
 }

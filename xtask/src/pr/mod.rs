@@ -10,6 +10,7 @@
 //! token; [`send`] then makes its calls with one App token ([`crate::github`]).
 
 mod checks;
+mod renovate;
 
 use std::path::{Path, PathBuf};
 
@@ -28,7 +29,8 @@ pub(crate) const APP_LOGIN: &str = "getabc-dev-agent[bot]";
 #[derive(Debug, Subcommand)]
 pub(crate) enum Action {
     /// List pull request NUMBER's failing, cancelled and running checks, and its latest
-    /// merge-queue run's, with each failing check's annotations.
+    /// merge-queue run's, with each failing check's annotations; warn first when the default
+    /// branch moved on files it changes.
     Checks { number: u64 },
     /// Open a pull request from the current branch, pushed, into the default branch.
     Open {
@@ -49,12 +51,17 @@ pub(crate) enum Action {
     /// Print a "## Test changes" section naming every test integrity flags; only the reasons
     /// are left to write.
     TestChanges,
+    /// Replace Renovate's pull request NUMBER, a tool bump in xtask/tools.toml, with one that
+    /// pins it: the bump on the default branch, pinned with `cargo xtask pin`, on branch
+    /// agent/renovate-NUMBER; then close Renovate's with a link. The checkout is not touched.
+    Renovate { number: u64 },
 }
 
 /// What [`send`] does once [`prepare`] has checked it.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Plan {
     Checks(u64),
+    Renovate(u64),
     Open {
         title: String,
         body: String,
@@ -79,6 +86,7 @@ pub(crate) fn prepare(
 ) -> anyhow::Result<Option<Plan>> {
     match action {
         Action::Checks { number } => Ok(Some(Plan::Checks(number))),
+        Action::Renovate { number } => Ok(Some(Plan::Renovate(number))),
         Action::TestChanges => {
             let commit = git::merge_base(root, &git::default_branch(root)?)?;
             out.push_str(&Review::of(root, &commit, None)?.skeleton());
@@ -130,6 +138,28 @@ pub(crate) fn prepare(
             }))
         }
     }
+}
+
+/// Whether `body` has a `## Review findings` section with something in it besides comments: what
+/// `/code-review` and `/security-review` found on the branch, or "None". #33 opened before they
+/// ran, and they then found a data-loss bug and 8 more issues that every gate had passed.
+/// The section is the lines after a line that is exactly that heading, up to the next heading of
+/// any level, whatever the line endings.
+fn reviewed(body: &str) -> bool {
+    let mut lines = body.lines().map(str::trim_end);
+    if !lines.any(|line| line == "## Review findings") {
+        return false;
+    }
+    let section: Vec<&str> = lines.take_while(|line| !line.starts_with('#')).collect();
+    let joined = section.join("\n");
+    let mut text = joined.as_str();
+    let mut kept = String::new();
+    while let Some((before, after)) = text.split_once("<!--") {
+        kept.push_str(before);
+        text = after.split_once("-->").map_or("", |(_, after)| after);
+    }
+    kept.push_str(text);
+    !kept.trim().is_empty()
 }
 
 /// The review size check, as `review` makes it.
@@ -186,6 +216,12 @@ fn preflight(root: &Path, body: &str, out: &mut String) -> anyhow::Result<Checke
             String::from_utf8_lossy(&why)
         );
     }
+    ensure!(
+        reviewed(body),
+        "the description has no `## Review findings` section saying what the B1 reviews found: \
+         run `/code-review high` and `/security-review` on the branch before it opens, fix what \
+         they confirm, and list each finding with what was done, or \"None\""
+    );
     let workflows = git::changes(root, &commit)?.into_iter().any(|change| {
         change
             .old
@@ -200,17 +236,31 @@ fn preflight(root: &Path, body: &str, out: &mut String) -> anyhow::Result<Checke
     Ok(Checked { branch, base, diff })
 }
 
-/// Carries out `plan` for the repository `repo` through `send`, writing what happened to `out`;
-/// whether all is well (for `checks`, whether every check passed).
+/// Carries out `plan` for the repository `repo` through `send`, with downloads from `fetch`,
+/// writing what happened to `out`; whether all is well (for `checks`, whether every check passed).
 pub(crate) fn send(
     plan: Plan,
     root: &Path,
     repo: &Repo,
     send: &mut Send<'_>,
+    fetch: &mut dyn FnMut(&str) -> anyhow::Result<Vec<u8>>,
     out: &mut String,
 ) -> anyhow::Result<bool> {
     match plan {
-        Plan::Checks(number) => checks::run(repo, number, send, out),
+        Plan::Renovate(number) => renovate::run(number, root, repo, send, fetch, out),
+        Plan::Checks(number) => {
+            // A warning only: a comparison GitHub cannot make never hides the checks.
+            if let Err(error) = stale(repo, number, send, out) {
+                say(
+                    out,
+                    &format!(
+                        "pr: could not compare #{number} with its base branch, so whether it \
+                         moved on is unknown: {error:#}"
+                    ),
+                );
+            }
+            checks::run(repo, number, send, out)
+        }
         Plan::Open {
             title,
             body,
@@ -242,6 +292,83 @@ pub(crate) fn send(
             diff_bytes,
         } => update(root, repo, send, (number, &body, &branch, diff_bytes), out),
     }
+}
+
+/// GitHub's compare API lists at most this many files.
+const COMPARE_FILES: usize = 300;
+
+/// Warns in `out` when the default branch moved on, since pull request `number`'s branch left it,
+/// files the pull request changes too, as GitHub's compare API shows them: the check before a
+/// merge that `pr open` makes before a pull request opens. #33 broke on its merge with main once
+/// #38 merged, though each passed alone.
+fn stale(repo: &Repo, number: u64, send: &mut Send<'_>, out: &mut String) -> anyhow::Result<()> {
+    let pull = github::get(send, repo.path(&format!("pulls/{number}")))?;
+    if text(&pull, "/state") != "open" {
+        return Ok(());
+    }
+    let base = text(&pull, "/base/ref").to_owned();
+    let head = text(&pull, "/head/sha").to_owned();
+    ensure!(
+        !base.is_empty() && !head.is_empty(),
+        "GitHub gave #{number} no base branch or head commit"
+    );
+    let files = |comparison: &Value| -> std::collections::BTreeSet<String> {
+        comparison
+            .get("files")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .flat_map(|file| {
+                ["/filename", "/previous_filename"]
+                    .into_iter()
+                    .map(|field| text(file, field).to_owned())
+            })
+            .filter(|path| !path.is_empty())
+            .collect()
+    };
+    let moved = github::get(send, repo.path(&format!("compare/{head}...{base}")))?;
+    let behind = moved.get("ahead_by").and_then(Value::as_u64).unwrap_or(0);
+    if behind == 0 {
+        return Ok(());
+    }
+    let changed = github::get(send, repo.path(&format!("compare/{base}...{head}")))?;
+    let both: Vec<String> = files(&changed)
+        .intersection(&files(&moved))
+        .cloned()
+        .collect();
+    let capped = [&moved, &changed].into_iter().any(|comparison| {
+        comparison
+            .get("files")
+            .and_then(Value::as_array)
+            .is_some_and(|listed| listed.len() >= COMPARE_FILES)
+    });
+    if both.is_empty() && !capped {
+        return Ok(());
+    }
+    say(
+        out,
+        &format!(
+            "pr: warning: {base} moved on by {behind} commit(s) since #{number}'s branch left it, \
+             changing {} file(s) #{number} changes too{}:",
+            both.len(),
+            if capped {
+                format!(", or more: GitHub lists at most {COMPARE_FILES} files of a comparison")
+            } else {
+                String::new()
+            }
+        ),
+    );
+    for path in &both {
+        say(out, &format!("  {path}"));
+    }
+    say(
+        out,
+        &format!(
+            "pr: merge it into the branch (`git merge origin/{base}`), check again and push \
+             before #{number} merges; never rebase a pushed branch"
+        ),
+    );
+    Ok(())
 }
 
 /// A string field of `value`, or nothing.
@@ -349,7 +476,7 @@ fn handover(root: &Path, head: &str, pusher: &str, number: u64) -> anyhow::Resul
 fn behind(root: &Path, base: &str, out: &mut String) -> anyhow::Result<()> {
     let short = base.strip_prefix("refs/remotes/").unwrap_or(base);
     if let Some((remote, branch)) = short.split_once('/')
-        && let Err(error) = git::fetch(root, remote, branch, git::FETCH_TIMEOUT)
+        && let Err(error) = git::fetch(root, remote, branch, git::REMOTE_TIMEOUT)
     {
         say(
             out,
