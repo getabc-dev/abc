@@ -1763,3 +1763,47 @@ fn a_worktrees_checkpoint_is_kept_by_its_own_xtask() {
     );
     assert!(!bin.join("args").exists(), "no xtask to hand it to");
 }
+
+/// Review finding: a subagent's stop recorded its report as the agent's last message, so a fresh
+/// session resumed from a subagent's words.
+#[test]
+fn only_the_main_agents_stop_records_its_last_message() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo = crate::testing::clone_with_origin(temp.path());
+    let stop = |input: serde_json::Value| {
+        let fields: HookInput = serde_json::from_value(input).unwrap();
+        super::stop_with(
+            &repo,
+            &fields,
+            &mut Fake::new(Ok(CheckResult::Passed)),
+            &mut Vec::new(),
+        );
+    };
+    stop(
+        serde_json::json!({ "hook_event_name": "Stop", "cwd": repo, "last_assistant_message": "Main: next, the queue." }),
+    );
+    stop(
+        serde_json::json!({ "hook_event_name": "SubagentStop", "agent_id": "a1", "cwd": repo, "last_assistant_message": "Explore: found 3 files." }),
+    );
+    let progress = fs::read_to_string(repo.join(crate::progress::PROGRESS)).unwrap();
+    assert!(
+        progress.contains("> Main: next, the queue.\n"),
+        "{progress}"
+    );
+    assert!(!progress.contains("Explore"), "{progress}");
+}
+
+/// Review finding: a `PostToolUse` answer could block, against the contract that the checkpoint
+/// never decides anything; a hand-over that answers so is refused.
+#[test]
+fn a_post_tool_use_answer_never_blocks() {
+    assert!(
+        Answer::parse(Event::PostToolUse, r#"{"decision":"block","reason":"no"}"#).is_err(),
+        "a block is not a PostToolUse answer"
+    );
+    assert_eq!(
+        Answer::parse(Event::PostToolUse, r#"{"systemMessage":"noted"}"#).unwrap(),
+        Answer::Notify("noted".to_owned())
+    );
+    assert_eq!(Answer::Block("x".to_owned()).json(Event::PostToolUse), None);
+}

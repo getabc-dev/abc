@@ -7,6 +7,7 @@ mod check;
 mod coverage;
 mod download;
 mod e2e;
+mod files;
 mod fuzz;
 mod gate;
 mod git;
@@ -425,6 +426,28 @@ fn verdict(passed: bool) -> ExitCode {
     }
 }
 
+/// The command after `cargo xtask` that a gate's pass is recorded under in the checkpoint, with
+/// what limits what it covered: `check --changed`, `mutants --base <rev> --shard k/n`.
+fn gate_label(task: &Task) -> String {
+    let name = gate_of(task).map_or("", |(gate, _)| gate.name());
+    if let Task::Check { changed: true, .. } = task {
+        return format!("{name} --changed");
+    }
+    if let Task::Coverage { base } = task {
+        return format!("{name} --base {base}");
+    }
+    if let Task::Mutants { base, shard, .. } = task {
+        return shard.map_or_else(
+            || format!("{name} --base {base}"),
+            |shard| format!("{name} --base {base} --shard {shard}"),
+        );
+    }
+    if let Task::Fuzz { seconds } = task {
+        return format!("{name} --seconds {seconds}");
+    }
+    name.to_owned()
+}
+
 /// Runs `task`; a heavy gate holds the gate lock while it runs, so gates run one at a time.
 fn run(
     task: Task,
@@ -434,11 +457,7 @@ fn run(
     let Some((gate, wait)) = gate_of(&task) else {
         return perform(task, invocation, report);
     };
-    let label = if matches!(task, Task::Check { changed: true, .. }) {
-        format!("{} --changed", gate.name())
-    } else {
-        gate.name().to_owned()
-    };
+    let label = gate_label(&task);
     match gate::take(&invocation.root, gate, wait, report)? {
         gate::Taken::Held(held) => {
             let result = perform(task, invocation, report);
@@ -987,6 +1006,31 @@ mod tests {
         serve_tokens, user_home, verdict,
     };
     use crate::testing::{git, repository_with_change, script};
+
+    /// Review finding: a pass was recorded under the gate's name alone, so one shard of the
+    /// mutants, or a run against another base, read as the whole gate passing.
+    #[test]
+    fn a_gate_pass_is_recorded_with_what_it_covered() {
+        let label = |args: &[&str]| {
+            let cli =
+                Cli::try_parse_from(std::iter::once("xtask").chain(args.iter().copied())).unwrap();
+            super::gate_label(&cli.command)
+        };
+        assert_eq!(label(&["check"]), "check");
+        assert_eq!(label(&["check", "--changed"]), "check --changed");
+        assert_eq!(
+            label(&["mutants", "--base", "origin/main", "--shard", "1/8"]),
+            "mutants --base origin/main --shard 1/8"
+        );
+        assert_eq!(
+            label(&["mutants", "--base", "origin/main"]),
+            "mutants --base origin/main"
+        );
+        assert_eq!(label(&["coverage", "--base", "b"]), "coverage --base b");
+        assert_eq!(label(&["fuzz", "--seconds", "5"]), "fuzz --seconds 5");
+        assert_eq!(label(&["spec"]), "spec");
+        assert_eq!(label(&["e2e"]), "e2e");
+    }
 
     #[test]
     fn cli_is_well_formed() {
@@ -1678,7 +1722,7 @@ mod tests {
         );
         let checkpoint = fs::read_to_string(root.join(crate::progress::PROGRESS)).unwrap();
         assert!(
-            checkpoint.contains("- `cargo xtask coverage` passed at "),
+            checkpoint.contains("- `cargo xtask coverage --base base` passed at "),
             "{checkpoint}"
         );
         assert_eq!(

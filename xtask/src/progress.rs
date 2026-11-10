@@ -33,6 +33,10 @@ pub(crate) const PROGRESS: &str = ".abc/progress.md";
 /// What the checkpoint is rendered from, relative to the worktree root.
 const STATE: &str = ".abc/progress.json";
 
+/// The lock every rendering holds, so that hooks rendering at once never lose each other's
+/// change.
+const LOCK: &str = ".abc/progress.lock";
+
 /// The most of the agent's last message the checkpoint keeps, in characters.
 const MESSAGE_CHARS: usize = 4000;
 
@@ -68,6 +72,14 @@ struct Pass {
     at: i64,
 }
 
+/// The commit HEAD is at, if any.
+fn head(root: &Path) -> Option<String> {
+    git::git(root, &["rev-parse", "--verify", "--quiet", "HEAD"])
+        .ok()
+        .map(|head| head.trim().to_owned())
+        .filter(|head| !head.is_empty())
+}
+
 /// What a rendering reads from the checkout.
 struct Tree {
     head: Option<String>,
@@ -86,10 +98,7 @@ impl Tree {
                 .map(str::to_owned)
                 .collect()
         };
-        let head = git::git(root, &["rev-parse", "--verify", "--quiet", "HEAD"])
-            .ok()
-            .map(|head| head.trim().to_owned())
-            .filter(|head| !head.is_empty());
+        let head = head(root);
         let branch = git::git(root, &["symbolic-ref", "--quiet", "--short", "HEAD"])
             .ok()
             .map(|branch| branch.trim().to_owned());
@@ -167,8 +176,8 @@ pub(crate) fn stopped(root: &Path, message: Option<&str>, now: i64) -> anyhow::R
 /// a reset. Says whether it did.
 pub(crate) fn observed(root: &Path, now: i64) -> anyhow::Result<bool> {
     let state = load(root)?;
-    let head = Tree::read(root).head;
-    if head == state.head && root.join(PROGRESS).is_file() {
+    // One git call: most Bash calls move nothing, and a full read of the tree is for rendering.
+    if head(root) == state.head && root.join(PROGRESS).is_file() {
         return Ok(false);
     }
     update(root, now, |_, _| {})?;
@@ -177,19 +186,18 @@ pub(crate) fn observed(root: &Path, now: i64) -> anyhow::Result<bool> {
 
 /// Loads the state, applies `change` and writes the state and the checkpoint.
 fn update(root: &Path, now: i64, change: impl FnOnce(&mut State, &Tree)) -> anyhow::Result<()> {
+    let _lock = crate::files::lock(&root.join(LOCK))?;
     let mut state = load(root)?;
     let tree = Tree::read(root);
     change(&mut state, &tree);
     state.head.clone_from(&tree.head);
     let task = task::read(root)?;
-    write(
-        root,
-        STATE,
+    crate::files::replace(
+        &root.join(STATE),
         &format!("{}\n", serde_json::to_string_pretty(&state)?),
     )?;
-    write(
-        root,
-        PROGRESS,
+    crate::files::replace(
+        &root.join(PROGRESS),
         &render(&state, &tree, task.as_deref(), now)?,
     )
 }
@@ -202,19 +210,6 @@ fn load(root: &Path) -> anyhow::Result<State> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(State::default()),
         Err(error) => Err(error).with_context(|| format!("could not read {STATE}")),
     }
-}
-
-/// Writes `text` to `file` in `root` atomically: a temporary file beside it, renamed over it.
-fn write(root: &Path, file: &str, text: &str) -> anyhow::Result<()> {
-    let path = root.join(file);
-    if let Some(dir) = path.parent() {
-        fs::create_dir_all(dir).with_context(|| format!("could not create {}", dir.display()))?;
-    }
-    let temporary = root.join(format!("{file}.{}.tmp", std::process::id()));
-    fs::write(&temporary, text)
-        .with_context(|| format!("could not write {}", temporary.display()))?;
-    fs::rename(&temporary, &path)
-        .with_context(|| format!("could not move {} into place", temporary.display()))
 }
 
 /// `seconds` since the Unix epoch as a UTC date and time to the minute.
@@ -463,6 +458,25 @@ mod tests {
             .as_secs();
         let now = u64::try_from(now()).unwrap();
         assert!(now.abs_diff(system) <= 5, "{now} vs {system}");
+    }
+
+    /// Review finding: two hooks rendering the checkpoint at once each wrote the state they had
+    /// read, so one's change was lost. Rendering holds the checkpoint's lock.
+    #[test]
+    fn rendering_holds_the_checkpoints_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        git(dir.path(), &["init", "-q"]);
+        let held = crate::files::lock(&dir.path().join(super::LOCK)).unwrap();
+        let root = dir.path().to_path_buf();
+        let writer = std::thread::spawn(move || set_next(&root, "after the lock", 0).unwrap());
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(
+            !dir.path().join(PROGRESS).exists(),
+            "it waited for the lock"
+        );
+        drop(held);
+        writer.join().unwrap();
+        assert!(progress(dir.path()).contains("after the lock"));
     }
 
     #[test]

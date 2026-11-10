@@ -257,18 +257,10 @@ impl Runs {
 
     /// Writes `run`'s state atomically.
     pub(crate) fn save(&self, run: &Run) -> anyhow::Result<()> {
-        let dir = self.path(&run.id);
-        std::fs::create_dir_all(&dir)
-            .with_context(|| format!("could not create {}", dir.display()))?;
-        let path = dir.join(STATE);
-        let partial = dir.join(format!(".{STATE}.{}", std::process::id()));
-        std::fs::write(
-            &partial,
-            format!("{}\n", serde_json::to_string_pretty(run)?),
+        crate::files::replace(
+            &self.path(&run.id).join(STATE),
+            &format!("{}\n", serde_json::to_string_pretty(run)?),
         )
-        .with_context(|| format!("could not write {}", partial.display()))?;
-        std::fs::rename(&partial, &path)
-            .with_context(|| format!("could not move {} into place", path.display()))
     }
 
     /// Every run, oldest first, and apart those whose state cannot be read, as one a build of
@@ -308,18 +300,7 @@ impl Runs {
 
     /// Takes the lock that serialises which run is active, until the returned file is dropped.
     fn lock(&self) -> anyhow::Result<File> {
-        std::fs::create_dir_all(&self.dir)
-            .with_context(|| format!("could not create {}", self.dir.display()))?;
-        let path = self.dir.join(LOCK);
-        let file = File::options()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(&path)
-            .with_context(|| format!("could not open {}", path.display()))?;
-        file.lock()
-            .with_context(|| format!("could not lock {}", path.display()))?;
-        Ok(file)
+        crate::files::lock(&self.dir.join(LOCK))
     }
 
     /// A new run of `brief` in `session`, created at `now`, with `status`.

@@ -250,12 +250,15 @@ impl Answer {
     /// The answer as the one line of JSON a hook for `event` prints; `None` when it says nothing.
     pub(crate) fn json(&self, event: Event) -> Option<String> {
         let output = match (self, event) {
-            (Self::Allow | Self::Held(_), _) => return None,
+            // A checkpoint never decides anything: nothing a PostToolUse hook says blocks.
+            (Self::Allow | Self::Held(_), _) | (Self::Block(_), Event::PostToolUse) => {
+                return None;
+            }
             (Self::Notify(message), _) => Printed {
                 system_message: Some(message.clone()),
                 ..Printed::default()
             },
-            (Self::Block(reason), Event::Stop | Event::PostToolUse) => Printed {
+            (Self::Block(reason), Event::Stop) => Printed {
                 decision: Some(StopDecision::Block),
                 reason: Some(reason.clone()),
                 ..Printed::default()
@@ -291,7 +294,7 @@ impl Answer {
                 },
             ) => Ok(Self::Notify(message)),
             (
-                Event::Stop | Event::PostToolUse,
+                Event::Stop,
                 Printed {
                     system_message: None,
                     decision: Some(StopDecision::Block),
@@ -508,11 +511,12 @@ fn stop_hook(input: &str, context: &Context, log: &mut Vec<u8>) -> Answer {
 /// own cap.
 fn stop_with(root: &Path, fields: &HookInput, steps: &mut impl Steps, log: &mut Vec<u8>) -> Answer {
     // The checkpoint is a record, never a decision: a failure to write it is only noted.
-    if let Err(error) = crate::progress::stopped(
-        root,
-        fields.last_assistant_message.as_deref(),
-        crate::progress::now(),
-    ) {
+    // A subagent's last words are its report to the main agent, not where the work stands.
+    let message = match fields.agent() {
+        Agent::Main => fields.last_assistant_message.as_deref(),
+        Agent::Sub(_) => None,
+    };
+    if let Err(error) = crate::progress::stopped(root, message, crate::progress::now()) {
         let _noted = writeln!(
             log,
             "xtask stop hook: the checkpoint was not written: {error:#}"

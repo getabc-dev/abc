@@ -429,16 +429,7 @@ pub(crate) fn apply(
     event: Event,
     note: &mut dyn std::io::Write,
 ) -> anyhow::Result<Decision> {
-    let lock_path = root.join(LOCK);
-    create_parent(&lock_path)?;
-    let lock = fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(&lock_path)
-        .with_context(|| format!("could not open {}", lock_path.display()))?;
-    lock.lock()
-        .with_context(|| format!("could not lock {}", lock_path.display()))?;
+    let _lock = crate::files::lock(&root.join(LOCK))?;
     let state = match load(root) {
         Ok(state) => state,
         Err(error) => {
@@ -468,14 +459,8 @@ fn load(root: &Path) -> anyhow::Result<State> {
 /// Writes `state` atomically: a temporary file beside it, renamed over it, so a reader never sees
 /// half a file.
 fn save(root: &Path, state: &State) -> anyhow::Result<()> {
-    let path = root.join(STATE);
-    create_parent(&path)?;
-    let temporary = root.join(format!("{STATE}.{}.tmp", std::process::id()));
     let text = serde_json::to_string_pretty(state).context("could not encode the stop state")?;
-    fs::write(&temporary, format!("{text}\n"))
-        .with_context(|| format!("could not write {}", temporary.display()))?;
-    fs::rename(&temporary, &path)
-        .with_context(|| format!("could not move {} into place", temporary.display()))
+    crate::files::replace(&root.join(STATE), &format!("{text}\n"))
 }
 
 /// Creates the directory `path` is in.
