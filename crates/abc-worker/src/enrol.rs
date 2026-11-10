@@ -141,7 +141,7 @@ pub async fn enrol_by_approval(
     home: &WorkerHome,
     env: &Env,
     server: &PublicUrl,
-    workspace: Option<&str>,
+    named_workspace: Option<&str>,
     machine: MachineInfo,
     if_enrolled: IfEnrolled,
     mut waiting: impl FnMut(&Waiting),
@@ -157,7 +157,7 @@ pub async fn enrol_by_approval(
         dial::get_session(env, server)
             .await
             .map_err(|error| tailnet_trouble(server, error))?,
-        workspace,
+        named_workspace,
     )?;
     let basis = Basis::Approval;
     let pending = match record.pending {
@@ -191,20 +191,11 @@ pub async fn enrol_by_approval(
         expires_at: asked.expires_at,
         workspace: workspace_name,
     });
-    let state = wait_for_decision(env, server, asked.request).await;
-    match state {
-        Ok(RequestState::Approved {
-            worker,
-            workspace,
-            name,
-        }) => {
+    match wait_for_decision(env, server, asked.request).await? {
+        Decided::Approved(enrolled) => {
             let current = Current {
                 key: pending,
-                worker: Enrolled {
-                    worker,
-                    workspace,
-                    name,
-                },
+                worker: enrolled,
             };
             held.save(Some(&current), None)?;
             Ok(Enrolment {
@@ -212,17 +203,22 @@ pub async fn enrol_by_approval(
                 again: false,
             })
         }
-        Ok(RequestState::Denied) => {
+        Decided::Denied => {
             held.save(record.current.as_ref(), None)?;
             Err(EnrolError::Denied)
         }
-        Ok(RequestState::Expired) => {
+        Decided::Expired => {
             held.save(record.current.as_ref(), None)?;
             Err(EnrolError::RequestExpired)
         }
-        Ok(RequestState::Pending { .. }) => unreachable!("the wait ends only on a decision"),
-        Err(error) => Err(error),
     }
+}
+
+/// How a request ended.
+enum Decided {
+    Approved(Enrolled),
+    Denied,
+    Expired,
 }
 
 /// Polls until the request is decided or expired. A server that cannot be reached for
@@ -232,12 +228,24 @@ async fn wait_for_decision(
     env: &Env,
     server: &PublicUrl,
     request: EnrolmentRequestId,
-) -> Result<RequestState, EnrolError> {
+) -> Result<Decided, EnrolError> {
     let mut failing_since: Option<tokio::time::Instant> = None;
     loop {
         match dial::get_request_state(env, server, request).await {
             Ok(RequestState::Pending { .. }) => failing_since = None,
-            Ok(decided) => return Ok(decided),
+            Ok(RequestState::Approved {
+                worker,
+                workspace,
+                name,
+            }) => {
+                return Ok(Decided::Approved(Enrolled {
+                    worker,
+                    workspace,
+                    name,
+                }));
+            }
+            Ok(RequestState::Denied) => return Ok(Decided::Denied),
+            Ok(RequestState::Expired) => return Ok(Decided::Expired),
             Err(
                 error @ (EnrolError::Unreachable(_)
                 | EnrolError::Unavailable
@@ -284,6 +292,10 @@ fn choose_workspace(
 
 /// An unreachable server on the approval path is almost always a machine that is not on the
 /// tailnet: say so, and how to fix it.
+#[expect(
+    clippy::wildcard_enum_match_arm,
+    reason = "only an unreachable server is a tailnet problem; every other error passes as it is"
+)]
 fn tailnet_trouble(server: &PublicUrl, error: EnrolError) -> EnrolError {
     match error {
         EnrolError::Unreachable(cause) => EnrolError::NotOnTailnet {

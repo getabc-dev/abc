@@ -320,25 +320,18 @@ async fn worker(conn: &mut PgConnection, row: &Row, event: &WorkerEvent) -> Resu
         workspace,
         ..
     } = *row;
-    let (via_token, via_request) = match event {
-        WorkerEvent::Enrolled {
-            via: EnrolledVia::Token { token },
-            ..
-        } => (Some(token.as_uuid()), None),
-        WorkerEvent::Enrolled {
-            via: EnrolledVia::Request { request },
-            ..
-        } => (None, Some(request.as_uuid())),
-        _ => (None, None),
-    };
     match event {
         WorkerEvent::Enrolled {
-            via: _,
+            via,
             key,
             name,
             machine,
             build,
         } => {
+            let (via_token, via_request) = match via {
+                EnrolledVia::Token { token } => (Some(token.as_uuid()), None),
+                EnrolledVia::Request { request } => (None, Some(request.as_uuid())),
+            };
             sqlx::query!(
                 "INSERT INTO actor (id, kind, display_name, created_at, changed_at)
                  VALUES ($1, 'worker', $2, $3, $4)",

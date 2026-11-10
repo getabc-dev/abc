@@ -586,7 +586,7 @@ async fn enrol(home: &WorkerHome, env: &Env, args: EnrolArgs) -> Result<(), Fail
     };
     let enrolment = abc_worker::enrol(home, env, &server, token, machine, if_enrolled)
         .await
-        .map_err(enrol_failure)?;
+        .map_err(|error| enrol_failure(&error))?;
     let enrolled = &enrolment.enrolled;
     let opening = if enrolment.again {
         "This machine was already enrolled with this token"
@@ -696,7 +696,7 @@ async fn worker_setup(home: &WorkerHome, env: &Env, args: WorkerSetupArgs) -> Re
                 },
             )
             .await
-            .map_err(enrol_failure)?;
+            .map_err(|error| enrol_failure(&error))?;
             console.line(&format!(
                 "Approved: enrolled this machine as {} (worker {}).",
                 enrolment.enrolled.name.as_str(),
@@ -705,16 +705,16 @@ async fn worker_setup(home: &WorkerHome, env: &Env, args: WorkerSetupArgs) -> Re
         }
     }
     abc_host::install_worker(&host, &service, &mut console).map_err(host_failure)?;
-    console.line(&format!(
-        "abc worker runs as a service now, and again after a reboot. Check it with: abc worker status\n\
-         Remove it with: abc worker uninstall"
-    ));
+    console.line(
+        "abc worker runs as a service now, and again after a reboot. Check it with: abc worker \
+         status\nRemove it with: abc worker uninstall",
+    );
     Ok(())
 }
 
 /// How an enrolment's failure is reported: one the person fixes by changing the command or their
 /// own setup exits 2, the rest 1.
-fn enrol_failure(error: abc_worker::EnrolError) -> Failure {
+fn enrol_failure(error: &abc_worker::EnrolError) -> Failure {
     use abc_worker::EnrolError as E;
     let fix_the_command = matches!(
         error,
@@ -728,7 +728,7 @@ fn enrol_failure(error: abc_worker::EnrolError) -> Failure {
             | E::ApprovalUnavailable
             | E::NotOnTailnet { .. }
     );
-    let shown: Box<dyn StdError> = chain(&error).into();
+    let shown: Box<dyn StdError> = chain(error).into();
     if fix_the_command {
         Failure::Config(shown)
     } else {

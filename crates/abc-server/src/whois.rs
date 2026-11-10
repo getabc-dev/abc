@@ -2,7 +2,7 @@
 //!
 //! Serve tells the server the person (`Tailscale-User-Login`) and the address it accepted the
 //! connection from (`X-Forwarded-For`, the last entry). The node is not in a header: the server
-//! asks its own tailscaled's LocalAPI, `GET /localapi/v0/whois?addr=<ip>:0`, over the Unix socket
+//! asks its own tailscaled's `LocalAPI`, `GET /localapi/v0/whois?addr=<ip>:0`, over the Unix socket
 //! `abc server setup` passes (`--tailscaled-socket`), so the node name is the tailnet's own and
 //! no client can claim another's. The answer's login must be the one Serve asserted.
 
@@ -16,7 +16,7 @@ use tokio::net::UnixStream;
 
 use abc_core::identity::{TailnetLogin, TailnetNode};
 
-/// How long one LocalAPI call may take.
+/// How long one `LocalAPI` call may take.
 const TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The largest answer read: a whois answer is a few KiB.
@@ -79,23 +79,24 @@ impl Whois {
         let Self::Tailscaled(socket) = self else {
             return Err(WhoisError::Off);
         };
-        let ip: IpAddr = source.parse().map_err(|_| WhoisError::BadAddress)?;
+        let ip: IpAddr = source.parse().map_err(|_bad| WhoisError::BadAddress)?;
         let target = match ip {
             IpAddr::V4(ip) => format!("{ip}:0"),
             IpAddr::V6(ip) => format!("[{ip}]:0"),
         };
         let body = tokio::time::timeout(TIMEOUT, local_api(socket, &target))
             .await
-            .map_err(|_| WhoisError::Failed("tailscaled did not answer in time".to_owned()))?
+            .map_err(|_elapsed| WhoisError::Failed("tailscaled did not answer in time".to_owned()))?
             .map_err(WhoisError::Failed)?;
-        let answer: Answer = serde_json::from_slice(&body)
-            .map_err(|_| WhoisError::Failed("tailscaled's answer was not understood".to_owned()))?;
+        let answer: Answer = serde_json::from_slice(&body).map_err(|_unread| {
+            WhoisError::Failed("tailscaled's answer was not understood".to_owned())
+        })?;
         let name = answer
             .node
             .ok_or_else(|| WhoisError::Failed("tailscaled knows no such node".to_owned()))?
             .name;
         let node = TailnetNode::parse(&name)
-            .map_err(|_| WhoisError::Failed("tailscaled named the node oddly".to_owned()))?;
+            .map_err(|_invalid| WhoisError::Failed("tailscaled named the node oddly".to_owned()))?;
         let asserted = answer.user.map(|user| user.login);
         if asserted.as_deref().map(str::to_ascii_lowercase) == Some(login.as_str().to_owned()) {
             Ok(node)
@@ -124,11 +125,7 @@ async fn local_api(socket: &Path, target: &str) -> Result<Vec<u8>, String> {
         .read_to_end(&mut answer)
         .await
         .map_err(|error| error.to_string())?;
-    let split = answer
-        .windows(4)
-        .position(|window| window == b"\r\n\r\n")
-        .ok_or("the answer has no header")?;
-    let head = std::str::from_utf8(&answer[..split]).map_err(|_| "the answer is not text")?;
+    let (head, body) = split_answer(&answer).ok_or("the answer has no header")?;
     let status = head
         .split_whitespace()
         .nth(1)
@@ -137,7 +134,18 @@ async fn local_api(socket: &Path, target: &str) -> Result<Vec<u8>, String> {
     if status != 200 {
         return Err(format!("tailscaled answered {status}"));
     }
-    Ok(answer.split_off(split + 4))
+    Ok(body.to_vec())
+}
+
+/// An HTTP answer's head, as text, and its body.
+fn split_answer(answer: &[u8]) -> Option<(&str, &[u8])> {
+    const END_OF_HEAD: &[u8] = b"\r\n\r\n";
+    let end = answer
+        .windows(END_OF_HEAD.len())
+        .position(|window| window == END_OF_HEAD)?;
+    let (head, rest) = answer.split_at(end);
+    let body = rest.get(END_OF_HEAD.len()..)?;
+    Some((std::str::from_utf8(head).ok()?, body))
 }
 
 #[cfg(test)]
@@ -146,9 +154,9 @@ mod tests {
 
     use super::*;
 
-    /// A stand-in for tailscaled's LocalAPI that answers every call with `reply`, and returns the
+    /// A stand-in for tailscaled's `LocalAPI` that answers every call with `reply`, and returns the
     /// request line it saw.
-    async fn serve_once(socket: &Path, reply: &'static str) -> tokio::task::JoinHandle<String> {
+    fn serve_once(socket: &Path, reply: &'static str) -> tokio::task::JoinHandle<String> {
         let listener = UnixListener::bind(socket).unwrap();
         tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
@@ -176,7 +184,7 @@ mod tests {
     async fn names_the_node_tailscaled_says_the_address_is() {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("t.sock");
-        let seen = serve_once(&socket, OK).await;
+        let seen = serve_once(&socket, OK);
         let node = Whois::Tailscaled(socket)
             .node("100.64.0.7", &login())
             .await
@@ -197,7 +205,7 @@ mod tests {
     async fn a_v6_address_is_bracketed() {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("t.sock");
-        let seen = serve_once(&socket, OK).await;
+        let seen = serve_once(&socket, OK);
         Whois::Tailscaled(socket)
             .node("fd7a:115c:a1e0::1", &login())
             .await
@@ -214,7 +222,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let other = TailnetLogin::parse("mallory@example.com").unwrap();
         let socket = dir.path().join("a.sock");
-        serve_once(&socket, OK).await;
+        serve_once(&socket, OK);
         assert_eq!(
             Whois::Tailscaled(socket).node("100.64.0.7", &other).await,
             Err(WhoisError::LoginMismatch),
@@ -226,11 +234,11 @@ mod tests {
             ("garbage", "HTTP/1.1 200 OK\r\n\r\nnot json"),
             ("no header", "oops"),
         ] {
-            let socket = dir.path().join(format!("{name}.sock").replace(' ', "-"));
-            serve_once(&socket, reply).await;
+            let broken = dir.path().join(format!("{name}.sock").replace(' ', "-"));
+            serve_once(&broken, reply);
             assert!(
                 matches!(
-                    Whois::Tailscaled(socket).node("100.64.0.7", &login()).await,
+                    Whois::Tailscaled(broken).node("100.64.0.7", &login()).await,
                     Err(WhoisError::Failed(_))
                 ),
                 "{name}"

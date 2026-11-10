@@ -193,7 +193,7 @@ async fn machines(
     // From the origin, the pending requests; after a position, every request changed since,
     // so a decided one leaves the screen. An expired one goes by its `expires_at`.
     let pending_only = after == Position::ORIGIN;
-    let rows = sqlx::query_as!(
+    let request_rows = sqlx::query_as!(
         RequestRow,
         "SELECT id, workspace_id, reserved_worker, key_digest, login, node, hostname, os, arch,
                 build, code, requested_at, requested_event, expires_at, decision, changed_at
@@ -208,7 +208,7 @@ async fn machines(
     )
     .fetch_all(&mut *conn)
     .await?;
-    let requests = rows
+    let requests = request_rows
         .iter()
         .map(|row| request_card(row, now))
         .collect::<Result<_, StoreError>>()?;

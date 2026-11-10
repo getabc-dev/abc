@@ -485,14 +485,14 @@ async fn request_enrolment(
         machine: body.machine,
         build: body.build,
     };
-    let requested = app
+    let asked = app
         .store
         .execute(&Caller::Tailnet(requester.login), &origin.into(), command)
         .await?;
     Ok(Json(ApprovalRequested {
-        request: requested.request,
-        code: requested.code,
-        expires_at: requested.expires_at,
+        request: asked.request,
+        code: asked.code,
+        expires_at: asked.expires_at,
     }))
 }
 

@@ -83,7 +83,7 @@ pub(crate) const MACHINE_LOGIN: &str = "alice@example.com";
 /// and its Serve share one.
 pub(crate) const MACHINE_NODE: &str = "mbp.tail1234.ts.net";
 
-/// A stand-in for abc's tailscaled at `socket`: LocalAPI's `whois`, answering that every address
+/// A stand-in for abc's tailscaled at `socket`: `LocalAPI`'s `whois`, answering that every address
 /// is [`MACHINE_NODE`] of [`MACHINE_LOGIN`].
 fn fake_tailscaled(socket: &Path) -> PathBuf {
     // A restarted server asks for its tailscaled again: the old stand-in's socket is replaced.
@@ -129,8 +129,8 @@ impl Serve {
         let acceptor = pki.acceptor();
         let requests = Arc::new(AtomicUsize::new(0));
         let counted = Arc::clone(&requests);
-        let asserted = Arc::new(std::sync::Mutex::new(login));
-        let shared = Arc::clone(&asserted);
+        let current = Arc::new(std::sync::Mutex::new(login));
+        let shared = Arc::clone(&current);
         let task = tokio::spawn(async move {
             let mut connections = JoinSet::new();
             loop {
@@ -140,18 +140,18 @@ impl Serve {
                 let acceptor = acceptor.clone();
                 let target = target.clone();
                 let counted = Arc::clone(&counted);
-                let asserted = Arc::clone(&shared);
+                let for_connection = Arc::clone(&shared);
                 connections.spawn(async move {
                     let Ok(tls) = acceptor.accept(tcp).await else {
                         return;
                     };
-                    let login = *asserted.lock().unwrap();
-                    proxy(tls, &target, &peer.ip().to_string(), login, &counted).await;
+                    let asserted = *for_connection.lock().unwrap();
+                    proxy(tls, &target, &peer.ip().to_string(), asserted, &counted).await;
                 });
             }
         });
         Self {
-            login: asserted,
+            login: current,
             url: PublicUrl::parse(&format!("https://localhost:{port}")).unwrap(),
             requests,
             task,

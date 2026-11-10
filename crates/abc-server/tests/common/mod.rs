@@ -94,7 +94,7 @@ pub(crate) fn config(pool: &PgPool, socket: PathBuf, link: LinkTimings) -> Serve
     }
 }
 
-/// Alice's MacBook, as the tailnet knows it.
+/// Alice's `MacBook`, as the tailnet knows it.
 pub(crate) const ALICE_MAC: &str = "100.64.0.1";
 /// Alice's other machine.
 pub(crate) const ALICE_OTHER: &str = "100.64.0.2";
@@ -117,7 +117,7 @@ fn whois_answer(addr: &str) -> Option<&'static str> {
     })
 }
 
-/// A stand-in for abc's tailscaled: a Unix socket answering LocalAPI's `whois` from a fixed
+/// A stand-in for abc's tailscaled: a Unix socket answering `LocalAPI`'s `whois` from a fixed
 /// table, as the real one does over HTTP.
 pub(crate) fn fake_tailscaled(dir: &std::path::Path) -> PathBuf {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -477,7 +477,7 @@ impl Call {
     }
 
     /// From the tailnet address Serve forwarded, as the last `X-Forwarded-For` entry.
-    pub(crate) fn from_node(self, address: &str) -> Self {
+    pub(crate) fn forwarded_from(self, address: &str) -> Self {
         self.header("x-forwarded-for", address)
     }
 

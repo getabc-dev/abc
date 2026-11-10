@@ -122,8 +122,8 @@ mod tests {
     async fn a_denied_request_ends_setup_and_the_next_run_asks_afresh() {
         let world = World::start().await;
         let (_dir, home) = home();
-        let (first, mut seen) = setup(&world, &home, IfEnrolled::Refuse);
-        let waiting = seen.recv().await.unwrap();
+        let (first, mut first_seen) = setup(&world, &home, IfEnrolled::Refuse);
+        let waiting = first_seen.recv().await.unwrap();
         decide(&world, &request_of(&waiting), "deny").await;
         let error = first.await.unwrap().unwrap_err();
         assert!(matches!(error, EnrolError::Denied), "{error}");
@@ -131,8 +131,8 @@ mod tests {
             error.to_string().contains("denied"),
             "a clear message: {error}"
         );
-        let (second, mut seen) = setup(&world, &home, IfEnrolled::Refuse);
-        let again = seen.recv().await.unwrap();
+        let (second, mut second_seen) = setup(&world, &home, IfEnrolled::Refuse);
+        let again = second_seen.recv().await.unwrap();
         assert_ne!(
             request_of(&again),
             request_of(&waiting),
@@ -145,12 +145,12 @@ mod tests {
     async fn setup_run_again_while_the_request_waits_is_the_same_request() {
         let world = World::start().await;
         let (_dir, home) = home();
-        let (first, mut seen) = setup(&world, &home, IfEnrolled::Refuse);
-        let waiting = seen.recv().await.unwrap();
+        let (first, mut first_seen) = setup(&world, &home, IfEnrolled::Refuse);
+        let waiting = first_seen.recv().await.unwrap();
         first.abort();
         let _gone = first.await;
-        let (second, mut seen) = setup(&world, &home, IfEnrolled::Refuse);
-        let again = seen.recv().await.unwrap();
+        let (second, mut second_seen) = setup(&world, &home, IfEnrolled::Refuse);
+        let again = second_seen.recv().await.unwrap();
         assert_eq!(again.code, waiting.code, "the same code");
         assert_eq!(request_of(&again), request_of(&waiting), "the same request");
         decide(&world, &request_of(&again), "approve").await;
@@ -167,19 +167,19 @@ mod tests {
         let world = World::start().await;
         let (_dir, home) = home();
         *world.serve.login.lock().unwrap() = None;
-        let (task, _seen) = setup(&world, &home, IfEnrolled::Refuse);
-        let error = task.await.unwrap().unwrap_err();
+        let (anonymous, _anonymous_seen) = setup(&world, &home, IfEnrolled::Refuse);
+        let error = anonymous.await.unwrap().unwrap_err();
         assert!(matches!(error, EnrolError::NoTailnetIdentity), "{error}");
         assert!(
             error.to_string().contains("--token-file"),
             "points at the token flow: {error}"
         );
         *world.serve.login.lock().unwrap() = Some("bob@example.com");
-        let (task, _seen) = setup(&world, &home, IfEnrolled::Refuse);
-        let error = task.await.unwrap().unwrap_err();
+        let (stranger, _stranger_seen) = setup(&world, &home, IfEnrolled::Refuse);
+        let stranger_error = stranger.await.unwrap().unwrap_err();
         assert!(
-            matches!(&error, EnrolError::NotAMember(login) if login == "bob@example.com"),
-            "{error}"
+            matches!(&stranger_error, EnrolError::NotAMember(login) if login == "bob@example.com"),
+            "{stranger_error}"
         );
     }
 

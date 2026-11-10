@@ -42,7 +42,7 @@ mod tests {
             .expect(
                 Call::post(&requests(&workspace))
                     .alice()
-                    .from_node(ALICE_MAC)
+                    .forwarded_from(ALICE_MAC)
                     .json(&ask_body(&key)),
                 OK,
                 "alice's Mac asks",
@@ -68,7 +68,9 @@ mod tests {
         assert_eq!(code.len(), 9, "XXXX-XXXX");
         let waiting = server
             .expect(
-                Call::get(&status(&request)).alice().from_node(ALICE_MAC),
+                Call::get(&status(&request))
+                    .alice()
+                    .forwarded_from(ALICE_MAC),
                 OK,
                 "the Mac polls",
             )
@@ -103,7 +105,9 @@ mod tests {
             .await;
         let done = server
             .expect(
-                Call::get(&status(&request)).alice().from_node(ALICE_MAC),
+                Call::get(&status(&request))
+                    .alice()
+                    .forwarded_from(ALICE_MAC),
                 OK,
                 "polls again",
             )
@@ -159,7 +163,9 @@ mod tests {
             .await;
         let state = server
             .expect(
-                Call::get(&status(&request)).alice().from_node(ALICE_MAC),
+                Call::get(&status(&request))
+                    .alice()
+                    .forwarded_from(ALICE_MAC),
                 OK,
                 "poll",
             )
@@ -186,19 +192,21 @@ mod tests {
         for (who, call) in [
             (
                 "another node of the same person",
-                Call::get(&status(&request)).alice().from_node(ALICE_OTHER),
+                Call::get(&status(&request))
+                    .alice()
+                    .forwarded_from(ALICE_OTHER),
             ),
             (
                 "another person",
                 Call::get(&status(&request))
                     .login("bob@example.com")
-                    .from_node(BOB_LAPTOP),
+                    .forwarded_from(BOB_LAPTOP),
             ),
             (
                 "the right login from an address with another's node",
                 Call::get(&status(&request))
                     .login("bob@example.com")
-                    .from_node(ALICE_MAC),
+                    .forwarded_from(ALICE_MAC),
             ),
         ] {
             server
@@ -232,7 +240,7 @@ mod tests {
             .refused(
                 ask(Call::post(&requests(&workspace))
                     .login("bob@example.com")
-                    .from_node(BOB_LAPTOP)),
+                    .forwarded_from(BOB_LAPTOP)),
                 StatusCode::FORBIDDEN,
                 "not_a_member",
                 "bob is not a member",
@@ -242,7 +250,7 @@ mod tests {
             .refused(
                 ask(Call::post(&requests(&workspace))
                     .alice()
-                    .from_node("100.64.9.9")),
+                    .forwarded_from("100.64.9.9")),
                 StatusCode::SERVICE_UNAVAILABLE,
                 "tailnet_node_unknown",
                 "an address no node owns",
@@ -258,7 +266,7 @@ mod tests {
             .await;
         server
             .refused(
-                ask(Call::post(&requests(&workspace)).from_node(ALICE_MAC)),
+                ask(Call::post(&requests(&workspace)).forwarded_from(ALICE_MAC)),
                 StatusCode::UNAUTHORIZED,
                 "tailnet_identity_required",
                 "no tailnet person",
@@ -268,7 +276,7 @@ mod tests {
             .refused(
                 ask(Call::post(&requests(&workspace))
                     .alice()
-                    .from_node(ALICE_MAC)
+                    .forwarded_from(ALICE_MAC)
                     .header("origin", "https://evil.example")),
                 StatusCode::FORBIDDEN,
                 "cross_site_request",
@@ -287,7 +295,7 @@ mod tests {
             .expect(
                 Call::post(&requests(&workspace))
                     .alice()
-                    .from_node(ALICE_MAC)
+                    .forwarded_from(ALICE_MAC)
                     .json(&ask_body(&key)),
                 OK,
                 "the answer was lost",
@@ -361,7 +369,7 @@ mod tests {
             &socket,
             Call::post(&requests("00000000-0000-4000-8000-000000000000"))
                 .alice()
-                .from_node(ALICE_MAC)
+                .forwarded_from(ALICE_MAC)
                 .json(&json!({})),
         )
         .await;
