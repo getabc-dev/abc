@@ -415,7 +415,7 @@ fn fake_claude(bin: &Path, answers: &[&str]) {
     let mut cases = String::new();
     for (n, answer) in answers.iter().enumerate() {
         let body = if *answer == "hang" {
-            "echo $$ > \"$bin/pid\"; exec sleep 600".to_owned()
+            "echo $$ > \"$bin/pid\"; exec sleep 60".to_owned()
         } else {
             format!("cat <<'JSON'\n{answer}\nJSON")
         };
@@ -809,6 +809,11 @@ fn supervisor_in_a_child_process() {
     let Some(paths) = std::env::var_os("XTASK_TEST_SUPERVISOR") else {
         return;
     };
+    // However its parent test ends, this process is gone within a minute.
+    std::thread::spawn(|| {
+        std::thread::sleep(std::time::Duration::from_secs(60));
+        std::process::abort();
+    });
     let paths = PathBuf::from(paths);
     let root = paths.join("root");
     let home = paths.join("home");
@@ -835,6 +840,16 @@ fn supervisor_in_a_child_process() {
     panic!("the supervisor returned, but its claude hangs until it is killed");
 }
 
+/// A child process killed when dropped, so a failing test leaves none running.
+struct Killed(std::process::Child);
+
+impl Drop for Killed {
+    fn drop(&mut self) {
+        let _killed = self.0.kill();
+        let _waited = self.0.wait();
+    }
+}
+
 /// Class 2: a reboot of the Mac stopped every VM and wiped the logs. A supervisor killed in the
 /// middle of an attempt, as a reboot kills it, leaves its run's state on the host; the next
 /// supervisor marks that attempt interrupted and carries on from the checkpoint in a fresh session.
@@ -849,17 +864,19 @@ fn a_killed_supervisor_resumes_from_the_checkpoint() {
     std::os::unix::fs::symlink(&world.root, paths.path().join("root")).unwrap();
     std::os::unix::fs::symlink(&world.host.home, paths.path().join("home")).unwrap();
     std::fs::write(paths.path().join("run"), &run.id).unwrap();
-    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
-        .args([
-            "vm::runs::tests::supervisor_in_a_child_process",
-            "--exact",
-            "--nocapture",
-        ])
-        .env("XTASK_TEST_SUPERVISOR", paths.path())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .unwrap();
+    let mut child = Killed(
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "vm::runs::tests::supervisor_in_a_child_process",
+                "--exact",
+                "--nocapture",
+            ])
+            .env("XTASK_TEST_SUPERVISOR", paths.path())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
     let mut running = None;
     for _ in 0..600 {
         let state = runs(&world).load(&run.id).unwrap();
@@ -874,15 +891,15 @@ fn a_killed_supervisor_resumes_from_the_checkpoint() {
             break;
         }
         assert!(
-            child.try_wait().unwrap().is_none(),
+            child.0.try_wait().unwrap().is_none(),
             "the supervisor is still running"
         );
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
     let running = running.expect("the attempt started and named its session");
     assert_eq!(running.attempts[0].outcome, None, "mid-attempt");
-    child.kill().unwrap();
-    child.wait().unwrap();
+    child.0.kill().unwrap();
+    child.0.wait().unwrap();
     let claude = std::fs::read_to_string(local.bin.join("pid")).unwrap();
     std::process::Command::new("kill")
         .arg(claude.trim())
