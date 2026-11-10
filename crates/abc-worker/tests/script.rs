@@ -209,7 +209,7 @@ mod tests {
         let key = abc_worker::testing::key(9);
         let text = key.expose_secret().as_str().to_owned();
         let record = format!(
-            "format = 1\n\n[current.key]\nserver = \"{url}\"\ntoken = \"{}\"\nkey = \"{text}\"\n\n[current.worker]\nworker = \"{}\"\nworkspace = \"{}\"\nname = \"scripted\"\n",
+            "format = 1\n\n[current.key]\nserver = \"{url}\"\nbasis = {{ token = \"{}\" }}\nkey = \"{text}\"\n\n[current.worker]\nworker = \"{}\"\nworkspace = \"{}\"\nname = \"scripted\"\n",
             "0".repeat(64),
             uuid::Uuid::from_u128(1),
             uuid::Uuid::from_u128(2),

@@ -86,6 +86,8 @@ pub(crate) const MACHINE_NODE: &str = "mbp.tail1234.ts.net";
 /// A stand-in for abc's tailscaled at `socket`: LocalAPI's `whois`, answering that every address
 /// is [`MACHINE_NODE`] of [`MACHINE_LOGIN`].
 fn fake_tailscaled(socket: &Path) -> PathBuf {
+    // A restarted server asks for its tailscaled again: the old stand-in's socket is replaced.
+    let _absent = std::fs::remove_file(socket);
     let listener = tokio::net::UnixListener::bind(socket).unwrap();
     tokio::spawn(async move {
         loop {
