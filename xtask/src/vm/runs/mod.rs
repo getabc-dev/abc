@@ -92,6 +92,13 @@ impl Status {
             } => format!("network down; probing at {}", crate::progress::utc(*until)),
             Self::Waiting {
                 until,
+                cause: Cause::Unavailable,
+            } => format!(
+                "the API is unavailable; trying again at {}",
+                crate::progress::utc(*until)
+            ),
+            Self::Waiting {
+                until,
                 cause: Cause::Unstarted,
             } => format!(
                 "the session could not start; starting it again at {}",
@@ -178,8 +185,9 @@ impl Run {
     pub(crate) fn prompt(&self) -> String {
         let keep = "Keep the checkpoint: at each milestone record your next step with `cargo \
                     xtask task next \"<step>\"`; the hooks write it to .abc/progress.md with the \
-                    gates passed and the commits, and commit and push your work as you go. End \
-                    PASS, FAIL or BLOCKED.";
+                    gates passed and the commits, and commit and push your work as you go. Begin \
+                    your final message, the handoff, with its verdict as its first word: PASS, \
+                    FAIL or BLOCKED.";
         let last = self
             .attempts
             .iter()

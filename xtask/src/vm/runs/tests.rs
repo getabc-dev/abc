@@ -54,11 +54,11 @@ fn recorded_results_read_as_their_kind_of_stop() {
     let result = |fields: serde_json::Value| classify(Some(&fields), MORNING);
     assert_eq!(
         result(serde_json::json!({"type": "result", "is_error": false,
-            "result": "Handoff: BLOCKED on the maintainer; the check PASSes"})),
+            "result": "BLOCKED: on the maintainer; the check PASSes"})),
         Outcome::Done {
             verdict: Verdict::Blocked
         },
-        "the first verdict word, whole"
+        "the first word, whole"
     );
     assert_eq!(
         result(serde_json::json!({"type": "result", "is_error": false, "result": "FAIL: two"})),
@@ -92,9 +92,9 @@ fn recorded_results_read_as_their_kind_of_stop() {
     );
     assert_eq!(
         result(serde_json::json!({"type": "result", "is_error": true,
-            "api_error": "overloaded", "result": "x".repeat(600)})),
+            "api_error": "invalid_request", "result": "x".repeat(600)})),
         Outcome::Error {
-            message: format!("overloaded: {}", "x".repeat(488))
+            message: format!("invalid_request: {}", "x".repeat(483))
         },
         "cut to 500 characters"
     );
@@ -111,9 +111,9 @@ fn a_limits_reset_is_the_next_such_time() {
     let at = |text: &str, now: i64| reset(&format!("limit · resets {text} (UTC)"), now);
     assert_eq!(at("10:40am", MORNING), Some(RESET));
     assert_eq!(
-        at("10:40am", RESET),
+        at("10:40am", RESET + 2 * 3600),
         Some(RESET + 24 * 3600),
-        "a time already past is tomorrow's"
+        "a time well past is tomorrow's"
     );
     assert_eq!(at("3pm", MORNING), Some(MORNING + 7 * 3600));
     assert_eq!(at("12am", MORNING), Some(MORNING + 16 * 3600));
@@ -123,9 +123,9 @@ fn a_limits_reset_is_the_next_such_time() {
         Some(MORNING + 2 * 24 * 3600 + 7 * 3600)
     );
     assert_eq!(
-        at("Nov 9, 3pm", MORNING),
-        Some(MORNING - 24 * 3600 + 7 * 3600 + 365 * 24 * 3600),
-        "a date already past is next year's"
+        at("Jan 3, 3pm", MORNING),
+        Some(MORNING + 54 * 24 * 3600 + 7 * 3600),
+        "a date long past is next year's"
     );
     for unread in [
         "13pm",
@@ -1520,4 +1520,135 @@ fn each_build_of_xtask_gets_its_own_copy() {
         2,
         "a new build, a new copy"
     );
+}
+
+/// Review finding: the first PASS, FAIL or BLOCKED anywhere in the text was taken as the verdict,
+/// so a handoff naming a gate's status first ended the run with the wrong one. The verdict is
+/// the handoff's first word, as the prompt asks.
+#[test]
+fn the_verdict_is_the_handoffs_first_word() {
+    let result = |text: &str| {
+        classify(
+            Some(&serde_json::json!({"type": "result", "is_error": false, "result": text})),
+            MORNING,
+        )
+    };
+    assert_eq!(
+        result("check --changed: PASS, coverage FAIL. Verdict: BLOCKED on the maintainer"),
+        Outcome::Unfinished {
+            message: "check --changed: PASS, coverage FAIL. Verdict: BLOCKED on the maintainer"
+                .to_owned()
+        }
+    );
+    assert_eq!(
+        result("I'll make the check PASS next"),
+        Outcome::Unfinished {
+            message: "I'll make the check PASS next".to_owned()
+        }
+    );
+    for (text, verdict) in [
+        (
+            "**BLOCKED** — the maintainer must label it; check PASS",
+            Verdict::Blocked,
+        ),
+        ("## FAIL\n\nthe e2e test", Verdict::Fail),
+        ("  PASS: all six criteria", Verdict::Pass),
+    ] {
+        assert_eq!(result(text), Outcome::Done { verdict }, "{text}");
+    }
+}
+
+/// Review finding: a reset a few minutes past, as when the stop hook ran after the limit
+/// message, was read as tomorrow's, so the run waited a day for a limit already over.
+#[test]
+fn a_reset_just_past_is_over_not_tomorrows() {
+    let at = |text: &str, now: i64| reset(&format!("limit · resets {text} (UTC)"), now);
+    assert_eq!(at("10:40am", RESET + 300), Some(RESET), "five minutes past");
+    assert_eq!(
+        after_attempt(
+            &[],
+            &Outcome::Limit {
+                reset: Some(RESET),
+                message: String::new()
+            },
+            RESET - 120,
+            None,
+            RESET + 300
+        ),
+        Next::Wait {
+            until: RESET + 300,
+            cause: Cause::Limit,
+            outage: None
+        },
+        "the next session starts at once"
+    );
+    assert_eq!(
+        at("8am", RESET),
+        Some(MORNING + 24 * 3600),
+        "a clock time well past is tomorrow's"
+    );
+    assert_eq!(
+        at("Nov 9, 3pm", MORNING),
+        Some(MORNING - 24 * 3600 + 7 * 3600),
+        "a date days past is over"
+    );
+}
+
+/// Review finding: an overloaded or failing API, transient as an outage is, failed the run after
+/// three tries in three minutes. It is waited out as an outage is, for up to a day.
+#[test]
+fn an_unavailable_api_is_waited_out_like_an_outage() {
+    for fields in [
+        serde_json::json!({"type": "result", "is_error": true, "api_error": "overloaded_error", "result": "API Error: 529 Overloaded"}),
+        serde_json::json!({"type": "result", "is_error": true, "api_error": "rate_limit_error", "result": "API Error: 429"}),
+        serde_json::json!({"type": "result", "is_error": true, "result": "API Error: 503 Service Unavailable"}),
+        serde_json::json!({"type": "result", "is_error": true, "result": "API Error: 500 Internal server error"}),
+    ] {
+        let outcome = classify(Some(&fields), MORNING);
+        assert!(
+            matches!(&outcome, Outcome::Unavailable { .. }),
+            "{fields}: {outcome:?}"
+        );
+        let next = after_attempt(
+            &[outcome.clone(), outcome.clone()],
+            &outcome,
+            MORNING,
+            None,
+            MORNING,
+        );
+        assert!(
+            matches!(
+                next,
+                Next::Wait {
+                    cause: Cause::Unavailable,
+                    outage: Some(_),
+                    ..
+                }
+            ),
+            "{next:?}"
+        );
+    }
+    assert!(matches!(
+        down(first_outage(), MORNING + MAX_OUTAGE, Cause::Unavailable),
+        Next::GiveUp(reason) if reason.starts_with("the API has failed every session since ")
+    ));
+}
+
+/// Review finding: an interrupted attempt between two failures reset the count of failures in a
+/// row, so a run failing on every session spent the whole cap of 40.
+#[test]
+fn an_interruption_does_not_reset_the_failures_in_a_row() {
+    let error = Outcome::Error {
+        message: "boom".to_owned(),
+    };
+    assert!(matches!(
+        after_attempt(
+            &[error.clone(), Outcome::Interrupted, error.clone(), Outcome::Interrupted],
+            &error,
+            0,
+            None,
+            MORNING
+        ),
+        Next::GiveUp(reason) if reason.starts_with("3 attempts in a row failed")
+    ));
 }

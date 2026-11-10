@@ -73,6 +73,8 @@ pub(crate) enum Outcome {
     Network { message: String },
     /// The session's VM could not be started, as after a reboot before the host is ready.
     Unstarted { message: String },
+    /// The API answered, but with an error that passes: overloaded, rate-limited or failing.
+    Unavailable { message: String },
     /// The session ended without an error and without a handoff.
     Unfinished { message: String },
     /// Any other error, or no result at all.
@@ -94,6 +96,7 @@ impl Outcome {
             Self::Limit { reset: None, .. } => "a usage limit".to_owned(),
             Self::Network { message } => format!("a network failure: {message}"),
             Self::Unstarted { message } => format!("the session could not start: {message}"),
+            Self::Unavailable { message } => format!("the API was unavailable: {message}"),
             Self::Unfinished { message } => {
                 format!("the session ended without a handoff: {message}")
             }
@@ -142,6 +145,9 @@ pub(crate) fn classify(result: Option<&serde_json::Value>, now: i64) -> Outcome 
     {
         return Outcome::Network { message: cut(text) };
     }
+    if is_error && unavailable(api_error, text) {
+        return Outcome::Unavailable { message: cut(text) };
+    }
     if is_error {
         let subtype = result
             .get("subtype")
@@ -158,14 +164,46 @@ pub(crate) fn classify(result: Option<&serde_json::Value>, now: i64) -> Outcome 
     }
 }
 
-/// The first of PASS, FAIL and BLOCKED that `text` names as a word.
+/// The handoff's verdict: its first word, PASS, FAIL or BLOCKED, after any Markdown emphasis or
+/// heading marks, as the run's prompt asks it to begin. A verdict word later in the text, such as
+/// a gate's status, is not one.
 pub(crate) fn verdict(text: &str) -> Option<Verdict> {
-    text.split(|c: char| !c.is_ascii_alphanumeric())
-        .find_map(|word| match word {
-            "PASS" => Some(Verdict::Pass),
-            "FAIL" => Some(Verdict::Fail),
-            "BLOCKED" => Some(Verdict::Blocked),
-            _ => None,
+    let first = text
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .find(|word| !word.is_empty())?;
+    let lead = text.trim_start().trim_start_matches(['*', '#', '_', ' ']);
+    if !lead.starts_with(first) {
+        return None;
+    }
+    match first {
+        "PASS" => Some(Verdict::Pass),
+        "FAIL" => Some(Verdict::Fail),
+        "BLOCKED" => Some(Verdict::Blocked),
+        _ => None,
+    }
+}
+
+/// The `api_error` values and status codes of an API error that passes: overloaded (529),
+/// rate-limited (429) or failing (500, 502, 503, 504).
+const UNAVAILABLE: [&str; 9] = [
+    "overloaded",
+    "rate_limit",
+    "Overloaded",
+    "529",
+    "429",
+    "500",
+    "502",
+    "503",
+    "504",
+];
+
+/// Whether an error result is the API being unavailable for a while.
+fn unavailable(api_error: Option<&str>, text: &str) -> bool {
+    api_error.is_some_and(|error| error.contains("overloaded") || error.contains("rate_limit"))
+        || text.strip_prefix("API Error: ").is_some_and(|rest| {
+            UNAVAILABLE
+                .iter()
+                .any(|marker| rest.starts_with(marker) || rest.contains(&format!("{marker} ")))
         })
 }
 
@@ -219,7 +257,17 @@ pub(crate) fn reset(text: &str, now: i64) -> Option<i64> {
         }
     };
     let mut at = day.with_time(time).assume_utc().unix_timestamp();
-    // A time already past is the next one: tomorrow's for a clock time, next year's for a date.
+    // A clock time up to an hour past is a reset already over, as when the session ended some
+    // minutes after the limit's message, once the stop hook had run; one further past is
+    // tomorrow's. A date up to half a year past is over; one further past is next year's.
+    let over = if date.is_none() {
+        3600
+    } else {
+        183 * 24 * 3600
+    };
+    if at <= now && now.saturating_sub(at) <= over {
+        return Some(at);
+    }
     while at <= now {
         at = match date {
             None => at.checked_add(24 * 60 * 60)?,
@@ -247,6 +295,8 @@ pub(crate) enum Cause {
     Network,
     /// The session could not start; the next attempt starts it again.
     Unstarted,
+    /// The API failed the session with an error that passes; the next attempt tries it again.
+    Unavailable,
 }
 
 /// An outage the run is waiting out: the network's, or the session's that could not start.
@@ -297,7 +347,12 @@ pub(crate) fn after_attempt(
     }
     // Only sessions count toward the cap: a VM that would not start ran none, and is bounded by
     // the outage's day instead.
-    let sessions = |each: &Outcome| !matches!(each, Outcome::Unstarted { .. });
+    let sessions = |each: &Outcome| {
+        !matches!(
+            each,
+            Outcome::Unstarted { .. } | Outcome::Unavailable { .. }
+        )
+    };
     let attempts = earlier
         .iter()
         .filter(|earlier| sessions(earlier))
@@ -322,15 +377,20 @@ pub(crate) fn after_attempt(
             cause: Cause::Limit,
             outage: None,
         },
-        Outcome::Network { .. } | Outcome::Unstarted { .. } => {
+        Outcome::Network { .. } | Outcome::Unstarted { .. } | Outcome::Unavailable { .. } => {
             let outage = outage.unwrap_or(Outage {
                 since: started,
                 tries: 0,
             });
-            let cause = if matches!(outcome, Outcome::Network { .. }) {
-                Cause::Network
-            } else {
-                Cause::Unstarted
+            let cause = match outcome {
+                Outcome::Network { .. } => Cause::Network,
+                Outcome::Unavailable { .. } => Cause::Unavailable,
+                Outcome::Done { .. }
+                | Outcome::Limit { .. }
+                | Outcome::Unstarted { .. }
+                | Outcome::Unfinished { .. }
+                | Outcome::Error { .. }
+                | Outcome::Interrupted => Cause::Unstarted,
             };
             down(outage, now, cause)
         }
@@ -338,6 +398,7 @@ pub(crate) fn after_attempt(
             let failures = earlier
                 .iter()
                 .rev()
+                .filter(|earlier| !matches!(earlier, Outcome::Interrupted))
                 .take_while(|earlier| earlier.failed())
                 .count()
                 .saturating_add(1);
@@ -367,10 +428,12 @@ pub(crate) fn down(outage: Outage, now: i64, cause: Cause) -> Next {
         tries: outage.tries.saturating_add(1),
     };
     if now.saturating_sub(outage.since) >= MAX_OUTAGE {
-        let what = if cause == Cause::Network {
-            "the API has been unreachable"
-        } else {
-            "the session has not started"
+        let what = match cause {
+            Cause::Network => "the API has been unreachable",
+            Cause::Unavailable => "the API has failed every session",
+            Cause::Start | Cause::Retry | Cause::Limit | Cause::Unstarted => {
+                "the session has not started"
+            }
         };
         return Next::GiveUp(format!(
             "{what} since {}, {} hours",
