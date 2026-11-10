@@ -268,8 +268,11 @@ hands off PASS, FAIL or BLOCKED, with no one to restart it:
 - The supervisor is a launchd agent (`~/Library/LaunchAgents/dev.getabc.run.<run>.plist`) or a
   systemd user unit (`abc-run-<run>.service`) running a copy of the xtask that started it, kept in
   `~/.local/state/abc/runs/bin/`, so rebuilding the main clone never breaks a run. After a reboot it
-  starts again when you log in, starts the VM and carries on from the checkpoint. On Linux, run
-  `loginctl enable-linger` once so it starts without a login.
+  starts again when you log in, starts the VM and carries on from the checkpoint. The VM needs
+  your token from the keychain (the Secret Service on Linux), which unlocks only when you log in:
+  until then each try to start the VM fails and the supervisor backs off, then carries on once
+  you have logged in, within a day. `loginctl enable-linger` starts Linux supervisors at boot,
+  but they still wait for that login.
 - Each run's `state.json` (status, reason, next attempt, every session's ids and outcome) and `log`
   (every session's stream-json) live in `~/.local/state/abc/runs/<run>/`, on the host.
 - One run is active at a time, since every session shares your subscription's usage window: `vm
