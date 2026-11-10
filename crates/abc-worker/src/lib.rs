@@ -38,7 +38,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub use dial::DialError;
-pub use enrol::{EnrolError, Enrolment, enrol, machine};
+pub use enrol::{EnrolError, Enrolment, Waiting, enrol, enrol_by_approval, machine};
 pub use home::{HomeError, WorkerHome};
 pub use policy::Terminal;
 
@@ -247,6 +247,8 @@ pub struct Timings {
     pub rate_limited_floor: Duration,
     /// How long a stopping worker waits for the server to answer its close.
     pub close_grace: Duration,
+    /// How often a machine waiting for its owner's approval asks where its request stands.
+    pub approval_poll: Duration,
 }
 
 impl Timings {
@@ -267,6 +269,7 @@ impl Timings {
             stable_after: IDLE_TIMEOUT,
             rate_limited_floor: Duration::from_secs(15),
             close_grace: Duration::from_secs(2),
+            approval_poll: Duration::from_secs(2),
         }
     }
 }

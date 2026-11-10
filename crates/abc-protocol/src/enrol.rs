@@ -34,6 +34,13 @@ pub const REQUESTS_PATH: &str = "/api/workspaces/{workspace}/enrolment-requests"
 /// `abc_core::query::RequestState`, and only to the login and node that made the request.
 pub const REQUEST_STATUS_PATH: &str = "/api/enrolment-requests/{request}";
 
+/// The page where the owner approves a request, relative to the server's URL: the machine prints
+/// it with the code. The web app serves it.
+#[must_use]
+pub fn approve_path(workspace: WorkspaceId, request: EnrolmentRequestId) -> String {
+    format!("/machines/requests/{workspace}/{request}")
+}
+
 /// The worker's enrolment request.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct EnrolRequest {

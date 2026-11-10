@@ -57,7 +57,7 @@ query!(WhoAmI, ReadAction::ViewSession, SessionView, |_s| {
 });
 
 /// The answer to [`WhoAmI`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, TS, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize, TS, JsonSchema)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum SessionView {
     /// The request carried no tailnet identity (a tagged device, or a non-browser client).
@@ -84,7 +84,7 @@ pub enum SessionView {
 }
 
 /// One of a person's workspaces.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, TS, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize, TS, JsonSchema)]
 pub struct WorkspaceSummary {
     /// The workspace.
     pub id: WorkspaceId,

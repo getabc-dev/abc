@@ -6,7 +6,7 @@
 //!                            macOS: ~/Library/Application Support/abc/worker
 //!                            Linux: $XDG_CONFIG_HOME/abc/worker, else ~/.config/abc/worker
 //!   worker.lock       0600   locked by `Held` for the process's life; never renamed
-//!   worker.toml       0600   the record: the enrolment in use (server, token digest, key, who
+//!   worker.toml       0600   the record: the enrolment in use (server, what it was made for, key, who
 //!                            it is) and a pending key whose answer has not been seen
 //! ```
 //!
@@ -141,24 +141,36 @@ pub(crate) struct Held {
     dir: PathBuf,
 }
 
-/// A key made for one enrolment token at one server.
+/// What a key was made to enrol with.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum Basis {
+    /// An enrolment token, by its digest. The same token again is a retry; another token is a new
+    /// enrolment. A digest of a 256-bit token reveals nothing.
+    Token(EnrolmentTokenDigest),
+    /// The owner's approval in the browser. Running setup again while the request waits is a
+    /// retry: the server answers the same request. One that ended (denied or expired) discards the
+    /// key, so the next run asks afresh.
+    Approval,
+}
+
+/// A key made for one enrolment at one server.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Slot {
     /// The server the key was made for. Enrolment and every dial use this URL and no other.
     pub(crate) server: PublicUrl,
-    /// The digest of the token the key was sent with. The same token again is a retry; another
-    /// token is a new enrolment. A digest of a 256-bit token reveals nothing.
-    pub(crate) token: EnrolmentTokenDigest,
+    /// What the key was sent with.
+    pub(crate) basis: Basis,
     /// The worker's key. It leaves its `Secret` only here and in the `Authorization` header.
     #[serde(serialize_with = "serialize_exposed")]
     pub(crate) key: Secret<WorkerKey>,
 }
 
 impl Slot {
-    /// Whether this key was made for `token` at `server`: sending it again is a retry.
-    pub(crate) fn is_for(&self, server: &PublicUrl, token: &EnrolmentTokenDigest) -> bool {
-        self.server == *server && self.token == *token
+    /// Whether this key was made for `basis` at `server`: sending it again is a retry.
+    pub(crate) fn is_for(&self, server: &PublicUrl, basis: &Basis) -> bool {
+        self.server == *server && self.basis == *basis
     }
 }
 
@@ -452,7 +464,7 @@ mod tests {
     fn slot(seed: u8) -> Slot {
         Slot {
             server: url(),
-            token: token_digest(),
+            basis: Basis::Token(token_digest()),
             key: key(seed),
         }
     }
@@ -460,14 +472,21 @@ mod tests {
     #[test]
     fn a_slot_is_for_one_token_at_one_server() {
         let slot = slot(1);
-        assert!(slot.is_for(&url(), &token_digest()), "its own");
+        assert!(
+            slot.is_for(&url(), &Basis::Token(token_digest())),
+            "its own"
+        );
+        assert!(!slot.is_for(&url(), &Basis::Approval), "not an approval");
         let other = PublicUrl::parse("https://other.test.ts.net").unwrap();
-        assert!(!slot.is_for(&other, &token_digest()), "another server");
+        assert!(
+            !slot.is_for(&other, &Basis::Token(token_digest())),
+            "another server"
+        );
         let token = EnrolmentToken::parse(&format!("abc_enr_{}", "2".repeat(52)))
             .unwrap()
             .expose_secret()
             .digest();
-        assert!(!slot.is_for(&url(), &token), "another token");
+        assert!(!slot.is_for(&url(), &Basis::Token(token)), "another token");
     }
 
     #[test]
@@ -484,7 +503,11 @@ mod tests {
         assert!(loaded.current.is_none(), "nothing in use");
         let pending = loaded.pending.unwrap();
         assert_eq!(pending.server, url(), "the server");
-        assert_eq!(pending.token, token_digest(), "the token's digest");
+        assert_eq!(
+            pending.basis,
+            Basis::Token(token_digest()),
+            "the token's digest"
+        );
         assert_eq!(pending.key.expose_secret().as_str(), text, "the key");
         let enrolled = Enrolled {
             worker: abc_core::id::WorkerId::from_uuid(uuid::Uuid::from_u128(7)),
