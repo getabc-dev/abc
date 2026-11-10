@@ -1,6 +1,6 @@
 //! abc server's own stack on its host, and the commands that set it up and look after it:
 //! `abc server setup`, `status`, `upgrade`, `backup`, `restore` and `uninstall` (decision 51);
-//! and a worker's service, which keeps `abc worker` running on its machine ([`worker`]).
+//! and a worker's service, which keeps `abc worker` running on its machine ([`worker::WorkerService`]).
 //!
 //! ```text
 //! Browser ──tailnet──▶ abc's tailscaled (node `abc`, userspace, unprivileged)
@@ -203,10 +203,11 @@ impl Server {
     ///
     /// As [`Host::discover`] and [`ServerHome::discover`].
     pub fn discover(lookup: impl Fn(&str) -> Option<OsString>) -> Result<Self, HostError> {
-        let host = Host::discover(&lookup)?;
-        let home = ServerHome::discover(host.os, |name| {
+        // The server's home first: without `HOME` its error names `ABC_SERVER_HOME` too.
+        let home = ServerHome::discover(Os::current(), |name| {
             lookup(name).filter(|value| !value.is_empty())
         })?;
+        let host = Host::discover(&lookup)?;
         Ok(Self { host, home })
     }
 }

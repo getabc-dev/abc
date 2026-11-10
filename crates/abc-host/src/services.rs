@@ -8,7 +8,7 @@
 //! other two and stops it with Postgres.
 //!
 //! On macOS each service writes its output to `<name>.log` in the log directory its
-//! [`Services`] is given: the server home's `logs/` for the stack, the worker home's for the
+//! `Services` is given: the server home's `logs/` for the stack, the worker home's for the
 //! worker, so neither needs the other's home. On Linux the journal keeps it.
 
 use std::ffi::OsString;
