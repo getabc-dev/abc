@@ -1433,4 +1433,118 @@ mod tests {
             "running again"
         );
     }
+
+    fn worker_service(machine: &Machine) -> abc_host::WorkerService {
+        abc_host::WorkerService {
+            abc: machine.programs().abc,
+            home: machine.root().join("worker-home"),
+        }
+    }
+
+    /// A worker's service installs once, runs, reports itself, and goes with `uninstall`.
+    fn worker_service_lifecycle(os: Os) {
+        let machine = Machine::new(os);
+        let host = machine.server().host;
+        let spec = worker_service(&machine);
+        let mut said = Vec::new();
+        let changed = abc_host::install_worker(&host, &spec, &mut Console::new(&mut said)).unwrap();
+        assert!(changed, "the first install changes things");
+        assert_eq!(mode(&spec.home.join("logs")), 0o700, "private logs");
+        let status = abc_host::worker_status(&host, &spec.home).unwrap();
+        assert!(status.healthy(), "{:#?}", status.lines());
+        let calls = machine.take_calls();
+        assert!(
+            calls
+                .iter()
+                .any(|call| call.starts_with("abc worker --home")),
+            "the service runs the worker: {calls:#?}"
+        );
+        let again =
+            abc_host::install_worker(&host, &spec, &mut Console::new(&mut Vec::new())).unwrap();
+        assert!(!again, "nothing changes the second time");
+
+        let mut told = Vec::new();
+        abc_host::uninstall_worker(&host, &spec.home, false, &mut Console::new(&mut told)).unwrap();
+        let told = String::from_utf8(told).unwrap();
+        assert!(told.contains("Removed abc worker's service."), "{told}");
+        assert!(told.contains("stay in"), "the home stays: {told}");
+        assert!(spec.home.is_dir());
+        let status = abc_host::worker_status(&host, &spec.home).unwrap();
+        assert!(!status.healthy(), "stopped for good");
+
+        let mut told = Vec::new();
+        abc_host::uninstall_worker(&host, &spec.home, true, &mut Console::new(&mut told)).unwrap();
+        let told = String::from_utf8(told).unwrap();
+        assert!(told.contains("was not installed."), "{told}");
+        assert!(told.contains("Deleted"), "{told}");
+        assert!(!spec.home.exists(), "purged");
+        let mut told = Vec::new();
+        abc_host::uninstall_worker(&host, &spec.home, true, &mut Console::new(&mut told)).unwrap();
+        assert!(
+            String::from_utf8(told)
+                .unwrap()
+                .contains("was not installed.")
+        );
+    }
+
+    #[test]
+    fn a_worker_service_on_macos_installs_reports_and_uninstalls() {
+        worker_service_lifecycle(Os::MacOs);
+    }
+
+    #[test]
+    fn a_worker_service_on_linux_installs_with_lingering_reports_and_uninstalls() {
+        worker_service_lifecycle(Os::Linux);
+    }
+
+    #[test]
+    fn a_purge_refuses_what_is_not_the_workers_own_private_directory() {
+        let machine = Machine::new(Os::Linux);
+        let host = machine.server().host;
+        let root = machine.root().to_path_buf();
+        let purge = |home: &Path| {
+            abc_host::uninstall_worker(&host, home, true, &mut Console::new(&mut Vec::new()))
+        };
+        let link = root.join("link");
+        let target = root.join("target");
+        std::fs::create_dir(&target).unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(
+            matches!(purge(&link), Err(HostError::UnsafePurge { reason, .. }) if reason.contains("symbolic")),
+            "a link"
+        );
+        let file = root.join("file");
+        std::fs::write(&file, "x").unwrap();
+        assert!(
+            matches!(purge(&file), Err(HostError::UnsafePurge { reason, .. }) if reason.contains("not a directory")),
+            "a file"
+        );
+        assert!(
+            matches!(purge(Path::new("/")), Err(HostError::UnsafePurge { reason, .. }) if reason.contains("root")),
+            "root"
+        );
+        std::fs::create_dir_all(host.user_home.join("w")).unwrap();
+        assert!(
+            matches!(purge(&host.user_home), Err(HostError::UnsafePurge { reason, .. }) if reason.contains("home")),
+            "the user's home"
+        );
+        assert!(
+            matches!(
+                purge(Path::new("relative")),
+                Err(HostError::ServicePath { .. })
+            ),
+            "relative"
+        );
+        let open = root.join("open");
+        std::fs::create_dir(&open).unwrap();
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            matches!(purge(&open), Err(HostError::Insecure { .. })),
+            "others can reach it"
+        );
+        assert!(
+            open.is_dir() && target.is_dir() && file.is_file(),
+            "nothing deleted"
+        );
+    }
 }

@@ -205,4 +205,45 @@ mod tests {
             assert!(text.contains(part), "{part:?} in {text}");
         }
     }
+
+    #[tokio::test]
+    async fn a_workspace_that_is_not_the_persons_is_refused_and_the_right_one_is_found_by_name() {
+        let world = World::start().await;
+        let (_dir, home) = home();
+        let url = world.serve.url.clone();
+        let error = abc_worker::enrol_by_approval(
+            &home,
+            &world.fast_env(),
+            &url,
+            Some("Elsewhere"),
+            machine(),
+            IfEnrolled::Refuse,
+            |_| {},
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, EnrolError::NoSuchWorkspace), "{error}");
+        let (shown, mut seen) = mpsc::unbounded_channel();
+        let env = world.fast_env();
+        let named = {
+            let home = home.clone();
+            tokio::spawn(async move {
+                abc_worker::enrol_by_approval(
+                    &home,
+                    &env,
+                    &url,
+                    Some("hOmE"),
+                    machine(),
+                    IfEnrolled::Refuse,
+                    |waiting| {
+                        shown.send(waiting.clone()).unwrap();
+                    },
+                )
+                .await
+            })
+        };
+        let waiting = seen.recv().await.unwrap();
+        assert_eq!(waiting.workspace.as_str(), "Home", "matched without case");
+        named.abort();
+    }
 }
