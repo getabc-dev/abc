@@ -59,13 +59,13 @@ pub(crate) enum Verdict {
 pub enum Terminal {
     /// Refused `worker_revoked`, or closed 4403.
     #[error(
-        "this worker was revoked; to use this machine again, enrol it with a new token: abc worker enrol --replace <url>"
+        "this worker was revoked; to use this machine again, enrol it with a new token: abc worker setup --replace <url>"
     )]
     Revoked,
     /// Refused `invalid_worker_key`: the server does not know this key (another server, or one
     /// whose database was reset).
     #[error(
-        "the server does not know this worker's key; enrol this machine again: abc worker enrol --replace <url>"
+        "the server does not know this worker's key; enrol this machine again: abc worker setup --replace <url>"
     )]
     InvalidKey,
     /// Closed 4409 while this process held its only link: another process connected with the

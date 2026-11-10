@@ -370,7 +370,7 @@ mod tests {
             "{stopped:?}"
         );
         assert!(
-            stopped.to_string().contains("abc worker enrol --replace"),
+            stopped.to_string().contains("abc worker setup --replace"),
             "and says how to fix it: {stopped}"
         );
     }

@@ -3,7 +3,10 @@
 //! worker always dials.
 //!
 //! ```text
-//! abc worker enrol <url>   lock the home -> save a new key (0600) -> POST /api/enrol with its
+//! abc worker setup <url>   ask the server to enrol (key made here, only its digest sent), wait for
+//!                          the owner's approval in the browser, store the enrolment, install the
+//!                          service (abc-host)
+//! abc worker enrol <url>   (headless, by token) lock the home -> save a new key (0600) -> POST /api/enrol with its
 //!                          digest (the same request on every re-run) -> record who we are
 //! abc worker               lock the home -> load the record -> loop { dial (TLS, bearer key) ->
 //!                          Hello / Welcome -> hold the link until it ends -> policy: dial again

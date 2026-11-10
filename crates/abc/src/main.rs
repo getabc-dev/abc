@@ -532,7 +532,7 @@ fn uninstall(purge: bool) -> Result<(), Failure> {
     abc_host::uninstall(&host, purge, &mut Console::new(&mut out)).map_err(host_failure)
 }
 
-/// `abc worker` and `abc worker enrol`.
+/// `abc worker` and its subcommands: `setup`, `enrol`, `status` and `uninstall`.
 async fn work(worker: WorkerCommand) -> Result<(), Failure> {
     let config = |error: Box<dyn StdError>| Failure::Config(error);
     let home = match worker.home {
@@ -651,7 +651,8 @@ async fn worker_setup(home: &WorkerHome, env: &Env, args: WorkerSetupArgs) -> Re
     match enrolled {
         Some((held_by, who)) if held_by == server && !args.replace => {
             console.line(&format!(
-                "This machine is already enrolled as {} with {server}.",
+                "This machine is already enrolled as {} with {server} (if the owner revoked it, run \
+                 this again with --replace).",
                 who.name.as_str()
             ));
         }
@@ -724,6 +725,7 @@ fn enrol_failure(error: &abc_worker::EnrolError) -> Failure {
             | E::NoSuchWorkspace
             | E::WhichWorkspace(_)
             | E::NoTailnetIdentity
+            | E::Unclaimed
             | E::NotAMember(_)
             | E::ApprovalUnavailable
             | E::NotOnTailnet { .. }

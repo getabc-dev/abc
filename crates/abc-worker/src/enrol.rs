@@ -106,7 +106,6 @@ pub async fn enrol(
     })
 }
 
-/// Sends `key`'s digest with `token` and returns who the server says this machine is.
 /// What a machine shows while it waits for its owner: where to approve, and the code to compare.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Waiting {
@@ -160,31 +159,41 @@ pub async fn enrol_by_approval(
         named_workspace,
     )?;
     let basis = Basis::Approval;
-    let pending = match record.pending {
-        Some(pending) if pending.is_for(server, &basis) => pending,
-        Some(_) | None => {
+    let mut resumed = record
+        .pending
+        .filter(|pending| pending.is_for(server, &basis));
+    // A key left by an interrupted run asks again; if its request has lapsed meanwhile, the
+    // server would only hand back the dead request, so a fresh key asks afresh.
+    let (pending, asked) = loop {
+        let (pending, reused) = if let Some(pending) = resumed.take() {
+            (pending, true)
+        } else {
             let mint = ChaChaMint::from_seed(SystemEntropy.seed()?);
             let pending = Slot {
                 server: server.clone(),
-                basis,
+                basis: basis.clone(),
                 key: WorkerKey::generate(&mint),
             };
             held.save(record.current.as_ref(), Some(&pending))?;
-            pending
+            (pending, false)
+        };
+        let asked = dial::post_request(
+            env,
+            server,
+            workspace_id,
+            &ApprovalRequest {
+                key: pending.key.expose_secret().digest(),
+                machine: machine.clone(),
+                build: env.build.clone(),
+            },
+        )
+        .await
+        .map_err(|error| tailnet_trouble(server, error))?;
+        let lapsed = std::time::SystemTime::from(asked.expires_at.as_offset()) <= env.wall.now();
+        if !(reused && lapsed) {
+            break (pending, asked);
         }
     };
-    let asked = dial::post_request(
-        env,
-        server,
-        workspace_id,
-        &ApprovalRequest {
-            key: pending.key.expose_secret().digest(),
-            machine,
-            build: env.build.clone(),
-        },
-    )
-    .await
-    .map_err(|error| tailnet_trouble(server, error))?;
     waiting(&Waiting {
         approve_path: approve_path(workspace_id, asked.request),
         code: asked.code,
@@ -306,6 +315,7 @@ fn tailnet_trouble(server: &PublicUrl, error: EnrolError) -> EnrolError {
     }
 }
 
+/// Sends `key`'s digest with `token` and returns who the server says this machine is.
 async fn send(
     env: &Env,
     server: &PublicUrl,
@@ -413,6 +423,7 @@ pub enum EnrolError {
     )]
     TokenUsed,
     /// `worker_revoked` on a retry: the worker this key enrolled as was revoked since.
+    /// The server cannot be reached from this machine, which is probably not on the tailnet.
     #[error(
         "cannot reach {server} from this machine ({cause}); abc workers use this machine's own \
          Tailscale, so install it (https://tailscale.com/download), sign in to the server's \
@@ -423,35 +434,44 @@ pub enum EnrolError {
         #[source]
         cause: DialError,
     },
+    /// The owner denied the request.
     #[error("the owner denied this machine; run `abc worker setup` again if that was a mistake")]
     Denied,
+    /// Nobody decided before the request expired.
     #[error(
-        "nobody approved this machine within 10 minutes; run `abc worker setup` again and approve \
+        "nobody approved this machine in time; run `abc worker setup` again and approve \
          it in the browser"
     )]
     RequestExpired,
+    /// The server has no tailscaled to name nodes with: tokens only.
     #[error(
         "the server cannot approve a machine in the browser; create an enrolment token on the \
          Machines page and run `abc worker enrol <url> --token-file <file>` instead"
     )]
     ApprovalUnavailable,
+    /// The request carried no tailnet person (a tagged device).
     #[error(
         "the server does not know you: this machine is not signed in to Tailscale as a person \
          (a tagged device has no identity); sign in as the person who owns the server, or enrol \
          with a token: `abc worker enrol <url> --token-file <file>`"
     )]
     NoTailnetIdentity,
+    /// The server has no owner yet.
     #[error("this server has no owner yet; open it in a browser and claim it first")]
     Unclaimed,
+    /// This tailnet login is not a member of the workspace.
     #[error(
         "{0} is not a member of this server's workspace; sign in to Tailscale as its owner, or \
          ask the owner to invite you"
     )]
     NotAMember(String),
+    /// No workspace of the given name.
     #[error("no workspace of that name; leave --workspace out to use your only one")]
     NoSuchWorkspace,
+    /// Several workspaces: one must be named.
     #[error("you belong to several workspaces ({}); name one with --workspace", .0.join(", "))]
     WhichWorkspace(Vec<String>),
+    /// The server revoked this worker.
     #[error(
         "the worker this machine enrolled as was revoked; enrol again with a new token and --replace"
     )]
