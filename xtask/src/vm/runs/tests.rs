@@ -1924,3 +1924,48 @@ fn gc_purges_ended_runs_only_when_told() {
     assert!(!all.dir.join(&ended.id).exists());
     assert!(all.dir.join(&queued.id).exists(), "only ended runs go");
 }
+
+/// Mutants: what reads an error as the API being unavailable, a date's window for being over,
+/// the size gc reports, and a listing that holds only unreadable runs.
+#[test]
+fn unavailable_errors_dates_and_sizes_are_read_exactly() {
+    let error = |fields: serde_json::Value| classify(Some(&fields), MORNING);
+    for fields in [
+        serde_json::json!({"type": "result", "is_error": true, "api_error": "rate_limit_error", "result": "Rate limited"}),
+        serde_json::json!({"type": "result", "is_error": true, "api_error": "overloaded_error", "result": "busy"}),
+        serde_json::json!({"type": "result", "is_error": true, "result": "API Error: the server said 503 Service Unavailable"}),
+    ] {
+        assert!(
+            matches!(error(fields.clone()), Outcome::Unavailable { .. }),
+            "{fields}"
+        );
+    }
+    assert!(matches!(
+        error(
+            serde_json::json!({"type": "result", "is_error": true, "result": "API Error: 400 bad request"})
+        ),
+        Outcome::Error { .. }
+    ));
+    assert_eq!(
+        reset("limit · resets Oct 31, 3pm (UTC)", MORNING),
+        Some(MORNING - 10 * 24 * 3600 + 7 * 3600),
+        "a date ten days past is over"
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a"), "x".repeat(1_000)).unwrap();
+    std::fs::write(dir.path().join("b"), "x".repeat(234)).unwrap();
+    assert_eq!(super::size_of(dir.path()), 1_234);
+    assert_eq!(super::size_of(&dir.path().join("none")), 0);
+
+    let runs = Runs {
+        dir: dir.path().join("runs"),
+    };
+    std::fs::create_dir_all(runs.dir.join("broken")).unwrap();
+    std::fs::write(runs.dir.join("broken/state.json"), "{").unwrap();
+    let mut out = Vec::new();
+    super::list(&runs, false, &mut out).unwrap();
+    let listed = String::from_utf8(out).unwrap();
+    assert!(listed.starts_with("broken\tunreadable: "), "{listed}");
+    assert!(!listed.contains("vm runs: none"), "{listed}");
+}
