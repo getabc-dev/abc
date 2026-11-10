@@ -16,7 +16,7 @@ use abc_core::command::SetupCodeIssued;
 use abc_core::credential::EnrolmentToken;
 use abc_core::query::{InstallationState, InstallationStatus};
 use abc_core::secret::Secret;
-use abc_host::{Console, Host, HostError, SetupOptions};
+use abc_host::{Console, Host, HostError, Server, SetupOptions};
 use abc_platform::telemetry::chain;
 use abc_protocol::url::PublicUrl;
 use abc_server::{Limits, LinkTimings, ServerConfig, WebApp};
@@ -203,7 +203,7 @@ fn host_database_url() -> Result<Secret<DatabaseUrl>, Failure> {
     if std::env::var_os(DATABASE_URL).is_some() {
         return database_url();
     }
-    let host = discover_host()?;
+    let host = discover_server()?;
     abc_host::database_url(&host)
         .map(DatabaseUrl::new)
         .map_err(|error| {
@@ -393,7 +393,12 @@ async fn open_store(url: &Secret<DatabaseUrl>, database: &DatabaseArgs) -> Resul
         .map_err(|error| run(Box::new(error)))
 }
 
-/// This machine, as `abc server setup` and the day-2 commands see it.
+/// This machine and abc server's home, as `abc server setup` and the day-2 commands see them.
+fn discover_server() -> Result<Server, Failure> {
+    Server::discover(|name| std::env::var_os(name)).map_err(host_failure)
+}
+
+/// This machine, for the worker's commands: they need no server home.
 fn discover_host() -> Result<Host, Failure> {
     Host::discover(|name| std::env::var_os(name)).map_err(host_failure)
 }
@@ -415,7 +420,7 @@ fn set_up(
     database: &DatabaseArgs,
     args: SetupArgs,
 ) -> Result<(), Failure> {
-    let host = discover_host()?;
+    let host = discover_server()?;
     let exe = std::env::current_exe().map_err(|error| Failure::Run(Box::new(error)))?;
     let mut out = std::io::stdout().lock();
     let mut console = Console::new(&mut out);
@@ -440,7 +445,7 @@ fn set_up(
             ));
             // In the fragment, which the browser never sends: no server or proxy log can hold it.
             let claim = format!("{}/#code={}", stack.public_url.origin(), shown.as_str());
-            abc_host::open_in_browser(&host, &mut console, &claim);
+            abc_host::open_in_browser(&host.host, &mut console, &claim);
         }
         Err(_claimed) => console.line(&format!(
             "abc is already claimed; open {}",
@@ -452,7 +457,7 @@ fn set_up(
 
 /// `abc server status`: exits 1 when a part is unhealthy.
 fn status() -> Result<(), Failure> {
-    let report = abc_host::status(&discover_host()?).map_err(host_failure)?;
+    let report = abc_host::status(&discover_server()?).map_err(host_failure)?;
     let mut out = std::io::stdout().lock();
     let mut console = Console::new(&mut out);
     for line in report.lines() {
@@ -469,14 +474,14 @@ fn status() -> Result<(), Failure> {
 
 /// `abc server upgrade`.
 fn upgrade() -> Result<(), Failure> {
-    let host = discover_host()?;
+    let host = discover_server()?;
     let mut out = std::io::stdout().lock();
     abc_host::upgrade(&host, &mut Console::new(&mut out)).map_err(host_failure)
 }
 
 /// `abc server backup`.
 fn backup(file: Option<&std::path::Path>) -> Result<(), Failure> {
-    let host = discover_host()?;
+    let host = discover_server()?;
     let written =
         abc_host::backup(&host, file, time::OffsetDateTime::now_utc()).map_err(host_failure)?;
     writeln!(
@@ -496,7 +501,7 @@ fn restore(
     file: &std::path::Path,
     force: bool,
 ) -> Result<(), Failure> {
-    let host = discover_host()?;
+    let host = discover_server()?;
     if !force {
         let url = abc_host::database_url(&host)
             .map(DatabaseUrl::new)
@@ -522,7 +527,7 @@ fn restore(
 
 /// `abc server uninstall`.
 fn uninstall(purge: bool) -> Result<(), Failure> {
-    let host = discover_host()?;
+    let host = discover_server()?;
     let mut out = std::io::stdout().lock();
     abc_host::uninstall(&host, purge, &mut Console::new(&mut out)).map_err(host_failure)
 }

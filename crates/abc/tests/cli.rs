@@ -244,7 +244,7 @@ mod tests {
         assert_eq!(output.status.code(), Some(2), "configuration");
         assert_eq!(
             text(&output.stderr),
-            "abc: this machine is not enrolled; run `abc worker enrol <url>` first\n",
+            "abc: this machine is not enrolled; run `abc worker setup <server-url>` first\n",
             "the fix"
         );
         let (_other_dir, other) = worker_home();
@@ -301,6 +301,86 @@ mod tests {
     }
 
     #[test]
+    fn a_token_file_is_read_and_never_echoed() {
+        let (dir, home) = worker_home();
+        let file = dir.path().join("token");
+        std::fs::write(&file, "hunter2\n").unwrap();
+        let output = run(&mut worker(
+            &[
+                "enrol",
+                "https://abc.ts.net",
+                "--token-file",
+                file.to_str().unwrap(),
+            ],
+            &home,
+        ));
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "a malformed token in the file"
+        );
+        assert!(
+            text(&output.stderr).contains("--token-file"),
+            "says where tokens can come from: {}",
+            text(&output.stderr)
+        );
+        assert!(!text(&output.stderr).contains("hunter2"), "never echoed");
+        let missing = run(&mut worker(
+            &[
+                "enrol",
+                "https://abc.ts.net",
+                "--token-file",
+                "/nonexistent/token",
+            ],
+            &home,
+        ));
+        assert_eq!(missing.status.code(), Some(2), "no such file");
+        assert!(
+            text(&missing.stderr).contains("cannot read the token file /nonexistent/token"),
+            "{}",
+            text(&missing.stderr)
+        );
+    }
+
+    #[test]
+    fn setup_refuses_a_bad_url_and_says_when_the_server_cannot_be_reached() {
+        let (dir, home) = worker_home();
+        let mut bad = worker(&["setup", "http://abc.ts.net"], &home);
+        bad.env("HOME", dir.path());
+        let bad = run(&mut bad);
+        assert_eq!(bad.status.code(), Some(2), "not https");
+        assert!(
+            text(&bad.stderr).contains("it must start with https://"),
+            "{}",
+            text(&bad.stderr)
+        );
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let url = format!("https://127.0.0.1:{port}");
+        let mut command = worker(&["setup", &url], &home);
+        command.env("HOME", dir.path());
+        let output = run(&mut command);
+        assert_eq!(output.status.code(), Some(2), "a machine to fix");
+        let said = text(&output.stderr);
+        assert!(
+            said.contains(&format!("cannot reach {url}"))
+                && said.contains("own Tailscale")
+                && said.contains("tailscale status"),
+            "says what is wrong and how to fix it: {said}"
+        );
+        assert!(
+            !home.join("worker.toml").exists() || {
+                let record = std::fs::read_to_string(home.join("worker.toml")).unwrap();
+                !record.contains("[current")
+            },
+            "nothing is enrolled"
+        );
+    }
+
+    #[test]
     fn enrolment_saves_its_key_before_it_reaches_for_the_server() {
         let (_dir, home) = worker_home();
         let port = std::net::TcpListener::bind("127.0.0.1:0")
@@ -338,7 +418,7 @@ mod tests {
         std::fs::write(
             &record,
             format!(
-                "format = 1\n\n[current.key]\nserver = \"https://127.0.0.1:{port}\"\ntoken = \"{}\"\nkey = \"abc_wk_{}\"\n\n[current.worker]\nworker = \"00000000-0000-0000-0000-000000000001\"\nworkspace = \"00000000-0000-0000-0000-000000000002\"\nname = \"mbp\"\n",
+                "format = 1\n\n[current.key]\nserver = \"https://127.0.0.1:{port}\"\nbasis = {{ token = \"{}\" }}\nkey = \"abc_wk_{}\"\n\n[current.worker]\nworker = \"00000000-0000-0000-0000-000000000001\"\nworkspace = \"00000000-0000-0000-0000-000000000002\"\nname = \"mbp\"\n",
                 "0".repeat(64),
                 "0".repeat(52)
             ),

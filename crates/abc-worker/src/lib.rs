@@ -317,7 +317,7 @@ impl Jitter {
 #[derive(Debug, Error)]
 pub enum RunError {
     /// The home holds no enrolment, or only a pending one.
-    #[error("this machine is not enrolled; run `abc worker enrol <url>` first")]
+    #[error("this machine is not enrolled; run `abc worker setup <server-url>` first")]
     NotEnrolled,
     /// The home is busy, insecure, damaged or unreadable.
     #[error(transparent)]
