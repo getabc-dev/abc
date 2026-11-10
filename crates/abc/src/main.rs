@@ -642,7 +642,7 @@ async fn worker_setup(home: &WorkerHome, env: &Env, args: WorkerSetupArgs) -> Re
     let host = discover_host()?;
     let exe = std::env::current_exe().map_err(|error| Failure::Run(Box::new(error)))?;
     let service = abc_host::WorkerService {
-        abc: abc_host::programs::Programs::from_install(&exe).abc,
+        abc: abc_host::programs::service_abc(&exe),
         home: home.dir().to_path_buf(),
     };
     let mut out = std::io::stdout().lock();

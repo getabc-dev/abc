@@ -44,6 +44,12 @@ export default defineConfig({
       dependencies: ["claim"],
       use: devices["Desktop Chrome"],
     },
+    {
+      name: "worker-setup",
+      testMatch: /worker-setup\.test\.ts/,
+      dependencies: ["machines"],
+      use: devices["Desktop Chrome"],
+    },
   ],
   webServer: {
     command: "node e2e/sidecar.ts",
