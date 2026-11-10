@@ -539,8 +539,8 @@ mod tests {
         let saved = fs::read_to_string(&path).unwrap();
         assert!(
             saved.starts_with(
-                "format = 1\n\n[current.key]\nserver = \"https://abc.test.ts.net\"\ntoken = \""
-            ),
+                "format = 1\n\n[current.key]\nserver = \"https://abc.test.ts.net\"\nkey = \""
+            ) && saved.contains("\n[current.key.basis]\ntoken = \""),
             "readable TOML: {saved}"
         );
     }
@@ -560,22 +560,22 @@ mod tests {
         for damaged in [
             "not toml at all".to_owned(),
             format!(
-                "format = 2\n\n[pending]\nserver = \"https://abc.test.ts.net\"\ntoken = \"{}\"\nkey = \"{}\"\n",
+                "format = 2\n\n[pending]\nserver = \"https://abc.test.ts.net\"\nbasis = {{ token = \"{}\" }}\nkey = \"{}\"\n",
                 "0".repeat(64),
                 secret.expose_secret().as_str()
             ),
             format!(
-                "format = 1\n\n[pending]\nserver = \"https://abc.test.ts.net\"\ntoken = \"{}\"\nkey = \"{}x\"\n",
+                "format = 1\n\n[pending]\nserver = \"https://abc.test.ts.net\"\nbasis = {{ token = \"{}\" }}\nkey = \"{}x\"\n",
                 "0".repeat(64),
                 secret.expose_secret().as_str()
             ),
             format!(
-                "format = 1\n\n[pending]\nserver = \"http://abc\"\ntoken = \"{}\"\nkey = \"{}\"\n",
+                "format = 1\n\n[pending]\nserver = \"http://abc\"\nbasis = {{ token = \"{}\" }}\nkey = \"{}\"\n",
                 "0".repeat(64),
                 secret.expose_secret().as_str()
             ),
             format!(
-                "format = 1\n\n[pending]\nserver = \"https://abc.test.ts.net\"\ntoken = \"{}\"\nkey = \"{}\"\nextra = 1\n",
+                "format = 1\n\n[pending]\nserver = \"https://abc.test.ts.net\"\nbasis = {{ token = \"{}\" }}\nkey = \"{}\"\nextra = 1\n",
                 "0".repeat(64),
                 secret.expose_secret().as_str()
             ),

@@ -655,6 +655,14 @@ mod tests {
                 "another worker already holds this machine's key (was the worker home copied?); enrol again with --replace",
             ),
             (
+                ApiCode::ApprovalUnavailable,
+                "the server cannot approve a machine in the browser; create an enrolment token on the Machines page and run `abc worker enrol <url> --token-file <file>` instead",
+            ),
+            (
+                ApiCode::TailnetIdentityRequired,
+                "the server does not know you: this machine is not signed in to Tailscale as a person (a tagged device has no identity); sign in as the person who owns the server, or enrol with a token: `abc worker enrol <url> --token-file <file>`",
+            ),
+            (
                 ApiCode::RateLimited,
                 "too many enrolment attempts from this machine; wait a minute and run the same command again",
             ),

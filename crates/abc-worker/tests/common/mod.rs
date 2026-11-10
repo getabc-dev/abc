@@ -118,13 +118,10 @@ pub(crate) struct Serve {
 
 impl Serve {
     /// Serves on a free loopback port, proxying to the socket at `target`.
-    pub(crate) async fn start(pki: &Pki, target: PathBuf) -> Self {
-        Self::start_as(pki, target, None).await
-    }
-
-    /// Like [`Serve::start`], with `login` asserted in `Tailscale-User-Login` for every request,
-    /// as Serve does for a machine signed in as that person.
-    pub(crate) async fn start_as(pki: &Pki, target: PathBuf, login: Option<&'static str>) -> Self {
+    ///
+    /// `login` is asserted in `Tailscale-User-Login` for every request, as Serve does for a
+    /// machine signed in as that person.
+    pub(crate) async fn start(pki: &Pki, target: PathBuf, login: Option<&'static str>) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let acceptor = pki.acceptor();
@@ -413,7 +410,7 @@ impl World {
         let dir = socket_dir();
         let socket = dir.path().join("abc.sock");
         let pki = Pki::new();
-        let serve = Serve::start_as(&pki, socket.clone(), Some(MACHINE_LOGIN)).await;
+        let serve = Serve::start(&pki, socket.clone(), Some(MACHINE_LOGIN)).await;
         let server = Server::start(&pool, socket.clone(), &serve.url, link).await;
         let store = Store::open(database(pool.clone()), StoreOptions::production())
             .await
