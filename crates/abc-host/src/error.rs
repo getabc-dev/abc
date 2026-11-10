@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use thiserror::Error;
 
-/// A failure of `abc server setup` or a day-2 command, with its fix.
+/// A failure of `abc server setup`, a day-2 command or a worker's service, with its fix.
 #[derive(Debug, Error)]
 pub enum HostError {
     /// Neither `ABC_SERVER_HOME` nor `HOME` is set.
@@ -13,6 +13,33 @@ pub enum HostError {
          directory abc should keep its server in"
     )]
     NoHomeDir,
+    /// `HOME` is not set, and the user's services are defined under it.
+    #[error(
+        "HOME is not set, and abc defines your services under your home directory: run the \
+         command again with HOME set to it"
+    )]
+    NoUserHome,
+    /// A path a service is given is one its definition cannot hold as it is.
+    #[error("{} cannot be given to abc's service: it {reason}", path.display())]
+    ServicePath {
+        /// The path.
+        path: PathBuf,
+        /// What is wrong with it, and what to do.
+        reason: &'static str,
+    },
+    /// `--purge` was asked to delete a directory it must not: what the worker's home names is
+    /// deleted whole, so it must be a directory of its own.
+    #[error(
+        "abc will not delete {}: it {reason}. Check the worker's home (--home or \
+         ABC_WORKER_HOME), or delete what you mean to yourself",
+        path.display()
+    )]
+    UnsafePurge {
+        /// The path.
+        path: PathBuf,
+        /// Why not.
+        reason: &'static str,
+    },
     /// Someone else can reach a file or directory of abc's, another user owns it, or it is a
     /// link.
     #[error(
@@ -218,6 +245,9 @@ impl HostError {
     pub const fn is_setup_problem(&self) -> bool {
         match self {
             Self::NoHomeDir
+            | Self::NoUserHome
+            | Self::ServicePath { .. }
+            | Self::UnsafePurge { .. }
             | Self::Insecure { .. }
             | Self::SocketPathTooLong { .. }
             | Self::UnusablePath { .. }
@@ -268,6 +298,9 @@ impl HostError {
                 fix: fix + &said,
             },
             other @ (Self::NoHomeDir
+            | Self::NoUserHome
+            | Self::ServicePath { .. }
+            | Self::UnsafePurge { .. }
             | Self::Insecure { .. }
             | Self::SocketPathTooLong { .. }
             | Self::UnusablePath { .. }
@@ -349,6 +382,15 @@ mod tests {
         let path = || std::path::PathBuf::from("/x");
         for setup in [
             HostError::NoHomeDir,
+            HostError::NoUserHome,
+            HostError::ServicePath {
+                path: path(),
+                reason: "is relative",
+            },
+            HostError::UnsafePurge {
+                path: path(),
+                reason: "is your home directory",
+            },
             HostError::NotAbcsHome { path: path() },
             HostError::NotSetUp { path: path() },
             HostError::BackupExists { path: path() },

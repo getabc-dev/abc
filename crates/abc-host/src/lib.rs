@@ -1,5 +1,6 @@
 //! abc server's own stack on its host, and the commands that set it up and look after it:
-//! `abc server setup`, `status`, `upgrade`, `backup`, `restore` and `uninstall` (decision 51).
+//! `abc server setup`, `status`, `upgrade`, `backup`, `restore` and `uninstall` (decision 51);
+//! and a worker's service, which keeps `abc worker` running on its machine ([`worker`]).
 //!
 //! ```text
 //! Browser ──tailnet──▶ abc's tailscaled (node `abc`, userspace, unprivileged)
@@ -18,6 +19,10 @@
 //! the same step lets the user's services run while they are logged out (lingering). [`root`]
 //! says what it runs before it asks.
 //!
+//! A [`Host`] is the machine as its user sees it: its service manager, its system programs and the
+//! user's home. A [`Server`] is a host with abc server's home on it; the worker's commands need
+//! only the host and the worker's own home, so a machine that only works needs no server home.
+//!
 //! Every function here runs other programs and waits for them; none is async. What only the
 //! store knows (a setup code, whether the server is claimed) the binary asks the store itself.
 
@@ -34,6 +39,7 @@ pub mod services;
 mod setup;
 mod status;
 mod tailscale;
+mod worker;
 
 use std::ffi::OsString;
 use std::io::Write;
@@ -46,18 +52,19 @@ pub use manage::{Backup, backup, restore, uninstall, upgrade};
 pub use process::quote as shell_word;
 pub use setup::{SetupOptions, Stack, open_in_browser, setup};
 pub use status::{Check, Report, status};
+pub use worker::{WorkerService, WorkerStatus, install_worker, uninstall_worker, worker_status};
 
 /// The URL abc server connects to its private Postgres with, from the configuration setup wrote.
 ///
 /// # Errors
 ///
 /// [`HostError::NotSetUp`] when there is no server here, and as [`config::Config::load`].
-pub fn database_url(host: &Host) -> Result<String, HostError> {
-    let config = config::Config::require(&host.home)?;
-    Ok(postgres::Postgres::new(&host.home, &config.programs).database_url())
+pub fn database_url(server: &Server) -> Result<String, HostError> {
+    let config = config::Config::require(&server.home)?;
+    Ok(postgres::Postgres::new(&server.home, &config.programs).database_url())
 }
 
-/// The operating systems abc's server runs on.
+/// The operating systems abc's server and workers run on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Os {
     /// macOS: launchd agents.
@@ -129,13 +136,13 @@ impl Timing {
     }
 }
 
-/// The machine abc's server stack runs on, as the person running a command sees it.
+/// The machine abc's services run on, as the person running a command sees it.
 #[derive(Debug, Clone)]
 pub struct Host {
     /// The operating system, which picks the service manager.
     pub os: Os,
-    /// abc server's home: its data, sockets and configuration.
-    pub home: ServerHome,
+    /// The user's home directory (`HOME`), which their services are given as theirs.
+    pub user_home: PathBuf,
     /// Where service definitions go: `~/Library/LaunchAgents` on macOS, the systemd user unit
     /// directory on Linux.
     pub services_dir: PathBuf,
@@ -149,34 +156,58 @@ pub struct Host {
 }
 
 impl Host {
-    /// This machine, read through `lookup` (the process environment in the binary): the home
-    /// from `ABC_SERVER_HOME` or this OS's place for it, the service directory from `HOME` (and
-    /// `XDG_CONFIG_HOME` on Linux), and `PATH`.
+    /// This machine, read through `lookup` (the process environment in the binary): the user's
+    /// home from `HOME`, the service directory from it (and `XDG_CONFIG_HOME` on Linux), and
+    /// `PATH`.
     ///
     /// # Errors
     ///
-    /// [`HostError::NoHomeDir`] when `HOME` is not set.
+    /// [`HostError::NoUserHome`] when `HOME` is not set.
     pub fn discover(lookup: impl Fn(&str) -> Option<OsString>) -> Result<Self, HostError> {
         let os = Os::current();
         let set = |name: &str| lookup(name).filter(|value| !value.is_empty());
-        let user_home = set("HOME").map(PathBuf::from);
-        let server_home = ServerHome::discover(os, set)?;
+        let user_home = set("HOME")
+            .map(PathBuf::from)
+            .ok_or(HostError::NoUserHome)?;
         let services_dir = match os {
-            Os::MacOs => user_home.map(|dir| dir.join("Library/LaunchAgents")),
+            Os::MacOs => user_home.join("Library/LaunchAgents"),
             Os::Linux => set("XDG_CONFIG_HOME")
-                .map(PathBuf::from)
-                .or_else(|| user_home.map(|dir| dir.join(".config")))
-                .map(|config| config.join("systemd/user")),
-        }
-        .ok_or(HostError::NoHomeDir)?;
+                .map_or_else(|| user_home.join(".config"), PathBuf::from)
+                .join("systemd/user"),
+        };
         Ok(Self {
             os,
-            home: server_home,
+            user_home,
             services_dir,
             uid: rustix::process::getuid().as_raw(),
             path: set("PATH").unwrap_or_default(),
             timing: Timing::production(),
         })
+    }
+}
+
+/// abc server's stack on a host: the machine and the server's home on it.
+#[derive(Debug, Clone)]
+pub struct Server {
+    /// The machine.
+    pub host: Host,
+    /// abc server's home: its data, sockets and configuration.
+    pub home: ServerHome,
+}
+
+impl Server {
+    /// This machine and its server home, read through `lookup`: the host as
+    /// [`Host::discover`] reads it, and the home from `ABC_SERVER_HOME` or this OS's place for it.
+    ///
+    /// # Errors
+    ///
+    /// As [`Host::discover`] and [`ServerHome::discover`].
+    pub fn discover(lookup: impl Fn(&str) -> Option<OsString>) -> Result<Self, HostError> {
+        let host = Host::discover(&lookup)?;
+        let home = ServerHome::discover(host.os, |name| {
+            lookup(name).filter(|value| !value.is_empty())
+        })?;
+        Ok(Self { host, home })
     }
 }
 
@@ -210,7 +241,7 @@ mod tests {
     use std::path::Path;
     use std::time::Duration;
 
-    use super::{Console, Host, HostError, Os, Timing};
+    use super::{Console, Host, HostError, Os, Server, Timing};
 
     fn env(pairs: &'static [(&'static str, &'static str)]) -> impl Fn(&str) -> Option<OsString> {
         move |name| {
@@ -235,25 +266,21 @@ mod tests {
             ("HOME", "/u/ada"),
             ("PATH", "/bin:/usr/bin"),
             ("XDG_CONFIG_HOME", "/cfg"),
-            ("XDG_DATA_HOME", "/data"),
         ]))
         .unwrap();
         assert_eq!(host.os, Os::current(), "this system");
         assert_eq!(host.path, OsString::from("/bin:/usr/bin"), "PATH");
+        assert_eq!(host.user_home, Path::new("/u/ada"), "HOME");
         assert_eq!(
             host.uid,
             rustix::process::getuid().as_raw(),
             "this process's user"
         );
-        let (services, home) = match host.os {
-            Os::MacOs => (
-                "/u/ada/Library/LaunchAgents",
-                "/u/ada/Library/Application Support/abc/server",
-            ),
-            Os::Linux => ("/cfg/systemd/user", "/data/abc/server"),
+        let services = match host.os {
+            Os::MacOs => "/u/ada/Library/LaunchAgents",
+            Os::Linux => "/cfg/systemd/user",
         };
         assert_eq!(host.services_dir, Path::new(services), "services");
-        assert_eq!(host.home.dir(), Path::new(home), "home");
         assert_eq!(
             host.timing.login,
             Duration::from_mins(15),
@@ -269,13 +296,38 @@ mod tests {
         }
         assert_eq!(no_xdg.path, OsString::new(), "no PATH, no system programs");
         assert!(
-            matches!(Host::discover(env(&[])), Err(HostError::NoHomeDir)),
+            matches!(Host::discover(env(&[])), Err(HostError::NoUserHome)),
             "no HOME"
         );
         assert!(
             matches!(
-                Host::discover(env(&[("ABC_SERVER_HOME", "/srv/abc")])),
-                Err(HostError::NoHomeDir)
+                Host::discover(env(&[("HOME", "")])),
+                Err(HostError::NoUserHome)
+            ),
+            "an empty HOME counts as unset"
+        );
+    }
+
+    #[test]
+    fn a_server_is_the_host_with_the_servers_home_on_it() {
+        let server = Server::discover(env(&[
+            ("HOME", "/u/ada"),
+            ("XDG_DATA_HOME", "/data"),
+            ("ABC_SERVER_HOME", ""),
+        ]))
+        .unwrap();
+        let home = match server.host.os {
+            Os::MacOs => "/u/ada/Library/Application Support/abc/server",
+            Os::Linux => "/data/abc/server",
+        };
+        assert_eq!(server.home.dir(), Path::new(home), "home");
+        let set = Server::discover(env(&[("HOME", "/u/ada"), ("ABC_SERVER_HOME", "/srv/abc")]))
+            .unwrap();
+        assert_eq!(set.home.dir(), Path::new("/srv/abc"), "ABC_SERVER_HOME");
+        assert!(
+            matches!(
+                Server::discover(env(&[("ABC_SERVER_HOME", "/srv/abc")])),
+                Err(HostError::NoUserHome)
             ),
             "the services still need HOME"
         );
