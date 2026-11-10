@@ -168,4 +168,15 @@ mod tests {
             "and reads back"
         );
     }
+
+    #[test]
+    fn the_approve_path_names_the_workspace_and_the_request() {
+        use abc_core::id::FromUuid as _;
+        let workspace = WorkspaceId::from_uuid(uuid::Uuid::from_u128(1));
+        let request = EnrolmentRequestId::from_uuid(uuid::Uuid::from_u128(2));
+        assert_eq!(
+            approve_path(workspace, request),
+            "/machines/requests/00000000-0000-0000-0000-000000000001/00000000-0000-0000-0000-000000000002"
+        );
+    }
 }

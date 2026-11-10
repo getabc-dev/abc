@@ -748,6 +748,11 @@ mod tests {
         );
         assert_eq!(code.to_string(), "MPJT-B9D5", "Display is the shown form");
         assert_eq!(
+            code.as_str(),
+            "MPJTB9D5",
+            "the store keeps it without the dash"
+        );
+        assert_eq!(
             ApprovalCode::parse("MPJTB9D5"),
             Ok(code.clone()),
             "the dash is optional"

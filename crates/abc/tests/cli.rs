@@ -447,6 +447,28 @@ mod tests {
         );
     }
 
+    #[test]
+    fn replace_goes_past_an_enrolment_with_the_same_or_another_server() {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let url = format!("https://127.0.0.1:{port}");
+        for enrolled_with in [url.as_str(), "https://abc.ts.net"] {
+            let (dir, home) = enrolled_home(enrolled_with);
+            let mut command = worker(&["setup", &url, "--replace"], &home);
+            command.env("HOME", dir.path());
+            let output = run(&mut command);
+            let said = text(&output.stderr);
+            assert!(
+                said.contains(&format!("cannot reach {url}")),
+                "it tries to enrol anew ({enrolled_with}): {said} {}",
+                text(&output.stdout)
+            );
+        }
+    }
+
     /// A directory holding a `loginctl` that says nobody lingers, for `PATH`.
     fn path_with_loginctl(dir: &std::path::Path) -> std::path::PathBuf {
         let bin = dir.join("bin");
