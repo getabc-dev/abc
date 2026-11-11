@@ -514,6 +514,43 @@ mod tests {
     }
 
     #[test]
+    fn the_enrolment_is_read_without_the_lock_and_only_a_missing_home_is_none() {
+        let (temp, home) = home();
+        assert!(home.enrolment().unwrap().is_none(), "no home yet");
+        let held = home.lock().unwrap();
+        assert!(home.enrolment().unwrap().is_none(), "a home with no record");
+        let enrolled = Enrolled {
+            worker: abc_core::id::WorkerId::from_uuid(uuid::Uuid::from_u128(7)),
+            workspace: abc_core::id::WorkspaceId::from_uuid(uuid::Uuid::from_u128(8)),
+            name: DisplayName::parse("mbp").unwrap(),
+        };
+        held.save(None, Some(&slot(1))).unwrap();
+        assert!(home.enrolment().unwrap().is_none(), "only pending");
+        let current = Current {
+            key: slot(1),
+            worker: enrolled.clone(),
+        };
+        held.save(Some(&current), None).unwrap();
+        assert_eq!(
+            home.enrolment().unwrap(),
+            Some((url(), enrolled)),
+            "while the worker holds the lock"
+        );
+        fs::set_permissions(home.dir(), fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            matches!(home.enrolment(), Err(HomeError::Insecure { .. })),
+            "an open home"
+        );
+        let file = temp.path().join("file");
+        fs::write(&file, "x").unwrap();
+        let beneath = WorkerHome::at(file.join("worker"));
+        assert!(
+            matches!(beneath.enrolment(), Err(HomeError::Io { .. })),
+            "a home that cannot be looked at is an error, not an absence"
+        );
+    }
+
+    #[test]
     fn a_record_survives_a_save_and_a_load() {
         let (_temp, home) = home();
         let held = home.lock().unwrap();

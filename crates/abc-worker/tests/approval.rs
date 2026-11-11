@@ -119,6 +119,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_server_that_goes_away_for_a_moment_does_not_end_the_wait() {
+        let mut world = World::start().await;
+        let (_dir, home) = home();
+        let (task, mut seen) = setup(&world, &home, IfEnrolled::Refuse);
+        let waiting = seen.recv().await.unwrap();
+        let request = request_of(&waiting);
+        world.stop_server().await;
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        assert!(!task.is_finished(), "polls that fail are tried again");
+        world.restart_server(crate::common::LINK).await;
+        decide(&world, &request, "approve").await;
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
     async fn a_denied_request_ends_setup_and_the_next_run_asks_afresh() {
         let world = World::start().await;
         let (_dir, home) = home();
