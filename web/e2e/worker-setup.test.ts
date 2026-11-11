@@ -29,20 +29,20 @@ test("a machine is approved in the browser, runs as a service and survives a res
     `abc worker setup ${ORIGIN}`,
   );
 
-  const machine = makeMachine("setup-host");
+  const machine = makeMachine("browser-host");
   const setup = machine.setup();
   const { page: approve, code } = await setup.approval();
   expect(approve).toContain("/machines/requests/");
 
   // Machines shows a notice for the pending machine, with the code, live and with no reload.
-  const notice = page.getByRole("alert").filter({ hasText: "setup-host wants to join" });
+  const notice = page.getByRole("alert").filter({ hasText: "browser-host wants to join" });
   await expect(notice).toBeVisible();
   await expect(notice.getByText(code)).toBeVisible();
   await capture(page, "machines-request");
   await notice.getByRole("link", { name: "Review request" }).click();
 
   // The Approve page shows the machine, who asked from which node, and the terminal's own code.
-  await expect(page.getByRole("heading", { level: 1 })).toHaveText("setup-host wants to join");
+  await expect(page.getByRole("heading", { level: 1 })).toHaveText("browser-host wants to join");
   await expect(page.getByText(code, { exact: true })).toBeVisible();
   await expect(page.getByText("e2e@example.com")).toBeVisible();
   await expect(page.getByText("e2e-mac.tail1234.ts.net")).toBeVisible();
@@ -53,11 +53,11 @@ test("a machine is approved in the browser, runs as a service and survives a res
 
   // The terminal learns, and leaves a service running.
   expect(await setup.finished()).toBe(0);
-  expect(setup.output).toContain("Approved: enrolled this machine as setup-host");
+  expect(setup.output).toContain("Approved: enrolled this machine as browser-host");
   expect(setup.output).toContain("runs as a service now");
 
   await page.getByRole("link", { name: "Back to Machines" }).click();
-  const card = page.getByRole("region", { name: "setup-host" });
+  const card = page.getByRole("region", { name: "browser-host" });
   await expect(card.getByText("Online", { exact: true })).toBeVisible(LIVE);
   expect((await machine.status()).code).toBe(0);
 
