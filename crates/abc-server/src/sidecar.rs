@@ -178,6 +178,14 @@ impl FromRequestParts<SidecarState> for TailnetRequester {
     async fn from_request_parts(parts: &mut Parts, state: &SidecarState) -> Result<Self, ApiError> {
         let TailnetCaller { login } = TailnetCaller::from_request_parts(parts, state).await?;
         let Ok(Source(source)) = Source::from_request_parts(parts, state).await;
+        // Before the whois, which waits on tailscaled: a source cannot make the server wait on it
+        // without limit, with any body or none.
+        if !state.lookups.allow(source.clone()) {
+            return Err(ApiError::new(
+                ApiCode::RateLimited,
+                "too many requests from this machine; wait a minute",
+            ));
+        }
         match state.whois.node(&source, &login).await {
             Ok(node) => Ok(Self(Requester { login, node })),
             Err(WhoisError::Off) => Err(ApiError::new(

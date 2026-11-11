@@ -19,7 +19,7 @@ use abc_core::query::{
 use abc_core::time::Timestamp;
 use sqlx::PgConnection;
 
-use crate::error::{QueryError, StoreError};
+use crate::error::{QueryError, StoreError, stored};
 use crate::execute::authenticate;
 use crate::facts::RequestRow;
 use crate::{Caller, Inner};
@@ -77,11 +77,6 @@ macro_rules! no_facts {
             std::future::ready(Ok(()))
         }
     };
-}
-
-/// Reads a stored value with `parse`, or reports which column is corrupt.
-fn stored<T, E>(column: &'static str, parsed: Result<T, E>) -> Result<T, StoreError> {
-    parsed.ok().ok_or(StoreError::Corrupt(column))
 }
 
 impl sealed::Sealed for WhoAmI {}

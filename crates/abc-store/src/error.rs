@@ -116,3 +116,8 @@ pub enum NotReady {
     #[error("log listener disconnected")]
     Listener,
 }
+
+/// Reads a stored value with `parse`, or reports which column is corrupt.
+pub(crate) fn stored<T, E>(column: &'static str, parsed: Result<T, E>) -> Result<T, StoreError> {
+    parsed.ok().ok_or(StoreError::Corrupt(column))
+}

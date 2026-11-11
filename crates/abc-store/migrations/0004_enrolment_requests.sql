@@ -35,14 +35,19 @@ CREATE TABLE enrolment_request (
 );
 CREATE INDEX enrolment_request_changes ON enrolment_request (workspace_id, changed_at);
 
--- A worker enrols through a token or through a request, exactly one.
+-- A worker enrols through a token or through a request, exactly one, and its id is the one that
+-- token or request reserved: a composite key makes the database say so, as 0003's did for tokens.
+ALTER TABLE enrolment_token ADD CONSTRAINT enrolment_token_reservation UNIQUE (id, reserved_worker);
+ALTER TABLE enrolment_request ADD CONSTRAINT enrolment_request_reservation
+    UNIQUE (id, reserved_worker);
 ALTER TABLE worker DROP CONSTRAINT worker_id_fkey;
 ALTER TABLE worker DROP CONSTRAINT worker_enrolled_via_fkey;
 ALTER TABLE worker RENAME COLUMN enrolled_via TO enrolled_via_token;
 ALTER TABLE worker ALTER COLUMN enrolled_via_token DROP NOT NULL;
+ALTER TABLE worker ADD COLUMN enrolled_via_request uuid NULL UNIQUE;
 ALTER TABLE worker ADD CONSTRAINT worker_enrolled_via_token_fkey
-    FOREIGN KEY (enrolled_via_token) REFERENCES enrolment_token (id);
-ALTER TABLE worker ADD COLUMN enrolled_via_request uuid NULL UNIQUE
-    REFERENCES enrolment_request (id);
+    FOREIGN KEY (enrolled_via_token, id) REFERENCES enrolment_token (id, reserved_worker);
+ALTER TABLE worker ADD CONSTRAINT worker_enrolled_via_request_fkey
+    FOREIGN KEY (enrolled_via_request, id) REFERENCES enrolment_request (id, reserved_worker);
 ALTER TABLE worker ADD CONSTRAINT worker_enrolled_once
     CHECK ((enrolled_via_token IS NULL) <> (enrolled_via_request IS NULL));

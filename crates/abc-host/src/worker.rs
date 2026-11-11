@@ -266,9 +266,21 @@ fn purgeable(host: &Host, home: &Path) -> Result<bool, HostError> {
     if user_home.starts_with(&real) {
         return Err(refuse("is your home directory, or holds it"));
     }
+    if !WORKER_HOME_FILES
+        .iter()
+        .any(|name| home.join(name).is_file())
+    {
+        return Err(refuse(
+            "holds no worker.toml or worker.lock, so it is not an abc worker's home",
+        ));
+    }
     private(home)?;
     Ok(true)
 }
+
+/// The files a worker's home holds once the worker has run in it, one of which a directory must
+/// have to be deleted as that home.
+const WORKER_HOME_FILES: [&str; 2] = ["worker.toml", "worker.lock"];
 
 #[cfg(test)]
 mod tests {

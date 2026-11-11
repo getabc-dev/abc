@@ -61,6 +61,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn requests_that_need_the_node_are_limited_per_source_before_anything_else() {
+        let database = TestDatabase::migrated().await;
+        let limits = abc_server::Limits {
+            lookups_per_minute: 2,
+            ..abc_server::Limits::default()
+        };
+        let server =
+            Server::start_limited(database.pool().clone(), LinkTimings::default(), limits).await;
+        let workspace = server.claimed().await;
+        let poll = || {
+            Call::get(&status("00000000-0000-0000-0000-000000000000"))
+                .alice()
+                .forwarded_from(ALICE_MAC)
+        };
+        for _ in 0..2 {
+            server
+                .refused(
+                    poll(),
+                    StatusCode::NOT_FOUND,
+                    "enrolment_request_unknown",
+                    "an unknown request",
+                )
+                .await;
+        }
+        server
+            .refused(
+                poll(),
+                StatusCode::TOO_MANY_REQUESTS,
+                "rate_limited",
+                "the third lookup",
+            )
+            .await;
+        // Not even a body that cannot be read gets past it: no whois, no parse.
+        let malformed = Call::post(&requests(&workspace))
+            .alice()
+            .forwarded_from(ALICE_MAC)
+            .json(&json!({}));
+        server
+            .refused(
+                malformed,
+                StatusCode::TOO_MANY_REQUESTS,
+                "rate_limited",
+                "a bad body from the same source",
+            )
+            .await;
+        server.stop().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn approving_in_the_browser_enrols_the_machine_that_asked() {
         let database = TestDatabase::migrated().await;
         let server = Server::start(database.pool().clone()).await;

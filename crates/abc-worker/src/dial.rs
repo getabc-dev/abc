@@ -181,8 +181,9 @@ pub(crate) fn enrol_refusal(status: u16, body: Option<ApiErrorBody>) -> EnrolErr
         ApiCode::ApprovalUnavailable => EnrolError::ApprovalUnavailable,
         ApiCode::TailnetIdentityRequired => EnrolError::NoTailnetIdentity,
         ApiCode::RateLimited => EnrolError::RateLimited,
-        // The server's tailscaled may be restarting: the same retry as an unavailable server.
-        ApiCode::Unavailable | ApiCode::TailnetNodeUnknown => EnrolError::Unavailable,
+        ApiCode::Unavailable => EnrolError::Unavailable,
+        // Its tailscaled may be restarting, or this machine just left the tailnet: retried alike.
+        ApiCode::TailnetNodeUnknown => EnrolError::TailnetNodeUnknown,
         ApiCode::MalformedRequest
         | ApiCode::CrossSiteRequest
         | ApiCode::NotFound
@@ -672,7 +673,7 @@ mod tests {
             ),
             (
                 ApiCode::TailnetNodeUnknown,
-                "the server is starting, stopping or cannot reach its database; run the same command again",
+                "the server could not tell which Tailscale node this machine is; check that it is signed in to the server's tailnet (`tailscale status`), then run the same command again",
             ),
         ];
         for code in ApiCode::ALL {

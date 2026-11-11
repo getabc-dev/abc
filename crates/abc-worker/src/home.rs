@@ -310,7 +310,7 @@ fn load_record(dir: &Path) -> Result<Option<Record>, HomeError> {
 pub enum HomeError {
     /// Another `abc worker` process holds this home.
     #[error(
-        "another abc worker is already using {}; stop it first (one worker per home)",
+        "another abc worker is already using {}; if it runs as a service, `abc worker uninstall` stops it (the key stays, and `abc worker setup` starts it again), otherwise stop that process (one worker per home)",
         dir.display()
     )]
     Busy {
