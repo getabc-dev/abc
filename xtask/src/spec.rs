@@ -212,7 +212,7 @@ impl Workspace {
 
 /// Removes `dir` and everything in it, if it exists, first making each directory writable again:
 /// the gate leaves its Quint home read-only.
-fn remove_tree(dir: &Path) -> anyhow::Result<()> {
+pub(crate) fn remove_tree(dir: &Path) -> anyhow::Result<()> {
     let Ok(metadata) = fs::symlink_metadata(dir) else {
         return Ok(());
     };
@@ -677,38 +677,16 @@ fn quint_files(dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
 }
 
 #[cfg(test)]
-/// A temporary directory that is removed even when `Workspace::create` made a read-only
-/// Quint home in it, and even when the test fails: a plain `TempDir` cannot remove one.
-pub(crate) struct Scratch(tempfile::TempDir);
-
-#[cfg(test)]
-impl Scratch {
-    pub(crate) fn new() -> Self {
-        Self(tempfile::tempdir().unwrap())
-    }
-
-    pub(crate) fn path(&self) -> &Path {
-        self.0.path()
-    }
-}
-
-#[cfg(test)]
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        remove_tree(&self.0.path().join("target/spec")).unwrap();
-    }
-}
-
-#[cfg(test)]
 mod tests {
     use std::fs;
     use std::os::unix::fs::PermissionsExt as _;
     use std::path::{Path, PathBuf};
 
+    use crate::testing::Scratch;
+
     use super::{
-        Checks, Found, Module, Options, RUNNER, Scratch, Seeded, Tools, Workspace, affected_by,
-        found, log_tail, present, quint_files, remove_tree, run, server_args, test_args,
-        trace_args,
+        Checks, Found, Module, Options, RUNNER, Seeded, Tools, Workspace, affected_by, found,
+        log_tail, present, quint_files, remove_tree, run, server_args, test_args, trace_args,
     };
     use crate::testing::{pinned_for_tests, script};
 
