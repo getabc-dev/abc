@@ -202,6 +202,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reads_an_answer_longer_than_a_few_kib() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("big.sock");
+        let padding = "x".repeat(4096);
+        let reply: &'static str = Box::leak(
+            format!(
+                "HTTP/1.1 200 OK\r\n\r\n{{\"Node\":{{\"Name\":\"mac.tail1.ts.net.\"}},\
+                 \"UserProfile\":{{\"LoginName\":\"alice@example.com\"}},\"Pad\":\"{padding}\"}}"
+            )
+            .into_boxed_str(),
+        );
+        serve_once(&socket, reply);
+        let node = Whois::Tailscaled(socket)
+            .node("100.64.0.7", &login())
+            .await
+            .unwrap();
+        assert_eq!(
+            node.as_str(),
+            "mac.tail1.ts.net",
+            "a 4 KiB answer is read whole"
+        );
+    }
+
+    #[tokio::test]
     async fn a_v6_address_is_bracketed() {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("t.sock");
