@@ -13,6 +13,11 @@
 //! | `DELETE /api/workspaces/{ws}/enrolment-tokens/{id}` | tailnet | `execute(RevokeEnrolmentToken)` |
 //! | `DELETE /api/workspaces/{ws}/workers/{id}` | tailnet | `execute(RevokeWorker)` |
 //! | `GET /api/workspaces/{ws}/live` (SSE) | tailnet | `query(ListMachines)`, then `MachinesSince` |
+//! | `POST /api/workspaces/{ws}/enrolment-requests` | tailnet, with its node | `execute(RequestEnrolment)` |
+//! | `GET /api/enrolment-requests/{id}` | the requesting login and node | `query(EnrolmentRequestStatus)` |
+//! | `GET /api/workspaces/{ws}/enrolment-requests/{id}` | tailnet | `query(ViewEnrolmentRequest)` |
+//! | `POST /api/workspaces/{ws}/enrolment-requests/{id}/approve` | tailnet | `execute(ApproveEnrolment)` |
+//! | `POST /api/workspaces/{ws}/enrolment-requests/{id}/deny` | tailnet | `execute(DenyEnrolment)` |
 //! | `POST /api/enrol` | anonymous (the token is the authority) | `execute(EnrolWorker)` |
 //! | `GET /api/worker/connect` (WebSocket) | worker key | `query(WorkerSelf)`, `execute(Start/EndSession)` |
 //!
@@ -41,13 +46,20 @@ use tracing::Instrument as _;
 use tracing::field::Empty;
 
 use abc_core::command::{
-    ClaimServer, EnrolWorker, IssueEnrolmentToken, RevokeEnrolmentToken, RevokeWorker,
+    ApproveEnrolment, ClaimServer, DenyEnrolment, EnrolWorker, IssueEnrolmentToken,
+    RequestEnrolment, RevokeEnrolmentToken, RevokeWorker,
 };
 use abc_core::decision::Origin;
-use abc_core::id::{CorrelationId, EnrolmentTokenId, WorkerId, WorkspaceId};
-use abc_core::query::{ListEnrolmentTokens, SessionView, TokenSummary, WhoAmI};
+use abc_core::id::{CorrelationId, EnrolmentRequestId, EnrolmentTokenId, WorkerId, WorkspaceId};
+use abc_core::query::{
+    EnrolmentRequestStatus, ListEnrolmentTokens, RequestCard, RequestState, SessionView,
+    TokenSummary, ViewEnrolmentRequest, WhoAmI,
+};
 use abc_protocol::api::ApiCode;
-use abc_protocol::enrol::{ENROL_PATH, EnrolRequest, EnrolResponse};
+use abc_protocol::enrol::{
+    ApprovalRequest, ApprovalRequested, ENROL_PATH, EnrolRequest, EnrolResponse,
+    REQUEST_STATUS_PATH, REQUESTS_PATH,
+};
 use abc_protocol::link::CONNECT_PATH;
 use abc_protocol::url::PublicUrl;
 use abc_store::{Caller, Store};
@@ -55,8 +67,9 @@ use abc_store::{Caller, Store};
 use crate::limits::{Limits, RateLimiter};
 use crate::listen::SidecarApp;
 use crate::sessions::Sessions;
-use crate::sidecar::{MaybeTailnetCaller, TailnetCaller};
+use crate::sidecar::{MaybeTailnetCaller, TailnetCaller, TailnetRequester};
 use crate::web::{Answer, WebApp};
+use crate::whois::Whois;
 use crate::worker_link::LinkTimings;
 use error::ApiError;
 use types::{ClaimRequest, ClaimResponse, IssueTokenRequest, TokenIssuedResponse};
@@ -85,6 +98,8 @@ pub(crate) struct SidecarState {
     pub(crate) session_starts: RateLimiter<WorkerId>,
     /// The web app, which answers what no API route matches outside `/api/`.
     pub(crate) web: WebApp,
+    /// Names the node a request came from.
+    pub(crate) whois: Whois,
 }
 
 /// The server-wide signal that it is shutting down: live streams end when it fires.
@@ -126,6 +141,20 @@ pub(crate) fn sidecar_app(state: SidecarState) -> SidecarApp {
         .route(
             "/api/workspaces/{workspace}/workers/{worker}",
             delete(revoke_worker),
+        )
+        .route(REQUESTS_PATH, post(request_enrolment))
+        .route(REQUEST_STATUS_PATH, get(enrolment_request_status))
+        .route(
+            "/api/workspaces/{workspace}/enrolment-requests/{request}",
+            get(view_enrolment_request),
+        )
+        .route(
+            "/api/workspaces/{workspace}/enrolment-requests/{request}/approve",
+            post(approve_enrolment),
+        )
+        .route(
+            "/api/workspaces/{workspace}/enrolment-requests/{request}/deny",
+            post(deny_enrolment),
         )
         .route(ENROL_PATH, post(enrol))
         .layer(middleware::from_fn(deadline));
@@ -431,4 +460,103 @@ async fn enrol(
         workspace: enrolled.workspace,
         name: enrolled.name,
     }))
+}
+
+/// A machine asks to enrol. The requester is the person Serve asserted, on the node abc's tailscaled
+/// names; the key never leaves the machine. Rate-limited per source like token enrolment.
+async fn request_enrolment(
+    State(app): State<SidecarState>,
+    TailnetRequester(requester): TailnetRequester,
+    origin: RequestOrigin,
+    source: Source,
+    ApiPath(workspace): ApiPath<WorkspaceId>,
+    ApiJson(body): ApiJson<ApprovalRequest>,
+) -> Result<Json<ApprovalRequested>, ApiError> {
+    if !app.enrolments.allow(source.0) {
+        return Err(ApiError::new(
+            ApiCode::RateLimited,
+            "too many enrolment attempts from this machine; wait a minute",
+        ));
+    }
+    let command = RequestEnrolment {
+        workspace,
+        requester: requester.clone(),
+        key: body.key,
+        machine: body.machine,
+        build: body.build,
+    };
+    let asked = app
+        .store
+        .execute(&Caller::Tailnet(requester.login), &origin.into(), command)
+        .await?;
+    Ok(Json(ApprovalRequested {
+        request: asked.request,
+        code: asked.code,
+        expires_at: asked.expires_at,
+    }))
+}
+
+/// Where a request stands, for the machine that made it: the same login on the same node, else
+/// the answer is the one for a request that does not exist.
+async fn enrolment_request_status(
+    State(app): State<SidecarState>,
+    TailnetRequester(requester): TailnetRequester,
+    ApiPath(request): ApiPath<EnrolmentRequestId>,
+) -> Result<([(HeaderName, HeaderValue); 1], Json<RequestState>), ApiError> {
+    let query = EnrolmentRequestStatus {
+        request,
+        requester: requester.clone(),
+    };
+    let state = app
+        .store
+        .query(&Caller::Tailnet(requester.login), query)
+        .await?;
+    Ok((
+        [(CACHE_CONTROL, HeaderValue::from_static("no-store"))],
+        Json(state),
+    ))
+}
+
+/// One request as the Approve page shows it.
+async fn view_enrolment_request(
+    State(app): State<SidecarState>,
+    caller: TailnetCaller,
+    ApiPath((workspace, request)): ApiPath<(WorkspaceId, EnrolmentRequestId)>,
+) -> Result<Json<RequestCard>, ApiError> {
+    app.store
+        .query(&caller.into(), ViewEnrolmentRequest { workspace, request })
+        .await?
+        .map(Json)
+        .ok_or_else(|| {
+            ApiError::new(
+                ApiCode::EnrolmentRequestUnknown,
+                "no such enrolment request",
+            )
+        })
+}
+
+async fn approve_enrolment(
+    State(app): State<SidecarState>,
+    caller: TailnetCaller,
+    origin: RequestOrigin,
+    ApiPath((workspace, request)): ApiPath<(WorkspaceId, EnrolmentRequestId)>,
+) -> Result<StatusCode, ApiError> {
+    let command = ApproveEnrolment { workspace, request };
+    app.store
+        .execute(&caller.into(), &origin.into(), command)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn deny_enrolment(
+    State(app): State<SidecarState>,
+    caller: TailnetCaller,
+    origin: RequestOrigin,
+    ApiPath((workspace, request)): ApiPath<(WorkspaceId, EnrolmentRequestId)>,
+) -> Result<StatusCode, ApiError> {
+    let command = DenyEnrolment { workspace, request };
+    app.store
+        .execute(&caller.into(), &origin.into(), command)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
 }

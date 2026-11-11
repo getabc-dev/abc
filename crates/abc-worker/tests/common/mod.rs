@@ -76,7 +76,42 @@ impl Pki {
 }
 
 /// The stand-in for Tailscale Serve.
+/// The login Serve asserts for a machine in tests that approve in the browser.
+pub(crate) const MACHINE_LOGIN: &str = "alice@example.com";
+
+/// The node abc's (stand-in) tailscaled names for every loopback address, since a test's machine
+/// and its Serve share one.
+pub(crate) const MACHINE_NODE: &str = "mbp.tail1234.ts.net";
+
+/// A stand-in for abc's tailscaled at `socket`: `LocalAPI`'s `whois`, answering that every address
+/// is [`MACHINE_NODE`] of [`MACHINE_LOGIN`].
+fn fake_tailscaled(socket: &Path) -> PathBuf {
+    // A restarted server asks for its tailscaled again: the old stand-in's socket is replaced.
+    let _absent = std::fs::remove_file(socket);
+    let listener = tokio::net::UnixListener::bind(socket).unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                let mut buffer = vec![0; 2048];
+                let _read = stream.read(&mut buffer).await;
+                let reply = format!(
+                    "HTTP/1.0 200 OK\r\n\r\n{{\"Node\":{{\"Name\":\"{MACHINE_NODE}.\"}},\
+                     \"UserProfile\":{{\"LoginName\":\"{MACHINE_LOGIN}\"}}}}"
+                );
+                let _written = stream.write_all(reply.as_bytes()).await;
+                let _closed = stream.shutdown().await;
+            });
+        }
+    });
+    socket.to_path_buf()
+}
+
 pub(crate) struct Serve {
+    /// The login asserted from now on; none plays a tagged device.
+    pub(crate) login: Arc<std::sync::Mutex<Option<&'static str>>>,
     pub(crate) url: PublicUrl,
     /// How many requests it has passed on.
     pub(crate) requests: Arc<AtomicUsize>,
@@ -85,12 +120,17 @@ pub(crate) struct Serve {
 
 impl Serve {
     /// Serves on a free loopback port, proxying to the socket at `target`.
-    pub(crate) async fn start(pki: &Pki, target: PathBuf) -> Self {
+    ///
+    /// `login` is asserted in `Tailscale-User-Login` for every request, as Serve does for a
+    /// machine signed in as that person.
+    pub(crate) async fn start(pki: &Pki, target: PathBuf, login: Option<&'static str>) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let acceptor = pki.acceptor();
         let requests = Arc::new(AtomicUsize::new(0));
         let counted = Arc::clone(&requests);
+        let current = Arc::new(std::sync::Mutex::new(login));
+        let shared = Arc::clone(&current);
         let task = tokio::spawn(async move {
             let mut connections = JoinSet::new();
             loop {
@@ -100,15 +140,18 @@ impl Serve {
                 let acceptor = acceptor.clone();
                 let target = target.clone();
                 let counted = Arc::clone(&counted);
+                let for_connection = Arc::clone(&shared);
                 connections.spawn(async move {
                     let Ok(tls) = acceptor.accept(tcp).await else {
                         return;
                     };
-                    proxy(tls, &target, &peer.ip().to_string(), &counted).await;
+                    let asserted = *for_connection.lock().unwrap();
+                    proxy(tls, &target, &peer.ip().to_string(), asserted, &counted).await;
                 });
             }
         });
         Self {
+            login: current,
             url: PublicUrl::parse(&format!("https://localhost:{port}")).unwrap(),
             requests,
             task,
@@ -128,6 +171,7 @@ async fn proxy(
     mut client: impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     target: &Path,
     peer: &str,
+    login: Option<&str>,
     requests: &AtomicUsize,
 ) {
     let mut head = Vec::new();
@@ -157,7 +201,13 @@ async fn proxy(
     rewritten.push_str(&host);
     rewritten.push_str("\r\nx-forwarded-proto: https\r\nx-forwarded-for: ");
     rewritten.push_str(peer);
-    rewritten.push_str("\r\n\r\n");
+    rewritten.push_str("\r\n");
+    if let Some(login) = login {
+        rewritten.push_str("tailscale-user-login: ");
+        rewritten.push_str(login);
+        rewritten.push_str("\r\n");
+    }
+    rewritten.push_str("\r\n");
     let Ok(mut server) = UnixStream::connect(target).await else {
         // The server is down: Serve answers 502.
         let _sent = client
@@ -216,6 +266,7 @@ impl Server {
             public_url: url.clone(),
             link,
             limits: Limits::default(),
+            tailscaled_socket: Some(fake_tailscaled(&socket.with_file_name("tailscaled.sock"))),
             // The worker's tests reach only the API.
             web: abc_server::WebApp::new(&[("index.html", b"<!doctype html>")]).unwrap(),
         };
@@ -361,7 +412,7 @@ impl World {
         let dir = socket_dir();
         let socket = dir.path().join("abc.sock");
         let pki = Pki::new();
-        let serve = Serve::start(&pki, socket.clone()).await;
+        let serve = Serve::start(&pki, socket.clone(), Some(MACHINE_LOGIN)).await;
         let server = Server::start(&pool, socket.clone(), &serve.url, link).await;
         let store = Store::open(database(pool.clone()), StoreOptions::production())
             .await

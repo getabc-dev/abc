@@ -1,0 +1,208 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT id, workspace_id, reserved_worker, key_digest, login, node, hostname, os, arch,\n                build, code, requested_at, requested_event, expires_at, decision, changed_at\n         FROM enrolment_request WHERE id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "enrolment_request",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "workspace_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "enrolment_request",
+            "name": "workspace_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "reserved_worker",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "enrolment_request",
+            "name": "reserved_worker"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "key_digest",
+        "type_info": "Bytea",
+        "origin": {
+          "Table": {
+            "table": "enrolment_request",
+            "name": "key_digest"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "login",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "enrolment_request",
+            "name": "login"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "node",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "enrolment_request",
+            "name": "node"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "hostname",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "enrolment_request",
+            "name": "hostname"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "os",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "enrolment_request",
+            "name": "os"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "arch",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "enrolment_request",
+            "name": "arch"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "build",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "enrolment_request",
+            "name": "build"
+          }
+        }
+      },
+      {
+        "ordinal": 10,
+        "name": "code",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "enrolment_request",
+            "name": "code"
+          }
+        }
+      },
+      {
+        "ordinal": 11,
+        "name": "requested_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "enrolment_request",
+            "name": "requested_at"
+          }
+        }
+      },
+      {
+        "ordinal": 12,
+        "name": "requested_event",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "enrolment_request",
+            "name": "requested_event"
+          }
+        }
+      },
+      {
+        "ordinal": 13,
+        "name": "expires_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "enrolment_request",
+            "name": "expires_at"
+          }
+        }
+      },
+      {
+        "ordinal": 14,
+        "name": "decision",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "enrolment_request",
+            "name": "decision"
+          }
+        }
+      },
+      {
+        "ordinal": 15,
+        "name": "changed_at",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "enrolment_request",
+            "name": "changed_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false
+    ]
+  },
+  "hash": "8d846d23a5210db435f2dee7829b4e3740abf1e5401e12d212815c0b55264d1d"
+}

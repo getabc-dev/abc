@@ -7,7 +7,7 @@ use crate::postgres::Postgres;
 use crate::services::{Part, ServiceState, Services};
 use crate::setup::{lingering, loginctl};
 use crate::tailscale::Tailscale;
-use crate::{Host, HostError, Os};
+use crate::{HostError, Os, Server};
 
 /// One part's health.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -23,7 +23,7 @@ pub struct Check {
 }
 
 impl Check {
-    fn ok(part: &str, detail: String) -> Self {
+    pub(crate) fn ok(part: &str, detail: String) -> Self {
         Self {
             part: part.to_owned(),
             healthy: true,
@@ -32,7 +32,7 @@ impl Check {
         }
     }
 
-    fn failing(part: &str, detail: String, fix: String) -> Self {
+    pub(crate) fn failing(part: &str, detail: String, fix: String) -> Self {
         Self {
             part: part.to_owned(),
             healthy: false,
@@ -89,52 +89,68 @@ const SETUP: &str = "abc server setup";
 /// # Errors
 ///
 /// [`HostError::NotSetUp`] when there is no server here, and as [`Config::load`].
-pub fn status(host: &Host) -> Result<Report, HostError> {
-    let config = Config::require(&host.home)?;
-    let services = Services::new(host);
-    let mut checks = vec![match config.programs.check(&host.home.config()) {
+pub fn status(server: &Server) -> Result<Report, HostError> {
+    let (host, home) = (&server.host, &server.home);
+    let config = Config::require(home)?;
+    let services = Services::new(host, home.logs());
+    let mut checks = vec![match config.programs.check(&home.config()) {
         Ok(()) => Check::ok("programs", "abc, its tailscaled and Postgres 18".to_owned()),
         Err(error) => Check::failing("programs", "missing".to_owned(), error.to_string()),
     }];
-    checks.extend(Part::ALL.map(|part| service_check(host, &services, part)));
-    checks.push(postgres_check(host, &config, &services));
-    checks.extend(tailnet_checks(host, &config, &services));
+    checks.extend(Part::STACK.map(|part| {
+        service_check(
+            part,
+            host.os,
+            services.state(part),
+            &services.log_hint(part),
+        )
+    }));
+    checks.push(postgres_check(server, &config, &services));
+    checks.extend(tailnet_checks(server, &config, &services));
     if host.os == Os::Linux {
-        checks.push(linger_check(host));
+        checks.push(linger_check(
+            loginctl(host).map(|loginctl| lingering(&loginctl, host.uid)),
+            host.uid,
+            SETUP,
+        ));
     }
     checks.push(server_check(&config, &services));
     Ok(Report { checks })
 }
 
-fn service_check(host: &Host, services: &Services<'_>, part: Part) -> Check {
+/// `part`'s service, found in `state` on `os`, with the command that shows its output.
+pub(crate) fn service_check(
+    part: Part,
+    os: Os,
+    state: Result<ServiceState, HostError>,
+    log_hint: &str,
+) -> Check {
     let name = format!("{} service", part.name());
-    let service = part.service_name(host.os);
-    match services.state(part) {
+    let service = part.service_name(os);
+    let setup = part.setup_command();
+    match state {
         Ok(ServiceState::Running) => Check::ok(&name, format!("{service} is running")),
         Ok(ServiceState::Stopped) => Check::failing(
             &name,
             format!("{service} is installed but not running"),
-            format!(
-                "{SETUP} (and read why it stopped: {})",
-                services.log_hint(part)
-            ),
+            format!("{setup} (and read why it stopped: {log_hint})"),
         ),
         Ok(ServiceState::Missing) => Check::failing(
             &name,
             format!("{service} is not installed"),
-            SETUP.to_owned(),
+            setup.to_owned(),
         ),
         Err(error) => Check::failing(&name, "unknown".to_owned(), error.to_string()),
     }
 }
 
-fn postgres_check(host: &Host, config: &Config, services: &Services<'_>) -> Check {
-    if Postgres::new(&host.home, &config.programs).ready() {
+fn postgres_check(server: &Server, config: &Config, services: &Services<'_>) -> Check {
+    if Postgres::new(&server.home, &config.programs).ready() {
         Check::ok(
             "postgres",
             format!(
                 "accepting connections on {}",
-                host.home.postgres_socket().display()
+                server.home.postgres_socket().display()
             ),
         )
     } else {
@@ -147,8 +163,8 @@ fn postgres_check(host: &Host, config: &Config, services: &Services<'_>) -> Chec
 }
 
 /// The node, then Serve, which can only be read once the node runs.
-fn tailnet_checks(host: &Host, config: &Config, services: &Services<'_>) -> [Check; 2] {
-    let tailscale = Tailscale::new(&host.home, &config.programs);
+fn tailnet_checks(server: &Server, config: &Config, services: &Services<'_>) -> [Check; 2] {
+    let tailscale = Tailscale::new(&server.home, &config.programs);
     let node = match tailscale.status() {
         Ok(node) => node,
         Err(error) => {
@@ -207,16 +223,17 @@ fn tailnet_checks(host: &Host, config: &Config, services: &Services<'_>) -> [Che
     [node_check, serve_check]
 }
 
-fn linger_check(host: &Host) -> Check {
-    match loginctl(host) {
-        Ok(loginctl) if lingering(&loginctl, host.uid) => Check::ok(
+/// Lingering for user `uid`, found in `lingering`, which `setup` turns on.
+pub(crate) fn linger_check(lingering: Result<bool, HostError>, uid: u32, setup: &str) -> Check {
+    match lingering {
+        Ok(true) => Check::ok(
             "lingering",
             "your services run while you are logged out".to_owned(),
         ),
-        Ok(_) => Check::failing(
+        Ok(false) => Check::failing(
             "lingering",
             "off: your services stop when you log out".to_owned(),
-            format!("{SETUP}, or sudo loginctl enable-linger {}", host.uid),
+            format!("{setup}, or sudo loginctl enable-linger {uid}"),
         ),
         Err(error) => Check::failing("lingering", "unknown".to_owned(), error.to_string()),
     }

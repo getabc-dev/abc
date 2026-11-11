@@ -16,7 +16,7 @@ use abc_core::command::SetupCodeIssued;
 use abc_core::credential::EnrolmentToken;
 use abc_core::query::{InstallationState, InstallationStatus};
 use abc_core::secret::Secret;
-use abc_host::{Console, Host, HostError, SetupOptions};
+use abc_host::{Console, Host, HostError, Server, SetupOptions};
 use abc_platform::telemetry::chain;
 use abc_protocol::url::PublicUrl;
 use abc_server::{Limits, LinkTimings, ServerConfig, WebApp};
@@ -67,6 +67,37 @@ enum WorkerAction {
     /// a command-line argument, where other users of this machine could read it and use it first.
     /// Running the same command again is safe: the same token gets the same answer.
     Enrol(EnrolArgs),
+    /// Enrol this machine with a server by approving it in the browser, and keep a worker running
+    /// on it as a service (a launchd agent on macOS, a systemd user unit on Linux) that starts
+    /// again after a reboot. The machine's own Tailscale reaches the server: nothing to copy.
+    /// Running it again repairs the service and asks for nothing twice.
+    Setup(WorkerSetupArgs),
+    /// Show this machine's enrolment and its worker's service, and the fix for anything that is
+    /// wrong. Exits 1 when something is.
+    Status,
+    /// Remove the worker's service. Its key and logs stay unless `--purge`.
+    Uninstall {
+        /// Also delete the worker's home, with its key: enrol this machine again to work here.
+        #[arg(long)]
+        purge: bool,
+    },
+}
+
+#[derive(Debug, clap::Args)]
+struct WorkerSetupArgs {
+    /// The server's tailnet URL, such as `https://abc.tail1234.ts.net`.
+    url: String,
+    /// The workspace to join, when you belong to several.
+    #[arg(long)]
+    workspace: Option<String>,
+    /// Enrol as a new worker even if this machine is already enrolled. The old worker stays on
+    /// the server, offline, until its owner revokes it.
+    #[arg(long)]
+    replace: bool,
+    /// The name this machine introduces itself with [default: on macOS its computer name, else
+    /// its hostname].
+    #[arg(long)]
+    hostname: Option<String>,
 }
 
 #[derive(Debug, clap::Args)]
@@ -81,6 +112,10 @@ struct EnrolArgs {
     /// its hostname].
     #[arg(long)]
     hostname: Option<String>,
+    /// Read the token from this file instead of `ABC_ENROLMENT_TOKEN` or standard input, for a
+    /// headless machine.
+    #[arg(long, value_name = "FILE")]
+    token_file: Option<PathBuf>,
 }
 
 /// The variable a token can be passed in.
@@ -168,7 +203,7 @@ fn host_database_url() -> Result<Secret<DatabaseUrl>, Failure> {
     if std::env::var_os(DATABASE_URL).is_some() {
         return database_url();
     }
-    let host = discover_host()?;
+    let host = discover_server()?;
     abc_host::database_url(&host)
         .map(DatabaseUrl::new)
         .map_err(|error| {
@@ -195,6 +230,11 @@ struct ServeArgs {
     /// `abc server setup` passes its own.
     #[arg(long, env = "ABC_SIDECAR_SOCKET")]
     sidecar_socket: Option<PathBuf>,
+    /// The socket of abc's own tailscaled, which names the tailnet node a request came from, so
+    /// a machine can be enrolled by the owner's approval in the browser. `abc server setup`
+    /// passes its own; without one, enrolment is by token only.
+    #[arg(long, env = "ABC_TAILSCALED_SOCKET")]
+    tailscaled_socket: Option<PathBuf>,
     /// Where health and readiness listen.
     #[arg(long, env = "ABC_OPS_ADDR", default_value = "127.0.0.1:7071")]
     ops_addr: SocketAddr,
@@ -288,6 +328,7 @@ async fn serve(server: ServerCommand) -> Result<(), Failure> {
         database_url: database_url()?,
         database_wait: Duration::from_secs(server.database.database_wait),
         sidecar_socket,
+        tailscaled_socket: server.serve.tailscaled_socket,
         ops_addr: server.serve.ops_addr,
         public_url,
         link: LinkTimings::default(),
@@ -352,7 +393,12 @@ async fn open_store(url: &Secret<DatabaseUrl>, database: &DatabaseArgs) -> Resul
         .map_err(|error| run(Box::new(error)))
 }
 
-/// This machine, as `abc server setup` and the day-2 commands see it.
+/// This machine and abc server's home, as `abc server setup` and the day-2 commands see them.
+fn discover_server() -> Result<Server, Failure> {
+    Server::discover(|name| std::env::var_os(name)).map_err(host_failure)
+}
+
+/// This machine, for the worker's commands: they need no server home.
 fn discover_host() -> Result<Host, Failure> {
     Host::discover(|name| std::env::var_os(name)).map_err(host_failure)
 }
@@ -374,7 +420,7 @@ fn set_up(
     database: &DatabaseArgs,
     args: SetupArgs,
 ) -> Result<(), Failure> {
-    let host = discover_host()?;
+    let host = discover_server()?;
     let exe = std::env::current_exe().map_err(|error| Failure::Run(Box::new(error)))?;
     let mut out = std::io::stdout().lock();
     let mut console = Console::new(&mut out);
@@ -399,7 +445,7 @@ fn set_up(
             ));
             // In the fragment, which the browser never sends: no server or proxy log can hold it.
             let claim = format!("{}/#code={}", stack.public_url.origin(), shown.as_str());
-            abc_host::open_in_browser(&host, &mut console, &claim);
+            abc_host::open_in_browser(&host.host, &mut console, &claim);
         }
         Err(_claimed) => console.line(&format!(
             "abc is already claimed; open {}",
@@ -411,7 +457,7 @@ fn set_up(
 
 /// `abc server status`: exits 1 when a part is unhealthy.
 fn status() -> Result<(), Failure> {
-    let report = abc_host::status(&discover_host()?).map_err(host_failure)?;
+    let report = abc_host::status(&discover_server()?).map_err(host_failure)?;
     let mut out = std::io::stdout().lock();
     let mut console = Console::new(&mut out);
     for line in report.lines() {
@@ -428,14 +474,14 @@ fn status() -> Result<(), Failure> {
 
 /// `abc server upgrade`.
 fn upgrade() -> Result<(), Failure> {
-    let host = discover_host()?;
+    let host = discover_server()?;
     let mut out = std::io::stdout().lock();
     abc_host::upgrade(&host, &mut Console::new(&mut out)).map_err(host_failure)
 }
 
 /// `abc server backup`.
 fn backup(file: Option<&std::path::Path>) -> Result<(), Failure> {
-    let host = discover_host()?;
+    let host = discover_server()?;
     let written =
         abc_host::backup(&host, file, time::OffsetDateTime::now_utc()).map_err(host_failure)?;
     writeln!(
@@ -455,7 +501,7 @@ fn restore(
     file: &std::path::Path,
     force: bool,
 ) -> Result<(), Failure> {
-    let host = discover_host()?;
+    let host = discover_server()?;
     if !force {
         let url = abc_host::database_url(&host)
             .map(DatabaseUrl::new)
@@ -481,12 +527,12 @@ fn restore(
 
 /// `abc server uninstall`.
 fn uninstall(purge: bool) -> Result<(), Failure> {
-    let host = discover_host()?;
+    let host = discover_server()?;
     let mut out = std::io::stdout().lock();
     abc_host::uninstall(&host, purge, &mut Console::new(&mut out)).map_err(host_failure)
 }
 
-/// `abc worker` and `abc worker enrol`.
+/// `abc worker` and its subcommands: `setup`, `enrol`, `status` and `uninstall`.
 async fn work(worker: WorkerCommand) -> Result<(), Failure> {
     let config = |error: Box<dyn StdError>| Failure::Config(error);
     let home = match worker.home {
@@ -499,6 +545,9 @@ async fn work(worker: WorkerCommand) -> Result<(), Failure> {
     let env = Env::production(build).map_err(|error| Failure::Run(Box::new(error)))?;
     match worker.action {
         Some(WorkerAction::Enrol(args)) => enrol(&home, &env, args).await,
+        Some(WorkerAction::Setup(args)) => worker_setup(&home, &env, args).await,
+        Some(WorkerAction::Status) => worker_status(&home),
+        Some(WorkerAction::Uninstall { purge }) => worker_uninstall(&home, purge),
         None => {
             abc_platform::telemetry::init(worker.log.as_deref())
                 .map_err(|error| config(Box::new(error)))?;
@@ -527,7 +576,7 @@ async fn enrol(home: &WorkerHome, env: &Env, args: EnrolArgs) -> Result<(), Fail
     let server = PublicUrl::parse(&args.url).map_err(|error| {
         config(format!("the URL must be the server's tailnet URL, such as https://abc.tail1234.ts.net ({error})").into())
     })?;
-    let token = enrolment_token().map_err(config)?;
+    let token = enrolment_token(args.token_file.as_deref()).map_err(config)?;
     let machine =
         abc_worker::machine(args.hostname.as_deref()).map_err(|error| config(Box::new(error)))?;
     let if_enrolled = if args.replace {
@@ -537,20 +586,7 @@ async fn enrol(home: &WorkerHome, env: &Env, args: EnrolArgs) -> Result<(), Fail
     };
     let enrolment = abc_worker::enrol(home, env, &server, token, machine, if_enrolled)
         .await
-        .map_err(|error| {
-            let fix_the_command = matches!(
-                error,
-                abc_worker::EnrolError::AlreadyEnrolled(_)
-                    | abc_worker::EnrolError::Hostname
-                    | abc_worker::EnrolError::Home(_)
-            );
-            let shown: Box<dyn StdError> = chain(&error).into();
-            if fix_the_command {
-                Failure::Config(shown)
-            } else {
-                Failure::Run(shown)
-            }
-        })?;
+        .map_err(|error| enrol_failure(&error))?;
     let enrolled = &enrolment.enrolled;
     let opening = if enrolment.again {
         "This machine was already enrolled with this token"
@@ -566,27 +602,178 @@ async fn enrol(home: &WorkerHome, env: &Env, args: EnrolArgs) -> Result<(), Fail
     .map_err(|error| Failure::Run(Box::new(error)))
 }
 
-/// The enrolment token, from [`ENROLMENT_TOKEN`] or else one line of standard input.
-fn enrolment_token() -> Result<Secret<EnrolmentToken>, Box<dyn StdError>> {
-    let text = match std::env::var(ENROLMENT_TOKEN) {
-        Ok(text) => Zeroizing::new(text),
-        Err(_unset) => {
-            let stdin = std::io::stdin();
-            let terminal = stdin.is_terminal();
-            if terminal {
-                write!(std::io::stderr().lock(), "Paste the enrolment token: ")?;
+/// The enrolment token, from `file`, else [`ENROLMENT_TOKEN`], else one line of standard input.
+fn enrolment_token(
+    file: Option<&std::path::Path>,
+) -> Result<Secret<EnrolmentToken>, Box<dyn StdError>> {
+    let from_env = std::env::var(ENROLMENT_TOKEN).map(Zeroizing::new);
+    let text =
+        match (file, from_env) {
+            (Some(path), _) => Zeroizing::new(std::fs::read_to_string(path).map_err(|error| {
+                format!("cannot read the token file {}: {error}", path.display())
+            })?),
+            (None, Ok(text)) => text,
+            (None, Err(_unset)) => {
+                let stdin = std::io::stdin();
+                let terminal = stdin.is_terminal();
+                if terminal {
+                    write!(std::io::stderr().lock(), "Paste the enrolment token: ")?;
+                }
+                // On a terminal the token is not echoed, so it stays out of the scrollback.
+                secret_input::read_line(&mut stdin.lock(), terminal.then(|| stdin.as_fd()))?
             }
-            // On a terminal the token is not echoed, so it stays out of the scrollback.
-            secret_input::read_line(&mut stdin.lock(), terminal.then(|| stdin.as_fd()))?
-        }
-    };
+        };
     EnrolmentToken::parse(text.trim()).map_err(|error| {
         format!(
             "{error}: pass the abc_enr_… token from the server's Machines screen in \
-             {ENROLMENT_TOKEN} or on standard input"
+             {ENROLMENT_TOKEN}, on standard input or in --token-file"
         )
         .into()
     })
+}
+
+/// `abc worker setup`: enrols this machine by the owner's approval in the browser, then installs
+/// the worker's service. No logger is installed: the person reads plain sentences.
+async fn worker_setup(home: &WorkerHome, env: &Env, args: WorkerSetupArgs) -> Result<(), Failure> {
+    let config = |error: Box<dyn StdError>| Failure::Config(error);
+    let server = PublicUrl::parse(&args.url).map_err(|error| {
+        config(format!("the URL must be the server's tailnet URL, such as https://abc.tail1234.ts.net ({error})").into())
+    })?;
+    let host = discover_host()?;
+    let exe = std::env::current_exe().map_err(|error| Failure::Run(Box::new(error)))?;
+    let service = abc_host::WorkerService {
+        abc: abc_host::programs::service_abc(&exe),
+        home: home.dir().to_path_buf(),
+    };
+    let mut out = std::io::stdout().lock();
+    let mut console = Console::new(&mut out);
+    let enrolled = home.enrolment().map_err(|error| config(Box::new(error)))?;
+    match enrolled {
+        Some((held_by, who)) if held_by == server && !args.replace => {
+            console.line(&format!(
+                "This machine is already enrolled as {} with {server} (if the owner revoked it, run \
+                 this again with --replace).",
+                who.name.as_str()
+            ));
+        }
+        Some((other, _)) if !args.replace => {
+            return Err(config(
+                format!(
+                    "this machine is enrolled with {other}; pass --replace to enrol it with \
+                     {server} instead"
+                )
+                .into(),
+            ));
+        }
+        _ => {
+            let machine = abc_worker::machine(args.hostname.as_deref())
+                .map_err(|error| config(Box::new(error)))?;
+            let if_enrolled = if args.replace {
+                IfEnrolled::Replace
+            } else {
+                IfEnrolled::Refuse
+            };
+            let approve = server.origin().to_owned();
+            let enrolment = abc_worker::enrol_by_approval(
+                home,
+                env,
+                &server,
+                args.workspace.as_deref(),
+                machine,
+                if_enrolled,
+                |waiting| {
+                    console.line(&format!(
+                        "Approve this machine in your browser, in workspace {}:",
+                        waiting.workspace.as_str()
+                    ));
+                    let page = format!("{approve}{}", waiting.approve_path);
+                    abc_host::open_in_browser(&host, &mut console, &page);
+                    console.line(&format!(
+                        "It shows the code {}: approve only if it matches. Waiting (until {:02}:{:02} UTC)…",
+                        waiting.code,
+                        waiting.expires_at.as_offset().hour(),
+                        waiting.expires_at.as_offset().minute()
+                    ));
+                },
+            )
+            .await
+            .map_err(|error| enrol_failure(&error))?;
+            console.line(&format!(
+                "Approved: enrolled this machine as {} (worker {}).",
+                enrolment.enrolled.name.as_str(),
+                enrolment.enrolled.worker
+            ));
+        }
+    }
+    abc_host::install_worker(&host, &service, &mut console).map_err(host_failure)?;
+    console.line(
+        "abc worker runs as a service now, and again after a reboot. Check it with: abc worker \
+         status\nRemove it with: abc worker uninstall",
+    );
+    Ok(())
+}
+
+/// How an enrolment's failure is reported: one the person fixes by changing the command or their
+/// own setup exits 2, the rest 1.
+fn enrol_failure(error: &abc_worker::EnrolError) -> Failure {
+    use abc_worker::EnrolError as E;
+    let fix_the_command = matches!(
+        error,
+        E::AlreadyEnrolled(_)
+            | E::Hostname
+            | E::Home(_)
+            | E::NoSuchWorkspace
+            | E::WhichWorkspace(_)
+            | E::NoTailnetIdentity
+            | E::Unclaimed
+            | E::NotAMember(_)
+            | E::ApprovalUnavailable
+            | E::NotOnTailnet { .. }
+    );
+    let shown: Box<dyn StdError> = chain(error).into();
+    if fix_the_command {
+        Failure::Config(shown)
+    } else {
+        Failure::Run(shown)
+    }
+}
+
+/// `abc worker status`: the enrolment and the service, each unhealthy part with its fix.
+fn worker_status(home: &WorkerHome) -> Result<(), Failure> {
+    let host = discover_host()?;
+    let enrolment = home
+        .enrolment()
+        .map_err(|error| Failure::Config(Box::new(error)))?;
+    let status = abc_host::worker_status(&host, home.dir()).map_err(host_failure)?;
+    let mut out = std::io::stdout().lock();
+    let mut console = Console::new(&mut out);
+    let enrolled = enrolment.is_some();
+    match enrolment {
+        Some((server, who)) => console.line(&format!(
+            "enrolled as {} (worker {}) with {server}",
+            who.name.as_str(),
+            who.worker
+        )),
+        None => console.line("not enrolled: run `abc worker setup <server-url>`"),
+    }
+    for line in status.lines() {
+        console.line(&line);
+    }
+    if enrolled && status.healthy() {
+        Ok(())
+    } else {
+        Err(Failure::Run(
+            "this machine's worker is not healthy; run the fix shown above".into(),
+        ))
+    }
+}
+
+/// `abc worker uninstall`.
+fn worker_uninstall(home: &WorkerHome, purge: bool) -> Result<(), Failure> {
+    let host = discover_host()?;
+    let mut out = std::io::stdout().lock();
+    abc_host::uninstall_worker(&host, home.dir(), purge, &mut Console::new(&mut out))
+        .map_err(host_failure)
 }
 
 /// Listens for SIGTERM and SIGINT at once, and returns a future that resolves on either. Listening

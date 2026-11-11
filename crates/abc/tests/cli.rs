@@ -244,7 +244,7 @@ mod tests {
         assert_eq!(output.status.code(), Some(2), "configuration");
         assert_eq!(
             text(&output.stderr),
-            "abc: this machine is not enrolled; run `abc worker enrol <url>` first\n",
+            "abc: this machine is not enrolled; run `abc worker setup <server-url>` first\n",
             "the fix"
         );
         let (_other_dir, other) = worker_home();
@@ -301,6 +301,86 @@ mod tests {
     }
 
     #[test]
+    fn a_token_file_is_read_and_never_echoed() {
+        let (dir, home) = worker_home();
+        let file = dir.path().join("token");
+        std::fs::write(&file, "hunter2\n").unwrap();
+        let output = run(&mut worker(
+            &[
+                "enrol",
+                "https://abc.ts.net",
+                "--token-file",
+                file.to_str().unwrap(),
+            ],
+            &home,
+        ));
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "a malformed token in the file"
+        );
+        assert!(
+            text(&output.stderr).contains("--token-file"),
+            "says where tokens can come from: {}",
+            text(&output.stderr)
+        );
+        assert!(!text(&output.stderr).contains("hunter2"), "never echoed");
+        let missing = run(&mut worker(
+            &[
+                "enrol",
+                "https://abc.ts.net",
+                "--token-file",
+                "/nonexistent/token",
+            ],
+            &home,
+        ));
+        assert_eq!(missing.status.code(), Some(2), "no such file");
+        assert!(
+            text(&missing.stderr).contains("cannot read the token file /nonexistent/token"),
+            "{}",
+            text(&missing.stderr)
+        );
+    }
+
+    #[test]
+    fn setup_refuses_a_bad_url_and_says_when_the_server_cannot_be_reached() {
+        let (dir, home) = worker_home();
+        let mut bad = worker(&["setup", "http://abc.ts.net"], &home);
+        bad.env("HOME", dir.path());
+        let bad = run(&mut bad);
+        assert_eq!(bad.status.code(), Some(2), "not https");
+        assert!(
+            text(&bad.stderr).contains("it must start with https://"),
+            "{}",
+            text(&bad.stderr)
+        );
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let url = format!("https://127.0.0.1:{port}");
+        let mut command = worker(&["setup", &url], &home);
+        command.env("HOME", dir.path());
+        let output = run(&mut command);
+        assert_eq!(output.status.code(), Some(2), "a machine to fix");
+        let said = text(&output.stderr);
+        assert!(
+            said.contains(&format!("cannot reach {url}"))
+                && said.contains("own Tailscale")
+                && said.contains("tailscale status"),
+            "says what is wrong and how to fix it: {said}"
+        );
+        assert!(
+            !home.join("worker.toml").exists() || {
+                let record = std::fs::read_to_string(home.join("worker.toml")).unwrap();
+                !record.contains("[current")
+            },
+            "nothing is enrolled"
+        );
+    }
+
+    #[test]
     fn enrolment_saves_its_key_before_it_reaches_for_the_server() {
         let (_dir, home) = worker_home();
         let port = std::net::TcpListener::bind("127.0.0.1:0")
@@ -324,6 +404,138 @@ mod tests {
         assert_eq!(mode, 0o600, "the key is saved, privately, for the retry");
     }
 
+    /// A private worker home holding an enrolment with the server at `server`.
+    fn enrolled_home(server: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let (dir, home) = worker_home();
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let record = home.join("worker.toml");
+        std::fs::write(
+            &record,
+            format!(
+                "format = 1\n\n[current.key]\nserver = \"{server}\"\nbasis = {{ token = \"{}\" }}\nkey = \"abc_wk_{}\"\n\n[current.worker]\nworker = \"00000000-0000-0000-0000-000000000001\"\nworkspace = \"00000000-0000-0000-0000-000000000002\"\nname = \"mbp\"\n",
+                "0".repeat(64),
+                "0".repeat(52)
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&record, std::fs::Permissions::from_mode(0o600)).unwrap();
+        (dir, home)
+    }
+
+    #[test]
+    fn setup_keeps_an_enrolment_with_the_same_server_and_refuses_another_without_replace() {
+        let (dir, home) = enrolled_home("https://abc.ts.net");
+        let mut same = worker(&["setup", "https://abc.ts.net"], &home);
+        same.env("HOME", dir.path());
+        let same = run(&mut same);
+        assert!(
+            text(&same.stdout)
+                .contains("This machine is already enrolled as mbp with https://abc.ts.net"),
+            "{}",
+            text(&same.stdout)
+        );
+        let mut other = worker(&["setup", "https://other.ts.net"], &home);
+        other.env("HOME", dir.path());
+        let other = run(&mut other);
+        assert_eq!(other.status.code(), Some(2));
+        assert!(
+            text(&other.stderr).contains("enrolled with https://abc.ts.net")
+                && text(&other.stderr).contains("--replace"),
+            "{}",
+            text(&other.stderr)
+        );
+    }
+
+    #[test]
+    fn replace_goes_past_an_enrolment_with_the_same_or_another_server() {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let url = format!("https://127.0.0.1:{port}");
+        for enrolled_with in [url.as_str(), "https://abc.ts.net"] {
+            let (dir, home) = enrolled_home(enrolled_with);
+            let mut command = worker(&["setup", &url, "--replace"], &home);
+            command.env("HOME", dir.path());
+            let output = run(&mut command);
+            let said = text(&output.stderr);
+            assert!(
+                said.contains(&format!("cannot reach {url}")),
+                "it tries to enrol anew ({enrolled_with}): {said} {}",
+                text(&output.stdout)
+            );
+        }
+    }
+
+    /// A directory holding a `loginctl` that says nobody lingers, for `PATH`.
+    fn path_with_loginctl(dir: &std::path::Path) -> std::path::PathBuf {
+        let bin = dir.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let loginctl = bin.join("loginctl");
+        std::fs::write(&loginctl, "#!/bin/sh\necho no\n").unwrap();
+        std::fs::set_permissions(&loginctl, std::fs::Permissions::from_mode(0o755)).unwrap();
+        bin
+    }
+
+    #[test]
+    fn status_reports_the_enrolment_and_exits_nonzero_while_the_service_is_not_healthy() {
+        let (dir, home) = enrolled_home("https://abc.ts.net");
+        let bin = path_with_loginctl(dir.path());
+        let mut status = worker(&["status"], &home);
+        status.env("HOME", dir.path()).env("PATH", &bin);
+        let status = run(&mut status);
+        assert_eq!(
+            status.status.code(),
+            Some(1),
+            "no service runs in this home"
+        );
+        let said = text(&status.stdout);
+        assert!(
+            said.contains(
+                "enrolled as mbp (worker 00000000-0000-0000-0000-000000000001) with https://abc.ts.net"
+            ) && said.contains("FAIL"),
+            "{said}"
+        );
+        assert!(
+            text(&status.stderr).contains("not healthy"),
+            "{}",
+            text(&status.stderr)
+        );
+        let (dir, home) = worker_home();
+        let bin = path_with_loginctl(dir.path());
+        let mut status = worker(&["status"], &home);
+        status.env("HOME", dir.path()).env("PATH", &bin);
+        let status = run(&mut status);
+        assert_eq!(status.status.code(), Some(1), "not enrolled");
+        assert!(
+            text(&status.stdout).contains("not enrolled: run `abc worker setup <server-url>`"),
+            "{}",
+            text(&status.stdout)
+        );
+    }
+
+    #[test]
+    fn uninstall_keeps_the_home_and_purge_deletes_it() {
+        let (dir, home) = enrolled_home("https://abc.ts.net");
+        let mut keep = worker(&["uninstall"], &home);
+        keep.env("HOME", dir.path());
+        let keep = run(&mut keep);
+        assert!(keep.status.success(), "{}", text(&keep.stderr));
+        assert!(
+            text(&keep.stdout).contains("was not installed"),
+            "{}",
+            text(&keep.stdout)
+        );
+        assert!(home.join("worker.toml").exists(), "the key stays");
+        let mut purge = worker(&["uninstall", "--purge"], &home);
+        purge.env("HOME", dir.path());
+        let purge = run(&mut purge);
+        assert!(purge.status.success(), "{}", text(&purge.stderr));
+        assert!(!home.exists(), "purged");
+    }
+
     #[tokio::test]
     async fn the_worker_runs_until_sigterm_and_exits_cleanly() {
         let (_dir, home) = worker_home();
@@ -338,7 +550,7 @@ mod tests {
         std::fs::write(
             &record,
             format!(
-                "format = 1\n\n[current.key]\nserver = \"https://127.0.0.1:{port}\"\ntoken = \"{}\"\nkey = \"abc_wk_{}\"\n\n[current.worker]\nworker = \"00000000-0000-0000-0000-000000000001\"\nworkspace = \"00000000-0000-0000-0000-000000000002\"\nname = \"mbp\"\n",
+                "format = 1\n\n[current.key]\nserver = \"https://127.0.0.1:{port}\"\nbasis = {{ token = \"{}\" }}\nkey = \"abc_wk_{}\"\n\n[current.worker]\nworker = \"00000000-0000-0000-0000-000000000001\"\nworkspace = \"00000000-0000-0000-0000-000000000002\"\nname = \"mbp\"\n",
                 "0".repeat(64),
                 "0".repeat(52)
             ),

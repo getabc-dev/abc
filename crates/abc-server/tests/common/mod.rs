@@ -90,7 +90,64 @@ pub(crate) fn config(pool: &PgPool, socket: PathBuf, link: LinkTimings) -> Serve
         link,
         limits: Limits::default(),
         web: web_app(),
+        tailscaled_socket: None,
     }
+}
+
+/// Alice's `MacBook`, as the tailnet knows it.
+pub(crate) const ALICE_MAC: &str = "100.64.0.1";
+/// Alice's other machine.
+pub(crate) const ALICE_OTHER: &str = "100.64.0.2";
+/// Bob's laptop.
+pub(crate) const BOB_LAPTOP: &str = "100.64.0.3";
+
+/// What abc's tailscaled answers for an address: the node and its person.
+fn whois_answer(addr: &str) -> Option<&'static str> {
+    Some(match addr.rsplit_once(':')?.0 {
+        ALICE_MAC => {
+            r#"{"Node":{"Name":"alice-mbp.tail1234.ts.net."},"UserProfile":{"LoginName":"alice@example.com"}}"#
+        }
+        ALICE_OTHER => {
+            r#"{"Node":{"Name":"alice-pc.tail1234.ts.net."},"UserProfile":{"LoginName":"alice@example.com"}}"#
+        }
+        BOB_LAPTOP => {
+            r#"{"Node":{"Name":"bob-laptop.tail1234.ts.net."},"UserProfile":{"LoginName":"bob@example.com"}}"#
+        }
+        _ => return None,
+    })
+}
+
+/// A stand-in for abc's tailscaled: a Unix socket answering `LocalAPI`'s `whois` from a fixed
+/// table, as the real one does over HTTP.
+pub(crate) fn fake_tailscaled(dir: &std::path::Path) -> PathBuf {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let socket = dir.join("tailscaled.sock");
+    let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                let mut buffer = vec![0; 2048];
+                let read = stream.read(&mut buffer).await.unwrap_or(0);
+                let head = String::from_utf8_lossy(&buffer[..read]).into_owned();
+                let line = head.lines().next().unwrap_or_default();
+                let addr = line
+                    .split("addr=")
+                    .nth(1)
+                    .and_then(|rest| rest.split(' ').next())
+                    .unwrap_or_default();
+                let reply = match whois_answer(addr) {
+                    Some(body) => format!("HTTP/1.0 200 OK\r\n\r\n{body}"),
+                    None => "HTTP/1.0 404 Not Found\r\n\r\nno such node".to_owned(),
+                };
+                let _written = stream.write_all(reply.as_bytes()).await;
+                let _closed = stream.shutdown().await;
+            });
+        }
+    });
+    socket
 }
 
 impl Server {
@@ -107,6 +164,7 @@ impl Server {
         let socket = dir.path().join("abc.sock");
         let mut config = config(&pool, socket.clone(), link);
         config.limits = limits;
+        config.tailscaled_socket = Some(fake_tailscaled(dir.path()));
         let ops = config.ops_addr;
         let (stop, stopped) = oneshot::channel::<()>();
         let task = tokio::spawn(abc_server::run(config, async move {
@@ -416,6 +474,11 @@ impl Call {
 
     pub(crate) fn alice(self) -> Self {
         self.login("alice@example.com")
+    }
+
+    /// From the tailnet address Serve forwarded, as the last `X-Forwarded-For` entry.
+    pub(crate) fn forwarded_from(self, address: &str) -> Self {
+        self.header("x-forwarded-for", address)
     }
 
     pub(crate) fn json(self, body: &Value) -> Self {

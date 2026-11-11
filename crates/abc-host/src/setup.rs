@@ -26,7 +26,7 @@ use crate::programs::Programs;
 use crate::root::{Linger, RootStep};
 use crate::services::{Part, Service, Services};
 use crate::tailscale::Tailscale;
-use crate::{Console, Host, HostError, Os};
+use crate::{Console, Host, HostError, Os, Server};
 
 /// What setup was asked for beyond the host.
 #[derive(Debug, Clone)]
@@ -53,11 +53,11 @@ pub struct Stack {
 ///
 /// [`HostError`], each naming its fix.
 pub fn setup(
-    host: &Host,
+    server: &Server,
     options: &SetupOptions,
     console: &mut Console<'_>,
 ) -> Result<Stack, HostError> {
-    let home = &host.home;
+    let (host, home) = (&server.host, &server.home);
     home.check_paths(host.os)?;
     home.create()?;
     let mut config = match Config::load(home)? {
@@ -67,7 +67,7 @@ pub fn setup(
     config.programs.check(&home.config())?;
     config.save(home)?;
     console.line(&format!("abc keeps its server in {}", home.dir().display()));
-    let services = Services::new(host);
+    let services = Services::new(host, home.logs());
 
     let postgres = Postgres::new(home, &config.programs);
     if postgres.init()? {
@@ -117,7 +117,7 @@ pub fn setup(
     config.public_url = Some(public_url.clone());
     config.save(home)?;
 
-    root_step(host, &tailscale, dns_name, console)?;
+    root_step(server, &tailscale, dns_name, console)?;
 
     services.install(&server_service(home, &config, &public_url, &postgres))?;
     stop_unless_ready(
@@ -155,29 +155,58 @@ fn stop_unless_ready<T>(
 
 /// Runs the root step for whatever is missing, then checks it took.
 fn root_step(
-    host: &Host,
+    server: &Server,
     tailscale: &Tailscale<'_>,
     dns_name: &str,
     console: &mut Console<'_>,
 ) -> Result<(), HostError> {
+    let host = &server.host;
     let wanted = tailscale.wanted_target();
     let serve_set = tailscale.serve_target(dns_name)?.as_deref() == Some(wanted.as_str());
-    let missing_linger = match host.os {
-        Os::MacOs => None,
-        Os::Linux => {
-            let loginctl = loginctl(host)?;
-            (!lingering(&loginctl, host.uid)).then_some(Linger {
-                loginctl,
-                uid: host.uid,
-            })
-        }
-    };
     let Some(step) = RootStep::of(
-        missing_linger,
+        missing_linger(host)?,
         (!serve_set).then(|| tailscale.serve_command()),
     ) else {
         return Ok(());
     };
+    let command = run_as_root(host, &step, SETUP, console)?;
+    if tailscale.serve_target(dns_name)?.as_deref() != Some(wanted.as_str()) {
+        return Err(HostError::ServeNotSet {
+            socket: server.home.abc_socket(),
+            command: command.shown(),
+        });
+    }
+    check_linger_took(&step, &command)?;
+    console.line(&format!("Serve on abc's node points at {wanted}."));
+    Ok(())
+}
+
+/// The command that sets the stack up, which a failed root step says to run again.
+const SETUP: &str = "abc server setup";
+
+/// Lingering for this host's user, when it is off on Linux: their services then stop at logout
+/// and do not start at boot. macOS has no such thing.
+pub(crate) fn missing_linger(host: &Host) -> Result<Option<Linger>, HostError> {
+    match host.os {
+        Os::MacOs => Ok(None),
+        Os::Linux => {
+            let loginctl = loginctl(host)?;
+            Ok((!lingering(&loginctl, host.uid)).then_some(Linger {
+                loginctl,
+                uid: host.uid,
+            }))
+        }
+    }
+}
+
+/// Says what `step` does, then runs it under `sudo`, where the person types their password.
+/// Returns the command it ran. A failure says to run it by hand, then `again`.
+pub(crate) fn run_as_root(
+    host: &Host,
+    step: &RootStep,
+    again: &str,
+    console: &mut Console<'_>,
+) -> Result<Invocation, HostError> {
     let sudo = find_on_path(&host.path, "sudo").ok_or(HostError::SystemProgramMissing {
         program: "sudo",
         needed_for: "for the one step only root may take",
@@ -188,16 +217,15 @@ fn root_step(
     }
     let command = step.command(&sudo);
     command.interactive(&format!(
-        "run `{}` yourself, then abc server setup again",
+        "run `{}` yourself, then {again} again",
         command.shown()
     ))?;
-    if tailscale.serve_target(dns_name)?.as_deref() != Some(wanted.as_str()) {
-        return Err(HostError::ServeNotSet {
-            socket: host.home.abc_socket(),
-            command: command.shown(),
-        });
-    }
-    if let RootStep::Linger(linger) | RootStep::Both(linger, _) = &step
+    Ok(command)
+}
+
+/// Fails unless the lingering `step` enabled, if any, is on now that `command` ran.
+pub(crate) fn check_linger_took(step: &RootStep, command: &Invocation) -> Result<(), HostError> {
+    if let RootStep::Linger(linger) | RootStep::Both(linger, _) = step
         && !lingering(&linger.loginctl, linger.uid)
     {
         return Err(HostError::Failed {
@@ -207,7 +235,6 @@ fn root_step(
             fix: format!("run `sudo loginctl enable-linger {}` yourself", linger.uid),
         });
     }
-    console.line(&format!("Serve on abc's node points at {wanted}."));
     Ok(())
 }
 
@@ -216,8 +243,7 @@ pub(crate) fn loginctl(host: &Host) -> Result<PathBuf, HostError> {
     find_on_path(&host.path, "loginctl").ok_or(HostError::SystemProgramMissing {
         program: "loginctl",
         needed_for: "to keep its services running while you are logged out",
-        fix: "abc's server runs as systemd user services on Linux; use a distribution with \
-              systemd",
+        fix: "abc runs as systemd user services on Linux; use a distribution with systemd",
     })
 }
 
@@ -256,19 +282,20 @@ pub fn open_in_browser(host: &Host, console: &mut Console<'_>, url: &str) {
 }
 
 /// The three services, from the configuration.
-pub(crate) fn definitions(host: &Host, config: &Config) -> Result<[Service; 3], HostError> {
+pub(crate) fn definitions(server: &Server, config: &Config) -> Result<[Service; 3], HostError> {
+    let home = &server.home;
     let public_url = config
         .public_url
         .as_ref()
         .ok_or_else(|| HostError::NotSetUp {
-            path: host.home.config(),
+            path: home.config(),
         })?;
-    let postgres = Postgres::new(&host.home, &config.programs);
-    let tailscale = Tailscale::new(&host.home, &config.programs);
+    let postgres = Postgres::new(home, &config.programs);
+    let tailscale = Tailscale::new(home, &config.programs);
     Ok([
         postgres_service(&postgres),
-        tailscaled_service(&host.home, &tailscale),
-        server_service(&host.home, config, public_url, &postgres),
+        tailscaled_service(home, &tailscale),
+        server_service(home, config, public_url, &postgres),
     ])
 }
 
@@ -311,6 +338,8 @@ fn server_service(
         "server".into(),
         "--sidecar-socket".into(),
         home.abc_socket().into_os_string(),
+        "--tailscaled-socket".into(),
+        home.tailscaled_socket().into_os_string(),
         "--ops-addr".into(),
         config.ops_addr.to_string().into(),
         "--public-url".into(),

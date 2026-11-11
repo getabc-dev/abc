@@ -238,7 +238,10 @@ fn plain(path: &str) -> bool {
 /// name's last `-`.
 fn named_by_hash(path: &str) -> bool {
     let name = path.rsplit('/').next().unwrap_or(path);
-    let stem = name.split('.').next().unwrap_or(name);
+    // The hash ends the name, before the extension: a chunk named after a route can hold dots.
+    let stem = name
+        .rsplit_once('.')
+        .map_or(name, |(stem, _extension)| stem);
     stem.rsplit_once('-').is_some_and(|(before, hash)| {
         !before.is_empty()
             && hash.len() >= 8
@@ -337,6 +340,26 @@ mod tests {
             None,
             "the policy is the page's"
         );
+        for dotted in [
+            "/assets/machines_.requests._workspace._request-6fcb18d3.js",
+            "/assets/vendor.react-b8678073.js",
+        ] {
+            assert_eq!(
+                header(
+                    &file(
+                        WebApp::new(&[
+                            ("index.html", INDEX),
+                            (dotted.trim_start_matches('/'), b"x")
+                        ])
+                        .unwrap()
+                        .answer(&Method::GET, dotted)
+                    ),
+                    &CACHE_CONTROL
+                ),
+                Some(IMMUTABLE),
+                "{dotted}: a name with dots still ends in its hash"
+            );
+        }
         let css = file(app().answer(&Method::GET, "/assets/index-244cdaf5.css"));
         assert_eq!(header(&css, &CONTENT_TYPE), Some("text/css; charset=utf-8"));
     }

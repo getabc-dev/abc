@@ -1,0 +1,18 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE enrolment_request SET decision = $2, decided_by = $3, decided_at = $4,\n                    changed_at = $5\n                 WHERE id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Uuid",
+        "Timestamptz",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "948c8d27daf96b874c7e3abf90bc6d10170ee3d7368fc067784851439dccfa8b"
+}

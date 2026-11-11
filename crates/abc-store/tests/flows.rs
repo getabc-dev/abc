@@ -902,4 +902,258 @@ mod tests {
         writer.rollback().await.unwrap();
         assert_views_replay(&pool).await;
     }
+
+    fn requester(node: &str) -> abc_core::identity::Requester {
+        abc_core::identity::Requester {
+            login: abc_core::identity::TailnetLogin::parse("alice@example.com").unwrap(),
+            node: abc_core::identity::TailnetNode::parse(node).unwrap(),
+        }
+    }
+
+    async fn ask(
+        fixture: &Fixture,
+        workspace: abc_core::id::WorkspaceId,
+        key: &abc_core::secret::Secret<abc_core::credential::WorkerKey>,
+        node: &str,
+    ) -> Result<
+        abc_core::command::EnrolmentRequested,
+        ExecuteError<abc_core::command::RequestRejection>,
+    > {
+        fixture
+            .store
+            .execute(
+                &Fixture::alice(),
+                &fixture.origin(),
+                abc_core::command::RequestEnrolment {
+                    workspace,
+                    requester: requester(node),
+                    key: key.expose_secret().digest(),
+                    machine: abc_store::testing::machine(),
+                    build: Version::new(0, 1, 0),
+                },
+            )
+            .await
+    }
+
+    #[tokio::test]
+    async fn an_enrolment_request_is_approved_once_and_a_repeat_records_nothing() {
+        use abc_core::command::{ApproveEnrolment, DecideRequestRejection, DenyEnrolment};
+        let database = TestDatabase::migrated().await;
+        let pool = database.pool();
+        let (fixture, claimed) = Fixture::claimed(pool.clone()).await;
+        let key = fixture.worker_key();
+        let asked = ask(&fixture, claimed.workspace, &key, "mbp.ts.net")
+            .await
+            .unwrap();
+        let events = fixture.event_count().await;
+        let again = ask(&fixture, claimed.workspace, &key, "mbp.ts.net")
+            .await
+            .unwrap();
+        assert_eq!(
+            again, asked,
+            "a lost answer asks again and gets the same request"
+        );
+        assert!(
+            matches!(
+                ask(&fixture, claimed.workspace, &key, "other.ts.net").await,
+                Err(ExecuteError::Rejected(
+                    abc_core::command::RequestRejection::KeyInUse
+                ))
+            ),
+            "the same key from another node is not the same request"
+        );
+        assert_eq!(
+            fixture.event_count().await,
+            events,
+            "nothing recorded by either"
+        );
+        let approve = ApproveEnrolment {
+            workspace: claimed.workspace,
+            request: asked.request,
+        };
+        fixture
+            .store
+            .execute(&Fixture::alice(), &fixture.origin(), approve)
+            .await
+            .unwrap();
+        let after = fixture.event_count().await;
+        assert_eq!(after, events + 2, "approved and enrolled, in one decision");
+        fixture
+            .store
+            .execute(&Fixture::alice(), &fixture.origin(), approve)
+            .await
+            .unwrap();
+        assert_eq!(
+            fixture.event_count().await,
+            after,
+            "approving twice records nothing"
+        );
+        let deny = DenyEnrolment {
+            workspace: claimed.workspace,
+            request: asked.request,
+        };
+        assert!(
+            matches!(
+                fixture
+                    .store
+                    .execute(&Fixture::alice(), &fixture.origin(), deny)
+                    .await,
+                Err(ExecuteError::Rejected(
+                    DecideRequestRejection::AlreadyApproved
+                ))
+            ),
+            "an approved request cannot be denied"
+        );
+        assert_eq!(
+            ask(&fixture, claimed.workspace, &key, "mbp.ts.net")
+                .await
+                .unwrap(),
+            asked,
+            "asking again after approval is still the same request"
+        );
+        let token = fixture.issue_token(claimed.workspace).await;
+        let held = fixture.worker_key();
+        fixture.enrol(&token.token, &held).await.unwrap();
+        assert!(
+            matches!(
+                ask(&fixture, claimed.workspace, &held, "mbp.ts.net").await,
+                Err(ExecuteError::Rejected(
+                    abc_core::command::RequestRejection::KeyInUse
+                ))
+            ),
+            "a key another worker holds cannot be asked with"
+        );
+        let session = fixture
+            .store
+            .query(&Fixture::worker(&key), WorkerSelf)
+            .await;
+        assert!(session.is_ok(), "the machine's own key is its credential");
+        assert_views_replay(&pool).await;
+    }
+
+    #[tokio::test]
+    async fn an_enrolment_request_expires_after_ten_minutes_and_cannot_be_approved() {
+        use abc_core::command::{ApproveEnrolment, DecideRequestRejection, REQUEST_TTL};
+        use abc_core::query::{EnrolmentRequestStatus, RequestState};
+        let database = TestDatabase::migrated().await;
+        let pool = database.pool();
+        let (fixture, claimed) = Fixture::claimed(pool.clone()).await;
+        let key = fixture.worker_key();
+        let asked = ask(&fixture, claimed.workspace, &key, "mbp.ts.net")
+            .await
+            .unwrap();
+        let status = |node: &str| EnrolmentRequestStatus {
+            request: asked.request,
+            requester: requester(node),
+        };
+        let now = fixture
+            .store
+            .query(&Fixture::alice(), status("mbp.ts.net"))
+            .await
+            .unwrap();
+        assert!(
+            matches!(now, RequestState::Pending { .. }),
+            "pending: {now:?}"
+        );
+        let elsewhere = fixture
+            .store
+            .query(&Fixture::alice(), status("other.ts.net"))
+            .await;
+        assert_eq!(
+            query_denial(elsewhere),
+            DenialReason::EnrolmentRequestUnknown,
+            "another node learns nothing"
+        );
+        fixture.clock.advance(REQUEST_TTL);
+        let late = fixture
+            .store
+            .query(&Fixture::alice(), status("mbp.ts.net"))
+            .await
+            .unwrap();
+        assert_eq!(late, RequestState::Expired, "ten minutes later");
+        let approve = ApproveEnrolment {
+            workspace: claimed.workspace,
+            request: asked.request,
+        };
+        assert!(
+            matches!(
+                fixture
+                    .store
+                    .execute(&Fixture::alice(), &fixture.origin(), approve)
+                    .await,
+                Err(ExecuteError::Rejected(DecideRequestRejection::Expired))
+            ),
+            "an expired request cannot be approved"
+        );
+        assert_views_replay(&pool).await;
+    }
+
+    #[tokio::test]
+    async fn machines_lists_pending_requests_and_a_decided_one_leaves_by_the_delta() {
+        use abc_core::command::DenyEnrolment;
+        use abc_core::query::{ListMachines, MachinesSince, ViewEnrolmentRequest};
+        let database = TestDatabase::migrated().await;
+        let pool = database.pool();
+        let (fixture, claimed) = Fixture::claimed(pool.clone()).await;
+        let workspace = claimed.workspace;
+        let key = fixture.worker_key();
+        let asked = ask(&fixture, workspace, &key, "mbp.ts.net").await.unwrap();
+        let list = || async {
+            fixture
+                .store
+                .query(&Fixture::alice(), ListMachines { workspace })
+                .await
+                .unwrap()
+        };
+        let before = list().await;
+        assert_eq!(before.requests.len(), 1, "pending, listed");
+        assert_eq!(before.requests[0].id, asked.request);
+        let card = fixture
+            .store
+            .query(
+                &Fixture::alice(),
+                ViewEnrolmentRequest {
+                    workspace,
+                    request: asked.request,
+                },
+            )
+            .await
+            .unwrap()
+            .expect("the request's own page finds it");
+        assert_eq!(card.code, asked.code, "with the code the terminal shows");
+        fixture
+            .store
+            .execute(
+                &Fixture::alice(),
+                &fixture.origin(),
+                DenyEnrolment {
+                    workspace,
+                    request: asked.request,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            list().await.requests.is_empty(),
+            "a decided request is no longer pending"
+        );
+        let delta = fixture
+            .store
+            .query(
+                &Fixture::alice(),
+                MachinesSince {
+                    workspace,
+                    after: before.head,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            delta.requests.len(),
+            1,
+            "the delta carries the decided request, so it leaves the screen"
+        );
+        assert_eq!(delta.requests[0].id, asked.request);
+        assert_views_replay(&pool).await;
+    }
 }

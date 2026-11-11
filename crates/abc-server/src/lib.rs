@@ -24,6 +24,7 @@ mod ops;
 mod sessions;
 mod sidecar;
 mod web;
+mod whois;
 mod worker_link;
 
 use std::future::Future;
@@ -55,6 +56,10 @@ pub struct ServerConfig {
     /// `ABC_SIDECAR_SOCKET`: the socket Tailscale Serve proxies to, `<home>/run/abc.sock` under
     /// `abc server setup`. The server refuses a directory others can reach.
     pub sidecar_socket: PathBuf,
+    /// `ABC_TAILSCALED_SOCKET`: the socket of the server's own tailscaled
+    /// (`<home>/run/tailscaled.sock` under `abc server setup`), which names the node a request
+    /// came from. Without it the server refuses enrolment by browser approval; tokens still work.
+    pub tailscaled_socket: Option<PathBuf>,
     /// `ABC_OPS_ADDR`, default `127.0.0.1:7071`.
     pub ops_addr: SocketAddr,
     /// `ABC_PUBLIC_URL`, such as `https://abc.tail1234.ts.net`: the URL Serve answers on. The
@@ -138,6 +143,9 @@ async fn serve(
         enrolments: limits::RateLimiter::new(config.limits.enrolments_per_minute),
         session_starts: limits::RateLimiter::new(config.limits.session_starts_per_minute),
         web: config.web,
+        whois: config
+            .tailscaled_socket
+            .map_or(whois::Whois::Off, whois::Whois::Tailscaled),
     });
     readiness.set(ops::Phase::Ready);
     tracing::info!(socket = %config.sidecar_socket.display(), "serving the tailnet API");
