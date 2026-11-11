@@ -485,24 +485,21 @@ fn run(
     }
 }
 
-/// Runs the mutants gate, and records the run in the checkpoint of the checkout it ran on,
-/// passing or failing: a fresh session re-tests the missed mutants only.
+/// Runs the mutants gate, and records the run in the checkpoint of the checkout it ran on, as
+/// `label`, whatever its verdict: a fresh session re-tests the missed mutants only. A run that
+/// ends in an error, such as a failing baseline, tested no mutant and records nothing.
 fn run_mutants(
     invocation: &Invocation<'_>,
+    label: &str,
     base: &str,
     options: &mutants::Options,
     tools: &mutants::Tools,
     report: &mut impl Write,
 ) -> anyhow::Result<ExitCode> {
-    let label = gate_label(&Task::Mutants {
-        base: base.to_owned(),
-        jobs: options.jobs,
-        shard: options.shard,
-    });
     let result = mutants::run(&invocation.root, base, options, tools, report)?;
     if invocation.root == invocation.home
         && let Err(error) =
-            progress::mutants_ran(&invocation.root, &label, &result.missed, progress::now())
+            progress::mutants_ran(&invocation.root, label, &result.missed, progress::now())
     {
         writeln!(
             report,
@@ -524,6 +521,7 @@ fn perform(
     let postgres = || check::postgres_bin(&|name| (invocation.test_tool)(root, name));
     let env = |name: &str| (invocation.env)(name);
     let mode = annotation::Mode::from_env(&env);
+    let label = gate_label(&task);
     match task {
         Task::Check { changed, .. } => {
             Ok(verdict(check(root, changed, tool, postgres()?, report)?))
@@ -537,6 +535,7 @@ fn perform(
         )?)),
         Task::Mutants { base, jobs, shard } => run_mutants(
             invocation,
+            &label,
             &base,
             &mutants::Options { jobs, shard, mode },
             &mutants::Tools::pinned(tool, postgres()?)?,

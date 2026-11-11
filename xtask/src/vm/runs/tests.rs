@@ -2218,3 +2218,55 @@ fn a_limit_file_that_cannot_be_read_is_an_error() {
     std::fs::create_dir(world.host.runs.join("limit.json")).unwrap();
     all.limit(MORNING).unwrap_err();
 }
+
+/// Review findings: a corrupt shared limit file stops no supervisor, and a run held by another
+/// run's limit that was waiting out an outage still probes the API afterwards.
+#[test]
+fn a_corrupt_limit_file_stops_no_run_and_an_outage_wait_keeps_its_probe() {
+    let (world, local) = briefed();
+    fake_claude(&local.bin, &[HANDOFF]);
+    let services = FakeServices::default();
+    std::fs::create_dir_all(&world.host.runs).unwrap();
+    std::fs::write(world.host.runs.join("limit.json"), "nonsense").unwrap();
+    let run = started(&world, &services);
+    let status = supervise(&world, &local, &services, &FakeClock::at(MORNING), &run.id);
+    assert_eq!(
+        status,
+        Status::Done {
+            verdict: Verdict::Pass
+        }
+    );
+    let log = std::fs::read_to_string(runs(&world).log(&run.id)).unwrap();
+    assert!(
+        log.contains("ignoring the shared usage limit: could not read"),
+        "{log}"
+    );
+
+    let held = runs(&world);
+    std::fs::remove_file(world.host.runs.join("limit.json")).unwrap();
+    held.note_limit(RESET, MORNING).unwrap();
+    let mut waiting = started(&world, &services);
+    waiting.status = Status::Waiting {
+        until: MORNING,
+        cause: Cause::Network,
+    };
+    held.save(&waiting).unwrap();
+    supervise(
+        &world,
+        &local,
+        &services,
+        &FakeClock::at(MORNING),
+        &waiting.id,
+    );
+    let probes = local
+        .fake
+        .calls
+        .borrow()
+        .iter()
+        .filter(|call| call.contains("curl"))
+        .count();
+    assert!(
+        probes >= 1,
+        "the network wait is probed after the limit: {probes}"
+    );
+}

@@ -916,16 +916,30 @@ impl Supervisor<'_> {
                     self.clock.sleep_until(until);
                     // A limit another run met holds every run until its reset. The sleep ended
                     // at `until` or later, so a reset not past `until` is over.
-                    if let Some(limit) = self.runs.limit(until)? {
+                    let shared = self.runs.limit(until).unwrap_or_else(|error| {
+                        // A shared file that cannot be read must not stop every run: this one
+                        // goes on, and the next limit rewrites the file.
+                        let _logged = writeln!(
+                            log,
+                            "--- abc run {id}: ignoring the shared usage limit: {error:#}"
+                        );
+                        None
+                    });
+                    if let Some(limit) = shared {
                         writeln!(
                             log,
                             "--- abc run {id}: waiting for the usage limit another run met, \
                              until {}",
                             crate::progress::utc(limit)
                         )?;
+                        // A run waiting out a network outage still probes the API after.
                         run.status = Status::Waiting {
                             until: limit,
-                            cause: Cause::Limit,
+                            cause: if cause == Cause::Network {
+                                cause
+                            } else {
+                                Cause::Limit
+                            },
                         };
                         self.runs.save(&run)?;
                         continue;
@@ -1024,7 +1038,16 @@ impl Supervisor<'_> {
             cause: Cause::Limit,
         } = run.status
         {
-            self.runs.note_limit(until, now)?;
+            // The attempt's end is kept first: a failure to share the reset costs the other runs
+            // an attempt on the limit, never this run its outcome.
+            self.runs.save(run)?;
+            if let Err(error) = self.runs.note_limit(until, now) {
+                writeln!(
+                    log,
+                    "--- abc run {}: could not share the usage limit: {error:#}",
+                    run.id
+                )?;
+            }
         }
         Ok(())
     }

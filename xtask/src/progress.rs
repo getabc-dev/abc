@@ -89,9 +89,6 @@ struct MutantsRun {
     missed: Vec<String>,
 }
 
-/// The missed mutants a rendering lists before it says how many more there are.
-const MISSED_LISTED: usize = 100;
-
 /// The commit HEAD is at, if any.
 fn head(root: &Path) -> Option<String> {
     git::git(root, &["rev-parse", "--verify", "--quiet", "HEAD"])
@@ -292,15 +289,8 @@ fn render_mutants(state: &State, tree: &Tree, out: &mut String) -> Result<(), st
             },
             utc(run.at)
         )?;
-        for line in run.missed.iter().take(MISSED_LISTED) {
+        for line in &run.missed {
             writeln!(out, "    {line}")?;
-        }
-        if run.missed.len() > MISSED_LISTED {
-            writeln!(
-                out,
-                "    and {} more",
-                run.missed.len().saturating_sub(MISSED_LISTED)
-            )?;
         }
     }
     Ok(())
@@ -560,14 +550,13 @@ mod tests {
             later.find("--base third").unwrap() < later.find("--base other").unwrap(),
             "newest first:\n{later}"
         );
-        let many: Vec<String> = (0..101).map(|n| format!("x.rs:{n}:1: delete !")).collect();
+        let many: Vec<String> = (0..300).map(|n| format!("x.rs:{n}:1: delete !")).collect();
         mutants_ran(&root, "mutants --base many", &many, 1_762_700_400).unwrap();
         let long = progress(&root);
         assert!(
-            long.contains("    x.rs:99:1: delete !\n    and 1 more\n"),
-            "{long}"
+            long.contains("    x.rs:299:1: delete !\n"),
+            "every missed mutant is listed, since a fresh session re-tests only those"
         );
-        assert!(!long.contains("x.rs:100:1"), "{long}");
     }
 
     #[test]
