@@ -458,11 +458,14 @@ fn run(
         return perform(task, invocation, report);
     };
     let label = gate_label(&task);
+    // A mutants run records itself, passing or not, in the checkpoint's own section.
+    let records_pass = !matches!(task, Task::Mutants { .. });
     match gate::take(&invocation.root, gate, wait, report)? {
         gate::Taken::Held(held) => {
             let result = perform(task, invocation, report);
             drop(held);
-            if matches!(result, Ok(code) if code == ExitCode::SUCCESS)
+            if records_pass
+                && matches!(result, Ok(code) if code == ExitCode::SUCCESS)
                 && invocation.root == invocation.home
                 && let Err(error) = progress::gate_passed(&invocation.root, &label, progress::now())
             {
@@ -498,8 +501,13 @@ fn run_mutants(
 ) -> anyhow::Result<ExitCode> {
     let result = mutants::run(&invocation.root, base, options, tools, report)?;
     if invocation.root == invocation.home
-        && let Err(error) =
-            progress::mutants_ran(&invocation.root, label, &result.missed, progress::now())
+        && let Err(error) = progress::mutants_ran(
+            &invocation.root,
+            label,
+            result.passed,
+            &result.missed,
+            progress::now(),
+        )
     {
         writeln!(
             report,

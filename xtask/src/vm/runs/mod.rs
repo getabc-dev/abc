@@ -360,6 +360,8 @@ impl Runs {
         );
         std::fs::create_dir_all(&self.dir)
             .with_context(|| format!("could not create {}", self.dir.display()))?;
+        // Runs being admitted read the number under this lock.
+        let _lock = self.lock()?;
         let settings = Settings { parallel };
         crate::files::replace(
             &self.dir.join(SETTINGS),
@@ -386,7 +388,12 @@ impl Runs {
     /// stays, so a run that met an earlier one never shortens it.
     fn note_limit(&self, until: i64, now: i64) -> anyhow::Result<()> {
         let _lock = crate::files::lock(&self.dir.join(LIMIT_LOCK))?;
-        let until = self.limit(now)?.map_or(until, |known| known.max(until));
+        // A file that cannot be read is no known limit: this one replaces it.
+        let until = self
+            .limit(now)
+            .ok()
+            .flatten()
+            .map_or(until, |known| known.max(until));
         crate::files::replace(
             &self.dir.join(LIMIT),
             &format!("{}\n", serde_json::to_string_pretty(&Limit { until })?),

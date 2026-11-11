@@ -109,7 +109,7 @@ pub(crate) struct Options {
 }
 
 /// How a mutants run ended.
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) struct Report {
     /// Whether the tests caught every mutant.
     pub(crate) passed: bool,

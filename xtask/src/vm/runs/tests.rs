@@ -2219,6 +2219,17 @@ fn a_limit_file_that_cannot_be_read_is_an_error() {
     all.limit(MORNING).unwrap_err();
 }
 
+/// A limit met while the shared file is corrupt replaces it, so sharing works again.
+#[test]
+fn a_limit_met_over_a_corrupt_file_rewrites_it() {
+    let (world, _local) = briefed();
+    let all = runs(&world);
+    std::fs::create_dir_all(&world.host.runs).unwrap();
+    std::fs::write(world.host.runs.join("limit.json"), "nonsense").unwrap();
+    all.note_limit(MORNING + 500, MORNING).unwrap();
+    assert_eq!(all.limit(MORNING).unwrap(), Some(MORNING + 500));
+}
+
 /// Review findings: a corrupt shared limit file stops no supervisor, and a run held by another
 /// run's limit that was waiting out an outage still probes the API afterwards.
 #[test]

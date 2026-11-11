@@ -85,6 +85,8 @@ struct MutantsRun {
     clean: bool,
     /// When it ended, in seconds since the Unix epoch.
     at: i64,
+    /// Whether the run passed: a failing run may list no missed mutant.
+    passed: bool,
     /// The mutants no test noticed, as cargo-mutants lists them.
     missed: Vec<String>,
 }
@@ -167,6 +169,7 @@ pub(crate) fn gate_passed(root: &Path, gate: &str, now: i64) -> anyhow::Result<(
 pub(crate) fn mutants_ran(
     root: &Path,
     gate: &str,
+    passed: bool,
     missed: &[String],
     now: i64,
 ) -> anyhow::Result<()> {
@@ -178,6 +181,7 @@ pub(crate) fn mutants_ran(
                     commit: commit.clone(),
                     clean: tree.uncommitted.is_empty(),
                     at: now,
+                    passed,
                     missed: missed.to_vec(),
                 },
             );
@@ -274,7 +278,8 @@ fn render_mutants(state: &State, tree: &Tree, out: &mut String) -> Result<(), st
             "an earlier commit"
         };
         let result = match run.missed.len() {
-            0 => "caught every mutant".to_owned(),
+            0 if run.passed => "caught every mutant".to_owned(),
+            0 => "failed without listing a missed mutant".to_owned(),
             1 => "missed 1 mutant".to_owned(),
             n => format!("missed {n} mutants"),
         };
@@ -505,7 +510,7 @@ mod tests {
         observed(&root, 100).unwrap();
         assert!(!progress(&root).contains("Mutants runs"), "none yet");
 
-        mutants_ran(&root, gate, &missed, 1_762_700_000).unwrap();
+        mutants_ran(&root, gate, false, &missed, 1_762_700_000).unwrap();
 
         let text = progress(&root);
         for expected in [
@@ -528,13 +533,14 @@ mod tests {
         mutants_ran(
             &root,
             "mutants --base origin/main --shard 1/8",
+            false,
             &missed[..1],
             1_762_700_100,
         )
         .unwrap();
-        mutants_ran(&root, "mutants --base other", &[], 1_762_700_200).unwrap();
+        mutants_ran(&root, "mutants --base other", true, &[], 1_762_700_200).unwrap();
         std::fs::write(root.join("c.txt"), "c\n").unwrap();
-        mutants_ran(&root, "mutants --base third", &[], 1_762_700_300).unwrap();
+        mutants_ran(&root, "mutants --base third", true, &[], 1_762_700_300).unwrap();
         let later = progress(&root);
         for expected in [
             "(an earlier commit), 2025-11-09 14:53 UTC, and missed 2 mutants",
@@ -550,8 +556,13 @@ mod tests {
             later.find("--base third").unwrap() < later.find("--base other").unwrap(),
             "newest first:\n{later}"
         );
+        mutants_ran(&root, "mutants --base silent", false, &[], 1_762_700_350).unwrap();
+        assert!(
+            progress(&root).contains("and failed without listing a missed mutant\n"),
+            "a failure is no pass"
+        );
         let many: Vec<String> = (0..300).map(|n| format!("x.rs:{n}:1: delete !")).collect();
-        mutants_ran(&root, "mutants --base many", &many, 1_762_700_400).unwrap();
+        mutants_ran(&root, "mutants --base many", false, &many, 1_762_700_400).unwrap();
         let long = progress(&root);
         assert!(
             long.contains("    x.rs:299:1: delete !\n"),
