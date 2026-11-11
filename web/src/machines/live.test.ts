@@ -26,6 +26,7 @@ const snapshot = received({
   type: "snapshot",
   head: 5,
   machines: [card("zeta", "w2", true), card("alpha", "w1", false)],
+  requests: [],
 });
 
 const restarting = new ApiError("internal", "the server answered 502", 502);
@@ -52,6 +53,7 @@ describe("live machines", () => {
         type: "machines",
         head: 9,
         changed: [card("alpha", "w1", true), card("beta", "w3", true)],
+        requests: [],
       }),
     );
     expect(model.head).toBe(9);
@@ -68,6 +70,7 @@ describe("live machines", () => {
         type: "snapshot",
         head: 1,
         machines: [card("a", "w9", true), card("a", "w1", true)],
+        requests: [],
       }),
     );
     expect(model.machines.map((machine) => machine.worker)).toEqual(["w1", "w9"]);
@@ -94,6 +97,7 @@ describe("live machines", () => {
         type: "machines",
         head: 6,
         changed: [],
+        requests: [],
       }),
     );
     expect(live.connection).toEqual({ state: "live" });
@@ -186,7 +190,7 @@ async function perform(client: ApiClient): Promise<Message[]> {
 
 describe("its effects", () => {
   test("connect dispatches each update, then the end", async () => {
-    const live: LiveUpdate = { type: "snapshot", head: 1, machines: [] };
+    const live: LiveUpdate = { type: "snapshot", head: 1, machines: [], requests: [] };
     const response = new Response(`data: ${JSON.stringify(live)}\n\n`, { status: 200 });
     expect(await perform(api(response))).toEqual([received(live), { type: "ended" }]);
   });

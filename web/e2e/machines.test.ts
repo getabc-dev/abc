@@ -102,6 +102,58 @@ test("a machine enrols, comes online, goes offline, and the page resumes after a
   await machine.stop();
 });
 
+/** Approves or denies the request a machine's setup asked for, through the API as the owner. */
+async function decide(
+  page: Page,
+  approvalPage: string,
+  decision: "approve" | "deny",
+): Promise<void> {
+  const [workspace, request] = new URL(approvalPage).pathname.split("/").slice(-2);
+  const answer = await page.request.post(
+    `/api/workspaces/${workspace}/enrolment-requests/${request}/${decision}`,
+  );
+  expect(answer.status()).toBe(204);
+}
+
+test("a machine set up by `abc worker setup` is approved through the API, runs as a service and is removed", async ({
+  page,
+  machine: makeMachine,
+}) => {
+  test.setTimeout(180_000);
+  const machine = makeMachine("setup-host");
+  const setup = machine.setup();
+  const { page: approvalPage, code } = await setup.approval();
+  expect(approvalPage).toContain("/machines/requests/");
+  expect(code).toMatch(/^[0-9A-Z]{4}-[0-9A-Z]{4}$/u);
+  await decide(page, approvalPage, "approve");
+
+  expect(await setup.finished()).toBe(0);
+  expect(setup.output).toContain("Approved: enrolled this machine as setup-host");
+  expect(setup.output).toContain("runs as a service now");
+  await expect.poll(async () => (await machine.status()).code, LIVE).toBe(0);
+
+  // A restart of the service: the worker goes, and comes back by itself.
+  await machine.restartService();
+  await expect.poll(async () => (await machine.status()).code, LIVE).toBe(0);
+
+  expect(await machine.uninstall()).toContain("Removed abc worker's service.");
+  expect((await machine.status()).code).toBe(1);
+});
+
+test("a machine the owner denies through the API is told so and is not enrolled", async ({
+  page,
+  machine: makeMachine,
+}) => {
+  test.setTimeout(120_000);
+  const machine = makeMachine("denied-host");
+  const setup = machine.setup();
+  const { page: approvalPage } = await setup.approval();
+  await decide(page, approvalPage, "deny");
+  expect(await setup.finished()).not.toBe(0);
+  expect(setup.output).toContain("the owner denied this machine");
+  expect((await machine.status()).code).toBe(1);
+});
+
 test("the shell's theme menu chooses Dark over a light system, kept across a reload", async ({
   page,
 }) => {

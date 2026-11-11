@@ -2,3 +2,6 @@
 
 /** The login the stand-in vouches for, as Serve does for the signed-in person. */
 export const LOGIN = "e2e@example.com";
+
+/** The tailnet node abc's stand-in tailscaled says every request came from. */
+export const NODE = "e2e-mac.tail1234.ts.net";

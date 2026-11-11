@@ -5,20 +5,23 @@ use std::future::Future;
 
 use abc_core::actor::{Principal, Role};
 use abc_core::command::OpenSession;
+use abc_core::command::RequestRecord;
 use abc_core::event::Position;
 use abc_core::id::{EnrolmentTokenId, FromUuid as _, PersonId, SessionId, WorkerId, WorkspaceId};
 use abc_core::identity::{Arch, DisplayName, MachineLabel, Os, WorkspaceName};
 use abc_core::policy::{Authorized, authorize};
 use abc_core::query::{
-    InstallationState, InstallationStatus, ListEnrolmentTokens, ListMachines, MachineCard,
-    MachinesSince, MachinesSnapshot, OpenSessions, Query, SessionView, TokenStatus, TokenSummary,
+    EnrolmentRequestStatus, InstallationState, InstallationStatus, ListEnrolmentTokens,
+    ListMachines, MachineCard, MachinesSince, MachinesSnapshot, OpenSessions, Query, RequestCard,
+    RequestState, RequestStatus, SessionView, TokenStatus, TokenSummary, ViewEnrolmentRequest,
     WhoAmI, WorkerIdentity, WorkerSelf, WorkspaceSummary,
 };
 use abc_core::time::Timestamp;
 use sqlx::PgConnection;
 
-use crate::error::{QueryError, StoreError};
+use crate::error::{QueryError, StoreError, stored};
 use crate::execute::authenticate;
+use crate::facts::RequestRow;
 use crate::{Caller, Inner};
 
 mod sealed {
@@ -27,7 +30,14 @@ mod sealed {
 
 /// A query the store can answer. Sealed; one impl per abc-core query. `fetch` takes the
 /// `Authorized<Self>`, so no implementation can run without the check (D10 for reads, I4).
-pub trait Fetchable: Query<Answer: Send> + Send + Sync + sealed::Sealed {
+pub trait Fetchable: Query<Answer: Send, Facts: Send> + Send + Sync + sealed::Sealed {
+    /// Loads the facts the query's proof is checked against, in its snapshot. Most queries load
+    /// none.
+    fn load<'c>(
+        &'c self,
+        conn: &'c mut PgConnection,
+    ) -> impl Future<Output = Result<Self::Facts, StoreError>> + Send + 'c;
+
     /// Reads the answer.
     fn fetch<'c>(
         auth: &'c Authorized<Self>,
@@ -50,19 +60,29 @@ pub(crate) async fn run<Q: Fetchable>(
         .map_err(StoreError::from)?;
     let now = inner.clock.now();
     let principal = authenticate(&mut tx, caller).await??;
-    let auth = authorize(&principal, query, &(), now)?;
+    let facts = query.load(&mut tx).await?;
+    let auth = authorize(&principal, query, &facts, now)?;
     let answer = Q::fetch(&auth, &principal, &mut tx, now).await?;
     tx.commit().await.map_err(StoreError::from)?;
     Ok(answer)
 }
 
-/// Reads a stored value with `parse`, or reports which column is corrupt.
-fn stored<T, E>(column: &'static str, parsed: Result<T, E>) -> Result<T, StoreError> {
-    parsed.ok().ok_or(StoreError::Corrupt(column))
+/// `Fetchable::load` for a query that loads no facts.
+macro_rules! no_facts {
+    () => {
+        fn load<'c>(
+            &'c self,
+            _conn: &'c mut PgConnection,
+        ) -> impl Future<Output = Result<(), StoreError>> + Send + 'c {
+            std::future::ready(Ok(()))
+        }
+    };
 }
 
 impl sealed::Sealed for WhoAmI {}
 impl Fetchable for WhoAmI {
+    no_facts!();
+
     async fn fetch(
         _auth: &Authorized<Self>,
         principal: &Principal,
@@ -129,6 +149,7 @@ async fn machines(
     conn: &mut PgConnection,
     workspace: WorkspaceId,
     after: Position,
+    now: Timestamp,
 ) -> Result<MachinesSnapshot, StoreError> {
     let head = sqlx::query_scalar!("SELECT position FROM event_log_head")
         .fetch_one(&mut *conn)
@@ -164,38 +185,67 @@ async fn machines(
             })
         })
         .collect::<Result<_, StoreError>>()?;
+    // From the origin, the pending requests; after a position, every request changed since,
+    // so a decided one leaves the screen. An expired one goes by its `expires_at`.
+    let pending_only = after == Position::ORIGIN;
+    let request_rows = sqlx::query_as!(
+        RequestRow,
+        "SELECT id, workspace_id, reserved_worker, key_digest, login, node, hostname, os, arch,
+                build, code, requested_at, requested_event, expires_at, decision, changed_at
+         FROM enrolment_request
+         WHERE workspace_id = $1 AND changed_at > $2
+           AND (NOT $3 OR (decision IS NULL AND expires_at > $4))
+         ORDER BY requested_at, id",
+        workspace.as_uuid(),
+        after.get(),
+        pending_only,
+        now.as_offset()
+    )
+    .fetch_all(&mut *conn)
+    .await?;
+    let requests = request_rows
+        .iter()
+        .map(|row| request_card(row, now))
+        .collect::<Result<_, StoreError>>()?;
     Ok(MachinesSnapshot {
         head: stored("event_log_head.position", Position::from_stored(head))?,
         machines,
+        requests,
     })
 }
 
 impl sealed::Sealed for ListMachines {}
 impl Fetchable for ListMachines {
+    no_facts!();
+
     fn fetch<'c>(
         auth: &'c Authorized<Self>,
         _principal: &'c Principal,
         conn: &'c mut PgConnection,
-        _now: Timestamp,
+        now: Timestamp,
     ) -> impl Future<Output = Result<MachinesSnapshot, StoreError>> + Send + 'c {
-        machines(conn, auth.request().workspace, Position::ORIGIN)
+        machines(conn, auth.request().workspace, Position::ORIGIN, now)
     }
 }
 
 impl sealed::Sealed for MachinesSince {}
 impl Fetchable for MachinesSince {
+    no_facts!();
+
     fn fetch<'c>(
         auth: &'c Authorized<Self>,
         _principal: &'c Principal,
         conn: &'c mut PgConnection,
-        _now: Timestamp,
+        now: Timestamp,
     ) -> impl Future<Output = Result<MachinesSnapshot, StoreError>> + Send + 'c {
-        machines(conn, auth.request().workspace, auth.request().after)
+        machines(conn, auth.request().workspace, auth.request().after, now)
     }
 }
 
 impl sealed::Sealed for ListEnrolmentTokens {}
 impl Fetchable for ListEnrolmentTokens {
+    no_facts!();
+
     async fn fetch(
         auth: &Authorized<Self>,
         _principal: &Principal,
@@ -239,6 +289,8 @@ impl Fetchable for ListEnrolmentTokens {
 
 impl sealed::Sealed for WorkerSelf {}
 impl Fetchable for WorkerSelf {
+    no_facts!();
+
     /// The worker the store authenticated. Running the query is the point: authentication fails
     /// with `WorkerRevoked` once the worker is revoked.
     fn fetch<'c>(
@@ -263,6 +315,8 @@ impl Fetchable for WorkerSelf {
 
 impl sealed::Sealed for OpenSessions {}
 impl Fetchable for OpenSessions {
+    no_facts!();
+
     async fn fetch(
         _auth: &Authorized<Self>,
         _principal: &Principal,
@@ -288,6 +342,8 @@ impl Fetchable for OpenSessions {
 
 impl sealed::Sealed for InstallationStatus {}
 impl Fetchable for InstallationStatus {
+    no_facts!();
+
     async fn fetch(
         _auth: &Authorized<Self>,
         _principal: &Principal,
@@ -303,5 +359,71 @@ impl Fetchable for InstallationStatus {
         } else {
             InstallationState::Unclaimed
         })
+    }
+}
+
+impl sealed::Sealed for EnrolmentRequestStatus {}
+impl Fetchable for EnrolmentRequestStatus {
+    fn load<'c>(
+        &'c self,
+        conn: &'c mut PgConnection,
+    ) -> impl Future<Output = Result<Option<RequestRecord>, StoreError>> + Send + 'c {
+        crate::facts::status_facts(self, conn)
+    }
+
+    /// Where the proven request stands now.
+    fn fetch<'c>(
+        auth: &'c Authorized<Self>,
+        _principal: &'c Principal,
+        _conn: &'c mut PgConnection,
+        now: Timestamp,
+    ) -> impl Future<Output = Result<RequestState, StoreError>> + Send + 'c {
+        std::future::ready(Ok(auth.proof().state(now)))
+    }
+}
+
+/// A request's card from its row.
+fn request_card(row: &RequestRow, now: Timestamp) -> Result<RequestCard, StoreError> {
+    let record = RequestRecord::try_from(row)?;
+    Ok(RequestCard {
+        id: record.id,
+        status: RequestStatus::of(&record, now),
+        hostname: record.machine.hostname,
+        os: record.machine.os,
+        arch: record.machine.arch,
+        build: record.build.to_string(),
+        login: record.requester.login,
+        node: record.requester.node,
+        code: record.code,
+        requested_at: Timestamp::from_utc(row.requested_at),
+        expires_at: record.expires_at,
+        changed_at: stored(
+            "enrolment_request.changed_at",
+            Position::from_stored(row.changed_at),
+        )?,
+    })
+}
+
+impl sealed::Sealed for ViewEnrolmentRequest {}
+impl Fetchable for ViewEnrolmentRequest {
+    no_facts!();
+
+    async fn fetch(
+        auth: &Authorized<Self>,
+        _principal: &Principal,
+        conn: &mut PgConnection,
+        now: Timestamp,
+    ) -> Result<Option<RequestCard>, StoreError> {
+        let row = sqlx::query_as!(
+            RequestRow,
+            "SELECT id, workspace_id, reserved_worker, key_digest, login, node, hostname, os, arch,
+                    build, code, requested_at, requested_event, expires_at, decision, changed_at
+             FROM enrolment_request WHERE id = $1 AND workspace_id = $2",
+            auth.request().request.as_uuid(),
+            auth.request().workspace.as_uuid()
+        )
+        .fetch_optional(&mut *conn)
+        .await?;
+        row.as_ref().map(|row| request_card(row, now)).transpose()
     }
 }

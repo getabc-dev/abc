@@ -113,7 +113,7 @@ test("an unclaimed server sends every route to the claim, which lands on home", 
   expect(claim?.init.body).toBe(
     JSON.stringify({ code: "abcd-efgh", display_name: "Ada Lovelace", workspace_name: "Home lab" }),
   );
-  live.send({ type: "snapshot", head: 4, machines: [] });
+  live.send({ type: "snapshot", head: 4, machines: [], requests: [] });
   await screen.findByRole("heading", { name: "Enrol your first machine" });
 });
 
@@ -213,7 +213,7 @@ test("a failed refetch of the session keeps the shell and its stream, with a not
     return live.response;
   });
   mount("/machines", fetcher);
-  live.send({ type: "snapshot", head: 1, machines: [card("lab box", "w1", true)] });
+  live.send({ type: "snapshot", head: 1, machines: [card("lab box", "w1", true)], requests: [] });
   await screen.findByRole("region", { name: "lab box" });
   // Coming back to the window asks again; this time the server fails.
   act(() => {
@@ -242,7 +242,7 @@ test("machines appear live in the shell and on their screen, and go offline", as
   mount("/", fetcher);
   await screen.findByText("Loading machines…");
   expect(screen.getByRole("banner").textContent).toContain("Home lab");
-  live.send({ type: "snapshot", head: 4, machines: [card("lab box", "w1", true)] });
+  live.send({ type: "snapshot", head: 4, machines: [card("lab box", "w1", true)], requests: [] });
   const region = await screen.findByRole("region", { name: "lab box" });
   expect(within(region).getByText("Online")).toBeDefined();
   expect(within(region).getByText("Linux on x86-64")).toBeDefined();
@@ -255,6 +255,7 @@ test("machines appear live in the shell and on their screen, and go offline", as
     type: "machines",
     head: 6,
     changed: [{ ...card("lab box", "w1", false), last_seen_at: "2026-11-06T09:30:00Z" }],
+    requests: [],
   });
   await within(region).findByText("Offline");
   expect(within(region).queryByText("Never connected")).toBeNull();
@@ -270,7 +271,7 @@ test("a dropped stream shows the page offline and resumes where it stopped", asy
     path === "/api/session" ? json(200, member) : (streams.shift() ?? stream()).response,
   );
   mount("/machines", fetcher);
-  first.send({ type: "snapshot", head: 4, machines: [card("lab box", "w1", true)] });
+  first.send({ type: "snapshot", head: 4, machines: [card("lab box", "w1", true)], requests: [] });
   await screen.findByRole("region", { name: "lab box" });
   act(() => {
     first.end();
@@ -278,7 +279,7 @@ test("a dropped stream shows the page offline and resumes where it stopped", asy
   await screen.findByText(/Offline: the connection to the server dropped/);
   expect(screen.getByText("Reconnecting")).toBeDefined();
   // The resume waits half a second.
-  second.send({ type: "machines", head: 7, changed: [card("laptop", "w2", true)] });
+  second.send({ type: "machines", head: 7, changed: [card("laptop", "w2", true)], requests: [] });
   await screen.findByRole("region", { name: "laptop" }, { timeout: 3000 });
   expect(screen.queryByText(/Offline: the connection/)).toBeNull();
   const resumed = requests.filter((request) => request.path.endsWith("/live"))[1];
@@ -296,7 +297,7 @@ test("a stream refused before any card is an error with a retry", async () => {
   expect(screen.getByText("you are not a member of this workspace")).toBeDefined();
   expect(screen.getByText("Stopped")).toBeDefined();
   await userEvent.click(screen.getByRole("button", { name: "Try again" }));
-  live.send({ type: "snapshot", head: 1, machines: [card("lab box", "w1", true)] });
+  live.send({ type: "snapshot", head: 1, machines: [card("lab box", "w1", true)], requests: [] });
   await screen.findByRole("region", { name: "lab box" });
 });
 
@@ -306,7 +307,7 @@ test("ended access keeps the cards, says so and offers a retry", async () => {
     "/machines",
     server(({ path }) => (path === "/api/session" ? json(200, member) : live.response)).fetcher,
   );
-  live.send({ type: "snapshot", head: 1, machines: [card("lab box", "w1", true)] });
+  live.send({ type: "snapshot", head: 1, machines: [card("lab box", "w1", true)], requests: [] });
   await screen.findByRole("region", { name: "lab box" });
   live.send({ type: "access_ended", head: 1 });
   const alert = await screen.findByRole("alert");
@@ -330,7 +331,7 @@ test("enrolling shows the commands with the server's URL and the token once", as
     return live.response;
   });
   mount("/machines", fetcher);
-  live.send({ type: "snapshot", head: 1, machines: [card("lab box", "w1", false)] });
+  live.send({ type: "snapshot", head: 1, machines: [card("lab box", "w1", false)], requests: [] });
   await userEvent.click(await screen.findByRole("button", { name: "Enrol a machine" }));
   await userEvent.type(screen.getByRole("textbox", { name: "Machine name" }), "laptop");
   await userEvent.click(screen.getByRole("button", { name: "Create enrolment token" }));
@@ -357,6 +358,7 @@ test("a revoked machine says so and leaves the shell's pills", async () => {
     type: "snapshot",
     head: 1,
     machines: [{ ...card("old box", "w1", false), revoked: true }, card("mac", "w2", true)],
+    requests: [],
   });
   const region = await screen.findByRole("region", { name: "old box" });
   expect(within(region).getByText("Revoked")).toBeDefined();
@@ -393,6 +395,7 @@ test("a workspace with only revoked machines offers the first enrolment", async 
     type: "snapshot",
     head: 1,
     machines: [{ ...card("old box", "w1", false), revoked: true }],
+    requests: [],
   });
   await screen.findByRole("heading", { name: "Enrol your first machine" });
   expect(screen.getByText("No machines")).toBeDefined();

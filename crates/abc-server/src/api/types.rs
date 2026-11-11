@@ -17,7 +17,7 @@ use abc_core::credential::{EnrolmentToken, SetupCode};
 use abc_core::event::Position;
 use abc_core::id::{EnrolmentTokenId, PersonId, WorkspaceId};
 use abc_core::identity::{DisplayName, MachineLabel, WorkspaceName};
-use abc_core::query::{MachineCard, SessionView, TokenSummary};
+use abc_core::query::{MachineCard, RequestCard, SessionView, TokenSummary};
 use abc_core::secret::{Secret, serialize_exposed};
 use abc_core::time::Timestamp;
 use abc_protocol::api::ApiErrorBody;
@@ -35,6 +35,7 @@ pub(crate) struct WebApi {
     issue_token_request: IssueTokenRequest,
     token_issued: TokenIssuedResponse,
     tokens: Vec<TokenSummary>,
+    enrolment_request: RequestCard,
     live: LiveUpdate,
     error: ApiErrorBody,
 }
@@ -118,6 +119,8 @@ pub(crate) enum LiveUpdate {
         head: Position,
         /// Every machine.
         machines: Vec<MachineCard>,
+        /// The enrolment requests still waiting for the owner.
+        requests: Vec<RequestCard>,
     },
     /// Cards that changed in the log after the previous `head` (or after `Last-Event-ID` on a
     /// resumed connection). Upsert by `worker`.
@@ -126,6 +129,8 @@ pub(crate) enum LiveUpdate {
         head: Position,
         /// The changed cards.
         changed: Vec<MachineCard>,
+        /// The enrolment requests that changed, decided ones included, so they leave the screen.
+        requests: Vec<RequestCard>,
     },
     /// The viewer lost access. The stream ends.
     AccessEnded {
@@ -238,10 +243,12 @@ mod tests {
             LiveUpdate::Snapshot {
                 head,
                 machines: Vec::new(),
+                requests: Vec::new(),
             },
             LiveUpdate::Machines {
                 head,
                 changed: Vec::new(),
+                requests: Vec::new(),
             },
             LiveUpdate::AccessEnded { head },
         ];

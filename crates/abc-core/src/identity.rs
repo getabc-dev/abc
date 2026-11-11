@@ -136,6 +136,65 @@ bounded_text!(
     "machine label"
 );
 
+/// A tailnet node's `MagicDNS` name, such as `macbook.tail1234.ts.net`, as abc's own tailscaled
+/// reports it for the address a request came from. Like [`TailnetLogin`] it means something only
+/// when abc-server built it, from its own tailscaled's answer.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, TS, JsonSchema)]
+#[serde(try_from = "String")]
+#[ts(type = "string")]
+pub struct TailnetNode(String);
+
+impl TailnetNode {
+    /// The longest DNS name, in bytes.
+    const MAX_LEN: usize = 253;
+
+    /// Parses a node name: 1 to 253 bytes of letters, digits, `-` and `.`, without the trailing
+    /// dot of a fully qualified name (one is dropped).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidValue`] for anything else.
+    pub fn parse(raw: &str) -> Result<Self, InvalidValue> {
+        let name = raw.strip_suffix('.').unwrap_or(raw);
+        let valid = (1..=Self::MAX_LEN).contains(&name.len())
+            && name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'.');
+        if valid {
+            Ok(Self(name.to_ascii_lowercase()))
+        } else {
+            Err(InvalidValue {
+                field: "tailnet node",
+                rule: "1 to 253 letters, digits, dashes and dots",
+            })
+        }
+    }
+
+    /// The name.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<String> for TailnetNode {
+    type Error = InvalidValue;
+
+    fn try_from(raw: String) -> Result<Self, Self::Error> {
+        Self::parse(&raw)
+    }
+}
+
+/// Who asked: the tailnet person Serve asserted and the node abc's tailscaled says the request
+/// came from.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, TS, JsonSchema)]
+pub struct Requester {
+    /// The person's login.
+    pub login: TailnetLogin,
+    /// Their node.
+    pub node: TailnetNode,
+}
+
 /// A label obeys the same rule as a display name, so it always is one.
 impl From<MachineLabel> for DisplayName {
     fn from(label: MachineLabel) -> Self {
@@ -318,6 +377,33 @@ mod tests {
             .unwrap(),
             r#"{"hostname":"mbp","os":"macos","arch":"x86_64"}"#,
             "the wire names match the stored names"
+        );
+    }
+
+    #[test]
+    fn node_names_are_dns_names_without_the_trailing_dot() {
+        assert_eq!(
+            TailnetNode::parse("MacBook.tail1234.ts.net.")
+                .unwrap()
+                .as_str(),
+            "macbook.tail1234.ts.net",
+            "lower case, the root dot dropped"
+        );
+        assert_eq!(
+            TailnetNode::parse(&"a".repeat(253)).unwrap().as_str().len(),
+            253,
+            "the longest"
+        );
+        for bad in ["", ".", "has space.ts.net", "under_score", &"a".repeat(254)] {
+            assert_eq!(
+                TailnetNode::parse(bad).unwrap_err().to_string(),
+                "invalid tailnet node: 1 to 253 letters, digits, dashes and dots",
+                "{bad:?}"
+            );
+        }
+        assert!(
+            serde_json::from_str::<TailnetNode>(r#""bad name""#).is_err(),
+            "parsed on the wire too"
         );
     }
 }

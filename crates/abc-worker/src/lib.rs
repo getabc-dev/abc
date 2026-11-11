@@ -3,7 +3,10 @@
 //! worker always dials.
 //!
 //! ```text
-//! abc worker enrol <url>   lock the home -> save a new key (0600) -> POST /api/enrol with its
+//! abc worker setup <url>   ask the server to enrol (key made here, only its digest sent), wait for
+//!                          the owner's approval in the browser, store the enrolment, install the
+//!                          service (abc-host)
+//! abc worker enrol <url>   (headless, by token) lock the home -> save a new key (0600) -> POST /api/enrol with its
 //!                          digest (the same request on every re-run) -> record who we are
 //! abc worker               lock the home -> load the record -> loop { dial (TLS, bearer key) ->
 //!                          Hello / Welcome -> hold the link until it ends -> policy: dial again
@@ -38,7 +41,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub use dial::DialError;
-pub use enrol::{EnrolError, Enrolment, enrol, machine};
+pub use enrol::{EnrolError, Enrolment, Waiting, enrol, enrol_by_approval, machine};
 pub use home::{HomeError, WorkerHome};
 pub use policy::Terminal;
 
@@ -247,6 +250,8 @@ pub struct Timings {
     pub rate_limited_floor: Duration,
     /// How long a stopping worker waits for the server to answer its close.
     pub close_grace: Duration,
+    /// How often a machine waiting for its owner's approval asks where its request stands.
+    pub approval_poll: Duration,
 }
 
 impl Timings {
@@ -267,6 +272,7 @@ impl Timings {
             stable_after: IDLE_TIMEOUT,
             rate_limited_floor: Duration::from_secs(15),
             close_grace: Duration::from_secs(2),
+            approval_poll: Duration::from_secs(2),
         }
     }
 }
@@ -314,7 +320,7 @@ impl Jitter {
 #[derive(Debug, Error)]
 pub enum RunError {
     /// The home holds no enrolment, or only a pending one.
-    #[error("this machine is not enrolled; run `abc worker enrol <url>` first")]
+    #[error("this machine is not enrolled; run `abc worker setup <server-url>` first")]
     NotEnrolled,
     /// The home is busy, insecure, damaged or unreadable.
     #[error(transparent)]

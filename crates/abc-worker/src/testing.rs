@@ -50,6 +50,7 @@ pub const fn fast() -> Timings {
         stable_after: Duration::from_secs(60),
         rate_limited_floor: Duration::from_millis(100),
         close_grace: Duration::from_secs(1),
+        approval_poll: Duration::from_millis(50),
     }
 }
 

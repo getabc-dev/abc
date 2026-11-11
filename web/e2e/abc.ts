@@ -6,9 +6,16 @@
 // test does persists, as it does on a real server, and a restart keeps it.
 
 import { type ChildProcess, spawn } from "node:child_process";
-import { createWriteStream, mkdirSync, mkdtempSync } from "node:fs";
+import {
+  cpSync,
+  createWriteStream,
+  mkdirSync,
+  mkdtempSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { createServer } from "node:net";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 import { type BrowserContext, test as base, expect, type Page } from "@playwright/test";
 
@@ -183,6 +190,8 @@ export class Server {
       {
         ABC_DATABASE_URL: database,
         ABC_SIDECAR_SOCKET: socket,
+        // The stand-in's tailscaled, beside the socket, which names the node of each request.
+        ABC_TAILSCALED_SOCKET: join(dirname(socket), "tailscaled.sock"),
         ABC_OPS_ADDR: `127.0.0.1:${ops}`,
         ABC_PUBLIC_URL: ORIGIN,
       },
@@ -216,14 +225,157 @@ export class Server {
   }
 }
 
-/** A machine with a worker home of its own. Tests get one from the `machine` fixture. */
+/** What `abc worker setup` prints while it waits for the owner, and how it ends. */
+class Setup {
+  readonly #child: ChildProcess;
+  #output = "";
+  readonly #ended: Promise<number | null>;
+
+  constructor(child: ChildProcess) {
+    this.#child = child;
+    child.stdout?.on("data", (chunk: Buffer) => {
+      this.#output += chunk.toString();
+    });
+    child.stderr?.on("data", (chunk: Buffer) => {
+      this.#output += chunk.toString();
+    });
+    this.#ended = exited(child);
+  }
+
+  /** Everything it has printed. */
+  get output(): string {
+    return this.#output;
+  }
+
+  /** The page it asks the owner to open, and the code it shows, once it has printed them. */
+  async approval(): Promise<{ readonly page: string; readonly code: string }> {
+    const deadline = Date.now() + READY_WITHIN_MS;
+    while (Date.now() < deadline) {
+      const page = /(https:\/\/\S+\/machines\/requests\/\S+)/u.exec(this.#output)?.[1];
+      const code = /code ([0-9A-Z]{4}-[0-9A-Z]{4})/u.exec(this.#output)?.[1];
+      if (page !== undefined && code !== undefined) {
+        return { page, code };
+      }
+      if (this.#child.exitCode !== null) {
+        throw new Error(`abc worker setup ended before it asked for approval: ${this.#output}`);
+      }
+      // oxlint-disable-next-line eslint/no-await-in-loop -- polling: each look needs the last
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    throw new Error(`abc worker setup did not ask for approval: ${this.#output}`);
+  }
+
+  /** Waits for it to end; its exit code. */
+  async finished(): Promise<number | null> {
+    return await this.#ended;
+  }
+}
+
+/** Runs the fake service manager or `abc` to completion: its standard output, or a failure. */
+async function tool(
+  program: string,
+  args: readonly string[],
+  env: Record<string, string>,
+): Promise<{ readonly code: number | null; readonly output: string }> {
+  const child = spawn(program, args, { env, stdio: ["ignore", "pipe", "pipe"] });
+  let output = "";
+  child.stdout.on("data", (chunk: Buffer) => {
+    output += chunk.toString();
+  });
+  child.stderr.on("data", (chunk: Buffer) => {
+    output += chunk.toString();
+  });
+  return { code: await exited(child), output };
+}
+
+/**
+ * A machine with a worker home of its own, and a home directory with fake service managers, root
+ * and browser (the ones `abc-host`'s tests use) on its `PATH`, which run what a service definition
+ * says. Tests get one from the `machine` fixture.
+ */
 class Machine {
   readonly #home = mkdtempSync(join(out, "worker-"));
+  /** The fakes' scratch tree: `bin/`, `state/`, `services/` and the user's `home/`. */
+  readonly #scratch = mkdtempSync(join(out, "machine-"));
   readonly #hostname: string;
   #process: ChildProcess | null = null;
 
   constructor(hostname: string) {
     this.#hostname = hostname;
+    cpSync(new URL("../../crates/abc-host/tests/fakes/bin", import.meta.url), this.#bin(), {
+      recursive: true,
+    });
+    mkdirSync(join(this.#scratch, "state"));
+    // The service definitions `abc worker setup` writes, where the fakes read them.
+    const definitions =
+      process.platform === "darwin"
+        ? join(this.#userHome(), "Library/LaunchAgents")
+        : join(this.#userHome(), ".config/systemd/user");
+    mkdirSync(definitions, { recursive: true });
+    symlinkSync(definitions, join(this.#scratch, "services"));
+    // Services get nothing of this environment but their own definition: trust in the stand-in's
+    // certificate is added, as a machine's own trust store would hold it.
+    writeFileSync(join(this.#scratch, "state/extra.env"), `SSL_CERT_FILE=${certificate}\n`);
+  }
+
+  #bin(): string {
+    return join(this.#scratch, "bin");
+  }
+
+  #userHome(): string {
+    return join(this.#scratch, "home");
+  }
+
+  /** The environment of a person's shell on this machine: its fakes first on `PATH`. */
+  #shell(): Record<string, string> {
+    return {
+      ...this.#env(),
+      HOME: this.#userHome(),
+      PATH: `${this.#bin()}:${PATH}`,
+      FAKE_ROOT: "1",
+    };
+  }
+
+  /** `abc worker setup <origin>`: it waits for the owner's approval in the browser. */
+  setup(): Setup {
+    mkdirSync(out, { recursive: true });
+    const log = createWriteStream(join(out, `setup-${this.#hostname}.log`), { flags: "a" });
+    const child = spawn(binary, ["worker", "setup", ORIGIN, "--hostname", this.#hostname], {
+      env: this.#shell(),
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    running.add(child);
+    child.once("exit", () => {
+      running.delete(child);
+    });
+    child.stdout.pipe(log);
+    return new Setup(child);
+  }
+
+  /** `abc worker status`: whether it succeeded, and what it said. */
+  async status(): Promise<{ readonly code: number | null; readonly output: string }> {
+    return await tool(binary, ["worker", "status"], this.#shell());
+  }
+
+  /** `abc worker uninstall`, as a person runs it. */
+  async uninstall(): Promise<string> {
+    const { code, output } = await tool(binary, ["worker", "uninstall"], this.#shell());
+    if (code !== 0) {
+      throw new Error(`abc worker uninstall exited with ${code}: ${output}`);
+    }
+    return output;
+  }
+
+  /** Restarts the worker's service, as a reboot would start it again. */
+  async restartService(): Promise<void> {
+    const [program, args] =
+      process.platform === "darwin"
+        ? ["launchctl", ["kickstart", "-k", `gui/${process.getuid?.() ?? 501}/dev.getabc.worker`]]
+        : ["systemctl", ["--user", "restart", "abc-worker.service"]];
+    const { code, output } = await tool(join(this.#bin(), program), args, this.#shell());
+    if (code !== 0) {
+      throw new Error(`restarting the service exited with ${code}: ${output}`);
+    }
   }
 
   /** The environment a worker runs in: its home, and trust in the stand-in's certificate. */

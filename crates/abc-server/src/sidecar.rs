@@ -25,11 +25,14 @@ use axum::extract::FromRequestParts;
 use axum::http::header::{HOST, ORIGIN};
 use axum::http::request::Parts;
 
-use abc_core::identity::TailnetLogin;
+use abc_core::identity::{Requester, TailnetLogin};
 use abc_store::Caller;
 
-use crate::api::SidecarState;
+use abc_protocol::api::ApiCode;
+
 use crate::api::error::ApiError;
+use crate::api::{SidecarState, Source};
+use crate::whois::WhoisError;
 
 /// The header Tailscale Serve sets with the user's login.
 const LOGIN_HEADER: &str = "tailscale-user-login";
@@ -137,7 +140,7 @@ impl FromRequestParts<SidecarState> for TailnetCaller {
             .map(|login| Self { login })
             .ok_or_else(|| {
                 ApiError::new(
-                    abc_protocol::api::ApiCode::TailnetIdentityRequired,
+                    ApiCode::TailnetIdentityRequired,
                     "this needs a signed-in tailnet person; tagged devices have no identity",
                 )
             })
@@ -161,5 +164,44 @@ impl FromRequestParts<SidecarState> for MaybeTailnetCaller {
         Ok(Self(
             asserted_login(parts)?.map_or(Caller::Anonymous, Caller::Tailnet),
         ))
+    }
+}
+
+/// A tailnet person and the node their request came from: the login Serve asserted, and the node
+/// abc's own tailscaled says owns the address Serve forwarded. Only enrolment requests need it.
+#[derive(Debug, Clone)]
+pub(crate) struct TailnetRequester(pub(crate) Requester);
+
+impl FromRequestParts<SidecarState> for TailnetRequester {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &SidecarState) -> Result<Self, ApiError> {
+        let TailnetCaller { login } = TailnetCaller::from_request_parts(parts, state).await?;
+        let Ok(Source(source)) = Source::from_request_parts(parts, state).await;
+        // Before the whois, which waits on tailscaled: a source cannot make the server wait on it
+        // without limit, with any body or none.
+        if !state.lookups.allow(source.clone()) {
+            return Err(ApiError::new(
+                ApiCode::RateLimited,
+                "too many requests from this machine; wait a minute",
+            ));
+        }
+        match state.whois.node(&source, &login).await {
+            Ok(node) => Ok(Self(Requester { login, node })),
+            Err(WhoisError::Off) => Err(ApiError::new(
+                ApiCode::ApprovalUnavailable,
+                "this server cannot approve a machine in the browser; enrol it with a token: \
+                 abc worker enrol --token-file",
+            )),
+            Err(error) => {
+                tracing::warn!(%error, "could not name the node a request came from");
+                Err(ApiError::new(
+                    ApiCode::TailnetNodeUnknown,
+                    "the server could not tell which tailnet node this request came from; check \
+                     that this machine is on the tailnet and that the server's Tailscale is \
+                     running",
+                ))
+            }
+        }
     }
 }

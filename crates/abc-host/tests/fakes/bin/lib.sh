@@ -18,7 +18,8 @@ running() {
 }
 
 # start NAME: runs state/NAME.args (one word a line) in the background with only state/NAME.env
-# (NAME=VALUE lines) and a PATH in its environment, as a service manager does, from state/
+# (NAME=VALUE lines), state/extra.env (the test's own additions, such as trust in a test CA) and a
+# PATH in its environment, as a service manager does, from state/
 # rather than the caller's directory (so nothing it writes there lands in the repository), its
 # output in state/NAME.log.
 start() {
@@ -31,6 +32,11 @@ start() {
 		while IFS= read -r pair; do
 			set -- "$@" "$pair"
 		done <"$STATE/$service.env"
+		if [ -f "$STATE/extra.env" ]; then
+			while IFS= read -r pair; do
+				set -- "$@" "$pair"
+			done <"$STATE/extra.env"
+		fi
 		while IFS= read -r word; do
 			set -- "$@" "$word"
 		done <"$STATE/$service.args"

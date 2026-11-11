@@ -14,16 +14,32 @@
 //!
 //! The response carries no secret. Losing it costs a retry, not a token.
 
-use abc_core::credential::{EnrolmentToken, WorkerKeyDigest};
-use abc_core::id::{WorkerId, WorkspaceId};
+use abc_core::credential::{ApprovalCode, EnrolmentToken, WorkerKeyDigest};
+use abc_core::id::{EnrolmentRequestId, WorkerId, WorkspaceId};
 use abc_core::identity::{DisplayName, MachineInfo};
 use abc_core::secret::{Secret, serialize_exposed};
+use abc_core::time::Timestamp;
 use semver::Version;
 use serde::{Deserialize, Serialize};
 
 /// The enrolment endpoint, relative to the server's tailnet URL. Requests carry
 /// `Content-Type: application/json`.
 pub const ENROL_PATH: &str = "/api/enrol";
+
+/// The path of a workspace's enrolment requests, with `{workspace}` as the workspace's id:
+/// `POST` asks to enrol (an [`ApprovalRequest`], answered with an [`ApprovalRequested`]).
+pub const REQUESTS_PATH: &str = "/api/workspaces/{workspace}/enrolment-requests";
+
+/// The path a waiting machine polls, with `{request}` as the request's id. It answers an
+/// `abc_core::query::RequestState`, and only to the login and node that made the request.
+pub const REQUEST_STATUS_PATH: &str = "/api/enrolment-requests/{request}";
+
+/// The page where the owner approves a request, relative to the server's URL: the machine prints
+/// it with the code. The web app serves it.
+#[must_use]
+pub fn approve_path(workspace: WorkspaceId, request: EnrolmentRequestId) -> String {
+    format!("/machines/requests/{workspace}/{request}")
+}
 
 /// The worker's enrolment request.
 #[derive(Debug, Serialize, Deserialize)]
@@ -37,6 +53,29 @@ pub struct EnrolRequest {
     pub machine: MachineInfo,
     /// The worker's abc release.
     pub build: Version,
+}
+
+/// A machine asking to be enrolled, to be approved in the browser. The key it generated stays on
+/// the machine: only its digest travels.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovalRequest {
+    /// The digest of the key the worker generated and already saved.
+    pub key: WorkerKeyDigest,
+    /// The machine.
+    pub machine: MachineInfo,
+    /// The worker's abc release.
+    pub build: Version,
+}
+
+/// What the machine shows while it waits for approval.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovalRequested {
+    /// The request, which the machine polls.
+    pub request: EnrolmentRequestId,
+    /// The code the Approve page shows too.
+    pub code: ApprovalCode,
+    /// When the request stops waiting.
+    pub expires_at: Timestamp,
 }
 
 /// A successful enrolment. Identical for the first call and for every retry with the same key.
@@ -127,6 +166,17 @@ mod tests {
             serde_json::from_str::<EnrolResponse>(&json).unwrap(),
             response,
             "and reads back"
+        );
+    }
+
+    #[test]
+    fn the_approve_path_names_the_workspace_and_the_request() {
+        use abc_core::id::FromUuid as _;
+        let workspace = WorkspaceId::from_uuid(uuid::Uuid::from_u128(1));
+        let request = EnrolmentRequestId::from_uuid(uuid::Uuid::from_u128(2));
+        assert_eq!(
+            approve_path(workspace, request),
+            "/machines/requests/00000000-0000-0000-0000-000000000001/00000000-0000-0000-0000-000000000002"
         );
     }
 }

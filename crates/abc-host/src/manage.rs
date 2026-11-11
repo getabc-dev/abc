@@ -12,7 +12,7 @@ use crate::postgres::{Postgres, backup_name};
 use crate::services::{Part, Services};
 use crate::setup::definitions;
 use crate::tailscale::Tailscale;
-use crate::{Console, Host, HostError};
+use crate::{Console, HostError, Server};
 
 /// The fix when Postgres is not running for a command that needs it.
 const POSTGRES_DOWN: &str = "check abc's Postgres with abc server status";
@@ -23,12 +23,13 @@ const POSTGRES_DOWN: &str = "check abc's Postgres with abc server status";
 /// # Errors
 ///
 /// [`HostError`], each naming its fix.
-pub fn upgrade(host: &Host, console: &mut Console<'_>) -> Result<(), HostError> {
-    let config = Config::require(&host.home)?;
-    config.programs.check(&host.home.config())?;
-    let services = Services::new(host);
-    let postgres = Postgres::new(&host.home, &config.programs);
-    let [postgres_service, tailscaled_service, server_service] = definitions(host, &config)?;
+pub fn upgrade(server: &Server, console: &mut Console<'_>) -> Result<(), HostError> {
+    let host = &server.host;
+    let config = Config::require(&server.home)?;
+    config.programs.check(&server.home.config())?;
+    let services = Services::new(host, server.home.logs());
+    let postgres = Postgres::new(&server.home, &config.programs);
+    let [postgres_service, tailscaled_service, server_service] = definitions(server, &config)?;
     // abc server goes first: Postgres stops only once its sessions end (launchd's SIGTERM is
     // Postgres's smart shutdown), and the server's pool keeps them open.
     services.stop(Part::Server)?;
@@ -73,14 +74,14 @@ pub struct Backup {
 ///
 /// [`HostError::BackupExists`], and [`HostError`]s naming their fixes.
 pub fn backup(
-    host: &Host,
+    server: &Server,
     file: Option<&Path>,
     now: time::OffsetDateTime,
 ) -> Result<Backup, HostError> {
-    let config = Config::require(&host.home)?;
-    let postgres = Postgres::new(&host.home, &config.programs);
+    let config = Config::require(&server.home)?;
+    let postgres = Postgres::new(&server.home, &config.programs);
     let path = file.map_or_else(
-        || host.home.backups().join(backup_name(now)),
+        || server.home.backups().join(backup_name(now)),
         Path::to_owned,
     );
     match fs::OpenOptions::new()
@@ -113,9 +114,10 @@ pub fn backup(
 /// # Errors
 ///
 /// [`HostError`], each naming its fix.
-pub fn restore(host: &Host, file: &Path, console: &mut Console<'_>) -> Result<(), HostError> {
-    let config = Config::require(&host.home)?;
-    let postgres = Postgres::new(&host.home, &config.programs);
+pub fn restore(server: &Server, file: &Path, console: &mut Console<'_>) -> Result<(), HostError> {
+    let host = &server.host;
+    let config = Config::require(&server.home)?;
+    let postgres = Postgres::new(&server.home, &config.programs);
     postgres.check_dump(file)?;
     if !postgres.ready() {
         return Err(HostError::Failed {
@@ -125,7 +127,7 @@ pub fn restore(host: &Host, file: &Path, console: &mut Console<'_>) -> Result<()
             fix: POSTGRES_DOWN.to_owned(),
         });
     }
-    let services = Services::new(host);
+    let services = Services::new(host, server.home.logs());
     services.stop(Part::Server)?;
     console.line("Stopped abc server.");
     let restored = postgres.restore(file);
@@ -153,21 +155,21 @@ pub fn restore(host: &Host, file: &Path, console: &mut Console<'_>) -> Result<()
 /// # Errors
 ///
 /// [`HostError`], each naming its fix.
-pub fn uninstall(host: &Host, purge: bool, console: &mut Console<'_>) -> Result<(), HostError> {
-    let config = Config::load(&host.home)?;
+pub fn uninstall(server: &Server, purge: bool, console: &mut Console<'_>) -> Result<(), HostError> {
+    let config = Config::load(&server.home)?;
     // A purge deletes the home whole, so it must be abc's: holding abc's configuration and
     // private to this user. Checked before anything changes.
-    if purge && host.home.exists() {
+    if purge && server.home.exists() {
         if config.is_none() {
             return Err(HostError::NotAbcsHome {
-                path: host.home.dir().to_path_buf(),
+                path: server.home.dir().to_path_buf(),
             });
         }
-        private(host.home.dir())?;
+        private(server.home.dir())?;
     }
-    let services = Services::new(host);
+    let services = Services::new(&server.host, server.home.logs());
     if let Some(config) = &config {
-        let tailscale = Tailscale::new(&host.home, &config.programs);
+        let tailscale = Tailscale::new(&server.home, &config.programs);
         match tailscale.log_out() {
             Ok(()) => console.line("Logged abc's node out of your tailnet."),
             Err(error) => console.line(&format!(
@@ -183,8 +185,8 @@ pub fn uninstall(host: &Host, purge: bool, console: &mut Console<'_>) -> Result<
         "Delete the device `abc` from your tailnet at https://login.tailscale.com/admin/machines \
          (it is listed as logged out).",
     );
-    let home = host.home.dir();
-    if !host.home.exists() {
+    let home = server.home.dir();
+    if !server.home.exists() {
         return Ok(());
     }
     if purge {

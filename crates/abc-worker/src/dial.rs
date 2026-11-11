@@ -8,9 +8,14 @@
 use std::time::Duration;
 
 use abc_core::credential::WorkerKey;
+use abc_core::id::{EnrolmentRequestId, WorkspaceId};
+use abc_core::query::{RequestState, SessionView};
 use abc_core::secret::Secret;
 use abc_protocol::api::{ApiCode, ApiErrorBody};
-use abc_protocol::enrol::{ENROL_PATH, EnrolRequest, EnrolResponse};
+use abc_protocol::enrol::{
+    ApprovalRequest, ApprovalRequested, ENROL_PATH, EnrolRequest, EnrolResponse,
+    REQUEST_STATUS_PATH, REQUESTS_PATH,
+};
 use abc_protocol::link::{CONNECT_PATH, MAX_MESSAGE};
 use abc_protocol::url::PublicUrl;
 use bytes::Bytes;
@@ -138,6 +143,12 @@ pub(crate) const fn refusal(status: u16, code: Option<ApiCode>) -> Refusal {
         | ApiCode::EnrolmentTokenUsed
         | ApiCode::WorkerKeyInUse
         | ApiCode::EnrolmentTokenAlreadyRedeemed
+        | ApiCode::EnrolmentRequestUnknown
+        | ApiCode::TailnetNodeUnknown
+        | ApiCode::ApprovalUnavailable
+        | ApiCode::EnrolmentRequestExpired
+        | ApiCode::EnrolmentRequestDenied
+        | ApiCode::EnrolmentRequestApproved
         | ApiCode::Internal => Refusal::Unexpected {
             status,
             code: Some(code),
@@ -167,13 +178,16 @@ pub(crate) fn enrol_refusal(status: u16, body: Option<ApiErrorBody>) -> EnrolErr
         }
         ApiCode::WorkerRevoked => EnrolError::Revoked,
         ApiCode::WorkerKeyInUse => EnrolError::KeyInUse,
+        ApiCode::ApprovalUnavailable => EnrolError::ApprovalUnavailable,
+        ApiCode::TailnetIdentityRequired => EnrolError::NoTailnetIdentity,
         ApiCode::RateLimited => EnrolError::RateLimited,
         ApiCode::Unavailable => EnrolError::Unavailable,
+        // Its tailscaled may be restarting, or this machine just left the tailnet: retried alike.
+        ApiCode::TailnetNodeUnknown => EnrolError::TailnetNodeUnknown,
         ApiCode::MalformedRequest
         | ApiCode::CrossSiteRequest
         | ApiCode::NotFound
         | ApiCode::MethodNotAllowed
-        | ApiCode::TailnetIdentityRequired
         | ApiCode::InvalidWorkerKey
         | ApiCode::NotAMember
         | ApiCode::WorkerOnly
@@ -184,6 +198,10 @@ pub(crate) fn enrol_refusal(status: u16, body: Option<ApiErrorBody>) -> EnrolErr
         | ApiCode::ServerOnly
         | ApiCode::UnknownWorker
         | ApiCode::EnrolmentTokenRequired
+        | ApiCode::EnrolmentRequestUnknown
+        | ApiCode::EnrolmentRequestExpired
+        | ApiCode::EnrolmentRequestDenied
+        | ApiCode::EnrolmentRequestApproved
         | ApiCode::Internal => refused(error.message),
     }
 }
@@ -236,14 +254,16 @@ async fn within<T>(
         .unwrap_or(Err(DialError::Timeout(limit)))
 }
 
-/// `POST /api/enrol`, bounded by the request timing.
-pub(crate) async fn post_enrol(
+/// One JSON exchange with the server over a fresh verified connection, bounded by the request
+/// timing: the status and the body (at most [`MAX_BODY`]).
+async fn exchange(
     env: &Env,
     server: &PublicUrl,
-    request: &EnrolRequest,
-) -> Result<EnrolResponse, EnrolError> {
-    let payload = serde_json::to_vec(request).map_err(|error| EnrolError::Encode(error.into()))?;
-    let (status, answer) = within(env.timings.request, async {
+    method: hyper::Method,
+    path: &str,
+    payload: Option<Vec<u8>>,
+) -> Result<(u16, Bytes), DialError> {
+    within(env.timings.request, async {
         let stream = tls(env, server).await?;
         let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
             .await
@@ -252,13 +272,22 @@ pub(crate) async fn post_enrol(
         drop(tokio::spawn(connection));
         let host =
             HeaderValue::from_str(server.host()).map_err(|error| DialError::Http(error.into()))?;
-        let post = hyper::Request::post(ENROL_PATH)
-            .header(HOST, host)
-            .header(CONTENT_TYPE, "application/json")
-            .body(Full::new(Bytes::from(payload)))
+        let mut builder = hyper::Request::builder()
+            .method(method)
+            .uri(path)
+            .header(HOST, host);
+        let body = match payload {
+            Some(payload) => {
+                builder = builder.header(CONTENT_TYPE, "application/json");
+                Full::new(Bytes::from(payload))
+            }
+            None => Full::new(Bytes::new()),
+        };
+        let request = builder
+            .body(body)
             .map_err(|error| DialError::Http(error.into()))?;
         let response = sender
-            .send_request(post)
+            .send_request(request)
             .await
             .map_err(|error| DialError::Http(error.into()))?;
         let status = response.status().as_u16();
@@ -270,12 +299,65 @@ pub(crate) async fn post_enrol(
         Ok((status, bytes))
     })
     .await
-    .map_err(EnrolError::Unreachable)?;
+}
+
+/// Reads a 200 answer as `T`, or reports the refusal in enrolment's terms.
+fn answer<T: serde::de::DeserializeOwned>(status: u16, body: &[u8]) -> Result<T, EnrolError> {
     if status == 200 {
-        serde_json::from_slice(&answer).map_err(|_unreadable| EnrolError::NotAbc { status })
+        serde_json::from_slice(body).map_err(|_unreadable| EnrolError::NotAbc { status })
     } else {
-        Err(enrol_refusal(status, api_error(&answer)))
+        Err(enrol_refusal(status, api_error(body)))
     }
+}
+
+/// `POST /api/enrol`, bounded by the request timing.
+pub(crate) async fn post_enrol(
+    env: &Env,
+    server: &PublicUrl,
+    request: &EnrolRequest,
+) -> Result<EnrolResponse, EnrolError> {
+    let payload = serde_json::to_vec(request).map_err(|error| EnrolError::Encode(error.into()))?;
+    let (status, body) = exchange(env, server, hyper::Method::POST, ENROL_PATH, Some(payload))
+        .await
+        .map_err(EnrolError::Unreachable)?;
+    answer(status, &body)
+}
+
+/// `GET /api/session`: who the server says this machine's person is, through the machine's own
+/// Tailscale.
+pub(crate) async fn get_session(env: &Env, server: &PublicUrl) -> Result<SessionView, EnrolError> {
+    let (status, body) = exchange(env, server, hyper::Method::GET, "/api/session", None)
+        .await
+        .map_err(EnrolError::Unreachable)?;
+    answer(status, &body)
+}
+
+/// `POST /api/workspaces/{workspace}/enrolment-requests`.
+pub(crate) async fn post_request(
+    env: &Env,
+    server: &PublicUrl,
+    workspace: WorkspaceId,
+    request: &ApprovalRequest,
+) -> Result<ApprovalRequested, EnrolError> {
+    let payload = serde_json::to_vec(request).map_err(|error| EnrolError::Encode(error.into()))?;
+    let path = REQUESTS_PATH.replace("{workspace}", &workspace.to_string());
+    let (status, body) = exchange(env, server, hyper::Method::POST, &path, Some(payload))
+        .await
+        .map_err(EnrolError::Unreachable)?;
+    answer(status, &body)
+}
+
+/// `GET /api/enrolment-requests/{request}`.
+pub(crate) async fn get_request_state(
+    env: &Env,
+    server: &PublicUrl,
+    request: EnrolmentRequestId,
+) -> Result<RequestState, EnrolError> {
+    let path = REQUEST_STATUS_PATH.replace("{request}", &request.to_string());
+    let (status, body) = exchange(env, server, hyper::Method::GET, &path, None)
+        .await
+        .map_err(EnrolError::Unreachable)?;
+    answer(status, &body)
 }
 
 /// What dialling the link gave.
@@ -574,12 +656,24 @@ mod tests {
                 "another worker already holds this machine's key (was the worker home copied?); enrol again with --replace",
             ),
             (
+                ApiCode::ApprovalUnavailable,
+                "the server cannot approve a machine in the browser; create an enrolment token on the Machines page and run `abc worker enrol <url> --token-file <file>` instead",
+            ),
+            (
+                ApiCode::TailnetIdentityRequired,
+                "the server does not know you: this machine is not signed in to Tailscale as a person (a tagged device has no identity); sign in as the person who owns the server, or enrol with a token: `abc worker enrol <url> --token-file <file>`",
+            ),
+            (
                 ApiCode::RateLimited,
                 "too many enrolment attempts from this machine; wait a minute and run the same command again",
             ),
             (
                 ApiCode::Unavailable,
                 "the server is starting, stopping or cannot reach its database; run the same command again",
+            ),
+            (
+                ApiCode::TailnetNodeUnknown,
+                "the server could not tell which Tailscale node this machine is; check that it is signed in to the server's tailnet (`tailscale status`), then run the same command again",
             ),
         ];
         for code in ApiCode::ALL {
