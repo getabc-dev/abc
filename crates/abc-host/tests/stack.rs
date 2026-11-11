@@ -1463,25 +1463,26 @@ mod tests {
             abc_host::install_worker(&host, &spec, &mut Console::new(&mut Vec::new())).unwrap();
         assert!(!again, "nothing changes the second time");
 
-        let mut told = Vec::new();
-        abc_host::uninstall_worker(&host, &spec.home, false, &mut Console::new(&mut told)).unwrap();
-        let told = String::from_utf8(told).unwrap();
-        assert!(told.contains("Removed abc worker's service."), "{told}");
-        assert!(told.contains("stay in"), "the home stays: {told}");
+        let mut kept = Vec::new();
+        abc_host::uninstall_worker(&host, &spec.home, false, &mut Console::new(&mut kept)).unwrap();
+        let kept = String::from_utf8(kept).unwrap();
+        assert!(kept.contains("Removed abc worker's service."), "{kept}");
+        assert!(kept.contains("stay in"), "the home stays: {kept}");
         assert!(spec.home.is_dir());
-        let status = abc_host::worker_status(&host, &spec.home).unwrap();
-        assert!(!status.healthy(), "stopped for good");
+        let stopped = abc_host::worker_status(&host, &spec.home).unwrap();
+        assert!(!stopped.healthy(), "stopped for good");
 
-        let mut told = Vec::new();
-        abc_host::uninstall_worker(&host, &spec.home, true, &mut Console::new(&mut told)).unwrap();
-        let told = String::from_utf8(told).unwrap();
-        assert!(told.contains("was not installed."), "{told}");
-        assert!(told.contains("Deleted"), "{told}");
+        let mut purged = Vec::new();
+        abc_host::uninstall_worker(&host, &spec.home, true, &mut Console::new(&mut purged))
+            .unwrap();
+        let purged = String::from_utf8(purged).unwrap();
+        assert!(purged.contains("was not installed."), "{purged}");
+        assert!(purged.contains("Deleted"), "{purged}");
         assert!(!spec.home.exists(), "purged");
-        let mut told = Vec::new();
-        abc_host::uninstall_worker(&host, &spec.home, true, &mut Console::new(&mut told)).unwrap();
+        let mut twice = Vec::new();
+        abc_host::uninstall_worker(&host, &spec.home, true, &mut Console::new(&mut twice)).unwrap();
         assert!(
-            String::from_utf8(told)
+            String::from_utf8(twice)
                 .unwrap()
                 .contains("was not installed.")
         );

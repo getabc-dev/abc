@@ -5,17 +5,19 @@
 // both as it does behind Serve, and passes a worker's WebSocket upgrade through, as Serve does.
 // `cargo xtask e2e` names the socket, the origin and the certificate it made for the run.
 
-import { readFileSync } from "node:fs";
+import { readFileSync, rmSync } from "node:fs";
 import {
+  createServer as createHttpServer,
   type IncomingHttpHeaders,
   type IncomingMessage,
   type OutgoingHttpHeaders,
   request,
 } from "node:http";
 import { createServer } from "node:https";
+import { dirname, join } from "node:path";
 import type { Duplex } from "node:stream";
 
-import { LOGIN } from "./identity.ts";
+import { LOGIN, NODE } from "./identity.ts";
 
 function required(name: string): string {
   const value = process.env[name];
@@ -32,8 +34,11 @@ const tls = {
   key: readFileSync(required("ABC_E2E_TLS_KEY")),
 };
 
-/** The headers Serve sends abc for a request from the browser with `incoming` headers. */
-function forwarded(incoming: IncomingHttpHeaders): OutgoingHttpHeaders {
+/**
+ * The headers Serve sends abc for a request with `incoming` headers, from the tailnet address
+ * `peer`.
+ */
+function forwarded(incoming: IncomingHttpHeaders, peer: string | undefined): OutgoingHttpHeaders {
   // Serve drops any identity or forwarding headers a client sends and sets its own.
   const headers: OutgoingHttpHeaders = { ...incoming };
   for (const name of Object.keys(headers)) {
@@ -48,6 +53,8 @@ function forwarded(incoming: IncomingHttpHeaders): OutgoingHttpHeaders {
     // The `Host` the browser sent, as Serve forwards it; none when it sent none.
     ...(host === undefined ? {} : { "x-forwarded-host": host }),
     "x-forwarded-proto": "https",
+    // The address Serve accepted the connection from, which abc asks its tailscaled about.
+    "x-forwarded-for": peer ?? "127.0.0.1",
     "tailscale-user-login": LOGIN,
   };
 }
@@ -58,7 +65,7 @@ const sidecar = createServer(tls, (incoming, outgoing) => {
       socketPath: socket,
       method: incoming.method,
       path: incoming.url,
-      headers: forwarded(incoming.headers),
+      headers: forwarded(incoming.headers, incoming.socket.remoteAddress),
     },
     (answer) => {
       outgoing.writeHead(answer.statusCode ?? 502, answer.headers);
@@ -79,7 +86,7 @@ sidecar.on("upgrade", (incoming: IncomingMessage, client: Duplex, head: Buffer) 
     socketPath: socket,
     method: incoming.method,
     path: incoming.url,
-    headers: forwarded(incoming.headers),
+    headers: forwarded(incoming.headers, incoming.socket.remoteAddress),
   });
   forward.on("upgrade", (answer, server, serverHead) => {
     const lines = [`HTTP/1.1 ${answer.statusCode ?? 101} ${answer.statusMessage ?? ""}`];
@@ -111,3 +118,21 @@ sidecar.on("upgrade", (incoming: IncomingMessage, client: Duplex, head: Buffer) 
 });
 
 sidecar.listen(Number(origin.port), "127.0.0.1");
+
+// A stand-in for abc's own tailscaled: LocalAPI's `whois` over a Unix socket beside abc's, which
+// the server is started with (`--tailscaled-socket`). Every address is the one node, as every
+// connection to the stand-in comes from this machine, and its person is the one the stand-in
+// vouches for.
+const tailscaled = join(dirname(socket), "tailscaled.sock");
+rmSync(tailscaled, { force: true });
+createHttpServer((_incoming, outgoing) => {
+  const body = JSON.stringify({
+    Node: { Name: `${NODE}.` },
+    UserProfile: { LoginName: LOGIN },
+  });
+  outgoing.writeHead(200, {
+    "content-type": "application/json",
+    "content-length": Buffer.byteLength(body),
+  });
+  outgoing.end(body);
+}).listen(tailscaled);

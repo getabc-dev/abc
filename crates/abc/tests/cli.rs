@@ -503,16 +503,16 @@ mod tests {
             "{}",
             text(&status.stderr)
         );
-        let (dir, home) = worker_home();
-        let bin = path_with_loginctl(dir.path());
-        let mut status = worker(&["status"], &home);
-        status.env("HOME", dir.path()).env("PATH", &bin);
-        let status = run(&mut status);
-        assert_eq!(status.status.code(), Some(1), "not enrolled");
+        let (bare, bare_home) = worker_home();
+        let bare_bin = path_with_loginctl(bare.path());
+        let mut bare_status = worker(&["status"], &bare_home);
+        bare_status.env("HOME", bare.path()).env("PATH", &bare_bin);
+        let bare_status = run(&mut bare_status);
+        assert_eq!(bare_status.status.code(), Some(1), "not enrolled");
         assert!(
-            text(&status.stdout).contains("not enrolled: run `abc worker setup <server-url>`"),
+            text(&bare_status.stdout).contains("not enrolled: run `abc worker setup <server-url>`"),
             "{}",
-            text(&status.stdout)
+            text(&bare_status.stdout)
         );
     }
 
