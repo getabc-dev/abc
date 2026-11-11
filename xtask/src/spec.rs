@@ -677,14 +677,38 @@ fn quint_files(dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
 }
 
 #[cfg(test)]
+/// A temporary directory that is removed even when `Workspace::create` made a read-only
+/// Quint home in it, and even when the test fails: a plain `TempDir` cannot remove one.
+pub(crate) struct Scratch(tempfile::TempDir);
+
+#[cfg(test)]
+impl Scratch {
+    pub(crate) fn new() -> Self {
+        Self(tempfile::tempdir().unwrap())
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        self.0.path()
+    }
+}
+
+#[cfg(test)]
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        remove_tree(&self.0.path().join("target/spec")).unwrap();
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use std::fs;
     use std::os::unix::fs::PermissionsExt as _;
     use std::path::{Path, PathBuf};
 
     use super::{
-        Checks, Found, Module, Options, RUNNER, Seeded, Tools, Workspace, affected_by, found,
-        log_tail, present, quint_files, remove_tree, run, server_args, test_args, trace_args,
+        Checks, Found, Module, Options, RUNNER, Scratch, Seeded, Tools, Workspace, affected_by,
+        found, log_tail, present, quint_files, remove_tree, run, server_args, test_args,
+        trace_args,
     };
     use crate::testing::{pinned_for_tests, script};
 
@@ -732,26 +756,6 @@ module tests {
         file: FILE,
         main: "tests",
     };
-
-    /// A temporary directory that is removed even when `Workspace::create` made a read-only
-    /// Quint home in it, and even when the test fails: a plain `TempDir` cannot remove one.
-    struct Scratch(tempfile::TempDir);
-
-    impl Scratch {
-        fn new() -> Self {
-            Self(tempfile::tempdir().unwrap())
-        }
-
-        fn path(&self) -> &Path {
-            self.0.path()
-        }
-    }
-
-    impl Drop for Scratch {
-        fn drop(&mut self) {
-            remove_tree(&self.0.path().join("target/spec")).unwrap();
-        }
-    }
 
     /// A tree whose `spec/` holds `files`.
     fn tree(files: &[(&str, &str)]) -> Scratch {

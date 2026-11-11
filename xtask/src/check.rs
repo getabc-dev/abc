@@ -1774,7 +1774,7 @@ mod tests {
 
     #[test]
     fn the_specs_gate_runs_when_specs_or_pins_change() {
-        let empty = tempfile::tempdir().unwrap();
+        let empty = crate::spec::Scratch::new();
         let (none, without) = spec_gate_in(empty.path(), None, None).unwrap();
         assert!(none.is_empty(), "{none:?}");
         assert!(
@@ -1782,7 +1782,7 @@ mod tests {
             "{without}"
         );
 
-        let specs = tempfile::tempdir().unwrap();
+        let specs = crate::spec::Scratch::new();
         fs::create_dir_all(specs.path().join("spec/runner")).unwrap();
         fs::write(
             specs.path().join("spec/runner/runner.qnt"),
