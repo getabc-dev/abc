@@ -1472,6 +1472,7 @@ mod tests {
         let stopped = abc_host::worker_status(&host, &spec.home).unwrap();
         assert!(!stopped.healthy(), "stopped for good");
 
+        std::fs::write(spec.home.join("worker.lock"), "").unwrap();
         let mut purged = Vec::new();
         abc_host::uninstall_worker(&host, &spec.home, true, &mut Console::new(&mut purged))
             .unwrap();
@@ -1536,8 +1537,16 @@ mod tests {
             ),
             "relative"
         );
+        let plain = root.join("plain");
+        std::fs::create_dir(&plain).unwrap();
+        std::fs::set_permissions(&plain, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            matches!(purge(&plain), Err(HostError::UnsafePurge { reason, .. }) if reason.contains("not an abc worker's home")),
+            "a private directory no worker has run in"
+        );
         let open = root.join("open");
         std::fs::create_dir(&open).unwrap();
+        std::fs::write(open.join("worker.toml"), "x").unwrap();
         std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert!(
             matches!(purge(&open), Err(HostError::Insecure { .. })),
@@ -1548,7 +1557,7 @@ mod tests {
             "a path through a file is an error, not an absent home"
         );
         assert!(
-            open.is_dir() && target.is_dir() && file.is_file(),
+            open.is_dir() && plain.is_dir() && target.is_dir() && file.is_file(),
             "nothing deleted"
         );
     }

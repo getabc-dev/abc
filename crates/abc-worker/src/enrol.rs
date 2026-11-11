@@ -258,6 +258,7 @@ async fn wait_for_decision(
             Err(
                 error @ (EnrolError::Unreachable(_)
                 | EnrolError::Unavailable
+                | EnrolError::TailnetNodeUnknown
                 | EnrolError::RateLimited),
             ) => {
                 let since = *failing_since.get_or_insert_with(tokio::time::Instant::now);
@@ -499,6 +500,13 @@ pub enum EnrolError {
         "the server is starting, stopping or cannot reach its database; run the same command again"
     )]
     Unavailable,
+    /// `tailnet_node_unknown`: the server's tailscaled could not say which node this request came
+    /// from.
+    #[error(
+        "the server could not tell which Tailscale node this machine is; check that it is signed \
+         in to the server's tailnet (`tailscale status`), then run the same command again"
+    )]
+    TailnetNodeUnknown,
     /// The server could not be reached, or did not answer in time.
     #[error("could not reach the server; run the same command again")]
     Unreachable(#[source] DialError),

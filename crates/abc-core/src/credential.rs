@@ -368,18 +368,18 @@ impl ApprovalCode {
         Self(std::mem::take(&mut *code))
     }
 
-    /// Reads a stored or sent code, with or without its dash.
+    /// Reads a stored or sent code, with or without the one dash after its fourth character.
     ///
     /// # Errors
     ///
     /// Returns [`MalformedCredential`] unless 8 upper-case Crockford characters remain.
     pub fn parse(text: &str) -> Result<Self, MalformedCredential> {
-        let code: String = text.chars().filter(|&symbol| symbol != '-').collect();
-        let valid = code.len() == APPROVAL_CODE_LEN
-            && code
-                .bytes()
-                .all(|byte| CROCKFORD.contains(&byte) && !byte.is_ascii_lowercase());
-        if valid {
+        let half = APPROVAL_CODE_LEN / 2;
+        let code = match text.split_at_checked(half) {
+            Some((first, rest)) => format!("{first}{}", rest.strip_prefix('-').unwrap_or(rest)),
+            None => text.to_owned(),
+        };
+        if code.len() == APPROVAL_CODE_LEN && code.bytes().all(|byte| CROCKFORD.contains(&byte)) {
             Ok(Self(code))
         } else {
             Err(MalformedCredential {
@@ -767,7 +767,16 @@ mod tests {
             code,
             "and reads it back"
         );
-        for bad in ["MPJT-B9D", "MPJT-B9D55", "mpjt-b9d5", "MPJT-B9DU"] {
+        for bad in [
+            "MPJT-B9D",
+            "MPJT-B9D55",
+            "mpjt-b9d5",
+            "MPJT-B9DU",
+            "M-P-J-T-B-9-D-5",
+            "MPJTB9D5-",
+            "MPJTB-9D5",
+            "-MPJTB9D5",
+        ] {
             assert!(ApprovalCode::parse(bad).is_err(), "{bad}");
         }
     }

@@ -24,7 +24,7 @@ use abc_core::time::Timestamp;
 use sqlx::PgConnection;
 use uuid::Uuid;
 
-use crate::error::StoreError;
+use crate::error::{StoreError, stored};
 use crate::execute::{Executable, Load};
 
 /// Shared by the two installation commands: whether the server is claimed, the newest setup code,
@@ -284,11 +284,6 @@ pub(crate) struct RequestRow {
     pub(crate) expires_at: time::OffsetDateTime,
     pub(crate) decision: Option<String>,
     pub(crate) changed_at: i64,
-}
-
-/// Reads a stored value with `parse`, or reports which column is corrupt.
-fn stored<T, E>(column: &'static str, parsed: Result<T, E>) -> Result<T, StoreError> {
-    parsed.ok().ok_or(StoreError::Corrupt(column))
 }
 
 impl TryFrom<&RequestRow> for RequestRecord {

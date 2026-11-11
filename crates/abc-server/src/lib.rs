@@ -141,6 +141,7 @@ async fn serve(
         drain: drain.clone(),
         limits: config.limits,
         enrolments: limits::RateLimiter::new(config.limits.enrolments_per_minute),
+        lookups: limits::RateLimiter::new(config.limits.lookups_per_minute),
         session_starts: limits::RateLimiter::new(config.limits.session_starts_per_minute),
         web: config.web,
         whois: config

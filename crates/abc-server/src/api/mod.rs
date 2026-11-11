@@ -94,6 +94,8 @@ pub(crate) struct SidecarState {
     pub(crate) limits: Limits,
     /// Enrolment attempts per source.
     pub(crate) enrolments: RateLimiter<String>,
+    /// Requests per source that ask tailscaled for their node.
+    pub(crate) lookups: RateLimiter<String>,
     /// Session starts per worker.
     pub(crate) session_starts: RateLimiter<WorkerId>,
     /// The web app, which answers what no API route matches outside `/api/`.
