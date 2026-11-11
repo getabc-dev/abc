@@ -485,6 +485,33 @@ fn run(
     }
 }
 
+/// Runs the mutants gate, and records the run in the checkpoint of the checkout it ran on,
+/// passing or failing: a fresh session re-tests the missed mutants only.
+fn run_mutants(
+    invocation: &Invocation<'_>,
+    base: &str,
+    options: &mutants::Options,
+    tools: &mutants::Tools,
+    report: &mut impl Write,
+) -> anyhow::Result<ExitCode> {
+    let label = gate_label(&Task::Mutants {
+        base: base.to_owned(),
+        jobs: options.jobs,
+        shard: options.shard,
+    });
+    let result = mutants::run(&invocation.root, base, options, tools, report)?;
+    if invocation.root == invocation.home
+        && let Err(error) =
+            progress::mutants_ran(&invocation.root, &label, &result.missed, progress::now())
+    {
+        writeln!(
+            report,
+            "{label}: ran, but the checkpoint was not written: {error:#}"
+        )?;
+    }
+    Ok(verdict(result.passed))
+}
+
 fn perform(
     task: Task,
     invocation: &Invocation<'_>,
@@ -508,31 +535,13 @@ fn perform(
             mode,
             report,
         )?)),
-        Task::Mutants { base, jobs, shard } => {
-            let label = gate_label(&Task::Mutants {
-                base: base.clone(),
-                jobs,
-                shard,
-            });
-            let result = mutants::run(
-                root,
-                &base,
-                &mutants::Options { jobs, shard, mode },
-                &mutants::Tools::pinned(tool, postgres()?)?,
-                report,
-            )?;
-            // Passing or failing: a fresh session re-tests the missed mutants only.
-            if root == home
-                && let Err(error) =
-                    progress::mutants_ran(root, &label, &result.missed, progress::now())
-            {
-                writeln!(
-                    report,
-                    "{label}: ran, but the checkpoint was not written: {error:#}"
-                )?;
-            }
-            Ok(verdict(result.passed))
-        }
+        Task::Mutants { base, jobs, shard } => run_mutants(
+            invocation,
+            &base,
+            &mutants::Options { jobs, shard, mode },
+            &mutants::Tools::pinned(tool, postgres()?)?,
+            report,
+        ),
         Task::Spec { traces } => run_spec(root, traces.as_deref(), tool, report),
         Task::Fuzz { seconds } => Ok(verdict(fuzz::run(
             root,
@@ -1753,11 +1762,11 @@ mod tests {
             dispatch(mutants(), &root, &root, &no_env).unwrap(),
             ExitCode::SUCCESS
         );
-        let checkpoint = fs::read_to_string(root.join(crate::progress::PROGRESS)).unwrap();
+        let recorded = fs::read_to_string(root.join(crate::progress::PROGRESS)).unwrap();
         assert!(
-            checkpoint.contains("- `cargo xtask mutants --base base --shard 1/2` ran at ")
-                && checkpoint.contains("and caught every mutant"),
-            "{checkpoint}"
+            recorded.contains("- `cargo xtask mutants --base base --shard 1/2` ran at ")
+                && recorded.contains("and caught every mutant"),
+            "{recorded}"
         );
         assert_eq!(
             dispatch(mutants(), &home, &root, &no_env).unwrap(),

@@ -565,22 +565,25 @@ pub(crate) fn start_next(
     let mut all = runs.list()?.runs;
     let mut started = Vec::new();
     loop {
-        let busy = active(&all);
+        let busy: Vec<PathBuf> = active(&all)
+            .iter()
+            .map(|run| run.worktree.clone())
+            .collect();
         if busy.len() >= parallel {
             return Ok(started);
         }
-        let Some(index) = all.iter().position(|run| {
-            run.status == Status::Queued && !busy.iter().any(|other| other.worktree == run.worktree)
-        }) else {
+        let Some(next) = all
+            .iter_mut()
+            .find(|run| run.status == Status::Queued && !busy.contains(&run.worktree))
+        else {
             return Ok(started);
         };
-        let mut next = all[index].clone();
         next.status = Status::Waiting {
             until: now,
             cause: Cause::Start,
         };
-        runs.save(&next)?;
-        all[index] = next.clone();
+        runs.save(next)?;
+        let next = next.clone();
         started.push(activate(runs, services, next)?);
     }
 }
@@ -641,7 +644,7 @@ pub(crate) fn cancel(
         format!(
             "cancelled {id}; started {}",
             next.iter()
-                .map(|run| run.id.as_str())
+                .map(|started| started.id.as_str())
                 .collect::<Vec<_>>()
                 .join(", ")
         )

@@ -2024,11 +2024,16 @@ fn the_parallel_setting_defaults_to_one_and_rejects_nonsense() {
         "{\"parallel\":2,\"x\":1}",
     )
     .unwrap();
-    assert!(runs(&world).settings().is_err(), "unknown fields");
+    runs(&world)
+        .settings()
+        .expect_err("unknown fields are refused");
     std::fs::remove_file(world.host.runs.join("settings.json")).unwrap();
     std::fs::create_dir(world.host.runs.join("settings.json")).unwrap();
-    let error = runs(&world).settings().unwrap_err();
-    assert!(format!("{error:#}").contains("could not read"), "{error:#}");
+    let unreadable = runs(&world).settings().unwrap_err();
+    assert!(
+        format!("{unreadable:#}").contains("could not read"),
+        "{unreadable:#}"
+    );
 }
 
 /// Criterion 1: with two slots, two runs are active in two worktrees; a third waits, and so does a
@@ -2208,8 +2213,8 @@ fn a_limit_file_that_cannot_be_read_is_an_error() {
     let all = runs(&world);
     std::fs::create_dir_all(&world.host.runs).unwrap();
     std::fs::write(world.host.runs.join("limit.json"), "nonsense").unwrap();
-    assert!(all.limit(MORNING).is_err());
+    all.limit(MORNING).unwrap_err();
     std::fs::remove_file(world.host.runs.join("limit.json")).unwrap();
     std::fs::create_dir(world.host.runs.join("limit.json")).unwrap();
-    assert!(all.limit(MORNING).is_err());
+    all.limit(MORNING).unwrap_err();
 }

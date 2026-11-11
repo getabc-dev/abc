@@ -820,10 +820,10 @@ mod tests {
         .unwrap();
         let text = String::from_utf8(out).unwrap();
         assert!(!report.passed, "a missed mutant fails: {text}");
+        // The report names the missed mutants for the checkpoint.
         assert_eq!(
             report.missed,
-            ["src/a.rs:1:18: replace a -> bool with false"],
-            "the report names the missed mutants for the checkpoint"
+            ["src/a.rs:1:18: replace a -> bool with false"]
         );
         assert!(
             text.contains("missed: src/a.rs:1:18: replace a -> bool with false"),

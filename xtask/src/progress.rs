@@ -257,6 +257,55 @@ fn load(root: &Path) -> anyhow::Result<State> {
     }
 }
 
+/// The section of mutants runs: each one's result and the mutants it missed.
+fn render_mutants(state: &State, tree: &Tree, out: &mut String) -> Result<(), std::fmt::Error> {
+    if state.mutants.is_empty() {
+        return Ok(());
+    }
+    out.push_str(
+        "\n## Mutants runs\n\nThe last full run of each, with the mutants it missed. Re-test \
+         only those, with `cargo xtask tool cargo-mutants mutants --iterate` or `-F <regex>` \
+         on each (`--in-diff` as `cargo xtask mutants` passes it); never run a second full \
+         pass, since CI's shards do the full pass.\n\n",
+    );
+    let mut runs: Vec<_> = state.mutants.iter().collect();
+    runs.sort_by_key(|(_, run)| std::cmp::Reverse(run.at));
+    for (gate, run) in runs {
+        let at = if tree.head.as_deref() == Some(run.commit.as_str()) {
+            "HEAD"
+        } else {
+            "an earlier commit"
+        };
+        let result = match run.missed.len() {
+            0 => "caught every mutant".to_owned(),
+            1 => "missed 1 mutant".to_owned(),
+            n => format!("missed {n} mutants"),
+        };
+        writeln!(
+            out,
+            "- `cargo xtask {gate}` ran at {} ({at}){}, {}, and {result}",
+            short(&run.commit),
+            if run.clean {
+                ""
+            } else {
+                " with uncommitted changes"
+            },
+            utc(run.at)
+        )?;
+        for line in run.missed.iter().take(MISSED_LISTED) {
+            writeln!(out, "    {line}")?;
+        }
+        if run.missed.len() > MISSED_LISTED {
+            writeln!(
+                out,
+                "    and {} more",
+                run.missed.len().saturating_sub(MISSED_LISTED)
+            )?;
+        }
+    }
+    Ok(())
+}
+
 /// `seconds` since the Unix epoch as a UTC date and time to the minute.
 pub(crate) fn utc(seconds: i64) -> String {
     match time::OffsetDateTime::from_unix_timestamp(seconds) {
@@ -326,49 +375,7 @@ fn render(
             utc(pass.at)
         )?;
     }
-    if !state.mutants.is_empty() {
-        out.push_str(
-            "\n## Mutants runs\n\nThe last full run of each, with the mutants it missed. Re-test \
-             only those, with `cargo xtask tool cargo-mutants mutants --iterate` or `-F <regex>` \
-             on each (`--in-diff` as `cargo xtask mutants` passes it); never run a second full \
-             pass, since CI's shards do the full pass.\n\n",
-        );
-        let mut runs: Vec<_> = state.mutants.iter().collect();
-        runs.sort_by_key(|(_, run)| std::cmp::Reverse(run.at));
-        for (gate, run) in runs {
-            let at = if tree.head.as_deref() == Some(run.commit.as_str()) {
-                "HEAD"
-            } else {
-                "an earlier commit"
-            };
-            let result = match run.missed.len() {
-                0 => "caught every mutant".to_owned(),
-                1 => "missed 1 mutant".to_owned(),
-                n => format!("missed {n} mutants"),
-            };
-            writeln!(
-                out,
-                "- `cargo xtask {gate}` ran at {} ({at}){}, {}, and {result}",
-                short(&run.commit),
-                if run.clean {
-                    ""
-                } else {
-                    " with uncommitted changes"
-                },
-                utc(run.at)
-            )?;
-            for line in run.missed.iter().take(MISSED_LISTED) {
-                writeln!(out, "    {line}")?;
-            }
-            if run.missed.len() > MISSED_LISTED {
-                writeln!(
-                    out,
-                    "    and {} more",
-                    run.missed.len().saturating_sub(MISSED_LISTED)
-                )?;
-            }
-        }
-    }
+    render_mutants(state, tree, &mut out)?;
     writeln!(
         out,
         "\n## Commits\n\nHEAD: {} on {}.",
