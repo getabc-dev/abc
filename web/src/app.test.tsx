@@ -256,7 +256,6 @@ test("machines appear live in the shell and on their screen, and go offline", as
     requests: [],
     head: 6,
     changed: [{ ...card("lab box", "w1", false), last_seen_at: "2026-11-06T09:30:00Z" }],
-    requests: [],
   });
   await within(region).findByText("Offline");
   expect(within(region).queryByText("Never connected")).toBeNull();
@@ -360,7 +359,6 @@ test("a revoked machine says so and leaves the shell's pills", async () => {
     requests: [],
     head: 1,
     machines: [{ ...card("old box", "w1", false), revoked: true }, card("mac", "w2", true)],
-    requests: [],
   });
   const region = await screen.findByRole("region", { name: "old box" });
   expect(within(region).getByText("Revoked")).toBeDefined();
@@ -398,7 +396,6 @@ test("a workspace with only revoked machines offers the first enrolment", async 
     requests: [],
     head: 1,
     machines: [{ ...card("old box", "w1", false), revoked: true }],
-    requests: [],
   });
   await screen.findByRole("heading", { name: "Enrol your first machine" });
   expect(screen.getByText("No machines")).toBeDefined();
