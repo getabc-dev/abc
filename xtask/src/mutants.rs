@@ -108,6 +108,16 @@ pub(crate) struct Options {
     pub(crate) mode: Mode,
 }
 
+/// How a mutants run ended.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct Report {
+    /// Whether the tests caught every mutant.
+    pub(crate) passed: bool,
+    /// Every missed mutant, as cargo-mutants lists it with its workspace's directory in front,
+    /// `<file>:<line>:<column>: <mutation>`, across every workspace.
+    pub(crate) missed: Vec<String>,
+}
+
 /// Runs cargo-mutants, with the cargo-mutants and cargo-nextest executables given, on the Rust
 /// lines changed since the merge base with `base`, in each workspace of the repository.
 ///
@@ -123,9 +133,10 @@ pub(crate) fn run(
     options: &Options,
     tools: &Tools,
     out: &mut impl Write,
-) -> anyhow::Result<bool> {
+) -> anyhow::Result<Report> {
     let commit = git::merge_base(root, base)?;
     let mut passed = true;
+    let mut missed = Vec::new();
     let mut mutated = false;
     // The step's annotations, across every workspace's missed mutants.
     let mut step = annotation::Step::new(options.mode);
@@ -151,13 +162,15 @@ pub(crate) fn run(
         if result.is_err() {
             write!(out, "{}", step.finish())?;
         }
-        passed &= result?;
+        let result = result?;
+        passed &= result.passed;
+        missed.extend(result.missed);
     }
     if !mutated {
         writeln!(out, "mutants: no Rust lines changed; nothing to mutate")?;
     }
     write!(out, "{}", step.finish())?;
-    Ok(passed)
+    Ok(Report { passed, missed })
 }
 
 /// The diff from `commit` of the files of `workspace`, with paths relative to its directory, as
@@ -241,7 +254,7 @@ impl Run<'_> {
         diff: &str,
         step: &mut annotation::Step,
         out: &mut impl Write,
-    ) -> anyhow::Result<bool> {
+    ) -> anyhow::Result<Report> {
         let root = self.root;
         let output = self.output();
         fs::create_dir_all(&output)
@@ -346,14 +359,14 @@ impl Run<'_> {
     }
 
     /// Reads the results cargo-mutants wrote in `results` and reports them, with its `result`;
-    /// whether the tests caught every mutant.
+    /// whether the tests caught every mutant, and the ones they missed.
     fn report(
         &self,
         results: &Path,
         result: Outcome,
         step: &mut annotation::Step,
         out: &mut impl Write,
-    ) -> anyhow::Result<bool> {
+    ) -> anyhow::Result<Report> {
         let named = |line: String| {
             if self.workspace.dir().is_empty() {
                 line
@@ -373,7 +386,7 @@ impl Run<'_> {
         write!(out, "{}", describe(passed, &missed, &timed_out))?;
         let annotations: Vec<Annotation> = missed.iter().map(|line| annotate(line)).collect();
         write!(out, "{}", step.emit(&annotations))?;
-        Ok(passed)
+        Ok(Report { passed, missed })
     }
 }
 
@@ -619,9 +632,20 @@ mod tests {
     use std::path::Path;
 
     use super::{
-        Options, Outcome, Shard, annotate, changes_rust, describe, listed, outcome, run,
+        Options, Outcome, Shard, annotate, changes_rust, describe, listed, outcome,
         test_env_config, test_runner, timeout_multiplier,
     };
+
+    /// [`super::run`], reduced to whether the tests caught every mutant.
+    fn run(
+        root: &Path,
+        base: &str,
+        options: &Options,
+        tools: &super::Tools,
+        out: &mut impl std::io::Write,
+    ) -> anyhow::Result<bool> {
+        super::run(root, base, options, tools, out).map(|report| report.passed)
+    }
     use crate::annotation::Mode;
     use crate::testing::{repository_with_change, script};
 
@@ -786,7 +810,7 @@ mod tests {
             "[ \"$1\" = mutants ] || exit 7\nwhile [ $# -gt 0 ]; do case \"$1\" in --output) out=$2 ;; --in-diff) diff=$2 ;; --timeout-multiplier) multiplier=$2 ;; esac; shift; done\ngrep -q 'src/a.rs' \"$diff\" || exit 8\n[ \"$multiplier\" = 6 ] || exit 9\nmkdir -p \"$out/mutants.out\"\necho 'src/a.rs:1:18: replace a -> bool with false' > \"$out/mutants.out/missed.txt\"\nexit 2\n",
         );
         let mut out = Vec::new();
-        let passed = run(
+        let report = super::run(
             &repo,
             "base",
             &TWO,
@@ -795,7 +819,12 @@ mod tests {
         )
         .unwrap();
         let text = String::from_utf8(out).unwrap();
-        assert!(!passed, "a missed mutant fails: {text}");
+        assert!(!report.passed, "a missed mutant fails: {text}");
+        assert_eq!(
+            report.missed,
+            ["src/a.rs:1:18: replace a -> bool with false"],
+            "the report names the missed mutants for the checkpoint"
+        );
         assert!(
             text.contains("missed: src/a.rs:1:18: replace a -> bool with false"),
             "{text}"

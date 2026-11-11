@@ -508,13 +508,31 @@ fn perform(
             mode,
             report,
         )?)),
-        Task::Mutants { base, jobs, shard } => Ok(verdict(mutants::run(
-            root,
-            &base,
-            &mutants::Options { jobs, shard, mode },
-            &mutants::Tools::pinned(tool, postgres()?)?,
-            report,
-        )?)),
+        Task::Mutants { base, jobs, shard } => {
+            let label = gate_label(&Task::Mutants {
+                base: base.clone(),
+                jobs,
+                shard,
+            });
+            let result = mutants::run(
+                root,
+                &base,
+                &mutants::Options { jobs, shard, mode },
+                &mutants::Tools::pinned(tool, postgres()?)?,
+                report,
+            )?;
+            // Passing or failing: a fresh session re-tests the missed mutants only.
+            if root == home
+                && let Err(error) =
+                    progress::mutants_ran(root, &label, &result.missed, progress::now())
+            {
+                writeln!(
+                    report,
+                    "{label}: ran, but the checkpoint was not written: {error:#}"
+                )?;
+            }
+            Ok(verdict(result.passed))
+        }
         Task::Spec { traces } => run_spec(root, traces.as_deref(), tool, report),
         Task::Fuzz { seconds } => Ok(verdict(fuzz::run(
             root,
@@ -1724,6 +1742,27 @@ mod tests {
         assert!(
             checkpoint.contains("- `cargo xtask coverage --base base` passed at "),
             "{checkpoint}"
+        );
+        // A mutants run is recorded too, with the mutants it missed or none.
+        let mutants = || Task::Mutants {
+            base: "base".to_owned(),
+            jobs: 1,
+            shard: Some(crate::mutants::Shard::parse("1/2").unwrap()),
+        };
+        assert_eq!(
+            dispatch(mutants(), &root, &root, &no_env).unwrap(),
+            ExitCode::SUCCESS
+        );
+        let checkpoint = fs::read_to_string(root.join(crate::progress::PROGRESS)).unwrap();
+        assert!(
+            checkpoint.contains("- `cargo xtask mutants --base base --shard 1/2` ran at ")
+                && checkpoint.contains("and caught every mutant"),
+            "{checkpoint}"
+        );
+        assert_eq!(
+            dispatch(mutants(), &home, &root, &no_env).unwrap(),
+            ExitCode::SUCCESS,
+            "judging another tree"
         );
         assert_eq!(
             dispatch(

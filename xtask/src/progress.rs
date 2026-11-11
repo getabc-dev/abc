@@ -50,6 +50,10 @@ struct State {
     /// Each gate's last pass, by its command (`check --changed`).
     #[serde(default)]
     gates: BTreeMap<String, Pass>,
+    /// Each mutants run's last result, by its command (`mutants --base origin/main`), pass or
+    /// fail: a fresh session re-tests the missed mutants and never repeats a full pass.
+    #[serde(default)]
+    mutants: BTreeMap<String, MutantsRun>,
     /// The agent's next step, in its words.
     #[serde(default)]
     next: Option<String>,
@@ -71,6 +75,22 @@ struct Pass {
     /// When it passed, in seconds since the Unix epoch.
     at: i64,
 }
+
+/// A mutants run, whatever its result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MutantsRun {
+    commit: String,
+    /// Whether the tree had no uncommitted changes when it ran.
+    clean: bool,
+    /// When it ended, in seconds since the Unix epoch.
+    at: i64,
+    /// The mutants no test noticed, as cargo-mutants lists them.
+    missed: Vec<String>,
+}
+
+/// The missed mutants a rendering lists before it says how many more there are.
+const MISSED_LISTED: usize = 100;
 
 /// The commit HEAD is at, if any.
 fn head(root: &Path) -> Option<String> {
@@ -137,6 +157,31 @@ pub(crate) fn gate_passed(root: &Path, gate: &str, now: i64) -> anyhow::Result<(
                     commit: commit.clone(),
                     clean: tree.uncommitted.is_empty(),
                     at: now,
+                },
+            );
+        }
+    })
+}
+
+/// Records that `gate` (its command after `cargo xtask`, such as `mutants --base origin/main`)
+/// ran on the checkout at `root` and ended at `now` with these `missed` mutants, none when every
+/// one was caught, and renders the checkpoint. A failing run is recorded too: a fresh session
+/// re-tests only the missed mutants, and never repeats a full pass.
+pub(crate) fn mutants_ran(
+    root: &Path,
+    gate: &str,
+    missed: &[String],
+    now: i64,
+) -> anyhow::Result<()> {
+    update(root, now, |state, tree| {
+        if let Some(commit) = &tree.head {
+            state.mutants.insert(
+                gate.to_owned(),
+                MutantsRun {
+                    commit: commit.clone(),
+                    clean: tree.uncommitted.is_empty(),
+                    at: now,
+                    missed: missed.to_vec(),
                 },
             );
         }
@@ -281,6 +326,49 @@ fn render(
             utc(pass.at)
         )?;
     }
+    if !state.mutants.is_empty() {
+        out.push_str(
+            "\n## Mutants runs\n\nThe last full run of each, with the mutants it missed. Re-test \
+             only those, with `cargo xtask tool cargo-mutants mutants --iterate` or `-F <regex>` \
+             on each (`--in-diff` as `cargo xtask mutants` passes it); never run a second full \
+             pass, since CI's shards do the full pass.\n\n",
+        );
+        let mut runs: Vec<_> = state.mutants.iter().collect();
+        runs.sort_by_key(|(_, run)| std::cmp::Reverse(run.at));
+        for (gate, run) in runs {
+            let at = if tree.head.as_deref() == Some(run.commit.as_str()) {
+                "HEAD"
+            } else {
+                "an earlier commit"
+            };
+            let result = match run.missed.len() {
+                0 => "caught every mutant".to_owned(),
+                1 => "missed 1 mutant".to_owned(),
+                n => format!("missed {n} mutants"),
+            };
+            writeln!(
+                out,
+                "- `cargo xtask {gate}` ran at {} ({at}){}, {}, and {result}",
+                short(&run.commit),
+                if run.clean {
+                    ""
+                } else {
+                    " with uncommitted changes"
+                },
+                utc(run.at)
+            )?;
+            for line in run.missed.iter().take(MISSED_LISTED) {
+                writeln!(out, "    {line}")?;
+            }
+            if run.missed.len() > MISSED_LISTED {
+                writeln!(
+                    out,
+                    "    and {} more",
+                    run.missed.len().saturating_sub(MISSED_LISTED)
+                )?;
+            }
+        }
+    }
     writeln!(
         out,
         "\n## Commits\n\nHEAD: {} on {}.",
@@ -327,7 +415,8 @@ mod tests {
     use std::path::Path;
 
     use super::{
-        PROGRESS, STATE, gate_passed, load, new_task, now, observed, set_next, stopped, utc,
+        PROGRESS, STATE, gate_passed, load, mutants_ran, new_task, now, observed, set_next,
+        stopped, utc,
     };
     use crate::testing::{clone_with_origin, git};
 
@@ -398,6 +487,80 @@ mod tests {
         );
         assert!(!fresh.contains("## Last message"), "{fresh}");
         assert!(fresh.contains("check --changed"), "passes stay:\n{fresh}");
+    }
+
+    /// The maintainer's request after I3's run: a mutants run that misses is recorded with when it
+    /// ran, on which commit and the missed list, so a fresh session re-tests only those.
+    #[test]
+    fn a_mutants_run_that_misses_is_recorded_with_its_missed_mutants() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = clone_with_origin(temp.path());
+        std::fs::write(root.join(".git/info/exclude"), ".abc/\n").unwrap();
+        std::fs::write(root.join("a.txt"), "a\n").unwrap();
+        git(&root, &["add", "a.txt"]);
+        git(&root, &["commit", "-qm", "Add a"]);
+        let head = git(&root, &["rev-parse", "HEAD"]).trim().to_owned();
+        let gate = "mutants --base origin/main";
+        let missed = [
+            "xtask/src/a.rs:1:18: replace a -> bool with false".to_owned(),
+            "xtask/src/b.rs:2:3: delete !".to_owned(),
+        ];
+        observed(&root, 100).unwrap();
+        assert!(!progress(&root).contains("Mutants runs"), "none yet");
+
+        mutants_ran(&root, gate, &missed, 1_762_700_000).unwrap();
+
+        let text = progress(&root);
+        for expected in [
+            "## Mutants runs\n\nThe last full run of each, with the mutants it missed. Re-test only those",
+            "never run a second full pass",
+            &format!(
+                "- `cargo xtask {gate}` ran at {} (HEAD), 2025-11-09 14:53 UTC, and missed 2 mutants\n",
+                head.get(..12).unwrap()
+            ),
+            "    xtask/src/a.rs:1:18: replace a -> bool with false\n    xtask/src/b.rs:2:3: delete !\n",
+        ] {
+            assert!(text.contains(expected), "{expected:?} in:\n{text}");
+        }
+        assert!(
+            !text.contains("## Gates passed\n\n- "),
+            "a miss is no pass:\n{text}"
+        );
+
+        git(&root, &["commit", "-qm", "Fix", "--allow-empty"]);
+        mutants_ran(
+            &root,
+            "mutants --base origin/main --shard 1/8",
+            &missed[..1],
+            1_762_700_100,
+        )
+        .unwrap();
+        mutants_ran(&root, "mutants --base other", &[], 1_762_700_200).unwrap();
+        std::fs::write(root.join("c.txt"), "c\n").unwrap();
+        mutants_ran(&root, "mutants --base third", &[], 1_762_700_300).unwrap();
+        let later = progress(&root);
+        for expected in [
+            "(an earlier commit), 2025-11-09 14:53 UTC, and missed 2 mutants",
+            "--shard 1/8` ran at ",
+            "and missed 1 mutant\n",
+            "`cargo xtask mutants --base other` ran at ",
+            "and caught every mutant\n",
+            "(HEAD) with uncommitted changes, ",
+        ] {
+            assert!(later.contains(expected), "{expected:?} in:\n{later}");
+        }
+        assert!(
+            later.find("--base third").unwrap() < later.find("--base other").unwrap(),
+            "newest first:\n{later}"
+        );
+        let many: Vec<String> = (0..101).map(|n| format!("x.rs:{n}:1: delete !")).collect();
+        mutants_ran(&root, "mutants --base many", &many, 1_762_700_400).unwrap();
+        let long = progress(&root);
+        assert!(
+            long.contains("    x.rs:99:1: delete !\n    and 1 more\n"),
+            "{long}"
+        );
+        assert!(!long.contains("x.rs:100:1"), "{long}");
     }
 
     #[test]

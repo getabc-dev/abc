@@ -275,9 +275,12 @@ hands off PASS, FAIL or BLOCKED, with no one to restart it:
   but they still wait for that login.
 - Each run's `state.json` (status, reason, next attempt, every session's ids and outcome) and `log`
   (every session's stream-json) live in `~/.local/state/abc/runs/<run>/`, on the host.
-- One run is active at a time, since every session shares your subscription's usage window: `vm
-  run` refuses while one is, and `vm queue add <worktree> <brief>` queues a brief to start when it
-  ends. `vm cancel <run>` stops a run's supervisor and its `claude` and starts the next.
+- One run is active at a time by default, since every session shares your subscription's usage
+  window; `vm parallel <n>` allows `n` at once (one per worktree: two `claude`s never share one).
+  `vm run` refuses past that number, and `vm queue add <worktree> <brief>` queues a brief to start
+  when a slot frees. When one run meets a usage limit, it records the reset in `limit.json` beside
+  the runs and the others wait for the same reset instead of each burning attempts. `vm cancel
+  <run>` stops a run's supervisor and its `claude` and starts the next.
 
 To move a run you started by hand onto this, stop its `claude` (or let it end), put its brief in
 the worktree, and `vm run` (or `vm queue add`) it: the first session reads the brief, and the
