@@ -2207,6 +2207,14 @@ fn a_run_that_meets_a_limit_records_its_reset_for_the_others() {
     assert_eq!(all.limit(MORNING).unwrap(), Some(RESET + 60));
 }
 
+/// No file is no limit, not an error.
+#[test]
+fn no_limit_file_is_no_limit() {
+    let (world, _local) = briefed();
+    let all = runs(&world);
+    assert_eq!(all.limit(MORNING).unwrap(), None);
+}
+
 #[test]
 fn a_limit_file_that_cannot_be_read_is_an_error() {
     let (world, _local) = briefed();

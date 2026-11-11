@@ -2,13 +2,15 @@
 //! directory: whole or not at all, and one writer at a time.
 
 use std::fs::{self, File};
+use std::io::Write as _;
 use std::path::Path;
 
 use anyhow::Context as _;
 
 /// Replaces the file at `path` with `text` atomically, creating its directory: a temporary file
 /// beside it, renamed over it, so a reader never sees half a file and two writers never mix
-/// theirs.
+/// theirs. The file is synced before the rename and the directory after it, so a crash leaves
+/// the old contents or the new, never an empty file.
 pub(crate) fn replace(path: &Path, text: &str) -> anyhow::Result<()> {
     let dir = path
         .parent()
@@ -22,10 +24,17 @@ pub(crate) fn replace(path: &Path, text: &str) -> anyhow::Result<()> {
         name.to_string_lossy(),
         std::process::id()
     ));
-    fs::write(&temporary, text)
+    let mut file = File::create(&temporary)
+        .with_context(|| format!("could not create {}", temporary.display()))?;
+    file.write_all(text.as_bytes())
+        .and_then(|()| file.sync_all())
         .with_context(|| format!("could not write {}", temporary.display()))?;
+    drop(file);
     fs::rename(&temporary, path)
-        .with_context(|| format!("could not move {} into place", temporary.display()))
+        .with_context(|| format!("could not move {} into place", temporary.display()))?;
+    File::open(dir)
+        .and_then(|directory| directory.sync_all())
+        .with_context(|| format!("could not sync {}", dir.display()))
 }
 
 /// Takes the lock file at `path`, creating it and its directory, and waits for it while another
