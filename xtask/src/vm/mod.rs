@@ -44,9 +44,14 @@ pub(crate) enum Action {
     /// Start a supervised run of BRIEF (a file in the worktree, such as .abc/brief.md) in the
     /// session for WORKTREE, as a host service that survives reboots: fresh `claude -p` sessions
     /// carry the brief on from the checkpoint .abc/progress.md across usage limits and outages
-    /// until the agent hands off PASS, FAIL or BLOCKED. Refuses while another run is active.
+    /// until the agent hands off PASS, FAIL or BLOCKED. Refuses while as many runs are active as
+    /// `vm parallel` allows (one by default).
     Run { worktree: PathBuf, brief: String },
-    /// List the queued runs; `vm queue add` queues one, to start when the active run ends.
+    /// How many supervised runs may be active at once: shows it, or with COUNT sets it (at least
+    /// 1; the default is 1). Runs share one usage window: when one meets a limit, the others wait
+    /// for its reset. A lower number stops no active run; it only keeps new ones from starting.
+    Parallel { count: Option<usize> },
+    /// List the queued runs; `vm queue add` queues one, to start when a slot frees.
     Queue {
         #[command(subcommand)]
         action: Option<QueueAction>,
@@ -95,7 +100,7 @@ pub(crate) enum Action {
 #[derive(Debug, Subcommand)]
 pub(crate) enum QueueAction {
     /// Queue a supervised run of BRIEF in the session for WORKTREE, as `vm run` starts one; it
-    /// starts at once when no run is active.
+    /// starts at once when a slot is free.
     Add { worktree: PathBuf, brief: String },
 }
 
@@ -405,6 +410,19 @@ pub(crate) fn run(
                 run.id,
                 all.log(&run.id).display()
             )?;
+        }
+        Action::Parallel { count } => {
+            let settings = match count {
+                Some(count) => all.set_parallel(count)?,
+                None => all.settings()?,
+            };
+            writeln!(out, "vm: {} runs may be active at once", settings.parallel)?;
+            if count.is_some() {
+                // A raised number frees slots for queued runs now.
+                for run in runs::start_next(&all, services, now)? {
+                    writeln!(out, "vm: started run {}", run.id)?;
+                }
+            }
         }
         Action::Queue { action: None } => runs::queued(&all, out)?,
         Action::Queue {

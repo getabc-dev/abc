@@ -5,6 +5,7 @@ import type { ClaimResponse } from "./ClaimResponse";
 import type { Graph } from "./Graph";
 import type { IssueTokenRequest } from "./IssueTokenRequest";
 import type { LiveUpdate } from "./LiveUpdate";
+import type { RequestCard } from "./RequestCard";
 import type { SessionView } from "./SessionView";
 import type { TokenIssuedResponse } from "./TokenIssuedResponse";
 import type { TokenSummary } from "./TokenSummary";
@@ -12,4 +13,4 @@ import type { TokenSummary } from "./TokenSummary";
 /**
  * The generation root. Never constructed.
  */
-export type WebApi = { session: SessionView, claim_request: ClaimRequest, claim_response: ClaimResponse, issue_token_request: IssueTokenRequest, token_issued: TokenIssuedResponse, tokens: Array<TokenSummary>, live: LiveUpdate, error: ApiErrorBody, graph: Graph, };
+export type WebApi = { session: SessionView, claim_request: ClaimRequest, claim_response: ClaimResponse, issue_token_request: IssueTokenRequest, token_issued: TokenIssuedResponse, tokens: Array<TokenSummary>, enrolment_request: RequestCard, live: LiveUpdate, error: ApiErrorBody, graph: Graph, };

@@ -969,7 +969,7 @@ fn one_run_is_active_and_the_queue_starts_the_rest_in_order() {
     })
     .unwrap_err();
     assert!(
-        refused.contains(" is active, and runs share one usage window"),
+        refused.contains(" is active in this worktree, and two claudes must never work in one"),
         "{refused}"
     );
     let all = runs(&world).list().unwrap().runs;
@@ -1876,10 +1876,9 @@ fn a_state_that_cannot_be_read_is_shown_and_holds_up_no_queue() {
             Status::Queued,
         )
         .unwrap();
-    let started = super::start_next(&all, &services, MORNING)
-        .unwrap()
-        .unwrap();
-    assert_eq!(started.id, queued.id);
+    let started = super::start_next(&all, &services, MORNING).unwrap();
+    assert_eq!(started.len(), 1);
+    assert_eq!(started[0].id, queued.id);
     let mut out = Vec::new();
     super::list(&all, false, &mut out).unwrap();
     let listed = String::from_utf8(out).unwrap();
@@ -1968,4 +1967,325 @@ fn unavailable_errors_dates_and_sizes_are_read_exactly() {
     let listed = String::from_utf8(out).unwrap();
     assert!(listed.starts_with("broken\tunreadable: "), "{listed}");
     assert!(!listed.contains("vm runs: none"), "{listed}");
+}
+
+/// A second linked worktree `v` of `world`'s main clone, holding a brief.
+fn second_worktree(world: &World) -> PathBuf {
+    let worktree = world.root.join("v");
+    let made = std::process::Command::new("git")
+        .current_dir(&world.host.repo)
+        .args(["worktree", "add", "--quiet", "-b", "second"])
+        .arg(&worktree)
+        .output()
+        .unwrap();
+    assert!(made.status.success(), "{made:?}");
+    std::fs::create_dir_all(worktree.join(".abc")).unwrap();
+    std::fs::write(worktree.join(".abc/brief.md"), "# Brief\n").unwrap();
+    worktree
+}
+
+fn session_of(world: &World, worktree: &Path) -> crate::vm::session::Session {
+    crate::vm::session::Session::open(worktree, &world.host.repo, &world.host.state).unwrap()
+}
+
+/// Criterion 1: the number of active runs is a setting, one by default.
+#[test]
+fn the_parallel_setting_defaults_to_one_and_rejects_nonsense() {
+    let (world, local) = briefed();
+    let services = FakeServices::default();
+    let act = |action| {
+        let (result, out) = act_with(&world, &local.fake, &services, action);
+        result.map(|_| out).map_err(|error| format!("{error:#}"))
+    };
+    assert_eq!(
+        act(Action::Parallel { count: None }).unwrap(),
+        "vm: 1 runs may be active at once\n"
+    );
+    assert_eq!(
+        act(Action::Parallel { count: Some(3) }).unwrap(),
+        "vm: 3 runs may be active at once\n"
+    );
+    assert_eq!(runs(&world).settings().unwrap().parallel, 3, "kept");
+    assert_eq!(
+        act(Action::Parallel { count: None }).unwrap(),
+        "vm: 3 runs may be active at once\n"
+    );
+    let zero = act(Action::Parallel { count: Some(0) }).unwrap_err();
+    assert!(zero.contains("at least one run must be allowed"), "{zero}");
+
+    std::fs::write(world.host.runs.join("settings.json"), "{\"parallel\":0}").unwrap();
+    let error = runs(&world).settings().unwrap_err();
+    assert!(
+        format!("{error:#}").contains("says 0 parallel runs"),
+        "{error:#}"
+    );
+    std::fs::write(
+        world.host.runs.join("settings.json"),
+        "{\"parallel\":2,\"x\":1}",
+    )
+    .unwrap();
+    runs(&world)
+        .settings()
+        .expect_err("unknown fields are refused");
+    std::fs::remove_file(world.host.runs.join("settings.json")).unwrap();
+    std::fs::create_dir(world.host.runs.join("settings.json")).unwrap();
+    let unreadable = runs(&world).settings().unwrap_err();
+    assert!(
+        format!("{unreadable:#}").contains("could not read"),
+        "{unreadable:#}"
+    );
+}
+
+/// Criterion 1: with two slots, two runs are active in two worktrees; a third waits, and so does a
+/// second in the same worktree; `vm runs` and `vm queue` show every active run; and raising the
+/// number starts what waits.
+#[test]
+fn runs_start_up_to_the_setting_each_in_its_own_worktree() {
+    let (world, local) = briefed();
+    let other = second_worktree(&world);
+    let services = FakeServices::default();
+    let all = runs(&world);
+    all.set_parallel(2).unwrap();
+    let first = super::start(&all, &services, &session(&world), ".abc/brief.md", MORNING).unwrap();
+    let second = super::start(
+        &all,
+        &services,
+        &session_of(&world, &other),
+        ".abc/brief.md",
+        MORNING,
+    )
+    .unwrap();
+    assert_ne!(first.id, second.id);
+    let again =
+        super::start(&all, &services, &session(&world), ".abc/brief.md", MORNING).unwrap_err();
+    assert!(
+        format!("{again:#}").contains("is active in this worktree"),
+        "{again:#}"
+    );
+    all.set_parallel(1).unwrap();
+    let full = super::start(
+        &all,
+        &services,
+        &session_of(&world, &other),
+        ".abc/brief.md",
+        MORNING,
+    )
+    .unwrap_err();
+    // The worktree check comes first; a third worktree meets the number.
+    assert!(format!("{full:#}").contains("is active in this worktree"));
+    all.set_parallel(2).unwrap();
+
+    let queued =
+        super::enqueue(&all, &services, &session(&world), ".abc/brief.md", MORNING).unwrap();
+    assert_eq!(queued.status, Status::Queued, "no slot is free");
+    all.set_parallel(1).unwrap();
+    let third = world.root.join("u");
+    let made = std::process::Command::new("git")
+        .current_dir(&world.host.repo)
+        .args(["worktree", "add", "--quiet", "-b", "third"])
+        .arg(&third)
+        .output()
+        .unwrap();
+    assert!(made.status.success());
+    std::fs::create_dir_all(third.join(".abc")).unwrap();
+    std::fs::write(third.join(".abc/brief.md"), "# Brief\n").unwrap();
+    let refused = super::start(
+        &all,
+        &services,
+        &session_of(&world, &third),
+        ".abc/brief.md",
+        MORNING,
+    )
+    .unwrap_err();
+    assert!(
+        format!("{refused:#}")
+            .contains("2 runs are active, the most `cargo xtask vm parallel` allows (1)"),
+        "{refused:#}"
+    );
+
+    let act = |action| {
+        let (result, out) = act_with(&world, &local.fake, &services, action);
+        result.map(|_| out).map_err(|error| format!("{error:#}"))
+    };
+    let queue = act(Action::Queue { action: None }).unwrap();
+    assert!(
+        queue.contains(&format!("active\t{}\t", first.id)),
+        "{queue}"
+    );
+    assert!(
+        queue.contains(&format!("active\t{}\t", second.id)),
+        "{queue}"
+    );
+    let listed = act(Action::Runs { json: false }).unwrap();
+    for id in [&first.id, &second.id, &queued.id] {
+        assert!(listed.contains(id.as_str()), "{listed}");
+    }
+    let json: Vec<Run> = serde_json::from_str(&act(Action::Runs { json: true }).unwrap()).unwrap();
+    assert_eq!(json.len(), 3);
+
+    // A slot frees when a run in the queued one's worktree ends, and raising the number starts
+    // runs that wait for a slot.
+    let cancelled = act(Action::Cancel {
+        run: first.id.clone(),
+    })
+    .unwrap();
+    assert_eq!(
+        cancelled,
+        format!("vm: cancelled {}\n", first.id),
+        "one slot, two active"
+    );
+    let raised = act(Action::Parallel { count: Some(2) }).unwrap();
+    assert_eq!(
+        raised,
+        format!(
+            "vm: 2 runs may be active at once\nvm: started run {}\n",
+            queued.id
+        )
+    );
+}
+
+/// Criterion 1: runs share one usage window. A run that meets a limit records its reset, and a
+/// run that would start an attempt before it waits for the same reset instead of burning an
+/// attempt on the limit.
+#[test]
+fn a_limit_one_run_met_holds_the_others_until_its_reset() {
+    let (world, local) = briefed();
+    fake_claude(&local.bin, &[HANDOFF]);
+    let services = FakeServices::default();
+    let all = runs(&world);
+    all.note_limit(RESET + 60, MORNING).unwrap();
+    all.note_limit(RESET - 600, MORNING).unwrap();
+    assert_eq!(
+        all.limit(MORNING).unwrap(),
+        Some(RESET + 60),
+        "an earlier reset never shortens a later one"
+    );
+    assert_eq!(
+        all.limit(RESET + 60).unwrap(),
+        None,
+        "a reset that has passed is over"
+    );
+    let run = started(&world, &services);
+    let clock = FakeClock::at(MORNING);
+
+    let status = supervise(&world, &local, &services, &clock, &run.id);
+
+    assert_eq!(
+        status,
+        Status::Done {
+            verdict: Verdict::Pass
+        }
+    );
+    assert_eq!(
+        *clock.slept.borrow(),
+        [MORNING, RESET + 60],
+        "it started its first attempt at the shared reset"
+    );
+    assert_eq!(
+        calls(&local.bin).len(),
+        1,
+        "no attempt was burnt on the limit"
+    );
+    let log = std::fs::read_to_string(all.log(&run.id)).unwrap();
+    assert!(
+        log.contains("waiting for the usage limit another run met, until 2026-11-10 10:41 UTC"),
+        "{log}"
+    );
+}
+
+/// Criterion 1: the run that meets the limit publishes its reset for the others.
+#[test]
+fn a_run_that_meets_a_limit_records_its_reset_for_the_others() {
+    let (world, local) = briefed();
+    fake_claude(&local.bin, &[LIMIT, HANDOFF]);
+    let services = FakeServices::default();
+    let run = started(&world, &services);
+    let clock = FakeClock::at(MORNING);
+    supervise(&world, &local, &services, &clock, &run.id);
+    let all = runs(&world);
+    // The reset has passed by the end; before it, it held.
+    assert_eq!(all.limit(MORNING).unwrap(), Some(RESET + 60));
+}
+
+/// No file is no limit, not an error.
+#[test]
+fn no_limit_file_is_no_limit() {
+    let (world, _local) = briefed();
+    let all = runs(&world);
+    assert_eq!(all.limit(MORNING).unwrap(), None);
+}
+
+#[test]
+fn a_limit_file_that_cannot_be_read_is_an_error() {
+    let (world, _local) = briefed();
+    let all = runs(&world);
+    std::fs::create_dir_all(&world.host.runs).unwrap();
+    std::fs::write(world.host.runs.join("limit.json"), "nonsense").unwrap();
+    all.limit(MORNING).unwrap_err();
+    std::fs::remove_file(world.host.runs.join("limit.json")).unwrap();
+    std::fs::create_dir(world.host.runs.join("limit.json")).unwrap();
+    all.limit(MORNING).unwrap_err();
+}
+
+/// A limit met while the shared file is corrupt replaces it, so sharing works again.
+#[test]
+fn a_limit_met_over_a_corrupt_file_rewrites_it() {
+    let (world, _local) = briefed();
+    let all = runs(&world);
+    std::fs::create_dir_all(&world.host.runs).unwrap();
+    std::fs::write(world.host.runs.join("limit.json"), "nonsense").unwrap();
+    all.note_limit(MORNING + 500, MORNING).unwrap();
+    assert_eq!(all.limit(MORNING).unwrap(), Some(MORNING + 500));
+}
+
+/// Review findings: a corrupt shared limit file stops no supervisor, and a run held by another
+/// run's limit that was waiting out an outage still probes the API afterwards.
+#[test]
+fn a_corrupt_limit_file_stops_no_run_and_an_outage_wait_keeps_its_probe() {
+    let (world, local) = briefed();
+    fake_claude(&local.bin, &[HANDOFF]);
+    let services = FakeServices::default();
+    std::fs::create_dir_all(&world.host.runs).unwrap();
+    std::fs::write(world.host.runs.join("limit.json"), "nonsense").unwrap();
+    let run = started(&world, &services);
+    let status = supervise(&world, &local, &services, &FakeClock::at(MORNING), &run.id);
+    assert_eq!(
+        status,
+        Status::Done {
+            verdict: Verdict::Pass
+        }
+    );
+    let log = std::fs::read_to_string(runs(&world).log(&run.id)).unwrap();
+    assert!(
+        log.contains("ignoring the shared usage limit: could not read"),
+        "{log}"
+    );
+
+    let held = runs(&world);
+    std::fs::remove_file(world.host.runs.join("limit.json")).unwrap();
+    held.note_limit(RESET, MORNING).unwrap();
+    let mut waiting = started(&world, &services);
+    waiting.status = Status::Waiting {
+        until: MORNING,
+        cause: Cause::Network,
+    };
+    held.save(&waiting).unwrap();
+    supervise(
+        &world,
+        &local,
+        &services,
+        &FakeClock::at(MORNING),
+        &waiting.id,
+    );
+    let probes = local
+        .fake
+        .calls
+        .borrow()
+        .iter()
+        .filter(|call| call.contains("curl"))
+        .count();
+    assert!(
+        probes >= 1,
+        "the network wait is probed after the limit: {probes}"
+    );
 }

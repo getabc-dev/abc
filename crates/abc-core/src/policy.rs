@@ -91,6 +91,17 @@ pub enum Capability {
         /// The token's workspace.
         workspace: WorkspaceId,
     },
+    /// The tailnet login a request names belongs to this person (loaded in the same
+    /// transaction).
+    Requester {
+        /// The person.
+        person: PersonId,
+    },
+    /// The caller's login and node are those that made this enrolment request.
+    EnrolmentApplicant {
+        /// The request's workspace.
+        workspace: WorkspaceId,
+    },
 }
 
 /// A proof's summary for the matrix.
@@ -151,6 +162,8 @@ pub enum WriteAction {
     ManageWorkers,
     /// Redeem an enrolment token.
     EnrolWorker,
+    /// Ask, from a machine, for it to be enrolled once the owner approves.
+    RequestEnrolment,
     /// A worker recording its own session start.
     ActAsWorker,
     /// The server recording what it observed (a session's end).
@@ -170,6 +183,8 @@ pub enum ReadAction {
     ViewWorkspace,
     /// A worker reading its own identity, at connect and while connected.
     ViewSelfAsWorker,
+    /// A machine waiting for its enrolment request, from the login and node that made it.
+    ViewOwnEnrolmentRequest,
     /// The server reading installation-wide state it acts on (the open sessions at boot).
     ViewAsServer,
 }
@@ -253,6 +268,27 @@ fn owner_of(standing: &Standing<'_>) -> Result<WritePermit, DenialReason> {
     }
 }
 
+/// Who may ask for a machine to enrol: a member of the workspace the request names, asking with
+/// their own tailnet login.
+fn member_requesting(standing: &Standing<'_>) -> Result<WritePermit, DenialReason> {
+    match standing.principal {
+        Principal::Person { id, .. } => {
+            match (named_workspace(standing.scope), standing.capability) {
+                (Some(workspace), Capability::Requester { person })
+                    if person == *id && standing.principal.role_in(workspace).is_some() =>
+                {
+                    Ok(write(Actor::Person(*id), workspace))
+                }
+                _ => Err(DenialReason::NotAMember),
+            }
+        }
+        Principal::Visitor { .. } => Err(DenialReason::NotAMember),
+        Principal::Worker { .. } | Principal::Anonymous | Principal::Server => {
+            Err(DenialReason::TailnetIdentityRequired)
+        }
+    }
+}
+
 impl PolicyAction for WriteAction {
     type Permit = WritePermit;
 
@@ -286,7 +322,9 @@ impl PolicyAction for WriteAction {
                     | Capability::ReserveInstallation { .. }
                     | Capability::WorkerHome { .. }
                     | Capability::RunHome { .. }
-                    | Capability::EnrolmentToken { .. } => Err(DenialReason::SetupCodeRequired),
+                    | Capability::EnrolmentToken { .. }
+                    | Capability::Requester { .. }
+                    | Capability::EnrolmentApplicant { .. } => Err(DenialReason::SetupCodeRequired),
                 },
                 Principal::Person { .. } => Err(DenialReason::ServerAlreadyClaimed),
                 Principal::Worker { .. } | Principal::Anonymous | Principal::Server => {
@@ -302,8 +340,13 @@ impl PolicyAction for WriteAction {
                 | Capability::OwnerSetup { .. }
                 | Capability::ReserveInstallation { .. }
                 | Capability::WorkerHome { .. }
-                | Capability::RunHome { .. } => Err(DenialReason::EnrolmentTokenRequired),
+                | Capability::RunHome { .. }
+                | Capability::Requester { .. }
+                | Capability::EnrolmentApplicant { .. } => {
+                    Err(DenialReason::EnrolmentTokenRequired)
+                }
             },
+            Self::RequestEnrolment => member_requesting(standing),
             Self::ActAsWorker => match (principal, standing.scope) {
                 (Principal::Worker { id, workspace }, Scope::OwnWorkspace) => {
                     Ok(write(Actor::Worker(*id), *workspace))
@@ -337,6 +380,17 @@ impl PolicyAction for ReadAction {
                     Ok(ReadPermit::Workspace(*workspace))
                 }
                 _ => Err(DenialReason::WorkerOnly),
+            },
+            Self::ViewOwnEnrolmentRequest => match (principal, standing.capability) {
+                (Principal::Person { .. }, Capability::EnrolmentApplicant { workspace }) => {
+                    Ok(ReadPermit::Workspace(workspace))
+                }
+                (Principal::Person { .. } | Principal::Visitor { .. }, _) => {
+                    Err(DenialReason::EnrolmentRequestUnknown)
+                }
+                (Principal::Worker { .. } | Principal::Anonymous | Principal::Server, _) => {
+                    Err(DenialReason::TailnetIdentityRequired)
+                }
             },
             Self::ViewAsServer => match principal {
                 Principal::Server => Ok(ReadPermit::Installation),
@@ -480,6 +534,9 @@ pub enum DenialReason {
     /// The worker was revoked.
     #[error("this worker was revoked")]
     WorkerRevoked,
+    /// No enrolment request with this id was made from this login and node.
+    #[error("no such enrolment request from this machine")]
+    EnrolmentRequestUnknown,
 }
 
 #[cfg(test)]
@@ -551,6 +608,11 @@ mod tests {
             },
             Capability::EnrolmentToken {
                 worker: id(3),
+                workspace: id(HOME),
+            },
+            Capability::Requester { person: id(1) },
+            Capability::Requester { person: id(2) },
+            Capability::EnrolmentApplicant {
                 workspace: id(HOME),
             },
         ]
@@ -674,6 +736,36 @@ mod tests {
                 Err(DenialReason::EnrolmentTokenRequired)
             }
         });
+    }
+
+    #[test]
+    fn a_member_asks_for_enrolment_only_with_their_own_login_in_their_workspace() {
+        check(
+            WriteAction::RequestEnrolment,
+            |who, scope, capability| match (who, scope, capability) {
+                ("owner", Scope::Workspace(workspace), Capability::Requester { person })
+                    if workspace == id(HOME) && person == id(1) =>
+                {
+                    Ok(write(Actor::Person(id(1)), id(HOME)))
+                }
+                ("owner" | "visitor", _, _) => Err(DenialReason::NotAMember),
+                _ => Err(DenialReason::TailnetIdentityRequired),
+            },
+        );
+    }
+
+    #[test]
+    fn only_the_requesting_login_and_node_see_their_request() {
+        check(
+            ReadAction::ViewOwnEnrolmentRequest,
+            |who, _, capability| match (who, capability) {
+                ("owner", Capability::EnrolmentApplicant { workspace }) => {
+                    Ok(ReadPermit::Workspace(workspace))
+                }
+                ("owner" | "visitor", _) => Err(DenialReason::EnrolmentRequestUnknown),
+                _ => Err(DenialReason::TailnetIdentityRequired),
+            },
+        );
     }
 
     #[test]

@@ -1,11 +1,15 @@
-//! The three services that run the stack as the user: launchd agents on macOS
-//! (`~/Library/LaunchAgents/dev.getabc.*.plist`), systemd user units on Linux
+//! The services abc runs as the user: the server stack's three and a worker's one. launchd
+//! agents on macOS (`~/Library/LaunchAgents/dev.getabc.*.plist`), systemd user units on Linux
 //! (`~/.config/systemd/user/abc-*.service`, with lingering so they run without a login).
 //!
 //! Each starts at login (or boot, with lingering) and is restarted when it fails. launchd has no
 //! dependencies between agents: abc server waits for Postgres itself (`ABC_DATABASE_WAIT`), and
 //! Serve's target needs no socket until a request comes. systemd orders abc server after the
 //! other two and stops it with Postgres.
+//!
+//! On macOS each service writes its output to `<name>.log` in the log directory its
+//! `Services` is given: the server home's `logs/` for the stack, the worker home's for the
+//! worker, so neither needs the other's home. On Linux the journal keeps it.
 
 use std::ffi::OsString;
 use std::fs;
@@ -16,7 +20,7 @@ use crate::home::write_private;
 use crate::process::{Invocation, find_on_path};
 use crate::{Host, HostError, Os};
 
-/// A part of the stack that runs as a service.
+/// A part of abc that runs as a service.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Part {
     /// abc's private Postgres.
@@ -25,11 +29,13 @@ pub enum Part {
     Tailscaled,
     /// `abc server`.
     Server,
+    /// `abc worker`, on a machine that does the work.
+    Worker,
 }
 
 impl Part {
-    /// Every part, in the order they start.
-    pub const ALL: [Self; 3] = [Self::Postgres, Self::Tailscaled, Self::Server];
+    /// The server stack's parts, in the order they start.
+    pub const STACK: [Self; 3] = [Self::Postgres, Self::Tailscaled, Self::Server];
 
     /// The part's short name.
     #[must_use]
@@ -38,6 +44,7 @@ impl Part {
             Self::Postgres => "postgres",
             Self::Tailscaled => "tailscaled",
             Self::Server => "server",
+            Self::Worker => "worker",
         }
     }
 
@@ -48,6 +55,25 @@ impl Part {
             Self::Postgres => "abc's Postgres",
             Self::Tailscaled => "abc's tailscaled",
             Self::Server => "abc server",
+            Self::Worker => "abc worker",
+        }
+    }
+
+    /// The command that installs the part's service, and repairs it.
+    #[must_use]
+    pub const fn setup_command(self) -> &'static str {
+        match self {
+            Self::Postgres | Self::Tailscaled | Self::Server => "abc server setup",
+            Self::Worker => "abc worker setup",
+        }
+    }
+
+    /// The command that says how the part's service stands.
+    #[must_use]
+    pub const fn status_command(self) -> &'static str {
+        match self {
+            Self::Postgres | Self::Tailscaled | Self::Server => "abc server status",
+            Self::Worker => "abc worker status",
         }
     }
 
@@ -83,15 +109,22 @@ pub enum ServiceState {
     Running,
 }
 
-/// The service manager of this host.
+/// The service manager of this host, for services whose output on macOS goes to `logs`.
 #[derive(Debug)]
 pub(crate) struct Services<'a> {
     host: &'a Host,
+    logs: PathBuf,
 }
 
 impl<'a> Services<'a> {
-    pub(crate) const fn new(host: &'a Host) -> Self {
-        Self { host }
+    /// The manager, with each service's macOS log file `<logs>/<name>.log`.
+    pub(crate) const fn new(host: &'a Host, logs: PathBuf) -> Self {
+        Self { host, logs }
+    }
+
+    /// `part`'s log file on macOS.
+    pub(crate) fn log_file(&self, part: Part) -> PathBuf {
+        self.logs.join(format!("{}.log", part.name()))
     }
 
     /// Where `part`'s definition lives.
@@ -109,11 +142,7 @@ impl<'a> Services<'a> {
             Os::MacOs => launchd_plist(
                 &service.part.service_name(Os::MacOs),
                 service,
-                &self
-                    .host
-                    .home
-                    .logs()
-                    .join(format!("{}.log", service.part.name())),
+                &self.log_file(service.part),
             ),
             Os::Linux => systemd_unit(service),
         }
@@ -124,8 +153,7 @@ impl<'a> Services<'a> {
             Os::MacOs => ("launchctl", "it is part of macOS; check your PATH"),
             Os::Linux => (
                 "systemctl",
-                "abc's server runs as systemd user services on Linux; use a distribution with \
-                 systemd",
+                "abc runs as systemd user services on Linux; use a distribution with systemd",
             ),
         };
         let path =
@@ -154,8 +182,10 @@ impl<'a> Services<'a> {
             .map_err(|source| HostError::io(&self.host.services_dir, source))?;
         let changed = write_private(&path, &self.render(service))?;
         let fix = format!(
-            "check {} with abc server status, and run abc server setup again",
-            part.title()
+            "check {} with {}, and run {} again",
+            part.title(),
+            part.status_command(),
+            part.setup_command()
         );
         let manager = self.manager()?;
         match self.host.os {
@@ -225,7 +255,7 @@ impl<'a> Services<'a> {
 
     /// Restarts `part`, or starts it if it was stopped.
     pub(crate) fn restart(&self, part: Part) -> Result<(), HostError> {
-        let fix = format!("run abc server setup to reinstall {}", part.title());
+        let fix = format!("run {} to reinstall {}", part.setup_command(), part.title());
         let manager = self.manager()?;
         match self.host.os {
             Os::MacOs => manager
@@ -241,7 +271,7 @@ impl<'a> Services<'a> {
 
     /// Stops `part` until the next restart or install.
     pub(crate) fn stop(&self, part: Part) -> Result<(), HostError> {
-        let fix = format!("check {} with abc server status", part.title());
+        let fix = format!("check {} with {}", part.title(), part.status_command());
         let manager = self.manager()?;
         match self.host.os {
             // An agent that is booted out stays out until it is bootstrapped again.
@@ -263,7 +293,7 @@ impl<'a> Services<'a> {
 
     /// Starts `part` after [`Services::stop`].
     pub(crate) fn start(&self, part: Part) -> Result<(), HostError> {
-        let fix = format!("run abc server setup to reinstall {}", part.title());
+        let fix = format!("run {} to reinstall {}", part.setup_command(), part.title());
         let manager = self.manager()?;
         match self.host.os {
             Os::MacOs => match self.launchd(part)? {
@@ -353,14 +383,7 @@ impl<'a> Services<'a> {
     /// The command that shows `part`'s recent output.
     pub(crate) fn log_hint(&self, part: Part) -> String {
         match self.host.os {
-            Os::MacOs => format!(
-                "tail -n 50 '{}'",
-                self.host
-                    .home
-                    .logs()
-                    .join(format!("{}.log", part.name()))
-                    .display()
-            ),
+            Os::MacOs => format!("tail -n 50 '{}'", self.log_file(part).display()),
             Os::Linux => format!(
                 "journalctl --user -u {} -n 50",
                 part.service_name(Os::Linux)
@@ -379,6 +402,15 @@ fn xml(text: &str) -> String {
 }
 
 /// A launchd agent: started at login, kept alive, private files, output to `log`.
+///
+/// The stack's agents are kept alive whatever ends them. The worker's is restarted only when it
+/// fails (`KeepAlive` with `SuccessfulExit` false), so a worker that exits 0 stays down. launchd
+/// cannot tell one failing exit status from another: unlike systemd's
+/// `RestartPreventExitStatus=2 3`, it restarts a worker that exited 2 (its home needs fixing) or
+/// 3 (the server told it to stop), at most once every ten seconds (launchd's default
+/// `ThrottleInterval`). Each such start finds the same refusal and exits again without working,
+/// and `abc worker status` and the log say why. The closest correct alternative, no `KeepAlive`,
+/// would leave a worker down after any crash, which is worse.
 fn launchd_plist(label: &str, service: &Service, log: &std::path::Path) -> String {
     let mut plist = String::from(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
@@ -411,11 +443,23 @@ fn launchd_plist(label: &str, service: &Service, log: &std::path::Path) -> Strin
         line(&mut plist, "\t</dict>");
     }
     let log = xml(&log.to_string_lossy());
+    line(&mut plist, "\t<key>RunAtLoad</key>");
+    line(&mut plist, "\t<true/>");
+    line(&mut plist, "\t<key>KeepAlive</key>");
+    match service.part {
+        Part::Postgres | Part::Tailscaled | Part::Server => line(&mut plist, "\t<true/>"),
+        Part::Worker => {
+            for text in [
+                "\t<dict>",
+                "\t\t<key>SuccessfulExit</key>",
+                "\t\t<false/>",
+                "\t</dict>",
+            ] {
+                line(&mut plist, text);
+            }
+        }
+    }
     for text in [
-        "\t<key>RunAtLoad</key>",
-        "\t<true/>",
-        "\t<key>KeepAlive</key>",
-        "\t<true/>",
         // 077: whatever a service creates is private to the user.
         "\t<key>Umask</key>",
         "\t<integer>63</integer>",
@@ -450,7 +494,7 @@ fn systemd_unit(service: &Service) -> String {
         format!("Description={}", service.part.title()),
     ];
     match service.part {
-        Part::Postgres | Part::Tailscaled => {}
+        Part::Postgres | Part::Tailscaled | Part::Worker => {}
         Part::Server => {
             lines.push(format!("Requires={}", other(Part::Postgres)));
             lines.push(format!(
@@ -483,8 +527,10 @@ fn systemd_unit(service: &Service) -> String {
             lines.extend(["KillSignal=SIGINT", "KillMode=mixed"].map(str::to_owned));
         }
         Part::Tailscaled => {}
-        // A configuration error (exit 2) or the server's own refusal (3) does not heal itself.
-        Part::Server => lines.push("RestartPreventExitStatus=2 3".to_owned()),
+        // A configuration error (exit 2) or the server's own refusal (3) does not heal itself:
+        // for the worker, 3 is the server telling it to stop (revoked, superseded, no common
+        // protocol), which a person has to act on.
+        Part::Server | Part::Worker => lines.push("RestartPreventExitStatus=2 3".to_owned()),
     }
     lines.extend(["", "[Install]", "WantedBy=default.target", ""].map(str::to_owned));
     lines.join("\n")
@@ -516,7 +562,7 @@ mod tests {
     #[test]
     fn services_are_named_for_each_manager() {
         assert_eq!(
-            Part::ALL.map(|part| part.service_name(Os::MacOs)),
+            Part::STACK.map(|part| part.service_name(Os::MacOs)),
             [
                 "dev.getabc.postgres",
                 "dev.getabc.tailscaled",
@@ -525,7 +571,7 @@ mod tests {
             "launchd labels"
         );
         assert_eq!(
-            Part::ALL.map(|part| part.service_name(Os::Linux)),
+            Part::STACK.map(|part| part.service_name(Os::Linux)),
             [
                 "abc-postgres.service",
                 "abc-tailscaled.service",
@@ -534,9 +580,27 @@ mod tests {
             "systemd units"
         );
         assert_eq!(
-            Part::ALL.map(Part::title),
+            Part::STACK.map(Part::title),
             ["abc's Postgres", "abc's tailscaled", "abc server"],
             "titles"
+        );
+        assert_eq!(
+            [
+                Part::Worker.service_name(Os::MacOs),
+                Part::Worker.service_name(Os::Linux),
+            ],
+            ["dev.getabc.worker", "abc-worker.service"],
+            "the worker's"
+        );
+        assert_eq!(
+            Part::STACK.map(|part| (part.setup_command(), part.status_command())),
+            [("abc server setup", "abc server status"); 3],
+            "the stack is the server's"
+        );
+        assert_eq!(
+            (Part::Worker.setup_command(), Part::Worker.status_command()),
+            ("abc worker setup", "abc worker status"),
+            "the worker is its own"
         );
     }
 
@@ -652,13 +716,13 @@ WantedBy=default.target
     fn definitions_live_where_each_manager_reads_them() {
         let mut host = crate::Host {
             os: Os::MacOs,
-            home: crate::ServerHome::at(PathBuf::from("/h")),
+            user_home: PathBuf::from("/Users/ada"),
             services_dir: PathBuf::from("/Users/ada/Library/LaunchAgents"),
             uid: 501,
             path: std::ffi::OsString::new(),
             timing: crate::Timing::production(),
         };
-        let services = super::Services::new(&host);
+        let services = super::Services::new(&host, PathBuf::from("/h/logs"));
         assert_eq!(
             services.definition(Part::Postgres),
             Path::new("/Users/ada/Library/LaunchAgents/dev.getabc.postgres.plist"),
@@ -676,7 +740,7 @@ WantedBy=default.target
         );
         host.os = Os::Linux;
         host.services_dir = PathBuf::from("/home/ada/.config/systemd/user");
-        let systemd = super::Services::new(&host);
+        let systemd = super::Services::new(&host, PathBuf::from("/h/logs"));
         assert_eq!(
             systemd.definition(Part::Server),
             Path::new("/home/ada/.config/systemd/user/abc-server.service"),

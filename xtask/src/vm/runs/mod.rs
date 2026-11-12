@@ -15,11 +15,14 @@
 //! ([`service`]), so a reboot starts it again, and it carries on: it marks the attempt the reboot
 //! cut off as interrupted, starts the VM, and restarts fresh from the checkpoint.
 //!
-//! One run is active at a time, since every session runs on the same subscription and so shares
-//! its usage window: `vm run` refuses while another is active, and `vm queue add` queues a brief
-//! for when the active run ends. The supervisor never reads, stores or logs the Claude token
-//! (I1): starting a VM pipes it from the keychain into the VM as `vm start` does, and only
-//! `claude` in the VM reads it.
+//! At most [`Settings::parallel`] runs are active at once (one by default; `vm parallel` sets
+//! it), each in its own worktree's session: `vm run` refuses past that number, and `vm queue add`
+//! queues a brief for when a slot frees. Every session runs on the same subscription and so
+//! shares its usage window: when a run's attempt ends on a limit, it records the reset in
+//! `limit.json` beside the runs, and no run starts an attempt before it, so the others wait for
+//! the same reset instead of each burning attempts on it. The supervisor never reads, stores or
+//! logs the Claude token (I1): starting a VM pipes it from the keychain into the VM as `vm start`
+//! does, and only `claude` in the VM reads it.
 
 pub(crate) mod outcome;
 pub(crate) mod service;
@@ -43,8 +46,39 @@ const STATE: &str = "state.json";
 /// A run's log, every attempt's output, in its directory.
 pub(crate) const LOG: &str = "log";
 
-/// The lock that serialises the decisions of which run is active.
+/// The lock that serialises the decisions of which runs are active.
 const LOCK: &str = "queue.lock";
+
+/// The file in the runs directory that holds [`Settings`].
+const SETTINGS: &str = "settings.json";
+
+/// The file in the runs directory that holds the usage limit the runs share ([`Limit`]).
+const LIMIT: &str = "limit.json";
+
+/// The lock that serialises writes of [`LIMIT`].
+const LIMIT_LOCK: &str = "limit.lock";
+
+/// The host's settings for supervised runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct Settings {
+    /// How many runs may be active at once: at least one.
+    pub(crate) parallel: usize,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self { parallel: 1 }
+    }
+}
+
+/// The usage limit the runs share: no attempt starts before `until`, in seconds since the Unix
+/// epoch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Limit {
+    until: i64,
+}
 
 /// Where a run stands.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -298,7 +332,75 @@ impl Runs {
         Ok(listing)
     }
 
-    /// Takes the lock that serialises which run is active, until the returned file is dropped.
+    /// The settings: the defaults until `vm parallel` sets them.
+    pub(crate) fn settings(&self) -> anyhow::Result<Settings> {
+        let path = self.dir.join(SETTINGS);
+        match std::fs::read_to_string(&path) {
+            Ok(text) => {
+                let settings: Settings = serde_json::from_str(&text)
+                    .with_context(|| format!("could not read {}", path.display()))?;
+                ensure!(
+                    settings.parallel >= 1,
+                    "{} says 0 parallel runs; `cargo xtask vm parallel <n>` sets at least 1",
+                    path.display()
+                );
+                Ok(settings)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Settings::default()),
+            Err(error) => Err(error).with_context(|| format!("could not read {}", path.display())),
+        }
+    }
+
+    /// Sets how many runs may be active at once. Runs already active are never stopped by a lower
+    /// number: it only keeps new ones from starting.
+    pub(crate) fn set_parallel(&self, parallel: usize) -> anyhow::Result<Settings> {
+        ensure!(
+            parallel >= 1,
+            "at least one run must be allowed; `cargo xtask vm cancel` stops runs"
+        );
+        std::fs::create_dir_all(&self.dir)
+            .with_context(|| format!("could not create {}", self.dir.display()))?;
+        // Runs being admitted read the number under this lock.
+        let _lock = self.lock()?;
+        let settings = Settings { parallel };
+        crate::files::replace(
+            &self.dir.join(SETTINGS),
+            &format!("{}\n", serde_json::to_string_pretty(&settings)?),
+        )?;
+        Ok(settings)
+    }
+
+    /// When the usage limit the runs share ends, if it is still in force at `now`.
+    fn limit(&self, now: i64) -> anyhow::Result<Option<i64>> {
+        let path = self.dir.join(LIMIT);
+        match std::fs::read_to_string(&path) {
+            Ok(text) => {
+                let limit: Limit = serde_json::from_str(&text)
+                    .with_context(|| format!("could not read {}", path.display()))?;
+                Ok(Some(limit.until).filter(|until| *until > now))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error).with_context(|| format!("could not read {}", path.display())),
+        }
+    }
+
+    /// Records that a run met the usage limit, which ends at `until`: the latest reset known
+    /// stays, so a run that met an earlier one never shortens it.
+    fn note_limit(&self, until: i64, now: i64) -> anyhow::Result<()> {
+        let _lock = crate::files::lock(&self.dir.join(LIMIT_LOCK))?;
+        // A file that cannot be read is no known limit: this one replaces it.
+        let until = self
+            .limit(now)
+            .ok()
+            .flatten()
+            .map_or(until, |known| known.max(until));
+        crate::files::replace(
+            &self.dir.join(LIMIT),
+            &format!("{}\n", serde_json::to_string_pretty(&Limit { until })?),
+        )
+    }
+
+    /// Takes the lock that serialises which runs are active, until the returned file is dropped.
     fn lock(&self) -> anyhow::Result<File> {
         crate::files::lock(&self.dir.join(LOCK))
     }
@@ -380,12 +482,13 @@ fn brief_in(worktree: &Path, brief: &str) -> anyhow::Result<String> {
         .with_context(|| format!("{brief} is not UTF-8"))
 }
 
-/// The run that is active, if any, among `runs`.
-fn active(runs: &[Run]) -> Option<&Run> {
-    runs.iter().find(|run| run.status.active())
+/// The runs that are active among `runs`.
+fn active(runs: &[Run]) -> Vec<&Run> {
+    runs.iter().filter(|run| run.status.active()).collect()
 }
 
-/// `vm run`: starts a run of `brief` in `session` now, refusing while another run is active.
+/// `vm run`: starts a run of `brief` in `session` now, refusing while as many runs are active as
+/// the settings allow, or while one is active in the same worktree.
 pub(crate) fn start(
     runs: &Runs,
     services: &dyn Services,
@@ -394,12 +497,24 @@ pub(crate) fn start(
     now: i64,
 ) -> anyhow::Result<Run> {
     let _lock = runs.lock()?;
-    if let Some(other) = active(&runs.list()?.runs) {
+    let parallel = runs.settings()?.parallel;
+    let listing = runs.list()?.runs;
+    let busy = active(&listing);
+    if let Some(same) = busy.iter().find(|run| run.worktree == session.worktree) {
         bail!(
-            "run {} is active, and runs share one usage window; queue this brief with `cargo \
-             xtask vm queue add`, or cancel that run with `cargo xtask vm cancel {}`",
-            other.id,
-            other.id
+            "run {} is active in this worktree, and two claudes must never work in one; queue \
+             this brief with `cargo xtask vm queue add`, or cancel that run with `cargo xtask vm \
+             cancel {}`",
+            same.id,
+            same.id
+        );
+    }
+    if busy.len() >= parallel {
+        bail!(
+            "{} runs are active, the most `cargo xtask vm parallel` allows ({parallel}), and runs \
+             share one usage window; queue this brief with `cargo xtask vm queue add`, raise \
+             the number, or cancel a run with `cargo xtask vm cancel <run>`",
+            busy.len()
         );
     }
     let run = runs.create(
@@ -426,8 +541,8 @@ fn activate(runs: &Runs, services: &dyn Services, mut run: Run) -> anyhow::Resul
     Ok(run)
 }
 
-/// `vm queue add`: queues a run of `brief` in `session`, which starts at once when no run is
-/// active.
+/// `vm queue add`: queues a run of `brief` in `session`, which starts at once when a slot is
+/// free.
 pub(crate) fn enqueue(
     runs: &Runs,
     services: &dyn Services,
@@ -440,30 +555,44 @@ pub(crate) fn enqueue(
         runs.create(session, brief, now, Status::Queued)?
     };
     Ok(start_next(runs, services, now)?
-        .filter(|started| started.id == run.id)
+        .into_iter()
+        .find(|started| started.id == run.id)
         .unwrap_or(run))
 }
 
-/// Starts the oldest queued run when no run is active, and returns it.
+/// Starts the oldest queued runs while a slot is free, and returns them. A queued run waits while
+/// a run is active in its worktree, since two claudes must never work in one.
 pub(crate) fn start_next(
     runs: &Runs,
     services: &dyn Services,
     now: i64,
-) -> anyhow::Result<Option<Run>> {
+) -> anyhow::Result<Vec<Run>> {
     let _lock = runs.lock()?;
-    let all = runs.list()?.runs;
-    if active(&all).is_some() {
-        return Ok(None);
+    let parallel = runs.settings()?.parallel;
+    let mut all = runs.list()?.runs;
+    let mut started = Vec::new();
+    loop {
+        let busy: Vec<PathBuf> = active(&all)
+            .iter()
+            .map(|run| run.worktree.clone())
+            .collect();
+        if busy.len() >= parallel {
+            return Ok(started);
+        }
+        let Some(next) = all
+            .iter_mut()
+            .find(|run| run.status == Status::Queued && !busy.contains(&run.worktree))
+        else {
+            return Ok(started);
+        };
+        next.status = Status::Waiting {
+            until: now,
+            cause: Cause::Start,
+        };
+        runs.save(next)?;
+        let next = next.clone();
+        started.push(activate(runs, services, next)?);
     }
-    let Some(mut next) = all.into_iter().find(|run| run.status == Status::Queued) else {
-        return Ok(None);
-    };
-    next.status = Status::Waiting {
-        until: now,
-        cause: Cause::Start,
-    };
-    runs.save(&next)?;
-    activate(runs, services, next).map(Some)
 }
 
 /// `vm cancel`: stops run `id`'s supervisor and removes its service, stops `claude` in its VM
@@ -516,9 +645,16 @@ pub(crate) fn cancel(
         Ok(())
     };
     let next = start_next(runs, services, now)?;
-    let said = match next {
-        Some(next) => format!("cancelled {id}; started {}", next.id),
-        None => format!("cancelled {id}"),
+    let said = if next.is_empty() {
+        format!("cancelled {id}")
+    } else {
+        format!(
+            "cancelled {id}; started {}",
+            next.iter()
+                .map(|started| started.id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
     };
     stopped
         .with_context(|| format!("{said}, but could not stop its claude"))
@@ -611,7 +747,7 @@ fn size_of(dir: &Path) -> u64 {
 /// `vm queue`: the queued runs, in the order they start.
 pub(crate) fn queued(runs: &Runs, out: &mut dyn Write) -> anyhow::Result<()> {
     let all = runs.list()?.runs;
-    if let Some(run) = active(&all) {
+    for run in active(&all) {
         writeln!(out, "active\t{}\t{}", run.id, run.status.describe())?;
     }
     let mut any = false;
@@ -785,6 +921,36 @@ impl Supervisor<'_> {
                 }
                 Status::Waiting { until, cause } => {
                     self.clock.sleep_until(until);
+                    // A limit another run met holds every run until its reset. The sleep ended
+                    // at `until` or later, so a reset not past `until` is over.
+                    let shared = self.runs.limit(until).unwrap_or_else(|error| {
+                        // A shared file that cannot be read must not stop every run: this one
+                        // goes on, and the next limit rewrites the file.
+                        let _logged = writeln!(
+                            log,
+                            "--- abc run {id}: ignoring the shared usage limit: {error:#}"
+                        );
+                        None
+                    });
+                    if let Some(limit) = shared {
+                        writeln!(
+                            log,
+                            "--- abc run {id}: waiting for the usage limit another run met, \
+                             until {}",
+                            crate::progress::utc(limit)
+                        )?;
+                        // A run waiting out a network outage still probes the API after.
+                        run.status = Status::Waiting {
+                            until: limit,
+                            cause: if cause == Cause::Network {
+                                cause
+                            } else {
+                                Cause::Limit
+                            },
+                        };
+                        self.runs.save(&run)?;
+                        continue;
+                    }
                     // The probe runs in the VM; a VM that is gone, as after a reboot, is started
                     // by the attempt instead.
                     if cause == Cause::Network
@@ -872,7 +1038,24 @@ impl Supervisor<'_> {
             run.attempts.len(),
             outcome.describe()
         )?;
-        run.end_attempt(outcome, self.clock.now());
+        let now = self.clock.now();
+        run.end_attempt(outcome, now);
+        if let Status::Waiting {
+            until,
+            cause: Cause::Limit,
+        } = run.status
+        {
+            // The attempt's end is kept first: a failure to share the reset costs the other runs
+            // an attempt on the limit, never this run its outcome.
+            self.runs.save(run)?;
+            if let Err(error) = self.runs.note_limit(until, now) {
+                writeln!(
+                    log,
+                    "--- abc run {}: could not share the usage limit: {error:#}",
+                    run.id
+                )?;
+            }
+        }
         Ok(())
     }
 

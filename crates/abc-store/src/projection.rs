@@ -9,8 +9,8 @@
 //! * the match below is exhaustive over `Event`, so a new event fails the build until projected.
 
 use abc_core::event::{
-    EnrolmentEvent, Event, InstallationEvent, PersonEvent, Recorded, RunEvent, WorkerEvent,
-    WorkspaceEvent,
+    EnrolledVia, EnrolmentEvent, EnrolmentRequestEvent, Event, InstallationEvent, PersonEvent,
+    Recorded, RunEvent, WorkerEvent, WorkspaceEvent,
 };
 use abc_core::identity::MachineLabel;
 use sqlx::PgConnection;
@@ -33,6 +33,7 @@ pub(crate) async fn apply(conn: &mut PgConnection, recorded: &Recorded) -> Resul
         Event::Person(event) => person(conn, &row, event).await,
         Event::Workspace(event) => workspace(conn, &row, event).await,
         Event::Enrolment(event) => enrolment(conn, &row, event).await,
+        Event::EnrolmentRequest(event) => enrolment_request(conn, &row, event).await,
         Event::Worker(event) => worker(conn, &row, event).await,
         Event::Run(event) => run(conn, &row, event).await,
     }
@@ -249,6 +250,69 @@ async fn enrolment(
     Ok(())
 }
 
+async fn enrolment_request(
+    conn: &mut PgConnection,
+    row: &Row,
+    event: &EnrolmentRequestEvent,
+) -> Result<(), StoreError> {
+    let Row {
+        at,
+        changed_at,
+        stream,
+        workspace,
+        actor,
+        event: event_id,
+    } = *row;
+    match event {
+        EnrolmentRequestEvent::Requested(requested) => {
+            sqlx::query!(
+                "INSERT INTO enrolment_request (id, workspace_id, reserved_worker, key_digest,
+                    requested_by, login, node, hostname, os, arch, build, code, requested_at,
+                    requested_event, expires_at, changed_at)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)",
+                stream,
+                workspace,
+                requested.worker.as_uuid(),
+                requested.key.as_bytes().as_slice(),
+                actor,
+                requested.requester.login.as_str(),
+                requested.requester.node.as_str(),
+                requested.machine.hostname.as_str(),
+                requested.machine.os.as_str(),
+                requested.machine.arch.as_str(),
+                requested.build.to_string(),
+                requested.code.as_str(),
+                at,
+                event_id,
+                requested.expires_at.as_offset(),
+                changed_at,
+            )
+            .execute(&mut *conn)
+            .await?;
+        }
+        EnrolmentRequestEvent::Approved | EnrolmentRequestEvent::Denied => {
+            let decision = if matches!(event, EnrolmentRequestEvent::Approved) {
+                "approved"
+            } else {
+                "denied"
+            };
+            sqlx::query!(
+                "UPDATE enrolment_request SET decision = $2, decided_by = $3, decided_at = $4,
+                    changed_at = $5
+                 WHERE id = $1",
+                stream,
+                decision,
+                actor,
+                at,
+                changed_at,
+            )
+            .execute(&mut *conn)
+            .await?;
+        }
+    }
+    Ok(())
+}
+
 async fn worker(conn: &mut PgConnection, row: &Row, event: &WorkerEvent) -> Result<(), StoreError> {
     let Row {
         at,
@@ -259,12 +323,16 @@ async fn worker(conn: &mut PgConnection, row: &Row, event: &WorkerEvent) -> Resu
     } = *row;
     match event {
         WorkerEvent::Enrolled {
-            token,
+            via,
             key,
             name,
             machine,
             build,
         } => {
+            let (via_token, via_request) = match via {
+                EnrolledVia::Token { token } => (Some(token.as_uuid()), None),
+                EnrolledVia::Request { request } => (None, Some(request.as_uuid())),
+            };
             sqlx::query!(
                 "INSERT INTO actor (id, kind, display_name, created_at, changed_at)
                  VALUES ($1, 'worker', $2, $3, $4)",
@@ -276,13 +344,14 @@ async fn worker(conn: &mut PgConnection, row: &Row, event: &WorkerEvent) -> Resu
             .execute(&mut *conn)
             .await?;
             sqlx::query!(
-                "INSERT INTO worker (id, workspace_id, key_digest, enrolled_via, hostname, os, arch,
-                    build, enrolled_at, changed_at)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+                "INSERT INTO worker (id, workspace_id, key_digest, enrolled_via_token,
+                    enrolled_via_request, hostname, os, arch, build, enrolled_at, changed_at)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
                 stream,
                 workspace,
                 key.as_bytes().as_slice(),
-                token.as_uuid(),
+                via_token,
+                via_request,
                 machine.hostname.as_str(),
                 machine.os.as_str(),
                 machine.arch.as_str(),

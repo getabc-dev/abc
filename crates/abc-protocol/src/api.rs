@@ -81,7 +81,23 @@ pub enum ApiCode {
     /// Another worker already enrolled with this key. Generate a new key and enrol again.
     WorkerKeyInUse,
 
+    /// No such enrolment request from this machine.
+    EnrolmentRequestUnknown,
+    /// abc's own tailscaled could not say which tailnet node made this request, so it cannot be
+    /// attributed to one. Check that this machine is on the tailnet and the server's Tailscale is
+    /// running.
+    TailnetNodeUnknown,
+    /// This server was started without its tailscaled's socket, so it cannot enrol a machine from
+    /// a browser approval. Enrol with a token (`abc worker enrol --token-file`).
+    ApprovalUnavailable,
+
     // Domain rules.
+    /// The enrolment request expired before anyone decided. Run `abc worker setup` again.
+    EnrolmentRequestExpired,
+    /// The enrolment request was denied.
+    EnrolmentRequestDenied,
+    /// The enrolment request was already approved: revoke the worker instead.
+    EnrolmentRequestApproved,
     /// The token was already redeemed: revoke the worker instead.
     EnrolmentTokenAlreadyRedeemed,
 
@@ -98,7 +114,7 @@ pub enum ApiCode {
 
 impl ApiCode {
     /// Every code, for exhaustive tests on both sides of the wire.
-    pub const ALL: [Self; 26] = [
+    pub const ALL: [Self; 32] = [
         Self::MalformedRequest,
         Self::CrossSiteRequest,
         Self::NotFound,
@@ -121,6 +137,12 @@ impl ApiCode {
         Self::EnrolmentTokenRevoked,
         Self::EnrolmentTokenUsed,
         Self::WorkerKeyInUse,
+        Self::EnrolmentRequestUnknown,
+        Self::TailnetNodeUnknown,
+        Self::ApprovalUnavailable,
+        Self::EnrolmentRequestExpired,
+        Self::EnrolmentRequestDenied,
+        Self::EnrolmentRequestApproved,
         Self::EnrolmentTokenAlreadyRedeemed,
         Self::RateLimited,
         Self::Unavailable,

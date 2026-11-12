@@ -65,6 +65,11 @@ id_type!(
     EnrolmentTokenId
 );
 id_type!(
+    /// A machine's request to enrol, approved or denied in the browser, and the stream of its
+    /// lifecycle events.
+    EnrolmentRequestId
+);
+id_type!(
     /// One WebSocket session of a worker, from handshake to close.
     SessionId
 );

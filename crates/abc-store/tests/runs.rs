@@ -141,6 +141,7 @@ mod tests {
                 | Event::Person(_)
                 | Event::Workspace(_)
                 | Event::Enrolment(_)
+                | Event::EnrolmentRequest(_)
                 | Event::Worker(_)) => panic!("{other:?} is not a run event"),
             })
             .collect()

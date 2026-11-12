@@ -7,6 +7,9 @@
 //! | [`EnrolmentToken`] | `abc_enr_` + 52 base32 characters      | the owner's request    | 256 bits |
 //! | [`WorkerKey`]      | `abc_wk_` + 52 base32 characters       | **the worker itself**  | 256 bits |
 //!
+//! An [`ApprovalCode`] is not a secret: it lets a person match the enrolment request in their
+//! terminal with the one on the Approve page.
+//!
 //! The prefixes let gitleaks and similar scanners recognise a leaked abc secret (I2). All three
 //! carry full entropy, so a plain SHA-256 digest is enough: brute force is infeasible, so no salt
 //! and no slow hash are needed. Digest comparison is constant-time ([`Digest::matches`]).
@@ -342,6 +345,83 @@ impl WorkerKey {
     }
 }
 
+/// The number of characters in an approval code.
+const APPROVAL_CODE_LEN: usize = 8;
+
+/// The short code a waiting `abc worker setup` and the Approve page both show, so the owner can
+/// check that the request they approve is the one their terminal made: 8 upper-case Crockford
+/// characters (40 bits), shown `XXXX-XXXX`. Not a secret: it grants nothing, and the log and
+/// views keep it in the clear.
+#[derive(
+    Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, ts_rs::TS, schemars::JsonSchema,
+)]
+#[serde(try_from = "String", into = "String")]
+#[ts(type = "string")]
+pub struct ApprovalCode(String);
+
+impl ApprovalCode {
+    /// Mints a code from the mint's entropy.
+    #[must_use]
+    pub fn generate(mint: &dyn Mint) -> Self {
+        let entropy = mint.secret();
+        let mut code = base32(entropy.as_slice(), APPROVAL_CODE_LEN, false);
+        Self(std::mem::take(&mut *code))
+    }
+
+    /// Reads a stored or sent code, with or without the one dash after its fourth character.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MalformedCredential`] unless 8 upper-case Crockford characters remain.
+    pub fn parse(text: &str) -> Result<Self, MalformedCredential> {
+        let half = APPROVAL_CODE_LEN / 2;
+        let code = match text.split_at_checked(half) {
+            Some((first, rest)) => format!("{first}{}", rest.strip_prefix('-').unwrap_or(rest)),
+            None => text.to_owned(),
+        };
+        if code.len() == APPROVAL_CODE_LEN && code.bytes().all(|byte| CROCKFORD.contains(&byte)) {
+            Ok(Self(code))
+        } else {
+            Err(MalformedCredential {
+                kind: "approval code",
+            })
+        }
+    }
+
+    /// The code's 8 characters, without the dash: what the store keeps.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// The code as people see it: two groups of four, joined by a dash.
+    #[must_use]
+    pub fn display_form(&self) -> String {
+        let (first, second) = self.0.split_at(APPROVAL_CODE_LEN / 2);
+        format!("{first}-{second}")
+    }
+}
+
+impl TryFrom<String> for ApprovalCode {
+    type Error = MalformedCredential;
+
+    fn try_from(text: String) -> Result<Self, Self::Error> {
+        Self::parse(&text)
+    }
+}
+
+impl From<ApprovalCode> for String {
+    fn from(code: ApprovalCode) -> Self {
+        code.display_form()
+    }
+}
+
+impl fmt::Display for ApprovalCode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.display_form())
+    }
+}
+
 // TryFrom<String> and Serialize for the prefixed credentials. Serialize exists only because
 // serialize_exposed needs it on the inner type; the Secret wrapper still has none.
 macro_rules! prefixed_credential_strings {
@@ -655,6 +735,49 @@ mod tests {
             prop_assert_eq!(EnrolmentToken::parse(&text).unwrap().expose_secret().digest(), digest);
             let key = WorkerKey::generate(&mint);
             prop_assert!(WorkerKey::parse(key.expose_secret().as_str()).is_ok());
+        }
+    }
+
+    #[test]
+    fn approval_codes_are_eight_crockford_characters_shown_in_two_groups() {
+        let code = ApprovalCode::generate(&FixedMint([0xA5; 32]));
+        assert_eq!(
+            code.display_form(),
+            "MPJT-B9D5",
+            "40 bits, upper case, a dash in the middle"
+        );
+        assert_eq!(code.to_string(), "MPJT-B9D5", "Display is the shown form");
+        assert_eq!(
+            code.as_str(),
+            "MPJTB9D5",
+            "the store keeps it without the dash"
+        );
+        assert_eq!(
+            ApprovalCode::parse("MPJTB9D5"),
+            Ok(code.clone()),
+            "the dash is optional"
+        );
+        assert_eq!(
+            serde_json::to_string(&code).unwrap(),
+            r#""MPJT-B9D5""#,
+            "the wire carries the shown form"
+        );
+        assert_eq!(
+            serde_json::from_str::<ApprovalCode>(r#""MPJT-B9D5""#).unwrap(),
+            code,
+            "and reads it back"
+        );
+        for bad in [
+            "MPJT-B9D",
+            "MPJT-B9D55",
+            "mpjt-b9d5",
+            "MPJT-B9DU",
+            "M-P-J-T-B-9-D-5",
+            "MPJTB9D5-",
+            "MPJTB-9D5",
+            "-MPJTB9D5",
+        ] {
+            assert!(ApprovalCode::parse(bad).is_err(), "{bad}");
         }
     }
 }

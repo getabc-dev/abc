@@ -13,6 +13,10 @@ use tokio::time::Instant;
 pub struct Limits {
     /// Enrolment attempts per minute from one source (the address Serve forwards).
     pub enrolments_per_minute: u32,
+    /// Requests per minute from one source that make the server ask its tailscaled which node
+    /// they came from, before anything else about them is read. A waiting machine polls every
+    /// two seconds.
+    pub lookups_per_minute: u32,
     /// Worker sessions one worker may start per minute.
     pub session_starts_per_minute: u32,
     /// `WebSocket`s one worker may hold at once, handshake or not.
@@ -23,6 +27,7 @@ impl Default for Limits {
     fn default() -> Self {
         Self {
             enrolments_per_minute: 20,
+            lookups_per_minute: 120,
             session_starts_per_minute: 30,
             sockets_per_worker: 4,
         }

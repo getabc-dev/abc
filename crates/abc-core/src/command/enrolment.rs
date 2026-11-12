@@ -17,7 +17,7 @@ use thiserror::Error;
 use super::claim::expiry;
 use crate::credential::{EnrolmentToken, WorkerKeyDigest};
 use crate::decision::{DecideCtx, Decision, DecisionBuilder};
-use crate::event::{EnrolmentEvent, WorkerEvent};
+use crate::event::{EnrolledVia, EnrolmentEvent, WorkerEvent};
 use crate::id::{EnrolmentTokenId, EventId, WorkerId, WorkspaceId};
 use crate::identity::{DisplayName, MachineInfo, MachineLabel};
 use crate::policy::{
@@ -271,7 +271,7 @@ impl Command for EnrolWorker {
         decision.emit(
             record.worker,
             WorkerEvent::Enrolled {
-                token: record.id,
+                via: EnrolledVia::Token { token: record.id },
                 key: command.key,
                 name,
                 machine: command.machine,
@@ -493,7 +493,7 @@ mod tests {
                 (
                     uuid::Uuid::from_u128(11),
                     WorkerEvent::Enrolled {
-                        token: id(10),
+                        via: EnrolledVia::Token { token: id(10) },
                         key: key(1),
                         name: DisplayName::parse("mbp").unwrap(),
                         machine: enrol(key(1)).machine,

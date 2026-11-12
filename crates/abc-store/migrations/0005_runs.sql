@@ -6,7 +6,8 @@
 
 ALTER TABLE event DROP CONSTRAINT event_stream_kind_check;
 ALTER TABLE event ADD CONSTRAINT event_stream_kind_check CHECK (stream_kind IN
-    ('installation', 'person', 'workspace', 'enrolment_token', 'worker', 'run'));
+    ('installation', 'person', 'workspace', 'enrolment_token', 'enrolment_request', 'worker',
+     'run'));
 
 CREATE TABLE run (
     id           uuid        PRIMARY KEY,

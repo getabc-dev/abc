@@ -458,11 +458,14 @@ fn run(
         return perform(task, invocation, report);
     };
     let label = gate_label(&task);
+    // A mutants run records itself, passing or not, in the checkpoint's own section.
+    let records_pass = !matches!(task, Task::Mutants { .. });
     match gate::take(&invocation.root, gate, wait, report)? {
         gate::Taken::Held(held) => {
             let result = perform(task, invocation, report);
             drop(held);
-            if matches!(result, Ok(code) if code == ExitCode::SUCCESS)
+            if records_pass
+                && matches!(result, Ok(code) if code == ExitCode::SUCCESS)
                 && invocation.root == invocation.home
                 && let Err(error) = progress::gate_passed(&invocation.root, &label, progress::now())
             {
@@ -485,6 +488,35 @@ fn run(
     }
 }
 
+/// Runs the mutants gate, and records the run in the checkpoint of the checkout it ran on, as
+/// `label`, whatever its verdict: a fresh session re-tests the missed mutants only. A run that
+/// ends in an error, such as a failing baseline, tested no mutant and records nothing.
+fn run_mutants(
+    invocation: &Invocation<'_>,
+    label: &str,
+    base: &str,
+    options: &mutants::Options,
+    tools: &mutants::Tools,
+    report: &mut impl Write,
+) -> anyhow::Result<ExitCode> {
+    let result = mutants::run(&invocation.root, base, options, tools, report)?;
+    if invocation.root == invocation.home
+        && let Err(error) = progress::mutants_ran(
+            &invocation.root,
+            label,
+            result.passed,
+            &result.missed,
+            progress::now(),
+        )
+    {
+        writeln!(
+            report,
+            "{label}: ran, but the checkpoint was not written: {error:#}"
+        )?;
+    }
+    Ok(verdict(result.passed))
+}
+
 fn perform(
     task: Task,
     invocation: &Invocation<'_>,
@@ -497,6 +529,7 @@ fn perform(
     let postgres = || check::postgres_bin(&|name| (invocation.test_tool)(root, name));
     let env = |name: &str| (invocation.env)(name);
     let mode = annotation::Mode::from_env(&env);
+    let label = gate_label(&task);
     match task {
         Task::Check { changed, .. } => {
             Ok(verdict(check(root, changed, tool, postgres()?, report)?))
@@ -508,13 +541,14 @@ fn perform(
             mode,
             report,
         )?)),
-        Task::Mutants { base, jobs, shard } => Ok(verdict(mutants::run(
-            root,
+        Task::Mutants { base, jobs, shard } => run_mutants(
+            invocation,
+            &label,
             &base,
             &mutants::Options { jobs, shard, mode },
             &mutants::Tools::pinned(tool, postgres()?)?,
             report,
-        )?)),
+        ),
         Task::Spec { traces } => run_spec(root, traces.as_deref(), tool, report),
         Task::Fuzz { seconds } => Ok(verdict(fuzz::run(
             root,
@@ -1724,6 +1758,27 @@ mod tests {
         assert!(
             checkpoint.contains("- `cargo xtask coverage --base base` passed at "),
             "{checkpoint}"
+        );
+        // A mutants run is recorded too, with the mutants it missed or none.
+        let mutants = || Task::Mutants {
+            base: "base".to_owned(),
+            jobs: 1,
+            shard: Some(crate::mutants::Shard::parse("1/2").unwrap()),
+        };
+        assert_eq!(
+            dispatch(mutants(), &root, &root, &no_env).unwrap(),
+            ExitCode::SUCCESS
+        );
+        let recorded = fs::read_to_string(root.join(crate::progress::PROGRESS)).unwrap();
+        assert!(
+            recorded.contains("- `cargo xtask mutants --base base --shard 1/2` ran at ")
+                && recorded.contains("and caught every mutant"),
+            "{recorded}"
+        );
+        assert_eq!(
+            dispatch(mutants(), &home, &root, &no_env).unwrap(),
+            ExitCode::SUCCESS,
+            "judging another tree"
         );
         assert_eq!(
             dispatch(

@@ -3,6 +3,10 @@
 //! the server tells a worker to stop.
 
 #[cfg(test)]
+#[expect(
+    dead_code,
+    reason = "the shared harness; this file needs only part of it"
+)]
 mod common;
 
 #[cfg(test)]
@@ -366,7 +370,7 @@ mod tests {
             "{stopped:?}"
         );
         assert!(
-            stopped.to_string().contains("abc worker enrol --replace"),
+            stopped.to_string().contains("abc worker setup --replace"),
             "and says how to fix it: {stopped}"
         );
     }

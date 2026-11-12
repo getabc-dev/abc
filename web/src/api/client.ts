@@ -5,9 +5,11 @@ import type { ApiCode } from "../generated/ApiCode";
 import type { ApiErrorBody } from "../generated/ApiErrorBody";
 import type { ClaimRequest } from "../generated/ClaimRequest";
 import type { ClaimResponse } from "../generated/ClaimResponse";
+import type { EnrolmentRequestId } from "../generated/EnrolmentRequestId";
 import type { IssueTokenRequest } from "../generated/IssueTokenRequest";
 import type { LiveUpdate } from "../generated/LiveUpdate";
 import type { Position } from "../generated/Position";
+import type { RequestCard } from "../generated/RequestCard";
 import type { SessionView } from "../generated/SessionView";
 import type { TokenIssuedResponse } from "../generated/TokenIssuedResponse";
 import type { WorkspaceId } from "../generated/WorkspaceId";
@@ -100,6 +102,27 @@ async function exchange<T>(
   return answer as T;
 }
 
+/** Sends a POST that answers 204, and throws the {@link ApiError} of any other answer. */
+async function command(
+  fetcher: Fetch,
+  path: string,
+  signal: AbortSignal | undefined,
+): Promise<void> {
+  const response = await send(fetcher, path, {
+    method: "POST",
+    headers: { accept: "application/json" },
+    ...(signal === undefined ? {} : { signal }),
+  });
+  if (!response.ok) {
+    throw await refusal(response);
+  }
+}
+
+/** The path of one of a workspace's enrolment requests. */
+function requestPath(workspace: WorkspaceId, request: EnrolmentRequestId): string {
+  return `/api/workspaces/${encodeURIComponent(workspace)}/enrolment-requests/${encodeURIComponent(request)}`;
+}
+
 /**
  * The workspace's live updates, from `GET /api/workspaces/{ws}/live`: a snapshot first, or, when
  * `after` is a position, what changed after it (sent as `Last-Event-ID`). Throws an
@@ -165,6 +188,21 @@ export function apiClient(fetcher: Fetch) {
         request,
         signal,
       ),
+    /** One request to enrol a machine, as the Approve page shows it. */
+    enrolmentRequest: (workspace: WorkspaceId, request: EnrolmentRequestId, signal?: AbortSignal) =>
+      exchange<RequestCard>(fetcher, "GET", requestPath(workspace, request), undefined, signal),
+    /** The owner approves a request, which enrols the machine that made it. */
+    approveEnrolmentRequest: (
+      workspace: WorkspaceId,
+      request: EnrolmentRequestId,
+      signal?: AbortSignal,
+    ) => command(fetcher, `${requestPath(workspace, request)}/approve`, signal),
+    /** The owner denies a request. */
+    denyEnrolmentRequest: (
+      workspace: WorkspaceId,
+      request: EnrolmentRequestId,
+      signal?: AbortSignal,
+    ) => command(fetcher, `${requestPath(workspace, request)}/deny`, signal),
     /** The workspace's live updates; see {@link live}. */
     live: (workspace: WorkspaceId, after: Position | null, signal: AbortSignal) =>
       live(fetcher, workspace, after, signal),

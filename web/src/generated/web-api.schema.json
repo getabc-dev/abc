@@ -10,6 +10,9 @@
     "claim_response": {
       "$ref": "#/$defs/ClaimResponse"
     },
+    "enrolment_request": {
+      "$ref": "#/$defs/RequestCard"
+    },
     "error": {
       "$ref": "#/$defs/ApiErrorBody"
     },
@@ -42,6 +45,7 @@
     "issue_token_request",
     "token_issued",
     "tokens",
+    "enrolment_request",
     "live",
     "error",
     "graph"
@@ -184,6 +188,36 @@
           "const": "worker_key_in_use"
         },
         {
+          "description": "No such enrolment request from this machine.",
+          "type": "string",
+          "const": "enrolment_request_unknown"
+        },
+        {
+          "description": "abc's own tailscaled could not say which tailnet node made this request, so it cannot be\nattributed to one. Check that this machine is on the tailnet and the server's Tailscale is\nrunning.",
+          "type": "string",
+          "const": "tailnet_node_unknown"
+        },
+        {
+          "description": "This server was started without its tailscaled's socket, so it cannot enrol a machine from\na browser approval. Enrol with a token (`abc worker enrol --token-file`).",
+          "type": "string",
+          "const": "approval_unavailable"
+        },
+        {
+          "description": "The enrolment request expired before anyone decided. Run `abc worker setup` again.",
+          "type": "string",
+          "const": "enrolment_request_expired"
+        },
+        {
+          "description": "The enrolment request was denied.",
+          "type": "string",
+          "const": "enrolment_request_denied"
+        },
+        {
+          "description": "The enrolment request was already approved: revoke the worker instead.",
+          "type": "string",
+          "const": "enrolment_request_approved"
+        },
+        {
           "description": "The token was already redeemed: revoke the worker instead.",
           "type": "string",
           "const": "enrolment_token_already_redeemed"
@@ -235,6 +269,10 @@
         "code",
         "message"
       ]
+    },
+    "ApprovalCode": {
+      "description": "The short code a waiting `abc worker setup` and the Approve page both show, so the owner can\ncheck that the request they approve is the one their terminal made: 8 upper-case Crockford\ncharacters (40 bits), shown `XXXX-XXXX`. Not a secret: it grants nothing, and the log and\nviews keep it in the clear.",
+      "type": "string"
     },
     "Arch": {
       "description": "The CPU architectures abc ships for.",
@@ -382,6 +420,11 @@
       "maxLength": 64,
       "minLength": 1
     },
+    "EnrolmentRequestId": {
+      "description": "A machine's request to enrol, approved or denied in the browser, and the stream of its\nlifecycle events.",
+      "type": "string",
+      "format": "uuid"
+    },
     "EnrolmentTokenId": {
       "description": "An enrolment token, and the stream of its lifecycle events.",
       "type": "string",
@@ -462,6 +505,13 @@
                 "$ref": "#/$defs/MachineCard"
               }
             },
+            "requests": {
+              "description": "The enrolment requests still waiting for the owner.",
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/RequestCard"
+              }
+            },
             "type": {
               "type": "string",
               "const": "snapshot"
@@ -470,7 +520,8 @@
           "required": [
             "type",
             "head",
-            "machines"
+            "machines",
+            "requests"
           ]
         },
         {
@@ -488,6 +539,13 @@
               "description": "The log head the cards reflect.",
               "$ref": "#/$defs/Position"
             },
+            "requests": {
+              "description": "The enrolment requests that changed, decided ones included, so they leave the screen.",
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/RequestCard"
+              }
+            },
             "type": {
               "type": "string",
               "const": "machines"
@@ -496,7 +554,8 @@
           "required": [
             "type",
             "head",
-            "changed"
+            "changed",
+            "requests"
           ]
         },
         {
@@ -625,6 +684,136 @@
       "description": "A place in the event log: the global sequence number. Positions are gapless and assigned in\ncommit order (the store serializes writers on the head row), so a consumer that has read every\nevent up to `N` has seen everything at or below `N`, forever. `Position::ORIGIN` (0) comes\nbefore the first event.",
       "type": "integer",
       "format": "int64"
+    },
+    "RequestCard": {
+      "description": "One enrolment request as the Machines notice and the Approve page show it.",
+      "type": "object",
+      "properties": {
+        "arch": {
+          "description": "Its architecture.",
+          "$ref": "#/$defs/Arch"
+        },
+        "build": {
+          "description": "The abc release it runs.",
+          "type": "string"
+        },
+        "changed_at": {
+          "description": "The log position that last changed it.",
+          "$ref": "#/$defs/Position"
+        },
+        "code": {
+          "description": "The code the machine's terminal shows.",
+          "$ref": "#/$defs/ApprovalCode"
+        },
+        "expires_at": {
+          "description": "When it can no longer be approved.",
+          "$ref": "#/$defs/Timestamp"
+        },
+        "hostname": {
+          "description": "The machine's hostname, which becomes the worker's name.",
+          "$ref": "#/$defs/DisplayName"
+        },
+        "id": {
+          "description": "The request.",
+          "$ref": "#/$defs/EnrolmentRequestId"
+        },
+        "login": {
+          "description": "The tailnet person who asked.",
+          "$ref": "#/$defs/TailnetLogin"
+        },
+        "node": {
+          "description": "The node they asked from.",
+          "$ref": "#/$defs/TailnetNode"
+        },
+        "os": {
+          "description": "Its operating system.",
+          "$ref": "#/$defs/Os"
+        },
+        "requested_at": {
+          "description": "When it was asked.",
+          "$ref": "#/$defs/Timestamp"
+        },
+        "status": {
+          "description": "Where it stands, derived when read.",
+          "$ref": "#/$defs/RequestStatus"
+        }
+      },
+      "required": [
+        "id",
+        "hostname",
+        "os",
+        "arch",
+        "build",
+        "login",
+        "node",
+        "code",
+        "requested_at",
+        "expires_at",
+        "status",
+        "changed_at"
+      ]
+    },
+    "RequestStatus": {
+      "description": "Where a request stands, for the web app.",
+      "oneOf": [
+        {
+          "description": "Waiting for the owner.",
+          "type": "object",
+          "properties": {
+            "status": {
+              "type": "string",
+              "const": "pending"
+            }
+          },
+          "required": [
+            "status"
+          ]
+        },
+        {
+          "description": "Approved: this worker exists.",
+          "type": "object",
+          "properties": {
+            "status": {
+              "type": "string",
+              "const": "approved"
+            },
+            "worker": {
+              "description": "The worker.",
+              "$ref": "#/$defs/WorkerId"
+            }
+          },
+          "required": [
+            "status",
+            "worker"
+          ]
+        },
+        {
+          "description": "Denied.",
+          "type": "object",
+          "properties": {
+            "status": {
+              "type": "string",
+              "const": "denied"
+            }
+          },
+          "required": [
+            "status"
+          ]
+        },
+        {
+          "description": "Not decided in time.",
+          "type": "object",
+          "properties": {
+            "status": {
+              "type": "string",
+              "const": "expired"
+            }
+          },
+          "required": [
+            "status"
+          ]
+        }
+      ]
     },
     "Role": {
       "description": "A person's role in a workspace. v1 has one person per server (decision 20), so the only role is\n`Owner`. Membership is still stored per (workspace, person), so adding a role later is a local\nchange to this enum and the policy matrix.",
@@ -870,6 +1059,10 @@
     },
     "TailnetLogin": {
       "description": "A person's Tailscale login, as Tailscale Serve asserts it in `Tailscale-User-Login`, for example\n`alice@example.com` or `alice@github`.\n\nHolding one proves nothing by itself. It means something only when abc-server's sidecar\nextractor built it from a request that arrived on the sidecar Unix socket. abc-store turns it\ninto a `Principal` inside the request's transaction.",
+      "type": "string"
+    },
+    "TailnetNode": {
+      "description": "A tailnet node's `MagicDNS` name, such as `macbook.tail1234.ts.net`, as abc's own tailscaled\nreports it for the address a request came from. Like [`TailnetLogin`] it means something only\nwhen abc-server built it, from its own tailscaled's answer.",
       "type": "string"
     },
     "Text": {

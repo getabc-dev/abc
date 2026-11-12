@@ -10,14 +10,20 @@ use serde::Serialize;
 use ts_rs::TS;
 
 use crate::actor::Role;
+use crate::command::{RequestRecord, RequestStanding};
+use crate::credential::ApprovalCode;
 use crate::event::Position;
-use crate::id::{EnrolmentTokenId, PersonId, WorkerId, WorkspaceId};
-use crate::identity::{Arch, DisplayName, MachineLabel, Os, TailnetLogin, WorkspaceName};
-use crate::policy::{DenialReason, NoProof, ReadAction, Request, Scope};
+use crate::id::{EnrolmentRequestId, EnrolmentTokenId, PersonId, WorkerId, WorkspaceId};
+use crate::identity::{
+    Arch, DisplayName, MachineLabel, Os, Requester, TailnetLogin, TailnetNode, WorkspaceName,
+};
+use crate::policy::{Capability, DenialReason, NoProof, Proof, ReadAction, Request, Scope};
 use crate::time::Timestamp;
 
-/// A request that only reads.
-pub trait Query: Request<Action = ReadAction, Facts = (), Proof = NoProof> {
+/// A request that only reads. Most load no facts and carry no proof; one that checks a
+/// capability (the enrolment request's status) loads the facts it proves against, as a command
+/// does.
+pub trait Query: Request<Action = ReadAction> {
     /// What it returns.
     type Answer;
 }
@@ -51,7 +57,7 @@ query!(WhoAmI, ReadAction::ViewSession, SessionView, |_s| {
 });
 
 /// The answer to [`WhoAmI`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, TS, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize, TS, JsonSchema)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum SessionView {
     /// The request carried no tailnet identity (a tagged device, or a non-browser client).
@@ -78,7 +84,7 @@ pub enum SessionView {
 }
 
 /// One of a person's workspaces.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, TS, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize, TS, JsonSchema)]
 pub struct WorkspaceSummary {
     /// The workspace.
     pub id: WorkspaceId,
@@ -125,6 +131,185 @@ pub struct MachinesSnapshot {
     pub head: Position,
     /// The cards: all of them for `ListMachines`, only those changed after `after` for `MachinesSince`.
     pub machines: Vec<MachineCard>,
+    /// Enrolment requests: the pending ones for `ListMachines`, every one changed after `after`
+    /// for `MachinesSince`, so a decided request leaves the screen.
+    pub requests: Vec<RequestCard>,
+}
+
+/// One enrolment request as the Machines notice and the Approve page show it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, TS, JsonSchema)]
+pub struct RequestCard {
+    /// The request.
+    pub id: EnrolmentRequestId,
+    /// The machine's hostname, which becomes the worker's name.
+    pub hostname: DisplayName,
+    /// Its operating system.
+    pub os: Os,
+    /// Its architecture.
+    pub arch: Arch,
+    /// The abc release it runs.
+    pub build: String,
+    /// The tailnet person who asked.
+    pub login: TailnetLogin,
+    /// The node they asked from.
+    pub node: TailnetNode,
+    /// The code the machine's terminal shows.
+    pub code: ApprovalCode,
+    /// When it was asked.
+    pub requested_at: Timestamp,
+    /// When it can no longer be approved.
+    pub expires_at: Timestamp,
+    /// Where it stands, derived when read.
+    pub status: RequestStatus,
+    /// The log position that last changed it.
+    pub changed_at: Position,
+}
+
+/// Where a request stands, for the web app.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, TS, JsonSchema)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum RequestStatus {
+    /// Waiting for the owner.
+    Pending,
+    /// Approved: this worker exists.
+    Approved {
+        /// The worker.
+        worker: WorkerId,
+    },
+    /// Denied.
+    Denied,
+    /// Not decided in time.
+    Expired,
+}
+
+impl RequestStatus {
+    /// The status of `record` at `now`, by the same rule the commands decide with.
+    #[must_use]
+    pub fn of(record: &RequestRecord, now: Timestamp) -> Self {
+        match record.standing(now) {
+            RequestStanding::Pending => Self::Pending,
+            RequestStanding::Approved => Self::Approved {
+                worker: record.worker,
+            },
+            RequestStanding::Denied => Self::Denied,
+            RequestStanding::Expired => Self::Expired,
+        }
+    }
+}
+
+/// The Approve page: one request of a workspace. `None` when it has no such request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ViewEnrolmentRequest {
+    /// The workspace.
+    pub workspace: WorkspaceId,
+    /// The request.
+    pub request: EnrolmentRequestId,
+}
+query!(
+    ViewEnrolmentRequest,
+    ReadAction::ViewWorkspace,
+    Option<RequestCard>,
+    |s| Scope::Workspace(s.workspace)
+);
+
+/// A waiting machine asks where its request stands, from the login and node that made it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnrolmentRequestStatus {
+    /// The request.
+    pub request: EnrolmentRequestId,
+    /// Who asks now, built like the request's own requester.
+    pub requester: Requester,
+}
+
+/// The request was made by the caller's login from the caller's node.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApplicantProof {
+    record: RequestRecord,
+}
+
+impl ApplicantProof {
+    /// Where the request stands at `now`, as the machine learns it.
+    #[must_use]
+    pub fn state(&self, now: Timestamp) -> RequestState {
+        let record = &self.record;
+        match record.standing(now) {
+            RequestStanding::Pending => RequestState::Pending {
+                code: record.code.clone(),
+                expires_at: record.expires_at,
+            },
+            RequestStanding::Approved => RequestState::Approved {
+                worker: record.worker,
+                workspace: record.workspace,
+                name: record.machine.hostname.clone(),
+            },
+            RequestStanding::Denied => RequestState::Denied,
+            RequestStanding::Expired => RequestState::Expired,
+        }
+    }
+}
+
+impl Proof for ApplicantProof {
+    fn capability(&self) -> Capability {
+        Capability::EnrolmentApplicant {
+            workspace: self.record.workspace,
+        }
+    }
+}
+
+impl Request for EnrolmentRequestStatus {
+    type Action = ReadAction;
+    const ACTION: ReadAction = ReadAction::ViewOwnEnrolmentRequest;
+    type Facts = Option<RequestRecord>;
+    type Proof = ApplicantProof;
+
+    fn scope(&self) -> Scope {
+        Scope::CapabilityWorkspace
+    }
+
+    /// Another login or node gets the same answer as a request that does not exist.
+    fn prove(
+        &self,
+        facts: &Option<RequestRecord>,
+        _now: Timestamp,
+    ) -> Result<ApplicantProof, DenialReason> {
+        facts
+            .as_ref()
+            .filter(|record| record.id == self.request && record.requester == self.requester)
+            .map(|record| ApplicantProof {
+                record: record.clone(),
+            })
+            .ok_or(DenialReason::EnrolmentRequestUnknown)
+    }
+}
+
+impl Query for EnrolmentRequestStatus {
+    type Answer = RequestState;
+}
+
+/// Where an enrolment request stands, as the waiting machine learns it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize, TS, JsonSchema)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum RequestState {
+    /// Waiting for the owner.
+    Pending {
+        /// The code to compare with the Approve page.
+        code: ApprovalCode,
+        /// When it stops waiting.
+        expires_at: Timestamp,
+    },
+    /// Approved: the machine's key is now this worker's.
+    Approved {
+        /// The worker.
+        worker: WorkerId,
+        /// Its workspace.
+        workspace: WorkspaceId,
+        /// Its display name.
+        name: DisplayName,
+    },
+    /// The owner denied it.
+    Denied,
+    /// Nobody decided in time.
+    Expired,
 }
 
 /// One worker as the Machines screen shows it. Everything here, online-ness included, is derived
@@ -324,6 +509,146 @@ mod tests {
             serde_json::to_string(&TokenStatus::Redeemed { worker }).unwrap(),
             format!(r#"{{"status":"redeemed","worker":"{}"}}"#, worker.as_uuid()),
             "tagged by status on the wire"
+        );
+    }
+
+    fn record() -> RequestRecord {
+        use crate::command::REQUEST_TTL;
+        use crate::credential::Digest;
+        RequestRecord {
+            id: EnrolmentRequestId::from_uuid(Uuid::from_u128(20)),
+            workspace: WorkspaceId::from_uuid(Uuid::from_u128(100)),
+            worker: WorkerId::from_uuid(Uuid::from_u128(21)),
+            key: Digest::from_bytes([7; 32]),
+            requester: requester("alice@example.com", "mbp.ts.net"),
+            machine: crate::identity::MachineInfo {
+                hostname: DisplayName::parse("mbp").unwrap(),
+                os: Os::Macos,
+                arch: Arch::Aarch64,
+            },
+            build: semver::Version::new(0, 1, 0),
+            code: ApprovalCode::parse("ABCD-EFGH").unwrap(),
+            expires_at: at().checked_add(REQUEST_TTL).unwrap(),
+            decision: None,
+            requested_event: crate::id::EventId::from_uuid(Uuid::from_u128(22)),
+        }
+    }
+
+    fn requester(login: &str, node: &str) -> Requester {
+        Requester {
+            login: TailnetLogin::parse(login).unwrap(),
+            node: TailnetNode::parse(node).unwrap(),
+        }
+    }
+
+    fn at() -> Timestamp {
+        Timestamp::from_utc(datetime!(2026-01-01 00:00:00 UTC))
+    }
+
+    #[test]
+    fn only_the_requesting_login_and_node_learn_where_a_request_stands() {
+        let ask = |login: &str, node: &str| EnrolmentRequestStatus {
+            request: record().id,
+            requester: requester(login, node),
+        };
+        let proof = ask("alice@example.com", "mbp.ts.net")
+            .prove(&Some(record()), at())
+            .unwrap();
+        assert_eq!(
+            proof.capability(),
+            Capability::EnrolmentApplicant {
+                workspace: record().workspace
+            },
+            "the request's workspace"
+        );
+        for (who, facts) in [
+            (ask("alice@example.com", "other.ts.net"), Some(record())),
+            (ask("bob@example.com", "mbp.ts.net"), Some(record())),
+            (ask("alice@example.com", "mbp.ts.net"), None),
+            (
+                EnrolmentRequestStatus {
+                    request: EnrolmentRequestId::from_uuid(Uuid::from_u128(99)),
+                    requester: requester("alice@example.com", "mbp.ts.net"),
+                },
+                Some(record()),
+            ),
+        ] {
+            assert_eq!(
+                who.prove(&facts, at()),
+                Err(DenialReason::EnrolmentRequestUnknown),
+                "{who:?} sees nothing"
+            );
+        }
+        assert_eq!(
+            proof.state(at()),
+            RequestState::Pending {
+                code: record().code,
+                expires_at: record().expires_at
+            },
+            "pending, with the code"
+        );
+        let later = record().expires_at;
+        assert_eq!(proof.state(later), RequestState::Expired, "then expired");
+        let approved = ApplicantProof {
+            record: RequestRecord {
+                decision: Some(crate::command::RequestDecision::Approved),
+                ..record()
+            },
+        };
+        assert_eq!(
+            approved.state(later),
+            RequestState::Approved {
+                worker: record().worker,
+                workspace: record().workspace,
+                name: DisplayName::parse("mbp").unwrap(),
+            },
+            "approved, for good"
+        );
+        let denied = ApplicantProof {
+            record: RequestRecord {
+                decision: Some(crate::command::RequestDecision::Denied),
+                ..record()
+            },
+        };
+        assert_eq!(denied.state(at()), RequestState::Denied, "denied");
+        assert_eq!(
+            serde_json::to_value(RequestState::Denied).unwrap(),
+            serde_json::json!({"state": "denied"}),
+            "tagged by state on the wire"
+        );
+    }
+
+    #[test]
+    fn a_request_cards_status_follows_the_record() {
+        assert_eq!(
+            RequestStatus::of(&record(), at()),
+            RequestStatus::Pending,
+            "pending"
+        );
+        assert_eq!(
+            RequestStatus::of(&record(), record().expires_at),
+            RequestStatus::Expired,
+            "expired"
+        );
+        let approved = RequestRecord {
+            decision: Some(crate::command::RequestDecision::Approved),
+            ..record()
+        };
+        assert_eq!(
+            RequestStatus::of(&approved, at()),
+            RequestStatus::Approved {
+                worker: record().worker
+            },
+            "approved, naming the worker"
+        );
+        let denied = RequestRecord {
+            decision: Some(crate::command::RequestDecision::Denied),
+            ..record()
+        };
+        assert_eq!(
+            RequestStatus::of(&denied, at()),
+            RequestStatus::Denied,
+            "denied"
         );
     }
 }

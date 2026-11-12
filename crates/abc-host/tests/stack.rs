@@ -15,7 +15,7 @@ mod tests {
 
     use abc_host::config::Config;
     use abc_host::programs::Programs;
-    use abc_host::{Console, Host, HostError, Os, ServerHome, SetupOptions, Timing};
+    use abc_host::{Console, Host, HostError, Os, Server, ServerHome, SetupOptions, Timing};
 
     /// The fakes' sources.
     fn fakes() -> PathBuf {
@@ -83,21 +83,24 @@ mod tests {
             ServerHome::at(self.root().join("home"))
         }
 
-        fn host(&self) -> Host {
-            Host {
-                os: self.os,
-                home: self.home(),
-                services_dir: self.root().join("services"),
-                uid: 501,
-                path: self.root().join("bin").into_os_string(),
-                timing: Timing {
-                    poll: Duration::from_millis(20),
-                    postgres: Duration::from_secs(10),
-                    tailscaled: Duration::from_secs(10),
-                    login: Duration::from_secs(10),
-                    server: Duration::from_secs(10),
-                    service: Duration::from_secs(5),
+        fn server(&self) -> Server {
+            Server {
+                host: Host {
+                    os: self.os,
+                    user_home: self.root().join("user"),
+                    services_dir: self.root().join("services"),
+                    uid: 501,
+                    path: self.root().join("bin").into_os_string(),
+                    timing: Timing {
+                        poll: Duration::from_millis(20),
+                        postgres: Duration::from_secs(10),
+                        tailscaled: Duration::from_secs(10),
+                        login: Duration::from_secs(10),
+                        server: Duration::from_secs(10),
+                        service: Duration::from_secs(5),
+                    },
                 },
+                home: self.home(),
             }
         }
 
@@ -115,7 +118,7 @@ mod tests {
         fn setup(&self, auth_key: Option<PathBuf>) -> (Result<abc_host::Stack, HostError>, String) {
             let mut said = Vec::new();
             let result = abc_host::setup(
-                &self.host(),
+                &self.server(),
                 &SetupOptions {
                     exe: PathBuf::from("/nonexistent/bin/abc"),
                     auth_key,
@@ -198,11 +201,11 @@ mod tests {
         let stack = stack.unwrap_or_else(|error| panic!("{error}\n{said}"));
         first_setup_ran_the_stack(&machine, &stack, &said);
         assert_eq!(
-            abc_host::database_url(&machine.host()).unwrap(),
+            abc_host::database_url(&machine.server()).unwrap(),
             stack.database_url,
             "the day-2 commands reach the database setup made"
         );
-        let report = abc_host::status(&machine.host()).unwrap();
+        let report = abc_host::status(&machine.server()).unwrap();
         assert!(report.healthy(), "{:#?}", report.lines());
         second_setup_changes_nothing(&machine);
     }
@@ -293,8 +296,9 @@ mod tests {
         root_was_asked_once(machine, &calls, said);
         assert!(
             calls.contains(&format!(
-                "abc server --sidecar-socket {} --ops-addr {} --public-url https://abc.tailfake.ts.net",
+                "abc server --sidecar-socket {} --tailscaled-socket {} --ops-addr {} --public-url https://abc.tailfake.ts.net",
                 machine.socket("abc.sock"),
+                machine.socket("tailscaled.sock"),
                 machine.ops
             )),
             "the server's service: {calls:#?}"
@@ -313,7 +317,7 @@ mod tests {
         for daemon in ["postgres.daemon", "tailscaled.daemon", "abc.daemon"] {
             assert!(machine.alive(daemon), "{daemon} runs under its service");
         }
-        let names: Vec<String> = abc_host::services::Part::ALL
+        let names: Vec<String> = abc_host::services::Part::STACK
             .iter()
             .map(|part| part.service_name(os))
             .collect();
@@ -442,11 +446,11 @@ mod tests {
     #[test]
     fn a_home_too_long_for_a_socket_fails_before_anything_is_made() {
         let machine = Machine::new(Os::MacOs);
-        let mut host = machine.host();
-        host.home = ServerHome::at(machine.root().join("a".repeat(120)));
+        let mut server = machine.server();
+        server.home = ServerHome::at(machine.root().join("a".repeat(120)));
         let mut said = Vec::new();
         let error = abc_host::setup(
-            &host,
+            &server,
             &SetupOptions {
                 exe: PathBuf::from("/x"),
                 auth_key: None,
@@ -458,7 +462,7 @@ mod tests {
             matches!(error, HostError::SocketPathTooLong { limit: 103, .. }),
             "{error:?}"
         );
-        assert!(!host.home.exists(), "nothing created");
+        assert!(!server.home.exists(), "nothing created");
     }
 
     #[test]
@@ -515,11 +519,11 @@ mod tests {
         let machine = Machine::new(Os::MacOs);
         // A browser that opens nothing.
         std::fs::write(machine.root().join("bin/open"), "#!/bin/sh\n").unwrap();
-        let mut host = machine.host();
-        host.timing.login = Duration::from_millis(300);
+        let mut server = machine.server();
+        server.host.timing.login = Duration::from_millis(300);
         let mut said = Vec::new();
         let error = abc_host::setup(
-            &host,
+            &server,
             &SetupOptions {
                 exe: PathBuf::from("/x"),
                 auth_key: None,
@@ -558,7 +562,7 @@ mod tests {
             .unwrap();
         std::fs::remove_file(machine.state("serve.json")).unwrap();
         std::fs::write(machine.state("linger"), "no\n").unwrap();
-        let report = abc_host::status(&machine.host()).unwrap();
+        let report = abc_host::status(&machine.server()).unwrap();
         assert!(!report.healthy(), "broken");
         let failing: Vec<(&str, &str)> = report
             .checks
@@ -601,7 +605,7 @@ mod tests {
             .count();
         assert_eq!(sudo, 1, "one sudo");
         assert!(
-            abc_host::status(&machine.host()).unwrap().healthy(),
+            abc_host::status(&machine.server()).unwrap().healthy(),
             "repaired"
         );
     }
@@ -610,7 +614,7 @@ mod tests {
     fn status_before_setup_says_to_run_setup() {
         let machine = Machine::new(Os::MacOs);
         std::fs::remove_file(machine.home().config()).unwrap();
-        let error = abc_host::status(&machine.host()).unwrap_err();
+        let error = abc_host::status(&machine.server()).unwrap_err();
         assert!(
             error.to_string().ends_with("run abc server setup"),
             "{error}"
@@ -620,7 +624,7 @@ mod tests {
     #[test]
     fn status_of_a_stack_that_is_down_says_what_to_read() {
         let machine = Machine::new(Os::MacOs);
-        let report = abc_host::status(&machine.host()).unwrap();
+        let report = abc_host::status(&machine.server()).unwrap();
         let lines = report.lines();
         let fixes: Vec<&str> = report
             .checks
@@ -643,10 +647,10 @@ mod tests {
     #[test]
     fn backup_writes_a_private_dump_and_restore_puts_it_back_with_the_server_stopped() {
         let machine = Machine::set_up(Os::MacOs);
-        let host = machine.host();
+        let server = machine.server();
         std::fs::write(machine.state("db-abc"), "the original\n").unwrap();
         let at = time::OffsetDateTime::from_unix_timestamp(1_793_000_000).unwrap();
-        let backup = abc_host::backup(&host, None, at).unwrap();
+        let backup = abc_host::backup(&server, None, at).unwrap();
         assert_eq!(
             backup.path,
             machine.home().backups().join("abc-20261026-073320.dump"),
@@ -661,7 +665,7 @@ mod tests {
         assert!(backup.bytes > 0, "its size");
         assert!(
             matches!(
-                abc_host::backup(&host, Some(&backup.path), at),
+                abc_host::backup(&server, Some(&backup.path), at),
                 Err(HostError::BackupExists { .. })
             ),
             "never overwritten"
@@ -673,7 +677,7 @@ mod tests {
         machine.take_calls();
         let mut restoring = Vec::new();
         let refused =
-            abc_host::restore(&host, &bogus, &mut Console::new(&mut restoring)).unwrap_err();
+            abc_host::restore(&server, &bogus, &mut Console::new(&mut restoring)).unwrap_err();
         assert!(
             refused
                 .to_string()
@@ -689,7 +693,7 @@ mod tests {
         );
 
         std::fs::write(machine.state("db-abc"), "changed since\n").unwrap();
-        abc_host::restore(&host, &backup.path, &mut Console::new(&mut restoring)).unwrap();
+        abc_host::restore(&server, &backup.path, &mut Console::new(&mut restoring)).unwrap();
         assert_eq!(
             std::fs::read_to_string(machine.state("db-abc")).unwrap(),
             "the original\n",
@@ -714,10 +718,10 @@ mod tests {
     #[test]
     fn upgrade_restarts_each_service_and_uninstall_keeps_the_data_unless_purged() {
         let machine = Machine::set_up(Os::MacOs);
-        let host = machine.host();
+        let server = machine.server();
         machine.take_calls();
         let mut upgrading = Vec::new();
-        abc_host::upgrade(&host, &mut Console::new(&mut upgrading)).unwrap();
+        abc_host::upgrade(&server, &mut Console::new(&mut upgrading)).unwrap();
         let restarts: Vec<String> = machine
             .take_calls()
             .into_iter()
@@ -745,7 +749,7 @@ mod tests {
         );
 
         let mut uninstalling = Vec::new();
-        abc_host::uninstall(&host, false, &mut Console::new(&mut uninstalling)).unwrap();
+        abc_host::uninstall(&server, false, &mut Console::new(&mut uninstalling)).unwrap();
         let told = String::from_utf8(uninstalling).unwrap();
         let calls = machine.take_calls();
         assert!(
@@ -772,7 +776,7 @@ mod tests {
         assert!(machine.home().postgres().exists(), "the data stays");
         assert!(told.contains("--purge deletes it"), "{told}");
         let mut purging = Vec::new();
-        abc_host::uninstall(&host, true, &mut Console::new(&mut purging)).unwrap();
+        abc_host::uninstall(&server, true, &mut Console::new(&mut purging)).unwrap();
         assert!(!machine.home().exists(), "purged");
     }
 
@@ -780,28 +784,28 @@ mod tests {
     fn day_two_commands_before_setup_say_to_run_setup() {
         let machine = Machine::new(Os::Linux);
         std::fs::remove_file(machine.home().config()).unwrap();
-        let host = machine.host();
+        let server = machine.server();
         let mut said = Vec::new();
         let now = time::OffsetDateTime::UNIX_EPOCH;
         for error in [
-            abc_host::database_url(&host).unwrap_err(),
-            abc_host::upgrade(&host, &mut Console::new(&mut said)).unwrap_err(),
-            abc_host::backup(&host, None, now).unwrap_err(),
-            abc_host::restore(&host, Path::new("/x"), &mut Console::new(&mut said)).unwrap_err(),
+            abc_host::database_url(&server).unwrap_err(),
+            abc_host::upgrade(&server, &mut Console::new(&mut said)).unwrap_err(),
+            abc_host::backup(&server, None, now).unwrap_err(),
+            abc_host::restore(&server, Path::new("/x"), &mut Console::new(&mut said)).unwrap_err(),
         ] {
             assert!(matches!(error, HostError::NotSetUp { .. }), "{error:?}");
         }
         // Uninstalling nothing succeeds.
-        abc_host::uninstall(&host, false, &mut Console::new(&mut said)).unwrap();
+        abc_host::uninstall(&server, false, &mut Console::new(&mut said)).unwrap();
     }
 
     /// `setup` on `machine` with `timing` changed by `adjust`, and what it said.
     fn setup_with(machine: &Machine, adjust: impl FnOnce(&mut Timing)) -> (HostError, String) {
-        let mut host = machine.host();
-        adjust(&mut host.timing);
+        let mut server = machine.server();
+        adjust(&mut server.host.timing);
         let mut said = Vec::new();
         let error = abc_host::setup(
-            &host,
+            &server,
             &SetupOptions {
                 exe: PathBuf::from("/x"),
                 auth_key: None,
@@ -859,7 +863,7 @@ mod tests {
                 && !machine.state("dev.getabc.postgres.loaded").exists(),
             "launchd no longer restarts it"
         );
-        let report = abc_host::status(&machine.host()).unwrap();
+        let report = abc_host::status(&machine.server()).unwrap();
         let service = report
             .checks
             .iter()
@@ -982,7 +986,7 @@ mod tests {
             config.save(&machine.home()).unwrap();
             machine.take_calls();
             let mut upgrading = Vec::new();
-            abc_host::upgrade(&machine.host(), &mut Console::new(&mut upgrading)).unwrap();
+            abc_host::upgrade(&machine.server(), &mut Console::new(&mut upgrading)).unwrap();
             let calls = machine.take_calls();
             let expected: &[&str] = match os {
                 Os::MacOs => &[
@@ -1019,7 +1023,7 @@ mod tests {
             "{\"Web\":{\"abc.tailfake.ts.net:443\":{\"Handlers\":{\"/\":{\"Proxy\":\"unix:/elsewhere\"}}}}}",
         )
         .unwrap();
-        let lines = abc_host::status(&machine.host()).unwrap().lines();
+        let lines = abc_host::status(&machine.server()).unwrap().lines();
         assert!(
             lines.iter().any(|line| line.contains(
                 "logged in as https://abc.tailfake.ts.net, which is not the configured URL"
@@ -1034,7 +1038,7 @@ mod tests {
             "{lines:#?}"
         );
         std::fs::remove_file(machine.state("logged-in")).unwrap();
-        let logged_out = abc_host::status(&machine.host()).unwrap().lines();
+        let logged_out = abc_host::status(&machine.server()).unwrap().lines();
         assert!(
             logged_out
                 .iter()
@@ -1048,7 +1052,7 @@ mod tests {
             "{logged_out:#?}"
         );
         std::fs::write(machine.state("garbled"), "").unwrap();
-        let report = abc_host::status(&machine.host()).unwrap();
+        let report = abc_host::status(&machine.server()).unwrap();
         let fixes: Vec<&str> = report
             .checks
             .iter()
@@ -1070,9 +1074,12 @@ mod tests {
             let broken = machine.root().join("broken.dump");
             std::fs::write(&broken, "FAKE DUMP\nBROKEN\n").unwrap();
             let mut restoring = Vec::new();
-            let error =
-                abc_host::restore(&machine.host(), &broken, &mut Console::new(&mut restoring))
-                    .unwrap_err();
+            let error = abc_host::restore(
+                &machine.server(),
+                &broken,
+                &mut Console::new(&mut restoring),
+            )
+            .unwrap_err();
             assert!(
                 error.to_string().contains("abc's database is unchanged"),
                 "{error}"
@@ -1097,7 +1104,7 @@ mod tests {
     #[test]
     fn backup_and_restore_need_a_running_postgres_and_a_failed_dump_leaves_no_file() {
         let machine = Machine::set_up(Os::Linux);
-        let host = machine.host();
+        let server = machine.server();
         replace_program(
             &machine,
             "programs/pg/pg_dump",
@@ -1105,7 +1112,7 @@ mod tests {
         );
         let file = machine.root().join("x.dump");
         let error =
-            abc_host::backup(&host, Some(&file), time::OffsetDateTime::UNIX_EPOCH).unwrap_err();
+            abc_host::backup(&server, Some(&file), time::OffsetDateTime::UNIX_EPOCH).unwrap_err();
         assert!(error.to_string().contains("connection failed"), "{error}");
         assert!(!file.exists(), "no half a backup");
         let good = machine.root().join("good.dump");
@@ -1116,7 +1123,8 @@ mod tests {
             .status()
             .unwrap();
         let mut restoring = Vec::new();
-        let down = abc_host::restore(&host, &good, &mut Console::new(&mut restoring)).unwrap_err();
+        let down =
+            abc_host::restore(&server, &good, &mut Console::new(&mut restoring)).unwrap_err();
         assert!(
             down.to_string()
                 .contains("check abc's Postgres with abc server status"),
@@ -1130,7 +1138,12 @@ mod tests {
         let machine = Machine::set_up(Os::Linux);
         std::fs::remove_file(machine.programs().tailscale).unwrap();
         let mut uninstalling = Vec::new();
-        abc_host::uninstall(&machine.host(), true, &mut Console::new(&mut uninstalling)).unwrap();
+        abc_host::uninstall(
+            &machine.server(),
+            true,
+            &mut Console::new(&mut uninstalling),
+        )
+        .unwrap();
         let told = String::from_utf8(uninstalling).unwrap();
         assert!(
             told.contains("Could not log abc's node out (") && told.contains("admin console"),
@@ -1177,7 +1190,7 @@ mod tests {
         config.save(&machine.home()).unwrap();
         machine.take_calls();
         let mut upgrading = Vec::new();
-        abc_host::upgrade(&machine.host(), &mut Console::new(&mut upgrading)).unwrap();
+        abc_host::upgrade(&machine.server(), &mut Console::new(&mut upgrading)).unwrap();
         let bootstraps = machine
             .take_calls()
             .into_iter()
@@ -1193,11 +1206,11 @@ mod tests {
     #[test]
     fn without_a_browser_the_link_is_printed_to_open_by_hand() {
         let machine = Machine::new(Os::Linux);
-        let mut host = machine.host();
-        host.path = std::ffi::OsString::new();
+        let mut server = machine.server();
+        server.host.path = std::ffi::OsString::new();
         let mut said = Vec::new();
         abc_host::open_in_browser(
-            &host,
+            &server.host,
             &mut Console::new(&mut said),
             "https://x.example/#code=1",
         );
@@ -1209,7 +1222,7 @@ mod tests {
         replace_program(&machine, "bin/xdg-open", "#!/bin/sh\nexit 3\n");
         let mut failed = Vec::new();
         abc_host::open_in_browser(
-            &machine.host(),
+            &machine.server().host,
             &mut Console::new(&mut failed),
             "https://x.example/",
         );
@@ -1244,7 +1257,7 @@ mod tests {
         let machine = Machine::new(Os::Linux);
         let nowhere = machine.root().join("missing/dir/x.dump");
         let error = abc_host::backup(
-            &machine.host(),
+            &machine.server(),
             Some(&nowhere),
             time::OffsetDateTime::UNIX_EPOCH,
         )
@@ -1258,21 +1271,21 @@ mod tests {
     #[test]
     fn purging_nothing_succeeds_and_a_purge_that_fails_says_so() {
         let machine = Machine::new(Os::Linux);
-        let mut host = machine.host();
+        let mut server = machine.server();
         let mut said = Vec::new();
         let locked = machine.home().dir().join("locked");
         std::fs::create_dir(&locked).unwrap();
         std::fs::write(locked.join("f"), "").unwrap();
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o500)).unwrap();
-        let error = abc_host::uninstall(&host, true, &mut Console::new(&mut said)).unwrap_err();
+        let error = abc_host::uninstall(&server, true, &mut Console::new(&mut said)).unwrap_err();
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
         assert!(
             matches!(&error, HostError::Io { path, .. } if path == machine.home().dir()),
             "{error:?}"
         );
-        host.home = ServerHome::at(machine.root().join("never-made"));
-        abc_host::uninstall(&host, true, &mut Console::new(&mut said)).unwrap();
-        assert!(!host.home.exists(), "still nothing");
+        server.home = ServerHome::at(machine.root().join("never-made"));
+        abc_host::uninstall(&server, true, &mut Console::new(&mut said)).unwrap();
+        assert!(!server.home.exists(), "still nothing");
     }
 
     #[test]
@@ -1298,15 +1311,15 @@ mod tests {
     #[test]
     fn purge_deletes_only_a_home_that_is_abcs() {
         let machine = Machine::new(Os::Linux);
-        let mut host = machine.host();
+        let mut server = machine.server();
         let mut said = Vec::new();
         // ABC_SERVER_HOME mistyped as a directory of the person's own.
         let theirs = machine.root().join("theirs");
         std::fs::create_dir(&theirs).unwrap();
         std::fs::set_permissions(&theirs, std::fs::Permissions::from_mode(0o700)).unwrap();
         std::fs::write(theirs.join("precious"), "keep me").unwrap();
-        host.home = ServerHome::at(theirs.clone());
-        let error = abc_host::uninstall(&host, true, &mut Console::new(&mut said)).unwrap_err();
+        server.home = ServerHome::at(theirs.clone());
+        let error = abc_host::uninstall(&server, true, &mut Console::new(&mut said)).unwrap_err();
         assert!(
             matches!(&error, HostError::NotAbcsHome { path } if *path == theirs),
             "{error:?}"
@@ -1318,7 +1331,7 @@ mod tests {
         // abc's home, opened to others, is not taken for abc's own either.
         std::fs::set_permissions(machine.home().dir(), std::fs::Permissions::from_mode(0o755))
             .unwrap();
-        let open = abc_host::uninstall(&machine.host(), true, &mut Console::new(&mut said));
+        let open = abc_host::uninstall(&machine.server(), true, &mut Console::new(&mut said));
         assert!(matches!(open, Err(HostError::Insecure { .. })), "{open:?}");
         assert!(machine.home().config().exists(), "kept");
     }
@@ -1352,7 +1365,7 @@ mod tests {
         std::fs::write(&good, "FAKE DUMP\nthe backup\n").unwrap();
         std::fs::write(machine.state("rename-fails"), "").unwrap();
         let mut restoring = Vec::new();
-        let error = abc_host::restore(&machine.host(), &good, &mut Console::new(&mut restoring))
+        let error = abc_host::restore(&machine.server(), &good, &mut Console::new(&mut restoring))
             .unwrap_err();
         assert!(error.to_string().contains("being accessed"), "{error}");
         assert_eq!(
@@ -1377,11 +1390,11 @@ mod tests {
         std::fs::write(machine.state("bootstrap-refuses"), "").unwrap();
         let broken = machine.root().join("broken.dump");
         std::fs::write(&broken, "FAKE DUMP\nBROKEN\n").unwrap();
-        let mut host = machine.host();
-        host.timing.service = Duration::from_millis(200);
+        let mut server = machine.server();
+        server.host.timing.service = Duration::from_millis(200);
         let mut restoring = Vec::new();
         let error =
-            abc_host::restore(&host, &broken, &mut Console::new(&mut restoring)).unwrap_err();
+            abc_host::restore(&server, &broken, &mut Console::new(&mut restoring)).unwrap_err();
         assert!(
             error.to_string().contains("abc's database is unchanged"),
             "the dump's own failure: {error}"
@@ -1401,7 +1414,7 @@ mod tests {
             .args(["-9", pid.trim()])
             .status()
             .unwrap();
-        let report = abc_host::status(&machine.host()).unwrap();
+        let report = abc_host::status(&machine.server()).unwrap();
         let server = report
             .checks
             .iter()
@@ -1416,8 +1429,136 @@ mod tests {
         let (repaired, said_repairing) = machine.setup(None);
         assert!(repaired.is_ok(), "{said_repairing}");
         assert!(
-            abc_host::status(&machine.host()).unwrap().healthy(),
+            abc_host::status(&machine.server()).unwrap().healthy(),
             "running again"
+        );
+    }
+
+    fn worker_service(machine: &Machine) -> abc_host::WorkerService {
+        abc_host::WorkerService {
+            abc: machine.programs().abc,
+            home: machine.root().join("worker-home"),
+        }
+    }
+
+    /// A worker's service installs once, runs, reports itself, and goes with `uninstall`.
+    fn worker_service_lifecycle(os: Os) {
+        let machine = Machine::new(os);
+        let host = machine.server().host;
+        let spec = worker_service(&machine);
+        let mut said = Vec::new();
+        let changed = abc_host::install_worker(&host, &spec, &mut Console::new(&mut said)).unwrap();
+        assert!(changed, "the first install changes things");
+        assert_eq!(mode(&spec.home.join("logs")), 0o700, "private logs");
+        let status = abc_host::worker_status(&host, &spec.home).unwrap();
+        assert!(status.healthy(), "{:#?}", status.lines());
+        let calls = machine.take_calls();
+        assert!(
+            calls
+                .iter()
+                .any(|call| call.starts_with("abc worker --home")),
+            "the service runs the worker: {calls:#?}"
+        );
+        let again =
+            abc_host::install_worker(&host, &spec, &mut Console::new(&mut Vec::new())).unwrap();
+        assert!(!again, "nothing changes the second time");
+
+        let mut kept = Vec::new();
+        abc_host::uninstall_worker(&host, &spec.home, false, &mut Console::new(&mut kept)).unwrap();
+        let kept = String::from_utf8(kept).unwrap();
+        assert!(kept.contains("Removed abc worker's service."), "{kept}");
+        assert!(kept.contains("stay in"), "the home stays: {kept}");
+        assert!(spec.home.is_dir());
+        let stopped = abc_host::worker_status(&host, &spec.home).unwrap();
+        assert!(!stopped.healthy(), "stopped for good");
+
+        std::fs::write(spec.home.join("worker.lock"), "").unwrap();
+        let mut purged = Vec::new();
+        abc_host::uninstall_worker(&host, &spec.home, true, &mut Console::new(&mut purged))
+            .unwrap();
+        let purged = String::from_utf8(purged).unwrap();
+        assert!(purged.contains("was not installed."), "{purged}");
+        assert!(purged.contains("Deleted"), "{purged}");
+        assert!(!spec.home.exists(), "purged");
+        let mut twice = Vec::new();
+        abc_host::uninstall_worker(&host, &spec.home, true, &mut Console::new(&mut twice)).unwrap();
+        assert!(
+            String::from_utf8(twice)
+                .unwrap()
+                .contains("was not installed.")
+        );
+    }
+
+    #[test]
+    fn a_worker_service_on_macos_installs_reports_and_uninstalls() {
+        worker_service_lifecycle(Os::MacOs);
+    }
+
+    #[test]
+    fn a_worker_service_on_linux_installs_with_lingering_reports_and_uninstalls() {
+        worker_service_lifecycle(Os::Linux);
+    }
+
+    #[test]
+    fn a_purge_refuses_what_is_not_the_workers_own_private_directory() {
+        let machine = Machine::new(Os::Linux);
+        let host = machine.server().host;
+        let root = machine.root().to_path_buf();
+        let purge = |home: &Path| {
+            abc_host::uninstall_worker(&host, home, true, &mut Console::new(&mut Vec::new()))
+        };
+        let link = root.join("link");
+        let target = root.join("target");
+        std::fs::create_dir(&target).unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(
+            matches!(purge(&link), Err(HostError::UnsafePurge { reason, .. }) if reason.contains("symbolic")),
+            "a link"
+        );
+        let file = root.join("file");
+        std::fs::write(&file, "x").unwrap();
+        assert!(
+            matches!(purge(&file), Err(HostError::UnsafePurge { reason, .. }) if reason.contains("not a directory")),
+            "a file"
+        );
+        assert!(
+            matches!(purge(Path::new("/")), Err(HostError::UnsafePurge { reason, .. }) if reason.contains("root")),
+            "root"
+        );
+        std::fs::create_dir_all(host.user_home.join("w")).unwrap();
+        assert!(
+            matches!(purge(&host.user_home), Err(HostError::UnsafePurge { reason, .. }) if reason.contains("home")),
+            "the user's home"
+        );
+        assert!(
+            matches!(
+                purge(Path::new("relative")),
+                Err(HostError::ServicePath { .. })
+            ),
+            "relative"
+        );
+        let plain = root.join("plain");
+        std::fs::create_dir(&plain).unwrap();
+        std::fs::set_permissions(&plain, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            matches!(purge(&plain), Err(HostError::UnsafePurge { reason, .. }) if reason.contains("not an abc worker's home")),
+            "a private directory no worker has run in"
+        );
+        let open = root.join("open");
+        std::fs::create_dir(&open).unwrap();
+        std::fs::write(open.join("worker.toml"), "x").unwrap();
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            matches!(purge(&open), Err(HostError::Insecure { .. })),
+            "others can reach it"
+        );
+        assert!(
+            matches!(purge(&file.join("home")), Err(HostError::Io { .. })),
+            "a path through a file is an error, not an absent home"
+        );
+        assert!(
+            open.is_dir() && plain.is_dir() && target.is_dir() && file.is_file(),
+            "nothing deleted"
         );
     }
 }

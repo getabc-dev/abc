@@ -121,6 +121,23 @@ fn postgres_major(said: &str) -> Option<&str> {
     version.split(['.', 'b', 'r']).next()
 }
 
+/// The abc that a service should run, for the abc at `exe` (the running binary): Homebrew's
+/// `opt/abc/bin/abc`, which survives an upgrade, for a binary in its `Cellar`; any other binary,
+/// resolved, as it is, wherever it was put.
+#[must_use]
+pub fn service_abc(exe: &Path) -> PathBuf {
+    let resolved = exe
+        .canonicalize()
+        .unwrap_or_else(|_unresolved| exe.to_owned());
+    let keg = resolved
+        .parent()
+        .and_then(Path::parent)
+        .map(Path::to_path_buf);
+    keg.and_then(|keg| homebrew_opt(&keg))
+        .filter(|opt| opt.exists())
+        .map_or(resolved, |opt| opt.join("bin/abc"))
+}
+
 /// The directory abc is installed in: Homebrew's `opt/abc` for a binary in its `Cellar`, else the
 /// directory above the binary's.
 fn install_root(exe: &Path) -> PathBuf {
@@ -149,7 +166,7 @@ mod tests {
     use std::os::unix::fs::PermissionsExt as _;
     use std::path::{Path, PathBuf};
 
-    use super::{Programs, homebrew_opt, install_root, postgres_major};
+    use super::{Programs, homebrew_opt, install_root, postgres_major, service_abc};
     use crate::HostError;
 
     fn executable(path: &Path, text: &str) {
@@ -177,6 +194,31 @@ mod tests {
             "another formula"
         );
         assert_eq!(homebrew_opt(Path::new("/")), None, "the root");
+    }
+
+    #[test]
+    fn a_service_runs_homebrews_stable_path_or_the_binary_where_it_is() {
+        let scratch = tempfile::tempdir().unwrap();
+        let prefix = scratch.path().canonicalize().unwrap();
+        let loose = prefix.join("target/release/abc");
+        executable(&loose, "");
+        assert_eq!(service_abc(&loose), loose, "a build somewhere: as it is");
+        let keg = prefix.join("Cellar/abc/0.2.0");
+        executable(&keg.join("bin/abc"), "");
+        assert_eq!(
+            service_abc(&keg.join("bin/abc")),
+            keg.join("bin/abc"),
+            "no opt link yet"
+        );
+        std::fs::create_dir_all(prefix.join("opt")).unwrap();
+        std::os::unix::fs::symlink(&keg, prefix.join("opt/abc")).unwrap();
+        std::fs::create_dir_all(prefix.join("bin")).unwrap();
+        std::os::unix::fs::symlink(keg.join("bin/abc"), prefix.join("bin/abc")).unwrap();
+        assert_eq!(
+            service_abc(&prefix.join("bin/abc")),
+            prefix.join("opt/abc/bin/abc"),
+            "Homebrew's link, which an upgrade keeps"
+        );
     }
 
     #[test]

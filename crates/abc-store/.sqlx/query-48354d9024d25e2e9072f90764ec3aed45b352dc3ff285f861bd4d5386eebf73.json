@@ -1,0 +1,24 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO worker (id, workspace_id, key_digest, enrolled_via_token,\n                    enrolled_via_request, hostname, os, arch, build, enrolled_at, changed_at)\n                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Bytea",
+        "Uuid",
+        "Uuid",
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Timestamptz",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "48354d9024d25e2e9072f90764ec3aed45b352dc3ff285f861bd4d5386eebf73"
+}

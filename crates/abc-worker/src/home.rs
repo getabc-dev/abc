@@ -6,7 +6,7 @@
 //!                            macOS: ~/Library/Application Support/abc/worker
 //!                            Linux: $XDG_CONFIG_HOME/abc/worker, else ~/.config/abc/worker
 //!   worker.lock       0600   locked by `Held` for the process's life; never renamed
-//!   worker.toml       0600   the record: the enrolment in use (server, token digest, key, who
+//!   worker.toml       0600   the record: the enrolment in use (server, what it was made for, key, who
 //!                            it is) and a pending key whose answer has not been seen
 //! ```
 //!
@@ -118,6 +118,25 @@ impl WorkerHome {
             Err(TryLockError::Error(source)) => Err(HomeError::io(&path, source)),
         }
     }
+
+    /// Who this machine is enrolled as, and with which server, without taking the lock: a running
+    /// worker holds it, and the record is replaced atomically, so reading it is safe. `None` when
+    /// the home holds no enrolment in use.
+    ///
+    /// # Errors
+    ///
+    /// [`HomeError`] for a home or record that others can reach, or that cannot be read.
+    pub fn enrolment(&self) -> Result<Option<(PublicUrl, Enrolled)>, HomeError> {
+        match fs::symlink_metadata(&self.dir) {
+            Ok(_) => private(&self.dir)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(source) => return Err(HomeError::io(&self.dir, source)),
+        }
+        let record = load_record(&self.dir)?;
+        Ok(record
+            .and_then(|record| record.current)
+            .map(|current| (current.key.server, current.worker)))
+    }
 }
 
 /// Fails unless `path` belongs to this process's user and gives others no access.
@@ -141,24 +160,36 @@ pub(crate) struct Held {
     dir: PathBuf,
 }
 
-/// A key made for one enrolment token at one server.
+/// What a key was made to enrol with.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum Basis {
+    /// An enrolment token, by its digest. The same token again is a retry; another token is a new
+    /// enrolment. A digest of a 256-bit token reveals nothing.
+    Token(EnrolmentTokenDigest),
+    /// The owner's approval in the browser. Running setup again while the request waits is a
+    /// retry: the server answers the same request. One that ended (denied or expired) discards the
+    /// key, so the next run asks afresh.
+    Approval,
+}
+
+/// A key made for one enrolment at one server.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Slot {
     /// The server the key was made for. Enrolment and every dial use this URL and no other.
     pub(crate) server: PublicUrl,
-    /// The digest of the token the key was sent with. The same token again is a retry; another
-    /// token is a new enrolment. A digest of a 256-bit token reveals nothing.
-    pub(crate) token: EnrolmentTokenDigest,
+    /// What the key was sent with.
+    pub(crate) basis: Basis,
     /// The worker's key. It leaves its `Secret` only here and in the `Authorization` header.
     #[serde(serialize_with = "serialize_exposed")]
     pub(crate) key: Secret<WorkerKey>,
 }
 
 impl Slot {
-    /// Whether this key was made for `token` at `server`: sending it again is a retry.
-    pub(crate) fn is_for(&self, server: &PublicUrl, token: &EnrolmentTokenDigest) -> bool {
-        self.server == *server && self.token == *token
+    /// Whether this key was made for `basis` at `server`: sending it again is a retry.
+    pub(crate) fn is_for(&self, server: &PublicUrl, basis: &Basis) -> bool {
+        self.server == *server && self.basis == *basis
     }
 }
 
@@ -203,26 +234,7 @@ impl Held {
     /// unparsable, or of another format is an error, never "absent": enrolling again over a
     /// damaged key would leave a worker behind on the server.
     pub(crate) fn load(&self) -> Result<Option<Record>, HomeError> {
-        let path = self.record_path();
-        match fs::symlink_metadata(&path) {
-            Ok(_) => private(&path)?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(source) => return Err(HomeError::io(&path, source)),
-        }
-        let text = zeroize::Zeroizing::new(
-            fs::read_to_string(&path).map_err(|source| HomeError::io(&path, source))?,
-        );
-        // The parser's message can quote the file, and the file holds the key: it is dropped.
-        let stored: Stored<Current, Slot> = toml_edit::de::from_str(&text)
-            .ok()
-            .ok_or_else(|| HomeError::Unreadable { path: path.clone() })?;
-        if stored.format != FORMAT {
-            return Err(HomeError::Unreadable { path });
-        }
-        Ok(Some(Record {
-            current: stored.current,
-            pending: stored.pending,
-        }))
+        load_record(&self.dir)
     }
 
     /// Replaces the record, atomically and durably: the new text goes to a fresh 0600 file, which
@@ -269,12 +281,36 @@ impl Held {
     }
 }
 
+/// The record in `dir`, or `None` when there is none. See [`Held::load`].
+fn load_record(dir: &Path) -> Result<Option<Record>, HomeError> {
+    let path = dir.join(RECORD);
+    match fs::symlink_metadata(&path) {
+        Ok(_) => private(&path)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => return Err(HomeError::io(&path, source)),
+    }
+    let text = zeroize::Zeroizing::new(
+        fs::read_to_string(&path).map_err(|source| HomeError::io(&path, source))?,
+    );
+    // The parser's message can quote the file, and the file holds the key: it is dropped.
+    let stored: Stored<Current, Slot> = toml_edit::de::from_str(&text)
+        .ok()
+        .ok_or_else(|| HomeError::Unreadable { path: path.clone() })?;
+    if stored.format != FORMAT {
+        return Err(HomeError::Unreadable { path });
+    }
+    Ok(Some(Record {
+        current: stored.current,
+        pending: stored.pending,
+    }))
+}
+
 /// The home could not be used. Each message says what to fix and never quotes the record.
 #[derive(Debug, Error)]
 pub enum HomeError {
     /// Another `abc worker` process holds this home.
     #[error(
-        "another abc worker is already using {}; stop it first (one worker per home)",
+        "another abc worker is already using {}; if it runs as a service, `abc worker uninstall` stops it (the key stays, and `abc worker setup` starts it again), otherwise stop that process (one worker per home)",
         dir.display()
     )]
     Busy {
@@ -452,7 +488,7 @@ mod tests {
     fn slot(seed: u8) -> Slot {
         Slot {
             server: url(),
-            token: token_digest(),
+            basis: Basis::Token(token_digest()),
             key: key(seed),
         }
     }
@@ -460,14 +496,58 @@ mod tests {
     #[test]
     fn a_slot_is_for_one_token_at_one_server() {
         let slot = slot(1);
-        assert!(slot.is_for(&url(), &token_digest()), "its own");
+        assert!(
+            slot.is_for(&url(), &Basis::Token(token_digest())),
+            "its own"
+        );
+        assert!(!slot.is_for(&url(), &Basis::Approval), "not an approval");
         let other = PublicUrl::parse("https://other.test.ts.net").unwrap();
-        assert!(!slot.is_for(&other, &token_digest()), "another server");
+        assert!(
+            !slot.is_for(&other, &Basis::Token(token_digest())),
+            "another server"
+        );
         let token = EnrolmentToken::parse(&format!("abc_enr_{}", "2".repeat(52)))
             .unwrap()
             .expose_secret()
             .digest();
-        assert!(!slot.is_for(&url(), &token), "another token");
+        assert!(!slot.is_for(&url(), &Basis::Token(token)), "another token");
+    }
+
+    #[test]
+    fn the_enrolment_is_read_without_the_lock_and_only_a_missing_home_is_none() {
+        let (temp, home) = home();
+        assert!(home.enrolment().unwrap().is_none(), "no home yet");
+        let held = home.lock().unwrap();
+        assert!(home.enrolment().unwrap().is_none(), "a home with no record");
+        let enrolled = Enrolled {
+            worker: abc_core::id::WorkerId::from_uuid(uuid::Uuid::from_u128(7)),
+            workspace: abc_core::id::WorkspaceId::from_uuid(uuid::Uuid::from_u128(8)),
+            name: DisplayName::parse("mbp").unwrap(),
+        };
+        held.save(None, Some(&slot(1))).unwrap();
+        assert!(home.enrolment().unwrap().is_none(), "only pending");
+        let current = Current {
+            key: slot(1),
+            worker: enrolled.clone(),
+        };
+        held.save(Some(&current), None).unwrap();
+        assert_eq!(
+            home.enrolment().unwrap(),
+            Some((url(), enrolled)),
+            "while the worker holds the lock"
+        );
+        fs::set_permissions(home.dir(), fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            matches!(home.enrolment(), Err(HomeError::Insecure { .. })),
+            "an open home"
+        );
+        let file = temp.path().join("file");
+        fs::write(&file, "x").unwrap();
+        let beneath = WorkerHome::at(file.join("worker"));
+        assert!(
+            matches!(beneath.enrolment(), Err(HomeError::Io { .. })),
+            "a home that cannot be looked at is an error, not an absence"
+        );
     }
 
     #[test]
@@ -484,7 +564,11 @@ mod tests {
         assert!(loaded.current.is_none(), "nothing in use");
         let pending = loaded.pending.unwrap();
         assert_eq!(pending.server, url(), "the server");
-        assert_eq!(pending.token, token_digest(), "the token's digest");
+        assert_eq!(
+            pending.basis,
+            Basis::Token(token_digest()),
+            "the token's digest"
+        );
         assert_eq!(pending.key.expose_secret().as_str(), text, "the key");
         let enrolled = Enrolled {
             worker: abc_core::id::WorkerId::from_uuid(uuid::Uuid::from_u128(7)),
@@ -516,8 +600,8 @@ mod tests {
         let saved = fs::read_to_string(&path).unwrap();
         assert!(
             saved.starts_with(
-                "format = 1\n\n[current.key]\nserver = \"https://abc.test.ts.net\"\ntoken = \""
-            ),
+                "format = 1\n\n[current.key]\nserver = \"https://abc.test.ts.net\"\nkey = \""
+            ) && saved.contains("\n[current.key.basis]\ntoken = \""),
             "readable TOML: {saved}"
         );
     }
@@ -537,22 +621,22 @@ mod tests {
         for damaged in [
             "not toml at all".to_owned(),
             format!(
-                "format = 2\n\n[pending]\nserver = \"https://abc.test.ts.net\"\ntoken = \"{}\"\nkey = \"{}\"\n",
+                "format = 2\n\n[pending]\nserver = \"https://abc.test.ts.net\"\nbasis = {{ token = \"{}\" }}\nkey = \"{}\"\n",
                 "0".repeat(64),
                 secret.expose_secret().as_str()
             ),
             format!(
-                "format = 1\n\n[pending]\nserver = \"https://abc.test.ts.net\"\ntoken = \"{}\"\nkey = \"{}x\"\n",
+                "format = 1\n\n[pending]\nserver = \"https://abc.test.ts.net\"\nbasis = {{ token = \"{}\" }}\nkey = \"{}x\"\n",
                 "0".repeat(64),
                 secret.expose_secret().as_str()
             ),
             format!(
-                "format = 1\n\n[pending]\nserver = \"http://abc\"\ntoken = \"{}\"\nkey = \"{}\"\n",
+                "format = 1\n\n[pending]\nserver = \"http://abc\"\nbasis = {{ token = \"{}\" }}\nkey = \"{}\"\n",
                 "0".repeat(64),
                 secret.expose_secret().as_str()
             ),
             format!(
-                "format = 1\n\n[pending]\nserver = \"https://abc.test.ts.net\"\ntoken = \"{}\"\nkey = \"{}\"\nextra = 1\n",
+                "format = 1\n\n[pending]\nserver = \"https://abc.test.ts.net\"\nbasis = {{ token = \"{}\" }}\nkey = \"{}\"\nextra = 1\n",
                 "0".repeat(64),
                 secret.expose_secret().as_str()
             ),

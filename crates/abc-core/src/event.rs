@@ -20,13 +20,15 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::actor::{Actor, Role};
-use crate::credential::{EnrolmentTokenDigest, SetupCodeDigest, WorkerKeyDigest};
+use crate::credential::{ApprovalCode, EnrolmentTokenDigest, SetupCodeDigest, WorkerKeyDigest};
 use crate::graph::GraphVersion;
 use crate::id::{
-    CorrelationId, EnrolmentTokenId, EventId, LeaseId, PersonId, RunId, SessionId, WorkerId,
-    WorkspaceId,
+    CorrelationId, EnrolmentRequestId, EnrolmentTokenId, EventId, LeaseId, PersonId, RunId,
+    SessionId, WorkerId, WorkspaceId,
 };
-use crate::identity::{DisplayName, MachineInfo, MachineLabel, TailnetLogin, WorkspaceName};
+use crate::identity::{
+    DisplayName, MachineInfo, MachineLabel, Requester, TailnetLogin, WorkspaceName,
+};
 use crate::run::{Answer, StepResult};
 use crate::time::Timestamp;
 
@@ -103,6 +105,8 @@ pub enum StreamKind {
     Workspace,
     /// One enrolment token's life.
     EnrolmentToken,
+    /// One machine's request to enrol, approved or denied in the browser.
+    EnrolmentRequest,
     /// One worker's life and sessions.
     Worker,
     /// One graph run.
@@ -111,11 +115,12 @@ pub enum StreamKind {
 
 impl StreamKind {
     /// Every kind, for the constraint drift test.
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::Installation,
         Self::Person,
         Self::Workspace,
         Self::EnrolmentToken,
+        Self::EnrolmentRequest,
         Self::Worker,
         Self::Run,
     ];
@@ -128,6 +133,7 @@ impl StreamKind {
             Self::Person => "person",
             Self::Workspace => "workspace",
             Self::EnrolmentToken => "enrolment_token",
+            Self::EnrolmentRequest => "enrolment_request",
             Self::Worker => "worker",
             Self::Run => "run",
         }
@@ -174,6 +180,8 @@ pub enum Event {
     Workspace(WorkspaceEvent),
     /// See [`EnrolmentEvent`].
     Enrolment(EnrolmentEvent),
+    /// See [`EnrolmentRequestEvent`].
+    EnrolmentRequest(EnrolmentRequestEvent),
     /// See [`WorkerEvent`].
     Worker(WorkerEvent),
     /// See [`RunEvent`].
@@ -272,16 +280,68 @@ pub enum EnrolmentEvent {
     },
 }
 
+/// Events on an enrolment request's stream. Pending until approved or denied, or until
+/// `expires_at`, which is derived at read time (no event, no sweeper).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum EnrolmentRequestEvent {
+    /// A machine asked to enrol; actor: the tailnet person who ran `abc worker setup`.
+    #[serde(rename = "enrolment_request.requested")]
+    Requested(Box<RequestedEnrolment>),
+    /// The owner approved it; the same decision records `worker.enrolled`.
+    #[serde(rename = "enrolment_request.approved")]
+    Approved,
+    /// The owner denied it.
+    #[serde(rename = "enrolment_request.denied")]
+    Denied,
+}
+
+/// What an `enrolment_request.requested` event records.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RequestedEnrolment {
+    /// The id the enrolled worker will have, reserved like a token's.
+    pub worker: WorkerId,
+    /// The digest of the key the machine generated and keeps.
+    pub key: WorkerKeyDigest,
+    /// Who asked, from Serve's identity and abc's tailscaled.
+    pub requester: Requester,
+    /// What the machine reported about itself.
+    pub machine: MachineInfo,
+    /// The abc release it runs.
+    pub build: Version,
+    /// The code its terminal and the Approve page show.
+    pub code: ApprovalCode,
+    /// When it can no longer be approved.
+    pub expires_at: Timestamp,
+}
+
+/// How a worker came to be enrolled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum EnrolledVia {
+    /// It redeemed an enrolment token.
+    Token {
+        /// The token.
+        token: EnrolmentTokenId,
+    },
+    /// The owner approved its request in the browser.
+    Request {
+        /// The request.
+        request: EnrolmentRequestId,
+    },
+}
+
 /// Events on a worker's stream.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum WorkerEvent {
-    /// The worker enrolled. Its actor is the worker itself, and its causation is the token's
-    /// `issued` event, which links the worker to the person who issued the token.
+    /// The worker enrolled. Through a token, its actor is the worker itself and its causation the
+    /// token's `issued` event, which links the worker to the person who issued the token; through
+    /// a request, its actor is the owner who approved it and its causation the `requested` event.
     #[serde(rename = "worker.enrolled")]
     Enrolled {
-        /// The token it redeemed.
-        token: EnrolmentTokenId,
+        /// How it enrolled.
+        via: EnrolledVia,
         /// The digest of its key.
         key: WorkerKeyDigest,
         /// Its display name: the token label if there was one, else the hostname.
@@ -391,6 +451,7 @@ impl Event {
             Self::Person(_) => StreamKind::Person,
             Self::Workspace(_) => StreamKind::Workspace,
             Self::Enrolment(_) => StreamKind::EnrolmentToken,
+            Self::EnrolmentRequest(_) => StreamKind::EnrolmentRequest,
             Self::Worker(_) => StreamKind::Worker,
             Self::Run(_) => StreamKind::Run,
         }
@@ -412,6 +473,11 @@ impl Event {
                 EnrolmentEvent::Issued { .. }
                 | EnrolmentEvent::Revoked
                 | EnrolmentEvent::Redeemed { .. },
+            )
+            | Self::EnrolmentRequest(
+                EnrolmentRequestEvent::Requested(_)
+                | EnrolmentRequestEvent::Approved
+                | EnrolmentRequestEvent::Denied,
             )
             | Self::Worker(
                 WorkerEvent::Enrolled { .. }
@@ -440,6 +506,7 @@ impl Event {
             Self::Person(event) => serde_json::to_value(event),
             Self::Workspace(event) => serde_json::to_value(event),
             Self::Enrolment(event) => serde_json::to_value(event),
+            Self::EnrolmentRequest(event) => serde_json::to_value(event),
             Self::Worker(event) => serde_json::to_value(event),
             Self::Run(event) => serde_json::to_value(event),
         }
@@ -468,6 +535,9 @@ impl Event {
             StreamKind::Person => serde_json::from_value(payload).map(Self::Person),
             StreamKind::Workspace => serde_json::from_value(payload).map(Self::Workspace),
             StreamKind::EnrolmentToken => serde_json::from_value(payload).map(Self::Enrolment),
+            StreamKind::EnrolmentRequest => {
+                serde_json::from_value(payload).map(Self::EnrolmentRequest)
+            }
             StreamKind::Worker => serde_json::from_value(payload).map(Self::Worker),
             StreamKind::Run => serde_json::from_value(payload).map(Self::Run),
         };
@@ -558,6 +628,13 @@ stream!(
     Enrolment,
     |s| s.as_uuid()
 );
+stream!(
+    EnrolmentRequestId,
+    EnrolmentRequest,
+    EnrolmentRequestEvent,
+    EnrolmentRequest,
+    |s| s.as_uuid()
+);
 stream!(WorkerId, Worker, WorkerEvent, Worker, |s| s.as_uuid());
 stream!(RunId, Run, RunEvent, Run, |s| s.as_uuid());
 
@@ -568,7 +645,7 @@ mod tests {
     use super::*;
     use crate::credential::Digest;
     use crate::id::FromUuid;
-    use crate::identity::{Arch, Os};
+    use crate::identity::{Arch, Os, TailnetNode};
     use crate::run::{Confidence, Decision, Verdict};
 
     fn id<T: FromUuid>(n: u128) -> T {
@@ -621,8 +698,39 @@ mod tests {
                 key: Digest::from_bytes([3; 32]),
             }
             .into(),
+            EnrolmentRequestEvent::Requested(Box::new(RequestedEnrolment {
+                worker: id(6),
+                key: Digest::from_bytes([4; 32]),
+                requester: Requester {
+                    login: TailnetLogin::parse("alice@example.com").unwrap(),
+                    node: TailnetNode::parse("mbp.tail1234.ts.net").unwrap(),
+                },
+                machine: MachineInfo {
+                    hostname: name.clone(),
+                    os: Os::Macos,
+                    arch: Arch::Aarch64,
+                },
+                build: Version::new(0, 1, 0),
+                code: ApprovalCode::parse("ABCD-1234").unwrap(),
+                expires_at: at(),
+            }))
+            .into(),
+            EnrolmentRequestEvent::Approved.into(),
+            EnrolmentRequestEvent::Denied.into(),
             WorkerEvent::Enrolled {
-                token: id(4),
+                via: EnrolledVia::Token { token: id(4) },
+                key: Digest::from_bytes([3; 32]),
+                name: name.clone(),
+                machine: MachineInfo {
+                    hostname: name.clone(),
+                    os: Os::Linux,
+                    arch: Arch::Aarch64,
+                },
+                build: Version::new(0, 1, 0),
+            }
+            .into(),
+            WorkerEvent::Enrolled {
+                via: EnrolledVia::Request { request: id(7) },
                 key: Digest::from_bytes([3; 32]),
                 name: name.clone(),
                 machine: MachineInfo {
@@ -718,6 +826,10 @@ mod tests {
                 "enrolment_token.issued",
                 "enrolment_token.revoked",
                 "enrolment_token.redeemed",
+                "enrolment_request.requested",
+                "enrolment_request.approved",
+                "enrolment_request.denied",
+                "worker.enrolled",
                 "worker.enrolled",
                 "worker.session_started",
                 "worker.session_ended",
@@ -805,6 +917,11 @@ mod tests {
         assert_eq!(<RunId as Stream>::KIND, StreamKind::Run, "kind");
         let person: PersonId = id(10);
         let workspace: WorkspaceId = id(11);
+        assert_eq!(
+            <EnrolmentRequestId as Stream>::KIND,
+            StreamKind::EnrolmentRequest,
+            "kind"
+        );
         let token: EnrolmentTokenId = id(12);
         assert_eq!(person.stream_id(), Uuid::from_u128(10), "person");
         assert_eq!(workspace.stream_id(), Uuid::from_u128(11), "workspace");
