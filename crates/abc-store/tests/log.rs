@@ -11,7 +11,9 @@ mod tests {
     use abc_core::command::{IssueEnrolmentToken, RevokeEnrolmentToken, RevokeWorker, TokenTtl};
     use abc_core::event::{Position, StreamKind};
     use abc_core::policy::DenialReason;
-    use abc_store::testing::{Fixture, assert_views_replay, database_url, views_replay_diff};
+    use abc_store::testing::{
+        Fixture, assert_views_replay, database_url, views_replay_diff, views_replay_diff_during,
+    };
     use abc_store::{DatabaseUrl, ExecuteError, OpenError, Store, StoreOptions};
     use rand::rngs::ChaCha20Rng;
     use rand::{RngExt as _, SeedableRng as _};
@@ -397,6 +399,47 @@ mod tests {
             Ok(()),
             "ready again once reconnected"
         );
+    }
+
+    #[tokio::test]
+    async fn replay_check_excludes_writers_between_its_live_read_and_its_replay() {
+        let database = TestDatabase::migrated().await;
+        let pool = database.pool();
+        let (fixture, claimed) = Fixture::claimed(pool.clone()).await;
+        fixture.issue_token(claimed.workspace).await;
+        let writer = pool.clone();
+        let refused = std::cell::Cell::new(false);
+        let difference = views_replay_diff_during(&pool, async {
+            // A writer's first statement; a commit here would reach the replay but not the live read.
+            let mut tx = writer.begin().await.unwrap();
+            let attempt = sqlx::query("SELECT position FROM event_log_head FOR UPDATE NOWAIT")
+                .fetch_one(&mut *tx)
+                .await;
+            refused.set(attempt.is_err_and(|error| {
+                error
+                    .as_database_error()
+                    .and_then(sqlx::error::DatabaseError::code)
+                    .is_some_and(|code| code == "55P03")
+            }));
+            tx.rollback().await.unwrap();
+        })
+        .await
+        .unwrap();
+        assert_eq!(difference, None, "the views match the log");
+        assert!(refused.get(), "a writer cannot start while the check runs");
+    }
+
+    #[tokio::test]
+    async fn a_write_racing_the_replay_check_waits_for_it_and_the_views_still_match() {
+        let database = TestDatabase::migrated().await;
+        let pool = database.pool();
+        let (fixture, claimed) = Fixture::claimed(pool.clone()).await;
+        let (difference, _) = tokio::join!(
+            views_replay_diff(&pool),
+            fixture.issue_token(claimed.workspace)
+        );
+        assert_eq!(difference.unwrap(), None, "one state, so no difference");
+        assert_views_replay(&pool).await;
     }
 
     #[tokio::test]
