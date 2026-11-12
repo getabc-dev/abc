@@ -13,6 +13,9 @@
     "error": {
       "$ref": "#/$defs/ApiErrorBody"
     },
+    "graph": {
+      "$ref": "#/$defs/Graph"
+    },
     "issue_token_request": {
       "$ref": "#/$defs/IssueTokenRequest"
     },
@@ -40,9 +43,33 @@
     "token_issued",
     "tokens",
     "live",
-    "error"
+    "error",
+    "graph"
   ],
   "$defs": {
+    "Access": {
+      "description": "What a step may touch. A step with all three at once is exposed to prompt injection that can\nact and leak: the Rule of Two refuses it, so every step has at most two.",
+      "type": "object",
+      "properties": {
+        "outside_actions": {
+          "description": "It acts outside its change: network writes, other repositories, deployments.",
+          "type": "boolean"
+        },
+        "private_data": {
+          "description": "It reads private data (secrets, customer data, private repositories).",
+          "type": "boolean"
+        },
+        "untrusted_input": {
+          "description": "It reads input an outsider can write (web pages, issues, other people's code).",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "untrusted_input",
+        "private_data",
+        "outside_actions"
+      ]
+    },
     "ApiCode": {
       "description": "Every error code. Grouped by who has to act.",
       "oneOf": [
@@ -120,6 +147,11 @@
           "description": "No such worker.",
           "type": "string",
           "const": "unknown_worker"
+        },
+        {
+          "description": "No such run.",
+          "type": "string",
+          "const": "unknown_run"
         },
         {
           "description": "An enrolment token is required.",
@@ -219,6 +251,90 @@
         }
       ]
     },
+    "BackEdge": {
+      "description": "A back edge: when the step passes and the checker asks to loop, the run goes back to `target`.",
+      "type": "object",
+      "properties": {
+        "bound": {
+          "description": "How many times a run may take it.",
+          "$ref": "#/$defs/LoopBound"
+        },
+        "target": {
+          "description": "An earlier step, or this one.",
+          "$ref": "#/$defs/StepId"
+        }
+      },
+      "required": [
+        "target",
+        "bound"
+      ]
+    },
+    "BounceBound": {
+      "description": "How many times a checker may bounce a step's work back to its maker before the step escalates\nto a person: 0 to 100 (spec `maxBounces`).",
+      "type": "integer",
+      "format": "uint32",
+      "maximum": 100,
+      "minimum": 0
+    },
+    "Checker": {
+      "description": "Who judges a step's work, with fresh eyes.",
+      "oneOf": [
+        {
+          "description": "A fresh agent reviews the work.",
+          "type": "object",
+          "properties": {
+            "prompt": {
+              "description": "What to look for.",
+              "$ref": "#/$defs/Text"
+            },
+            "type": {
+              "type": "string",
+              "const": "agent"
+            }
+          },
+          "required": [
+            "type",
+            "prompt"
+          ]
+        },
+        {
+          "description": "A command decides.",
+          "type": "object",
+          "properties": {
+            "command": {
+              "description": "The command line.",
+              "$ref": "#/$defs/Text"
+            },
+            "type": {
+              "type": "string",
+              "const": "code"
+            }
+          },
+          "required": [
+            "type",
+            "command"
+          ]
+        },
+        {
+          "description": "A named gate decides.",
+          "type": "object",
+          "properties": {
+            "check": {
+              "description": "Which one.",
+              "$ref": "#/$defs/GateName"
+            },
+            "type": {
+              "type": "string",
+              "const": "gate"
+            }
+          },
+          "required": [
+            "type",
+            "check"
+          ]
+        }
+      ]
+    },
     "ClaimRequest": {
       "description": "`POST /api/owner/claim`.",
       "type": "object",
@@ -270,6 +386,42 @@
       "description": "An enrolment token, and the stream of its lifecycle events.",
       "type": "string",
       "format": "uuid"
+    },
+    "EventName": {
+      "description": "The named event a wait step waits for.",
+      "type": "string"
+    },
+    "GateName": {
+      "description": "The named check a gate runs.",
+      "type": "string"
+    },
+    "Graph": {
+      "description": "A valid graph: steps in execution order. Only [`GraphBuilder::build`] and deserializing make\none, and both run the same checks.",
+      "type": "object",
+      "properties": {
+        "name": {
+          "$ref": "#/$defs/GraphName"
+        },
+        "steps": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Step"
+          }
+        }
+      },
+      "required": [
+        "name",
+        "steps"
+      ]
+    },
+    "GraphName": {
+      "description": "A graph's name. Two graphs of one name differ by their [`GraphVersion`].",
+      "type": "string"
+    },
+    "GraphVersion": {
+      "description": "The sha256 of a graph's canonical form: [`DOMAIN`], then the graph as compact JSON. The form\nhas no maps, no floats and no optional spacing, and its fields keep the order they are declared\nin (`graph/mod.rs`), so the same graph hashes the same on every build and machine. Any change\nto any step, name or edge changes the hash. A run pins one (decision 65).",
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
     },
     "IssueTokenRequest": {
       "description": "`POST /api/workspaces/{ws}/enrolment-tokens`.",
@@ -366,6 +518,13 @@
           ]
         }
       ]
+    },
+    "LoopBound": {
+      "description": "How many times a run may take a back edge: 1 to 100, so a cycle always ends (spec `bound`).",
+      "type": "integer",
+      "format": "uint32",
+      "maximum": 100,
+      "minimum": 1
     },
     "MachineCard": {
       "description": "One worker as the Machines screen shows it. Everything here, online-ness included, is derived\nfrom the log through the `worker` view, so one SSE mechanism (a cursor over positions) keeps the\nscreen current.",
@@ -566,8 +725,155 @@
         }
       ]
     },
+    "Step": {
+      "description": "One step: a maker's work, its checker, and what it may touch.",
+      "type": "object",
+      "properties": {
+        "access": {
+          "description": "What it may touch.",
+          "$ref": "#/$defs/Access"
+        },
+        "back_edge": {
+          "description": "Where it may loop back to, if anywhere.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/BackEdge"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "checker": {
+          "description": "Who judges it.",
+          "$ref": "#/$defs/Checker"
+        },
+        "id": {
+          "description": "Its name.",
+          "$ref": "#/$defs/StepId"
+        },
+        "kind": {
+          "description": "The maker's work.",
+          "$ref": "#/$defs/StepKind"
+        },
+        "max_bounces": {
+          "description": "How often the checker may send the work back before a person decides.",
+          "$ref": "#/$defs/BounceBound"
+        }
+      },
+      "required": [
+        "id",
+        "kind",
+        "checker",
+        "max_bounces",
+        "access"
+      ]
+    },
+    "StepId": {
+      "description": "A step's name, unique in its graph.",
+      "type": "string"
+    },
+    "StepKind": {
+      "description": "The work a step's maker does.",
+      "oneOf": [
+        {
+          "description": "An agent works from instructions.",
+          "type": "object",
+          "properties": {
+            "prompt": {
+              "description": "What to do.",
+              "$ref": "#/$defs/Text"
+            },
+            "type": {
+              "type": "string",
+              "const": "agent"
+            }
+          },
+          "required": [
+            "type",
+            "prompt"
+          ]
+        },
+        {
+          "description": "A command runs in the sandbox.",
+          "type": "object",
+          "properties": {
+            "command": {
+              "description": "The command line.",
+              "$ref": "#/$defs/Text"
+            },
+            "type": {
+              "type": "string",
+              "const": "code"
+            }
+          },
+          "required": [
+            "type",
+            "command"
+          ]
+        },
+        {
+          "description": "A named gate (a deterministic check, such as the tests) runs.",
+          "type": "object",
+          "properties": {
+            "check": {
+              "description": "Which one.",
+              "$ref": "#/$defs/GateName"
+            },
+            "type": {
+              "type": "string",
+              "const": "gate"
+            }
+          },
+          "required": [
+            "type",
+            "check"
+          ]
+        },
+        {
+          "description": "The run waits for an outside event, such as a webhook or a deploy finishing.",
+          "type": "object",
+          "properties": {
+            "event": {
+              "description": "Which one.",
+              "$ref": "#/$defs/EventName"
+            },
+            "type": {
+              "type": "string",
+              "const": "wait"
+            }
+          },
+          "required": [
+            "type",
+            "event"
+          ]
+        },
+        {
+          "description": "Another graph runs as this step, pinned by its version.",
+          "type": "object",
+          "properties": {
+            "graph": {
+              "description": "The graph, by version.",
+              "$ref": "#/$defs/GraphVersion"
+            },
+            "type": {
+              "type": "string",
+              "const": "subgraph"
+            }
+          },
+          "required": [
+            "type",
+            "graph"
+          ]
+        }
+      ]
+    },
     "TailnetLogin": {
       "description": "A person's Tailscale login, as Tailscale Serve asserts it in `Tailscale-User-Login`, for example\n`alice@example.com` or `alice@github`.\n\nHolding one proves nothing by itself. It means something only when abc-server's sidecar\nextractor built it from a request that arrived on the sidecar Unix socket. abc-store turns it\ninto a `Principal` inside the request's transaction.",
+      "type": "string"
+    },
+    "Text": {
+      "description": "Instructions or a command line: 1 to 16384 bytes, with no control characters but newline and\ntab.",
       "type": "string"
     },
     "Timestamp": {
