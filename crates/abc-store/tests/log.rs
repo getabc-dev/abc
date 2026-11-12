@@ -418,7 +418,7 @@ mod tests {
             refused.set(attempt.is_err_and(|error| {
                 error
                     .as_database_error()
-                    .and_then(|database| database.code())
+                    .and_then(sqlx::error::DatabaseError::code)
                     .is_some_and(|code| code == "55P03")
             }));
         })
