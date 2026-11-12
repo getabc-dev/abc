@@ -21,10 +21,13 @@ use uuid::Uuid;
 
 use crate::actor::{Actor, Role};
 use crate::credential::{EnrolmentTokenDigest, SetupCodeDigest, WorkerKeyDigest};
+use crate::graph::GraphVersion;
 use crate::id::{
-    CorrelationId, EnrolmentTokenId, EventId, PersonId, SessionId, WorkerId, WorkspaceId,
+    CorrelationId, EnrolmentTokenId, EventId, LeaseId, PersonId, RunId, SessionId, WorkerId,
+    WorkspaceId,
 };
 use crate::identity::{DisplayName, MachineInfo, MachineLabel, TailnetLogin, WorkspaceName};
+use crate::run::{Answer, StepResult};
 use crate::time::Timestamp;
 
 /// A place in the event log: the global sequence number. Positions are gapless and assigned in
@@ -102,16 +105,19 @@ pub enum StreamKind {
     EnrolmentToken,
     /// One worker's life and sessions.
     Worker,
+    /// One graph run.
+    Run,
 }
 
 impl StreamKind {
     /// Every kind, for the constraint drift test.
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::Installation,
         Self::Person,
         Self::Workspace,
         Self::EnrolmentToken,
         Self::Worker,
+        Self::Run,
     ];
 
     /// The stored name.
@@ -123,6 +129,7 @@ impl StreamKind {
             Self::Workspace => "workspace",
             Self::EnrolmentToken => "enrolment_token",
             Self::Worker => "worker",
+            Self::Run => "run",
         }
     }
 
@@ -169,6 +176,8 @@ pub enum Event {
     Enrolment(EnrolmentEvent),
     /// See [`WorkerEvent`].
     Worker(WorkerEvent),
+    /// See [`RunEvent`].
+    Run(RunEvent),
 }
 
 /// Events on the installation stream. Their `workspace_id` is the workspace the claim creates (or
@@ -307,6 +316,51 @@ pub enum WorkerEvent {
     Revoked,
 }
 
+/// Events on a run's stream: every decision the graph runner makes (`spec/runner/`, whose
+/// `Event` type these mirror one to one; `docs/spec/runner.md` maps each to its spec action). The
+/// run is the stream, so the spec's `runId` is the stream id. Each event carries what its effect
+/// depends on, so replaying a run's stream rebuilds its state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum RunEvent {
+    /// A person started the run, which pins the graph's version (spec `RunStarted`).
+    #[serde(rename = "run.started")]
+    Started {
+        /// The graph version the run runs, whatever is published later.
+        graph: GraphVersion,
+    },
+    /// The run's current step and phase were leased to a worker (spec `LeaseGranted`).
+    #[serde(rename = "run.lease_granted")]
+    LeaseGranted {
+        /// The lease.
+        lease: LeaseId,
+        /// The worker it is for.
+        worker: WorkerId,
+    },
+    /// The worker stopped heartbeating the lease, so the step is free again (spec `LeaseExpired`).
+    #[serde(rename = "run.lease_expired")]
+    LeaseExpired {
+        /// The lease.
+        lease: LeaseId,
+    },
+    /// A live lease's result arrived and was applied: at most once per lease (spec
+    /// `ResultApplied`). A result that arrives for a lease that is not live is discarded, and
+    /// records nothing.
+    #[serde(rename = "run.result_applied")]
+    ResultApplied {
+        /// The lease.
+        lease: LeaseId,
+        /// What it reported.
+        result: StepResult,
+    },
+    /// A person answered the escalation the run is parked on (spec `Answered`).
+    #[serde(rename = "run.answered")]
+    Answered {
+        /// The answer.
+        answer: Answer,
+    },
+}
+
 /// Why a worker session ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -338,6 +392,7 @@ impl Event {
             Self::Workspace(_) => StreamKind::Workspace,
             Self::Enrolment(_) => StreamKind::EnrolmentToken,
             Self::Worker(_) => StreamKind::Worker,
+            Self::Run(_) => StreamKind::Run,
         }
     }
 
@@ -363,6 +418,13 @@ impl Event {
                 | WorkerEvent::SessionStarted { .. }
                 | WorkerEvent::SessionEnded { .. }
                 | WorkerEvent::Revoked,
+            )
+            | Self::Run(
+                RunEvent::Started { .. }
+                | RunEvent::LeaseGranted { .. }
+                | RunEvent::LeaseExpired { .. }
+                | RunEvent::ResultApplied { .. }
+                | RunEvent::Answered { .. },
             ) => SchemaVersion::V1,
         }
     }
@@ -379,6 +441,7 @@ impl Event {
             Self::Workspace(event) => serde_json::to_value(event),
             Self::Enrolment(event) => serde_json::to_value(event),
             Self::Worker(event) => serde_json::to_value(event),
+            Self::Run(event) => serde_json::to_value(event),
         }
     }
 
@@ -406,6 +469,7 @@ impl Event {
             StreamKind::Workspace => serde_json::from_value(payload).map(Self::Workspace),
             StreamKind::EnrolmentToken => serde_json::from_value(payload).map(Self::Enrolment),
             StreamKind::Worker => serde_json::from_value(payload).map(Self::Worker),
+            StreamKind::Run => serde_json::from_value(payload).map(Self::Run),
         };
         decoded.map_err(|error| undecodable(Some(error)))
     }
@@ -495,6 +559,7 @@ stream!(
     |s| s.as_uuid()
 );
 stream!(WorkerId, Worker, WorkerEvent, Worker, |s| s.as_uuid());
+stream!(RunId, Run, RunEvent, Run, |s| s.as_uuid());
 
 #[cfg(test)]
 mod tests {
@@ -504,6 +569,7 @@ mod tests {
     use crate::credential::Digest;
     use crate::id::FromUuid;
     use crate::identity::{Arch, Os};
+    use crate::run::{Confidence, Decision, Verdict};
 
     fn id<T: FromUuid>(n: u128) -> T {
         T::from_uuid(Uuid::from_u128(n))
@@ -578,6 +644,28 @@ mod tests {
             }
             .into(),
             WorkerEvent::Revoked.into(),
+            RunEvent::Started {
+                graph: GraphVersion::from_bytes([7; 32]),
+            }
+            .into(),
+            RunEvent::LeaseGranted {
+                lease: id(6),
+                worker: id(3),
+            }
+            .into(),
+            RunEvent::LeaseExpired { lease: id(6) }.into(),
+            RunEvent::ResultApplied {
+                lease: id(6),
+                result: StepResult::Judged(Decision {
+                    verdict: Verdict::Bounce,
+                    confidence: Confidence::new(70).unwrap(),
+                }),
+            }
+            .into(),
+            RunEvent::Answered {
+                answer: Answer::Retry,
+            }
+            .into(),
         ]
     }
 
@@ -610,7 +698,7 @@ mod tests {
                 "{kind:?} round-trips"
             );
         }
-        assert_eq!(StreamKind::parse("run"), None, "not yet");
+        assert_eq!(StreamKind::parse("graph"), None, "not a kind");
     }
 
     #[test]
@@ -634,6 +722,11 @@ mod tests {
                 "worker.session_started",
                 "worker.session_ended",
                 "worker.revoked",
+                "run.started",
+                "run.lease_granted",
+                "run.lease_expired",
+                "run.result_applied",
+                "run.answered",
             ],
             "the log's event types"
         );
@@ -707,6 +800,9 @@ mod tests {
             StreamKind::EnrolmentToken,
             "kind"
         );
+        let run: RunId = id(13);
+        assert_eq!(run.stream_id(), Uuid::from_u128(13), "run");
+        assert_eq!(<RunId as Stream>::KIND, StreamKind::Run, "kind");
         let person: PersonId = id(10);
         let workspace: WorkspaceId = id(11);
         let token: EnrolmentTokenId = id(12);

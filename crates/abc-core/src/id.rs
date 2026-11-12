@@ -69,6 +69,14 @@ id_type!(
     SessionId
 );
 id_type!(
+    /// One run of a graph, and the stream of its events.
+    RunId
+);
+id_type!(
+    /// One lease: a run's step and phase given to one worker.
+    LeaseId
+);
+id_type!(
     /// One event in the log.
     EventId
 );

@@ -25,5 +25,6 @@ pub mod id;
 pub mod identity;
 pub mod policy;
 pub mod query;
+pub mod run;
 pub mod secret;
 pub mod time;

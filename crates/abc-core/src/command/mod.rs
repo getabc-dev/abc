@@ -8,6 +8,7 @@
 
 mod claim;
 mod enrolment;
+mod run;
 mod worker;
 
 pub use claim::{
@@ -17,6 +18,10 @@ pub use claim::{
 pub use enrolment::{
     EnrolFacts, EnrolWorker, Enrolled, IssueEnrolmentToken, RevokeEnrolmentToken,
     RevokeTokenRejection, TokenIssued, TokenProof, TokenRecord, TokenTtl,
+};
+pub use run::{
+    AnswerEscalation, ApplyResult, ExpireLease, GrantLease, LeaseRecord, LeaseWorker, ResultFate,
+    RunFacts, RunProof, RunRecord, RunRejection, StartRun,
 };
 pub use worker::{
     EndSession, OpenSession, RevokeWorker, RevokeWorkerRejection, SelfFacts, SelfProof,
