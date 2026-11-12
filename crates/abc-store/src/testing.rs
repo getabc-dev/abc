@@ -374,14 +374,35 @@ async fn log(conn: &mut PgConnection) -> Result<Vec<Recorded>, StoreError> {
 /// first view table whose rows differ from the live ones, with both versions. `None` means the
 /// views are exactly what replaying the log produces.
 ///
+/// The transaction first takes the event log's head lock, as every writer does, so no write
+/// commits between the live read and the replay: both see one state.
+///
 /// # Errors
 ///
 /// Returns [`StoreError`] when the database fails or the log cannot be decoded.
 pub async fn views_replay_diff(pool: &PgPool) -> Result<Option<String>, StoreError> {
-    let mut conn = pool.acquire().await?;
-    let tables = view_tables(&mut conn).await?;
-    let live = dump(&mut conn, &tables).await?;
-    let mut tx = conn.begin().await?;
+    views_replay_diff_during(pool, async {}).await
+}
+
+/// [`views_replay_diff`], running `during` after the live views are read and before the replay,
+/// the moment a concurrent write would corrupt the comparison. Tests use it to look at what a
+/// writer can do there. `during` runs while the head lock is held: a write through the event path
+/// awaited inside it waits for that lock and never finishes.
+///
+/// # Errors
+///
+/// Returns [`StoreError`] when the database fails or the log cannot be decoded.
+pub async fn views_replay_diff_during(
+    pool: &PgPool,
+    during: impl Future<Output = ()>,
+) -> Result<Option<String>, StoreError> {
+    let mut tx = pool.begin().await?;
+    sqlx::query_scalar!("SELECT position FROM event_log_head FOR UPDATE")
+        .fetch_one(&mut *tx)
+        .await?;
+    let tables = view_tables(&mut tx).await?;
+    let live = dump(&mut tx, &tables).await?;
+    during.await;
     let list = tables
         .iter()
         .map(|table| format!("{table:?}"))
