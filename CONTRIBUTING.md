@@ -227,7 +227,8 @@ cargo xtask vm run ../abc-my-change .abc/brief.md
                                          # a supervised run of the brief, as a host service (below)
 cargo xtask vm queue add ../abc-other .abc/brief.md
                                          # runs it once the active run ends; `vm queue` lists them
-cargo xtask vm runs                      # every run: status, attempts, brief, log; --json for scripts
+cargo xtask vm runs                      # every run: status, attempts, brief, log; --json for scripts (stdout)
+cargo xtask vm ls                        # the VMs, name and status; --json for scripts (stdout)
 cargo xtask vm cancel abc-my-change-20261110T080000
 cargo xtask vm auth ../abc-my-change     # how Claude Code is signed in, without secrets
 cargo xtask vm sync ../abc-my-change     # move the worktree's branch to the VM's commits
