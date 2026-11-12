@@ -20,6 +20,7 @@ pub mod command;
 pub mod credential;
 pub mod decision;
 pub mod event;
+pub mod graph;
 pub mod id;
 pub mod identity;
 pub mod policy;
