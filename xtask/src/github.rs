@@ -184,6 +184,96 @@ pub(crate) fn timeline(
     Ok(items)
 }
 
+/// How many pages of open pull requests [`open_pulls`] reads at most: 1,000 pull requests.
+const PULL_PAGES: usize = 10;
+
+/// How many pages of one pull request's files [`pull_files`] reads at most: GitHub lists no more
+/// than 3,000 files of a pull request.
+const FILE_PAGES: usize = 30;
+
+/// An open pull request of the repository.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OpenPull {
+    pub(crate) number: u64,
+    pub(crate) title: String,
+    /// The branch it comes from.
+    pub(crate) branch: String,
+}
+
+/// Every open pull request, read through `page`. Fails on more than [`PULL_PAGES`] pages, which
+/// would be read in part.
+pub(crate) fn open_pulls(
+    page: &mut impl FnMut(&str) -> anyhow::Result<Value>,
+) -> anyhow::Result<Vec<OpenPull>> {
+    let mut pulls = Vec::new();
+    let complete = read_pages(
+        PULL_PAGES,
+        |index| format!("pulls?state=open&per_page={PER_PAGE}&page={index}"),
+        page,
+        |path, answer| {
+            let batch = answer
+                .as_array()
+                .with_context(|| format!("GitHub answered {path} with no list"))?;
+            for pull in batch {
+                let text = |pointer: &str| {
+                    pull.pointer(pointer)
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned()
+                };
+                pulls.push(OpenPull {
+                    number: pull
+                        .get("number")
+                        .and_then(Value::as_u64)
+                        .with_context(|| format!("{path} lists a pull request with no number"))?,
+                    title: text("/title"),
+                    branch: text("/head/ref"),
+                });
+            }
+            Ok(batch.len())
+        },
+    )?;
+    anyhow::ensure!(
+        complete,
+        "more than {} pull requests are open, more than xtask reads",
+        PULL_PAGES * PER_PAGE
+    );
+    Ok(pulls)
+}
+
+/// The paths pull request `number` changes, a renamed file's old path too, read through `page`.
+/// Fails on more pages than [`FILE_PAGES`].
+pub(crate) fn pull_files(
+    number: u64,
+    page: &mut impl FnMut(&str) -> anyhow::Result<Value>,
+) -> anyhow::Result<std::collections::BTreeSet<String>> {
+    let mut files = std::collections::BTreeSet::new();
+    let complete = read_pages(
+        FILE_PAGES,
+        |index| format!("pulls/{number}/files?per_page={PER_PAGE}&page={index}"),
+        page,
+        |path, answer| {
+            let batch = answer
+                .as_array()
+                .with_context(|| format!("GitHub answered {path} with no list"))?;
+            for file in batch {
+                for field in ["/filename", "/previous_filename"] {
+                    if let Some(name) = file.pointer(field).and_then(Value::as_str) {
+                        files.insert(name.to_owned());
+                    }
+                }
+            }
+            Ok(batch.len())
+        },
+    )?;
+    anyhow::ensure!(
+        complete,
+        "#{number} changes more than {} files, more than xtask reads",
+        FILE_PAGES * PER_PAGE
+    );
+    Ok(files)
+}
+
 /// The latest push that made `head` the pull request's head, from the pull request's own
 /// records: the [`PUSH_WORKFLOW`] runs for `head` on its head branch, its `head_ref_force_pushed`
 /// events and its `reopened` events in `timeline`, whichever came last; `page` answers a path
@@ -380,6 +470,77 @@ mod tests {
             error.to_string(),
             "the timeline of pull request #7 has more than 5000 items, more than xtask reads"
         );
+    }
+
+    /// Open pull requests are read page by page, with their branches; a list that never ends
+    /// fails.
+    #[test]
+    fn reads_the_open_pull_requests_to_a_bound() {
+        let mut asked = Vec::new();
+        let pulls = super::open_pulls(&mut |path: &str| {
+            asked.push(path.to_owned());
+            Ok(json!([{"number": 5, "title": "t", "head": {"ref": "agent/a"}}]))
+        })
+        .unwrap();
+        assert_eq!(
+            pulls,
+            [super::OpenPull {
+                number: 5,
+                title: "t".to_owned(),
+                branch: "agent/a".to_owned()
+            }]
+        );
+        assert_eq!(asked, ["pulls?state=open&per_page=100&page=1"]);
+
+        let error = super::open_pulls(&mut |_: &str| {
+            Ok(serde_json::Value::Array(vec![
+                json!({"number": 1});
+                super::PER_PAGE
+            ]))
+        })
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("more than 1000 pull requests"),
+            "{error}"
+        );
+        let error =
+            super::open_pulls(&mut |_: &str| Ok(json!([{"title": "no number"}]))).unwrap_err();
+        assert!(error.to_string().contains("no number"), "{error}");
+        let error = super::open_pulls(&mut |_: &str| Ok(json!({"message": "x"}))).unwrap_err();
+        assert!(error.to_string().contains("with no list"), "{error}");
+    }
+
+    /// A pull request's files include a renamed file's old path, and a list GitHub cuts off at its
+    /// last page fails, so an overlap is never judged from a part.
+    #[test]
+    fn reads_the_files_of_a_pull_request() {
+        let files = super::pull_files(9, &mut |path: &str| {
+            assert_eq!(path, "pulls/9/files?per_page=100&page=1");
+            Ok(json!([
+                {"filename": "b.rs", "previous_filename": "a.rs"},
+                {"filename": "c.rs"},
+            ]))
+        })
+        .unwrap();
+        assert_eq!(
+            files.into_iter().collect::<Vec<_>>(),
+            ["a.rs", "b.rs", "c.rs"]
+        );
+        let error = super::pull_files(9, &mut |_: &str| {
+            Ok(serde_json::Value::Array(vec![
+                json!({"filename": "x"});
+                super::PER_PAGE
+            ]))
+        })
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("#9 changes more than 3000 files"),
+            "{error}"
+        );
+        let error = super::pull_files(9, &mut |_: &str| Ok(json!("no"))).unwrap_err();
+        assert!(error.to_string().contains("with no list"), "{error}");
     }
 
     /// Runs are read page by page to GitHub's last, [`super::RUN_PAGES`], however full it is.
