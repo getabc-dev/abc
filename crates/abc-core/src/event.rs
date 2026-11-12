@@ -752,6 +752,15 @@ mod tests {
             }
             .into(),
             WorkerEvent::Revoked.into(),
+        ]
+        .into_iter()
+        .chain(every_run_event())
+        .collect()
+    }
+
+    /// One payload of every run event.
+    fn every_run_event() -> Vec<Event> {
+        vec![
             RunEvent::Started {
                 graph: GraphVersion::from_bytes([7; 32]),
             }
