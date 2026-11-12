@@ -454,9 +454,14 @@ mod tests {
 
     #[test]
     fn text_is_bounded_and_printable() {
+        assert_eq!(
+            Text::parse("do it\n\tnow").unwrap().as_str(),
+            "do it\n\tnow",
+            "newline and tab are text, kept as written"
+        );
         assert!(
-            Text::parse("do it\n\tnow").is_ok(),
-            "newline and tab are text"
+            Text::parse(&"x".repeat(16 * 1024)).is_ok(),
+            "16 KiB is the longest allowed"
         );
         for bad in ["", "  \n", "a\u{0}b", &"x".repeat(16 * 1024 + 1)] {
             assert!(Text::parse(bad).is_err(), "{:?} is refused", bad.len());
