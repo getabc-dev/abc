@@ -473,22 +473,31 @@ pub(crate) fn run(
         }
         Action::Gc { yes } => gc(host, backend, yes, out)?,
         Action::Image => image(host, backend, out)?,
-        Action::Ls { json } => {
-            let sandboxes = backend.list(false)?;
-            if json {
-                writeln!(data, "{}", serde_json::to_string_pretty(&sandboxes)?)?;
-            } else {
-                if sandboxes.is_empty() {
-                    writeln!(out, "vm ls: no VMs")?;
-                }
-                for sandbox in &sandboxes {
-                    writeln!(data, "{}\t{}", sandbox.name, sandbox.status)?;
-                }
-            }
-        }
+        Action::Ls { json } => list_vms(backend, json, data, out)?,
         Action::Billing => billing(env)?,
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// `vm ls`: the VMs msb knows, as `name<TAB>status` lines or as JSON, on `data`; a message on `out`.
+fn list_vms(
+    backend: &dyn Backend,
+    json: bool,
+    data: &mut impl Write,
+    out: &mut impl Write,
+) -> anyhow::Result<()> {
+    let sandboxes = backend.list(false)?;
+    if json {
+        writeln!(data, "{}", serde_json::to_string_pretty(&sandboxes)?)?;
+        return Ok(());
+    }
+    if sandboxes.is_empty() {
+        writeln!(out, "vm ls: no VMs")?;
+    }
+    for sandbox in &sandboxes {
+        writeln!(data, "{}\t{}", sandbox.name, sandbox.status)?;
+    }
+    Ok(())
 }
 
 /// `cargo xtask vm billing`, inside a VM: fails unless Claude Code there can use only the

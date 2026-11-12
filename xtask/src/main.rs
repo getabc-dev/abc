@@ -1185,11 +1185,10 @@ mod tests {
         let missing = |tree: &Path, name: &str| -> anyhow::Result<PathBuf> {
             anyhow::bail!("{name} is not set up in {}", tree.display())
         };
+        // `check` asks for the tree's Postgres only when a test step runs
+        // (`check::tests::postgres_is_looked_up_only_when_a_test_step_runs`); coverage and
+        // mutants ask at once.
         for task in [
-            Task::Check {
-                changed: false,
-                wait_at_most: None,
-            },
             Task::Coverage {
                 base: "base".to_owned(),
             },

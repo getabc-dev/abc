@@ -341,7 +341,7 @@ fn updating_lists_the_overlaps_too_and_a_failed_list_only_says_so() {
     let temp = tempfile::tempdir().unwrap();
     let work = checkout(temp.path());
     let head = git(&work, &["rev-parse", "HEAD"]).trim().to_owned();
-    let mut answer = replies(&head, APP_LOGIN);
+    let mut listed = replies(&head, APP_LOGIN);
     let (result, out, _) = update(&work, REASONED, |request| {
         if request.method == "GET" && request.path.starts_with("/repos/o/r/pulls?state=open") {
             return open_pulls(request).unwrap();
@@ -349,7 +349,7 @@ fn updating_lists_the_overlaps_too_and_a_failed_list_only_says_so() {
         if request.path.starts_with("/repos/o/r/pulls/1") {
             return open_pulls(request).unwrap();
         }
-        answer(request)
+        listed(request)
     });
     assert!(result.unwrap(), "{out}");
     assert!(
@@ -361,17 +361,17 @@ fn updating_lists_the_overlaps_too_and_a_failed_list_only_says_so() {
     assert!(out.contains("pr: updated the description of #7"), "{out}");
 
     // GitHub cannot list: said, and the update goes on.
-    let mut answer = replies(&head, APP_LOGIN);
-    let (result, out, sent) = update(&work, REASONED, |request| {
+    let mut unlisted = replies(&head, APP_LOGIN);
+    let (broke, said, sent) = update(&work, REASONED, |request| {
         if request.path.starts_with("/repos/o/r/pulls?state=open") {
             return json!({"message": "not a list"});
         }
-        answer(request)
+        unlisted(request)
     });
-    assert!(result.unwrap(), "{out}");
+    assert!(broke.unwrap(), "{said}");
     assert!(
-        out.contains("pr: could not compare this branch with the other open pull requests"),
-        "{out}"
+        said.contains("pr: could not compare this branch with the other open pull requests"),
+        "{said}"
     );
     assert!(
         sent.iter().any(|request| request.method == "PATCH"),

@@ -138,8 +138,7 @@ impl Backend for Fake {
     /// Models `msb ls --format json` as the real msb answers it (`msb::tests::a_listing_means_the_same_to_the_fake_and_to_the_real_msb`): a list
     /// of VMs, empty for none, with `--running` leaving out the stopped ones; the one VM here
     /// runs. A failing msb is [`Msb`](super::msb::Msb)'s own test.
-    fn list(&self, running_only: bool) -> anyhow::Result<Vec<Sandbox>> {
-        let _ = running_only;
+    fn list(&self, _running_only: bool) -> anyhow::Result<Vec<Sandbox>> {
         Ok(vec![Sandbox {
             name: "abc-w".to_owned(),
             status: "Running".to_owned(),

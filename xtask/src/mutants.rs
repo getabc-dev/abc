@@ -380,17 +380,22 @@ impl Run<'_> {
         let result = outcome(status.code())?;
         scratch.remove()?;
         if let Selection::Baseline = selection {
-            writeln!(
-                out,
-                "mutants: the tests pass in the unmutated copy{}",
-                self.label()
-            )?;
-            return Ok(Report {
-                passed: true,
-                missed: Vec::new(),
-            });
+            return self.baseline_passed(out);
         }
         self.report(&results, result, step, out)
+    }
+
+    /// The report of a baseline-only run whose unmutated tests passed.
+    fn baseline_passed(&self, out: &mut impl Write) -> anyhow::Result<Report> {
+        writeln!(
+            out,
+            "mutants: the tests pass in the unmutated copy{}",
+            self.label()
+        )?;
+        Ok(Report {
+            passed: true,
+            missed: Vec::new(),
+        })
     }
 
     /// The workspace's directory as " of dir/", empty for the main workspace.
@@ -1090,7 +1095,7 @@ mod tests {
         let repo = repository_with_change(&temp.path().join("repo"), &[("README.md", "# x\n")]);
         let mutants = temp.path().join("cargo-mutants");
         script(&mutants, "exit 0\n");
-        let error = format!(
+        let empty = format!(
             "{:#}",
             super::run(
                 &repo,
@@ -1102,8 +1107,8 @@ mod tests {
             .unwrap_err()
         );
         assert!(
-            error.contains("found no mutant to run the baseline with"),
-            "{error}"
+            empty.contains("found no mutant to run the baseline with"),
+            "{empty}"
         );
         let broken = temp.path().join("broken");
         script(&broken, "echo 'no manifest here' >&2\nexit 1\n");

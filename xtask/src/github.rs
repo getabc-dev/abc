@@ -503,11 +503,14 @@ mod tests {
             error.to_string().contains("more than 1000 pull requests"),
             "{error}"
         );
-        let error =
+        let numberless =
             super::open_pulls(&mut |_: &str| Ok(json!([{"title": "no number"}]))).unwrap_err();
-        assert!(error.to_string().contains("no number"), "{error}");
-        let error = super::open_pulls(&mut |_: &str| Ok(json!({"message": "x"}))).unwrap_err();
-        assert!(error.to_string().contains("with no list"), "{error}");
+        assert!(numberless.to_string().contains("no number"), "{numberless}");
+        let not_a_list = super::open_pulls(&mut |_: &str| Ok(json!({"message": "x"}))).unwrap_err();
+        assert!(
+            not_a_list.to_string().contains("with no list"),
+            "{not_a_list}"
+        );
     }
 
     /// A pull request's files include a renamed file's old path, and a list GitHub cuts off at its
@@ -539,8 +542,11 @@ mod tests {
                 .contains("#9 changes more than 3000 files"),
             "{error}"
         );
-        let error = super::pull_files(9, &mut |_: &str| Ok(json!("no"))).unwrap_err();
-        assert!(error.to_string().contains("with no list"), "{error}");
+        let not_a_list = super::pull_files(9, &mut |_: &str| Ok(json!("no"))).unwrap_err();
+        assert!(
+            not_a_list.to_string().contains("with no list"),
+            "{not_a_list}"
+        );
     }
 
     /// Runs are read page by page to GitHub's last, [`super::RUN_PAGES`], however full it is.

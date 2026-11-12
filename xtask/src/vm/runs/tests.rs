@@ -987,19 +987,6 @@ fn one_run_is_active_and_the_queue_starts_the_rest_in_order() {
     );
     assert!(queue.contains(&format!("\n1\t{}\t", all[1].id)), "{queue}");
 
-    let streams = super::super::tests::act_streams(
-        &world,
-        &local.fake,
-        &services,
-        Action::Runs { json: true },
-    );
-    streams.result.unwrap();
-    assert_eq!(streams.stderr, "", "nothing but the JSON is said");
-    assert!(
-        serde_json::from_str::<Vec<Run>>(&streams.stdout).is_ok(),
-        "stdout holds the JSON alone: {}",
-        streams.stdout
-    );
     let listed = act(Action::Runs { json: false }).unwrap();
     assert!(listed.contains("\tqueued\t0 attempts\t"), "{listed}");
     assert!(
@@ -1912,16 +1899,48 @@ fn a_state_that_cannot_be_read_is_shown_and_holds_up_no_queue() {
         "an unreadable run is a message, not a row"
     );
     // The same with --json: the readable runs alone, as a JSON array, on stdout.
-    let (mut out, mut data) = (Vec::new(), Vec::new());
-    super::list(&all, true, &mut data, &mut out).unwrap();
-    let shown: Vec<Run> = serde_json::from_slice(&data).unwrap();
+    let (mut said, mut json) = (Vec::new(), Vec::new());
+    super::list(&all, true, &mut json, &mut said).unwrap();
+    let shown: Vec<Run> = serde_json::from_slice(&json).unwrap();
     assert_eq!(shown.len(), 1, "{shown:?}");
     assert!(
-        String::from_utf8(out)
+        String::from_utf8(said)
             .unwrap()
             .contains(&format!("vm runs: {}: unreadable: ", broken.id)),
         "said beside the JSON, not in it"
     );
+}
+
+/// `vm runs` is for scripts: its listing, as a table or as `--json`, is on stdout alone, and a
+/// message is never in it.
+#[test]
+fn the_runs_listing_is_on_stdout_alone() {
+    let (world, local) = briefed();
+    let services = FakeServices::default();
+    let streams = |json| {
+        super::super::tests::act_streams(&world, &local.fake, &services, Action::Runs { json })
+    };
+    let empty_json = streams(true);
+    empty_json.result.unwrap();
+    assert_eq!(empty_json.stdout, "[]\n", "no run is an empty array");
+    assert_eq!(empty_json.stderr, "");
+    let empty_table = streams(false);
+    empty_table.result.unwrap();
+    assert_eq!(empty_table.stdout, "", "no row");
+    assert_eq!(empty_table.stderr, "vm runs: none\n", "a message");
+
+    let made = runs(&world)
+        .create(&session(&world), ".abc/brief.md", MORNING, Status::Queued)
+        .unwrap();
+    let json = streams(true);
+    json.result.unwrap();
+    assert_eq!(json.stderr, "", "nothing but the JSON is said");
+    let shown: Vec<Run> = serde_json::from_str(&json.stdout).unwrap();
+    assert_eq!(shown, std::slice::from_ref(&made));
+    let table = streams(false);
+    table.result.unwrap();
+    assert!(table.stdout.starts_with(&made.id), "{}", table.stdout);
+    assert_eq!(table.stderr, "");
 }
 
 /// Review finding: ended runs' directories, with every session's log, were never removed.

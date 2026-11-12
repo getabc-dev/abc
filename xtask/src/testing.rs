@@ -170,7 +170,7 @@ pub(crate) fn checkout() -> PathBuf {
 /// value, the checkout xtask was built from.
 fn checkout_named(value: Option<std::ffi::OsString>) -> Result<PathBuf, String> {
     let Some(value) = value else {
-        return Ok(crate::repo_root().unwrap());
+        return crate::repo_root().map_err(|error| format!("{error:#}"));
     };
     let path = PathBuf::from(value);
     if path.is_relative() {
