@@ -237,44 +237,52 @@ fn check_text(ruleset: &str, workflows: &[(String, String)]) -> anyhow::Result<(
 /// The gates whose runs include the tests, as `cargo xtask` subcommands.
 const TEST_GATES: [&str; 3] = ["check", "coverage", "mutants"];
 
+/// Every job of the workflow `text` of `file` that has steps, with the `run:` scripts of its
+/// steps in order, as job id and scripts.
+fn run_scripts(file: &str, text: &str) -> anyhow::Result<Vec<(String, Vec<String>)>> {
+    let documents =
+        YamlLoader::load_from_str(text).with_context(|| format!("{file} is not YAML"))?;
+    let Some(jobs) = documents
+        .first()
+        .and_then(|workflow| workflow["jobs"].as_hash())
+    else {
+        return Ok(Vec::new());
+    };
+    Ok(jobs
+        .iter()
+        .map(|(id, job)| {
+            let runs = job["steps"]
+                .as_vec()
+                .into_iter()
+                .flatten()
+                .filter_map(|step| step["run"].as_str())
+                .map(str::to_owned)
+                .collect();
+            (id.as_str().unwrap_or("?").to_owned(), runs)
+        })
+        .collect())
+}
+
 /// Fails when a job of `workflows` runs a gate that runs the tests without first installing the
 /// tools the tests need with `cargo xtask setup --for-tests`.
 fn installs_test_tools(workflows: &[(String, String)]) -> anyhow::Result<()> {
     let mut missing = Vec::new();
     for (file, text) in workflows {
-        let documents =
-            YamlLoader::load_from_str(text).with_context(|| format!("{file} is not YAML"))?;
-        let Some(jobs) = documents
-            .first()
-            .and_then(|workflow| workflow["jobs"].as_hash())
-        else {
-            continue;
-        };
-        for (id, job) in jobs {
+        for (id, runs) in run_scripts(file, text)? {
             let mut ready = false;
-            for run in job["steps"]
-                .as_vec()
-                .into_iter()
-                .flatten()
-                .filter_map(|step| step["run"].as_str())
+            for words in runs
+                .iter()
+                .flat_map(|run| run.lines())
+                .map(|line| line.split_whitespace().collect::<Vec<_>>())
             {
-                let commands: Vec<Vec<&str>> = run
-                    .lines()
-                    .map(|line| line.split_whitespace().collect())
-                    .collect();
-                for words in commands {
-                    match words.as_slice() {
-                        ["cargo", "xtask", "setup", rest @ ..] if rest.contains(&"--for-tests") => {
-                            ready = true;
-                        }
-                        ["cargo", "xtask", gate, ..] if !ready && TEST_GATES.contains(gate) => {
-                            missing.push(format!(
-                                "{file}: job {} runs `cargo xtask {gate}`",
-                                id.as_str().unwrap_or("?")
-                            ));
-                        }
-                        _ => {}
+                match words.as_slice() {
+                    ["cargo", "xtask", "setup", rest @ ..] if rest.contains(&"--for-tests") => {
+                        ready = true;
                     }
+                    ["cargo", "xtask", gate, ..] if !ready && TEST_GATES.contains(gate) => {
+                        missing.push(format!("{file}: job {id} runs `cargo xtask {gate}`"));
+                    }
+                    _ => {}
                 }
             }
         }
@@ -284,6 +292,28 @@ fn installs_test_tools(workflows: &[(String, String)]) -> anyhow::Result<()> {
         "these jobs run the tests without the tools they need; run `cargo xtask setup \
          --for-tests` in an earlier step: {}",
         missing.join("; ")
+    );
+    Ok(())
+}
+
+/// Fails when a `run:` step of `workflows` names `.tools/`: the pinned tools' paths come from
+/// `cargo xtask tool` and `cargo xtask test-tool` alone, never from a path built in shell, which
+/// duplicates xtask's layout and was wrong once (a relative `ABC_TEST_POSTGRES_BIN`, in
+/// `tailscale.yml`, that only a labelled run exercised).
+fn names_no_tool_path(workflows: &[(String, String)]) -> anyhow::Result<()> {
+    let mut found = Vec::new();
+    for (file, text) in workflows {
+        for (id, runs) in run_scripts(file, text)? {
+            if runs.iter().any(|run| run.contains(".tools/")) {
+                found.push(format!("{file}: job {id}"));
+            }
+        }
+    }
+    ensure!(
+        found.is_empty(),
+        "these jobs build a path into `.tools/` in a `run:` step; take a tool's path from \
+         `cargo xtask tool <name>` or `cargo xtask test-tool <name>` instead: {}",
+        found.join("; ")
     );
     Ok(())
 }
@@ -315,6 +345,7 @@ pub(crate) fn check(root: &Path) -> anyhow::Result<()> {
     let workflows = workflows(root)?;
     check_text(&read(RULESET)?, &workflows)?;
     installs_test_tools(&workflows)?;
+    names_no_tool_path(&workflows)?;
     check_refs(&read(BRANCHES)?, Refs::Branches).with_context(|| BRANCHES.to_owned())?;
     check_refs(&read(TAGS)?, Refs::Tags).with_context(|| TAGS.to_owned())
 }
@@ -546,7 +577,7 @@ mod tests {
 
     use super::{
         Action, BRANCHES, Existing, REPLACED, Refs, TAGS, apply, check, check_refs, check_text,
-        github_error, installs_test_tools, plan, repository, required_checks,
+        github_error, installs_test_tools, names_no_tool_path, plan, repository, required_checks,
     };
     use crate::testing::{git, repository as new_repository};
 
@@ -749,6 +780,36 @@ mod tests {
         ))
         .unwrap();
         installs_test_tools(&job("      - run: cargo xtask review --base x\n")).unwrap();
+    }
+
+    #[test]
+    fn a_run_step_never_names_the_tools_directory() {
+        let job = |run: &str| {
+            vec![(
+                "tailscale.yml".to_owned(),
+                format!(
+                    "on: [pull_request]\njobs:\n  tailscale:\n    steps:\n      - uses: ./a\n      - run: {run}\n"
+                ),
+            )]
+        };
+        // The defect on main until now: a path built in shell, relative, so the test, run from
+        // another directory, found no initdb.
+        let error = format!(
+            "{:#}",
+            names_no_tool_path(&job(
+                "export ABC_TEST_POSTGRES_BIN=$(dirname \"$(find .tools/postgresql -name postgres)\")"
+            ))
+            .unwrap_err()
+        );
+        assert!(
+            error.contains("tailscale.yml: job tailscale") && error.contains("test-tool"),
+            "{error}"
+        );
+        names_no_tool_path(&job(
+            "export ABC_TEST_POSTGRES_BIN=$(dirname \"$(cargo xtask test-tool postgresql)\")",
+        ))
+        .unwrap();
+        names_no_tool_path(&[("c.yml".to_owned(), "on: [push]\n".to_owned())]).unwrap();
     }
 
     #[test]

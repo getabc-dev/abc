@@ -161,8 +161,27 @@ pub(crate) fn repository_with_change(path: &Path, files: &[(&str, &str)]) -> Pat
 /// at run time in [`crate::mutants::TEST_REPOSITORY`]. Only tests read it; the shipped binary
 /// finds its checkout from where it was built alone.
 pub(crate) fn checkout() -> PathBuf {
-    std::env::var_os(crate::mutants::TEST_REPOSITORY)
-        .map_or_else(|| crate::repo_root().unwrap(), PathBuf::from)
+    checkout_named(std::env::var_os(crate::mutants::TEST_REPOSITORY))
+        .unwrap_or_else(|wrong| panic!("{wrong}"))
+}
+
+/// The checkout the variable's `value` names, which must be an absolute path: a test runs from
+/// its crate's directory, so a relative one would name another place than the one meant. Without a
+/// value, the checkout xtask was built from.
+fn checkout_named(value: Option<std::ffi::OsString>) -> Result<PathBuf, String> {
+    let Some(value) = value else {
+        return Ok(crate::repo_root().unwrap());
+    };
+    let path = PathBuf::from(value);
+    if path.is_relative() {
+        return Err(format!(
+            "{} is `{}`, a relative path, and the tests run from another directory: give an \
+             absolute one",
+            crate::mutants::TEST_REPOSITORY,
+            path.display()
+        ));
+    }
+    Ok(path)
 }
 
 /// The file at `path` in this repository, for a test that checks it. Read at run time from
@@ -268,4 +287,18 @@ impl Drop for Scratch {
             removed.unwrap();
         }
     }
+}
+
+#[test]
+fn the_checkout_variable_must_be_an_absolute_path_and_a_relative_one_is_named() {
+    let error = checkout_named(Some("../abc".into())).unwrap_err();
+    assert!(
+        error.contains("XTASK_TEST_REPOSITORY is `../abc`, a relative path"),
+        "{error}"
+    );
+    assert_eq!(
+        checkout_named(Some("/work/abc".into())).unwrap(),
+        PathBuf::from("/work/abc")
+    );
+    assert_eq!(checkout_named(None).unwrap(), crate::repo_root().unwrap());
 }
