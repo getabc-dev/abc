@@ -27,6 +27,7 @@ const snapshot = received({
   requests: [],
   head: 5,
   machines: [card("zeta", "w2", true), card("alpha", "w1", false)],
+  requests: [],
 });
 
 const restarting = new ApiError("internal", "the server answered 502", 502);
@@ -54,6 +55,7 @@ describe("live machines", () => {
         requests: [],
         head: 9,
         changed: [card("alpha", "w1", true), card("beta", "w3", true)],
+        requests: [],
       }),
     );
     expect(model.head).toBe(9);
@@ -71,6 +73,7 @@ describe("live machines", () => {
         requests: [],
         head: 1,
         machines: [card("a", "w9", true), card("a", "w1", true)],
+        requests: [],
       }),
     );
     expect(model.machines.map((machine) => machine.worker)).toEqual(["w1", "w9"]);
@@ -98,6 +101,7 @@ describe("live machines", () => {
         requests: [],
         head: 6,
         changed: [],
+        requests: [],
       }),
     );
     expect(live.connection).toEqual({ state: "live" });
