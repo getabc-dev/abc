@@ -2,6 +2,12 @@
 # A stand-in for systemctl --user: daemon-reload, enable, disable, start, stop, restart and
 # is-active. It runs each unit's ExecStart with its Environment, read from the unit file the way
 # systemd quotes them, and stops it with the unit's KillSignal.
+#
+# Models: systemctl --user. Environment: a unit runs with only its Environment= lines, the test's
+# state/extra.env and PATH=/usr/bin:/bin, never the caller's environment, with stdin /dev/null.
+# Streams: the unit's stdout and stderr go to state/UNIT.log; is-active prints its word on stdout
+# and the errors go to stderr. Exit codes: 0; 3 from is-active for a unit that is not running, as
+# systemd's; 2 without --user; 64 for any other command.
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 # shellcheck source-path=SCRIPTDIR source=lib.sh
 . "$ROOT/bin/lib.sh"

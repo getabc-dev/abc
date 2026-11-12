@@ -174,6 +174,14 @@ code running the tree's tests, so it opens no new trust boundary.
   that meet it merge main once it is in, and none carries its own copy of the fix, so no two
   branches fix it twice. `cargo xtask pr open` and `pr update` list the open PRs that change the
   files this branch changes, to find a fix already in flight.
+- **G3 · A fake of an external program says what it models and has a test for it.** Its header
+  or doc comment names the environment it gives the program it runs, the streams it writes (what
+  goes to stdout, what to stderr) and its exit codes, and a test holds it to that: against the
+  real program wherever one runs on a CI runner (Postgres's programs, `msb ls`), otherwise against
+  what its header says. msb's own listing went to stderr where the fake's went to stdout, and a
+  fake launchctl gave services a full environment where launchd's is empty; both passed their
+  tests and failed on a real machine. A script reads a machine-readable listing (`--json`) on
+  stdout, never a table.
 
 Database tests get a fresh, uniquely named database each (`abc_store::testing::TestDatabase`) on
 the server `ABC_TEST_DATABASE_URL` names. `.cargo/config.toml` sets it to one warm Postgres 18

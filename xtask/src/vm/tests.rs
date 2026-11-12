@@ -13,6 +13,13 @@ use super::{
 use crate::testing::{git, repository, script};
 
 /// A backend that records what it is asked and answers from a script.
+///
+/// Models: microsandbox's `msb`, as [`Backend`] drives it. Environment: none, since msb's own
+/// `MSB_HOME` is the real backend's concern. Streams: `exec` gives stdout and stderr apart, and
+/// `list` is the JSON `msb ls --format json` prints on stdout, never msb's human table, which
+/// goes to stderr. Exit codes: an `exec` carries the program's, and every other call succeeds.
+/// `msb::tests::a_listing_means_the_same_to_the_fake_and_to_the_real_msb` holds the listing to the
+/// real msb.
 #[derive(Default)]
 pub(super) struct Fake {
     pub(super) running: bool,
@@ -268,6 +275,12 @@ fn none(_: &str) -> Option<OsString> {
 }
 
 /// Services that record what they are asked to do.
+///
+/// Models: the host's service manager (launchd or systemd) as `runs::service::Services` drives
+/// it: install, start and retire a supervisor's service. Environment: none runs, so the empty
+/// environment launchd gives a service is `service`'s own tests' concern (and
+/// `crates/abc-host/tests/fakes.rs` holds a fake launchctl to it). Streams: none. Exit codes: every
+/// call succeeds. No real launchd or systemd runs in CI.
 #[derive(Default)]
 pub(super) struct FakeServices {
     pub(super) calls: RefCell<Vec<String>>,

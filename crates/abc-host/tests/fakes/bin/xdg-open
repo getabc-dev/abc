@@ -1,6 +1,9 @@
 #!/bin/sh
 # A stand-in for the browser (open on macOS, xdg-open on Linux): records the URL, and a login
 # link logs abc's fake node in, as the person would.
+#
+# Models: the browser opener. Environment: the caller's. Streams: prints nothing. Exit codes:
+# always 0.
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 # shellcheck source-path=SCRIPTDIR source=lib.sh
 . "$ROOT/bin/lib.sh"

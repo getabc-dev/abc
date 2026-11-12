@@ -2,6 +2,11 @@
 # A stand-in for sudo: records the command, then runs it as "root", which the fakes read from
 # FAKE_ROOT. With state/sudo-refuses it fails as a wrong password does, and with
 # state/sudo-does-nothing it succeeds without running anything.
+#
+# Models: sudo. Environment: the command runs with the caller's environment and FAKE_ROOT=1, which
+# is what the other fakes read as root. Streams: the command's own, passed through; a refusal is
+# on stderr. Exit codes: the command's; 1 when state/sudo-refuses; 0 without running anything when
+# state/sudo-does-nothing.
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 # shellcheck source-path=SCRIPTDIR source=lib.sh
 . "$ROOT/bin/lib.sh"

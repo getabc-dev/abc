@@ -6,6 +6,11 @@
 # no DNS name, as without MagicDNS), garbled (status answers something that is not JSON) and
 # garbled-once-up (the same, once up has started).
 # A waiting up leaves its process id in state/up.pid.
+#
+# Models: tailscale (the CLI) answering for the fake daemon. Environment: FAKE_ROOT=1 (set by the
+# fake sudo) decides whether `serve` may run, as root does. Streams: status prints JSON on stdout,
+# every error is on stderr. Exit codes: 0; 1 when the daemon does not run, when `up` is refused
+# (up-fails) or `serve` is not root's; 2 without --socket first or for a command it does not know.
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 # shellcheck source-path=SCRIPTDIR source=../bin/lib.sh
 . "$ROOT/bin/lib.sh"

@@ -1,5 +1,9 @@
 #!/bin/sh
 # A stand-in for Postgres 18's initdb: makes a cluster directory that says it is 18.
+#
+# Models: Postgres 18's initdb (checked against the real one in tests/fakes.rs). Environment: none
+# read. Streams: the error is on stderr. Exit codes: 0 with a PG_VERSION of 18 in --pgdata; 1
+# without --pgdata.
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 # shellcheck source-path=SCRIPTDIR source=../../bin/lib.sh
 . "$ROOT/bin/lib.sh"

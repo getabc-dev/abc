@@ -1,5 +1,9 @@
 #!/bin/sh
 # A stand-in for abc's tailscaled: records how it was started and runs until stopped.
+#
+# Models: tailscaled. Environment: needs TS_LOGS_DIR to name a directory, as the real one without
+# it falls back to the system's state directory beside the user's own Tailscale. Streams: that
+# complaint is on stderr. Exit codes: 1 without TS_LOGS_DIR; otherwise it never exits by itself.
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 # shellcheck source-path=SCRIPTDIR source=../bin/lib.sh
 . "$ROOT/bin/lib.sh"

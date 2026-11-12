@@ -1,6 +1,10 @@
 #!/bin/sh
 # A stand-in for abc server: records how it was started and runs until stopped. The test answers
 # its ops address while it runs.
+#
+# Models: abc server as a service runs it. Environment: whatever the service manager gave it, its
+# ABC_* variables recorded in state/abc.environment. Streams: prints nothing. Exit codes: never
+# exits by itself; it runs until stopped.
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 # shellcheck source-path=SCRIPTDIR source=../bin/lib.sh
 . "$ROOT/bin/lib.sh"

@@ -197,7 +197,12 @@ pub(crate) fn pinned_for_tests(name: &str) -> PathBuf {
     crate::tools::for_tests(&checkout(), name).unwrap_or_else(|error| panic!("{error:#}"))
 }
 
-/// A fake node and pnpm in `dir`. pnpm logs each call's arguments to `dir/pnpm.log`, fails a call
+/// A fake node and pnpm in `dir`.
+///
+/// Models: node and pnpm as `web` runs them. Environment: pnpm needs node's directory first on
+/// `PATH`, as the real one does, and checks what `cargo xtask e2e` gives Playwright. Streams: it
+/// prints nothing and logs its arguments to a file. Exit codes: 0, or 1 for a call whose arguments
+/// hold `fail`. Its tests are those of every gate that uses it. pnpm logs each call's arguments to `dir/pnpm.log`, fails a call
 /// whose arguments contain `fail` (when it is not empty), refuses to run unless node's directory
 /// comes first on `PATH`, writes `web/dist/index.html` for the build and a Vitest lcov for the
 /// coverage run, and checks the environment `cargo xtask e2e` gives Playwright.

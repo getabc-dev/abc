@@ -1,5 +1,8 @@
 #!/bin/sh
 # The user's own tailscale on the PATH, which abc must never run.
+#
+# Models: nothing real: a tripwire. Environment: the caller's. Streams: prints nothing. Exit
+# codes: always 1, after recording the call, so a test sees abc run the user's tailscale.
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 # shellcheck source-path=SCRIPTDIR source=lib.sh
 . "$ROOT/bin/lib.sh"

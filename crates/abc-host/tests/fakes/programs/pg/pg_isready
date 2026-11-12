@@ -1,5 +1,9 @@
 #!/bin/sh
 # A stand-in for pg_isready: ready while the fake server runs.
+#
+# Models: pg_isready. Environment: none read. Streams: prints nothing (the real one prints a
+# status line on stdout). Exit codes: 0 while the fake server runs, non-zero otherwise (the real
+# one's is 1 or 2).
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 # shellcheck source-path=SCRIPTDIR source=../../bin/lib.sh
 . "$ROOT/bin/lib.sh"

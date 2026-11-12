@@ -410,6 +410,12 @@ impl Backend for Local {
 /// for every later call), each a stream-json result, after an init line naming session `s<n>`;
 /// it records each call's arguments in `bin/calls`, one per line. An answer `hang` writes the
 /// init line and its pid to `bin/pid`, then sleeps.
+///
+/// Models: `claude -p --output-format stream-json`. Environment: none read. Streams: stream-json
+/// lines on stdout, whose results are those recorded from real runs ([`LIMIT`], [`DNS`],
+/// [`HANDOFF`]), and a line on stderr. Exit codes: always 0, where the real claude exits non-zero
+/// for some errors, so the supervisor reads the result line and never the exit code, which
+/// `classify`'s tests pin.
 fn fake_claude(bin: &Path, answers: &[&str]) {
     std::fs::create_dir_all(bin).unwrap();
     let mut cases = String::new();

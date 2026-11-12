@@ -2,6 +2,10 @@
 # A stand-in for psql, knowing only the statements abc sends. A database is a file,
 # state/db-<name>, holding what was loaded into it. With state/rename-fails, renaming the restored
 # database into abc's place fails.
+#
+# Models: psql, for the statements abc sends. Environment: none read. Streams: a query's rows are
+# on stdout, errors on stderr. Exit codes: 0; 1 when state/rename-fails refuses a rename; 3 for a
+# statement it does not know.
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 # shellcheck source-path=SCRIPTDIR source=../../bin/lib.sh
 . "$ROOT/bin/lib.sh"

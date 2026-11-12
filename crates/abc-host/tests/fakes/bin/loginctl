@@ -1,6 +1,10 @@
 #!/bin/sh
 # A stand-in for loginctl: show-user's Linger, and enable-linger, which only root may run: the fake
 # sudo's FAKE_ROOT, or the machine's own sudo in the real-Tailscale test.
+#
+# Models: loginctl. Environment: the caller's. Streams: show-user prints yes or no on stdout; a
+# refusal is on stderr. Exit codes: 0; 1 for enable-linger without root (the fake sudo's
+# FAKE_ROOT, or uid 0); 64 for any other command.
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 # shellcheck source-path=SCRIPTDIR source=lib.sh
 . "$ROOT/bin/lib.sh"
