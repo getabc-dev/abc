@@ -531,9 +531,7 @@ fn perform(
     let mode = annotation::Mode::from_env(&env);
     let label = gate_label(&task);
     match task {
-        Task::Check { changed, .. } => {
-            Ok(verdict(check(root, changed, tool, postgres()?, report)?))
-        }
+        Task::Check { changed, .. } => Ok(verdict(check(root, changed, tool, &postgres, report)?)),
         Task::Coverage { base } => Ok(verdict(coverage::run(
             root,
             &base,
@@ -831,12 +829,12 @@ fn run_hook(event: hook::Event, home: &Path, report: &mut impl Write) -> anyhow:
 }
 
 /// `cargo xtask check` on `root`, with the pinned tools `tool` finds, the bin directory of the
-/// Postgres `root` pins for its tests and the warm Postgres.
+/// Postgres `root` pins for its tests, found only when a test step runs, and the warm Postgres.
 fn check(
     root: &Path,
     changed: bool,
     tool: &dyn Fn(&str) -> anyhow::Result<PathBuf>,
-    postgres_bin: PathBuf,
+    postgres_bin: &dyn Fn() -> anyhow::Result<PathBuf>,
     report: &mut impl Write,
 ) -> anyhow::Result<bool> {
     let postgres = check::Postgres {
