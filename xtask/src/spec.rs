@@ -212,7 +212,7 @@ impl Workspace {
 
 /// Removes `dir` and everything in it, if it exists, first making each directory writable again:
 /// the gate leaves its Quint home read-only.
-fn remove_tree(dir: &Path) -> anyhow::Result<()> {
+pub(crate) fn remove_tree(dir: &Path) -> anyhow::Result<()> {
     let Ok(metadata) = fs::symlink_metadata(dir) else {
         return Ok(());
     };
@@ -682,6 +682,8 @@ mod tests {
     use std::os::unix::fs::PermissionsExt as _;
     use std::path::{Path, PathBuf};
 
+    use crate::testing::Scratch;
+
     use super::{
         Checks, Found, Module, Options, RUNNER, Seeded, Tools, Workspace, affected_by, found,
         log_tail, present, quint_files, remove_tree, run, server_args, test_args, trace_args,
@@ -734,8 +736,8 @@ module tests {
     };
 
     /// A tree whose `spec/` holds `files`.
-    fn tree(files: &[(&str, &str)]) -> tempfile::TempDir {
-        let root = tempfile::tempdir().unwrap();
+    fn tree(files: &[(&str, &str)]) -> Scratch {
+        let root = Scratch::new();
         for (path, text) in files {
             let path = root.path().join(path);
             fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -870,7 +872,7 @@ module tests {
 
     #[test]
     fn a_tree_without_specs_fails() {
-        let root = tempfile::tempdir().unwrap();
+        let root = Scratch::new();
         let mut out = Vec::new();
         let unused = || -> anyhow::Result<Tools> { panic!("no tools needed") };
         assert!(
@@ -924,7 +926,7 @@ module tests {
 
     #[test]
     fn the_server_listens_until_it_is_dropped_and_waits_only_so_long() {
-        let root = tempfile::tempdir().unwrap();
+        let root = Scratch::new();
         let tools = pinned();
         let workspace = Workspace::create(root.path(), &tools).unwrap();
         let server = super::Server::start(&tools, &workspace, super::SERVER_START_CHECKS).unwrap();
@@ -1021,7 +1023,7 @@ module tests {
 
     #[test]
     fn a_server_that_exits_is_tried_on_another_port_a_few_times() {
-        let root = tempfile::tempdir().unwrap();
+        let root = Scratch::new();
         let tools = pinned();
         let workspace = Workspace::create(root.path(), &tools).unwrap();
         let bin = root.path().join("bin");
@@ -1216,7 +1218,7 @@ module tests {
 
     #[test]
     fn the_workspace_is_laid_out_fresh_and_removable() {
-        let root = tempfile::tempdir().unwrap();
+        let root = Scratch::new();
         let stale = root.path().join("target/spec/stale");
         fs::create_dir_all(&stale).unwrap();
         fs::set_permissions(&stale, fs::Permissions::from_mode(0o555)).unwrap();
@@ -1243,7 +1245,7 @@ module tests {
 
     #[test]
     fn a_log_tail_is_its_last_lines() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = Scratch::new();
         let log = dir.path().join("log");
         let lines: Vec<String> = (1..=25).map(|n| format!("line {n}")).collect();
         fs::write(&log, lines.join("\n")).unwrap();

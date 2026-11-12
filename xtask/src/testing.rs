@@ -245,3 +245,27 @@ pub(crate) fn abc_tree(root: &Path) {
     )
     .unwrap();
 }
+
+/// A temporary directory that is removed even when `spec::Workspace::create` made a read-only
+/// Quint home in it, and even when the test fails: a plain `TempDir` cannot remove one.
+pub(crate) struct Scratch(tempfile::TempDir);
+
+impl Scratch {
+    pub(crate) fn new() -> Self {
+        Self(tempfile::tempdir().unwrap())
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        self.0.path()
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let removed = crate::spec::remove_tree(&crate::web::target_dir(self.0.path()).join("spec"));
+        // A second panic while a failing test unwinds would abort the run and hide its message.
+        if !std::thread::panicking() {
+            removed.unwrap();
+        }
+    }
+}

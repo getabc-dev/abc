@@ -17,9 +17,10 @@ path = "junit.xml"
 filter = "test(abc_server_setup_serves_the_real_binaries_through_tailscale)"
 slow-timeout = { period = "60s", terminate-after = 10 }
 
-# Builds xtask from a copy of the repository, from scratch the first time.
+# Build xtask from a copy of the repository, from scratch the first time: more than two minutes
+# on a loaded agent VM, where the default limit failed the coverage and mutants baselines.
 [[profile.default.overrides]]
-filter = "test(the_hooks_answer_when_the_main_workspace_does_not_resolve)"
+filter = "test(the_hooks_answer_when_the_main_workspace_does_not_resolve) | test(the_stop_hook_never_starts_check_beside_another_gate)"
 slow-timeout = { period = "60s", terminate-after = 10 }
 
 # The specs' gate tests each start a JVM for Apalache's server, and TLC another: one at a time, so

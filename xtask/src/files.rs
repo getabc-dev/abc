@@ -2,17 +2,25 @@
 //! directory: whole or not at all, and one writer at a time.
 
 use std::fs::{self, File};
+use std::io::Write as _;
 use std::path::Path;
 
 use anyhow::Context as _;
 
 /// Replaces the file at `path` with `text` atomically, creating its directory: a temporary file
 /// beside it, renamed over it, so a reader never sees half a file and two writers never mix
-/// theirs.
+/// theirs. The file is synced before the rename and the directory after it, so a crash leaves
+/// the old contents or the new, never an empty file.
 pub(crate) fn replace(path: &Path, text: &str) -> anyhow::Result<()> {
     let dir = path
         .parent()
         .with_context(|| format!("{} names no file in a directory", path.display()))?;
+    // A bare file name has the empty path as its parent, which names the current directory.
+    let dir = if dir.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        dir
+    };
     fs::create_dir_all(dir).with_context(|| format!("could not create {}", dir.display()))?;
     let name = path
         .file_name()
@@ -22,10 +30,27 @@ pub(crate) fn replace(path: &Path, text: &str) -> anyhow::Result<()> {
         name.to_string_lossy(),
         std::process::id()
     ));
-    fs::write(&temporary, text)
-        .with_context(|| format!("could not write {}", temporary.display()))?;
-    fs::rename(&temporary, path)
-        .with_context(|| format!("could not move {} into place", temporary.display()))
+    let written = write_synced(&temporary, text)
+        .with_context(|| format!("could not write {}", temporary.display()))
+        .and_then(|()| {
+            fs::rename(&temporary, path)
+                .with_context(|| format!("could not move {} into place", temporary.display()))
+        });
+    if written.is_err() {
+        // Nothing is left for a later writer to trip over; the error that matters is above.
+        drop(fs::remove_file(&temporary));
+    }
+    written?;
+    File::open(dir)
+        .and_then(|directory| directory.sync_all())
+        .with_context(|| format!("could not sync {}", dir.display()))
+}
+
+/// Writes `text` to a new file at `path` and syncs it to disk.
+fn write_synced(path: &Path, text: &str) -> std::io::Result<()> {
+    let mut file = File::create(path)?;
+    file.write_all(text.as_bytes())?;
+    file.sync_all()
 }
 
 /// Takes the lock file at `path`, creating it and its directory, and waits for it while another
@@ -65,6 +90,25 @@ mod tests {
         replace(std::path::Path::new("/"), "x").unwrap_err();
         std::fs::create_dir(dir.path().join("a/b/dir")).unwrap();
         replace(&dir.path().join("a/b/dir"), "x").unwrap_err();
+        let after: Vec<_> = std::fs::read_dir(dir.path().join("a/b"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(
+            after.len(),
+            2,
+            "a failed move leaves no temporary file: {after:?}"
+        );
+    }
+
+    #[test]
+    fn a_bare_file_name_is_replaced_in_the_current_directory() {
+        // The test binary's working directory is its package; the name is unique to this test.
+        let name = format!("files-test-{}.tmp-state", std::process::id());
+        replace(std::path::Path::new(&name), "one").unwrap();
+        let text = std::fs::read_to_string(&name);
+        std::fs::remove_file(&name).unwrap();
+        assert_eq!(text.unwrap(), "one");
     }
 
     #[test]
