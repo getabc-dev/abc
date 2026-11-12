@@ -503,3 +503,14 @@ test("the Approve page denies, and says when a request is not this workspace's",
   await screen.findByRole("heading", { level: 1, name: "No such request" });
   expect(screen.queryByRole("button", { name: "Try again" })).toBeNull();
 });
+
+test("the Approve page of another workspace's request asks nothing of the server", async () => {
+  const live = stream();
+  const { fetcher, requests } = server(({ path }) =>
+    path === "/api/session" ? json(200, member) : live.response,
+  );
+  mount(`/machines/requests/0190f5a2-0000-7000-8000-0000000000ff/${REQUEST}`, fetcher);
+  await screen.findByRole("heading", { level: 1, name: "No such request" });
+  expect(screen.getByText(/another workspace/)).toBeDefined();
+  expect(requests.some((entry) => entry.path.includes("enrolment-requests"))).toBe(false);
+});

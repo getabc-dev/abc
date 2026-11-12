@@ -47,7 +47,34 @@ function details(card: RequestCard) {
   ];
 }
 
+/** The request page of the signed-in workspace; a link to another workspace's request is none. */
 export function ApproveScreen({
+  workspace,
+  request,
+}: {
+  readonly workspace: WorkspaceId;
+  readonly request: EnrolmentRequestId;
+}) {
+  const signedIn = useWorkspace().workspace.id;
+  if (workspace !== signedIn) {
+    return (
+      <TitledCard title="No such request" level={1} className="w-full max-w-xl">
+        <div className="flex flex-col items-start gap-4">
+          <p className="text-muted-foreground">
+            This link is for another workspace than the one you are signed in to. Open it from the
+            account that owns that workspace.
+          </p>
+          <Link to="/machines" className={buttonVariants({ variant: "outline" })}>
+            Back to Machines
+          </Link>
+        </div>
+      </TitledCard>
+    );
+  }
+  return <Request key={request} workspace={workspace} request={request} />;
+}
+
+function Request({
   workspace,
   request,
 }: {
