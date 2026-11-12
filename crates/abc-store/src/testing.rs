@@ -385,7 +385,9 @@ pub async fn views_replay_diff(pool: &PgPool) -> Result<Option<String>, StoreErr
 }
 
 /// [`views_replay_diff`], running `during` after the live views are read and before the replay,
-/// the moment a concurrent write would corrupt the comparison. Tests use it to put a write there.
+/// the moment a concurrent write would corrupt the comparison. Tests use it to look at what a
+/// writer can do there. `during` runs while the head lock is held: a write through the event path
+/// awaited inside it waits for that lock and never finishes.
 ///
 /// # Errors
 ///

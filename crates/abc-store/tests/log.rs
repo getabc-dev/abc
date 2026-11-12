@@ -421,11 +421,25 @@ mod tests {
                     .and_then(sqlx::error::DatabaseError::code)
                     .is_some_and(|code| code == "55P03")
             }));
+            tx.rollback().await.unwrap();
         })
         .await
         .unwrap();
         assert_eq!(difference, None, "the views match the log");
         assert!(refused.get(), "a writer cannot start while the check runs");
+    }
+
+    #[tokio::test]
+    async fn a_write_racing_the_replay_check_waits_for_it_and_the_views_still_match() {
+        let database = TestDatabase::migrated().await;
+        let pool = database.pool();
+        let (fixture, claimed) = Fixture::claimed(pool.clone()).await;
+        let (difference, _) = tokio::join!(
+            views_replay_diff(&pool),
+            fixture.issue_token(claimed.workspace)
+        );
+        assert_eq!(difference.unwrap(), None, "one state, so no difference");
+        assert_views_replay(&pool).await;
     }
 
     #[tokio::test]
