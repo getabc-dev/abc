@@ -1056,14 +1056,15 @@ mod tests {
         script(
             &mutants,
             &format!(
-                "case \"$2\" in --list) echo 'src/a.rs:1:18: replace a -> bool with true'; echo 'src/a.rs:1:18: replace a -> bool with false'; exit 0 ;; esac\n\
+                "case \"$2\" in --list) echo \"$*\" >> {listed}; echo 'src/a.rs:1:18: replace a -> bool with true'; echo 'src/a.rs:1:18: replace a -> bool with false'; exit 0 ;; esac\n\
                  echo \"$*\" > {}\n\
                  while [ $# -gt 0 ]; do case \"$1\" in --output) out=$2 ;; esac; shift; done\n\
                  mkdir -p \"$out/mutants.out\"\n\
                  echo 'src/a.rs:1:18: replace a -> bool with true' > \"$out/mutants.out/missed.txt\"\n\
                  [ -z '{outcomes}' ] || echo '{outcomes}' > \"$out/mutants.out/outcomes.json\"\n\
                  exit {code}\n",
-                args.display()
+                args.display(),
+                listed = dir.join("listed").display()
             ),
         );
         (mutants, args)
@@ -1101,6 +1102,21 @@ mod tests {
             "the first listed mutant alone: {args}"
         );
         assert!(!args.contains("--shard"), "{args}");
+        // Each workspace lists its own mutants: xtask's from its directory, the main one from the
+        // root.
+        let mut listed: Vec<String> = fs::read_to_string(temp.path().join("listed"))
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        listed.sort();
+        assert_eq!(
+            listed,
+            [
+                "mutants --list --colors never",
+                "mutants --list --colors never --dir xtask"
+            ]
+        );
     }
 
     #[test]
