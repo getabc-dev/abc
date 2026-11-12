@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE run SET live_lease = NULL, changed_at = $3 WHERE id = $1 AND live_lease = $2",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "99bedfccba6ffcffce4f17e66edae967b0241c91c44a1381d281b020d9e91bcb"
+}

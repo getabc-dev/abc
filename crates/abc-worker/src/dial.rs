@@ -131,6 +131,7 @@ pub(crate) const fn refusal(status: u16, code: Option<ApiCode>) -> Refusal {
         | ApiCode::SetupCodeExpired
         | ApiCode::ServerOnly
         | ApiCode::UnknownWorker
+        | ApiCode::UnknownRun
         | ApiCode::EnrolmentTokenRequired
         | ApiCode::EnrolmentTokenUnknown
         | ApiCode::EnrolmentTokenExpired
@@ -183,6 +184,7 @@ pub(crate) fn enrol_refusal(status: u16, body: Option<ApiErrorBody>) -> EnrolErr
         | ApiCode::SetupCodeExpired
         | ApiCode::ServerOnly
         | ApiCode::UnknownWorker
+        | ApiCode::UnknownRun
         | ApiCode::EnrolmentTokenRequired
         | ApiCode::Internal => refused(error.message),
     }

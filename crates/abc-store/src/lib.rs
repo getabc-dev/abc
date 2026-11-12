@@ -18,6 +18,7 @@ mod error;
 mod execute;
 mod facts;
 mod feed;
+mod log;
 mod projection;
 mod read;
 #[cfg(feature = "testing")]

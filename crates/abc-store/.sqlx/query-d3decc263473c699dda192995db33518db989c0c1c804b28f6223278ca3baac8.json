@@ -1,0 +1,52 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT id, ended, epoch FROM run_lease WHERE run_id = $1 ORDER BY granted_at, id",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "run_lease",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "ended",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "run_lease",
+            "name": "ended"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "epoch",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "run_lease",
+            "name": "epoch"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      true,
+      false
+    ]
+  },
+  "hash": "d3decc263473c699dda192995db33518db989c0c1c804b28f6223278ca3baac8"
+}

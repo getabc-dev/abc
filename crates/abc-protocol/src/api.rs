@@ -66,6 +66,8 @@ pub enum ApiCode {
     ServerOnly,
     /// No such worker.
     UnknownWorker,
+    /// No such run.
+    UnknownRun,
     /// An enrolment token is required.
     EnrolmentTokenRequired,
     /// No such enrolment token.
@@ -96,7 +98,7 @@ pub enum ApiCode {
 
 impl ApiCode {
     /// Every code, for exhaustive tests on both sides of the wire.
-    pub const ALL: [Self; 25] = [
+    pub const ALL: [Self; 26] = [
         Self::MalformedRequest,
         Self::CrossSiteRequest,
         Self::NotFound,
@@ -112,6 +114,7 @@ impl ApiCode {
         Self::SetupCodeExpired,
         Self::ServerOnly,
         Self::UnknownWorker,
+        Self::UnknownRun,
         Self::EnrolmentTokenRequired,
         Self::EnrolmentTokenUnknown,
         Self::EnrolmentTokenExpired,

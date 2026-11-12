@@ -6,13 +6,15 @@ use std::future::Future;
 
 use abc_core::actor::Principal;
 use abc_core::command::{
-    ClaimServer, EndSession, EnrolFacts, EnrolWorker, InstallationFacts, IssueEnrolmentToken,
-    IssueSetupCode, OpenSession, RevokeEnrolmentToken, RevokeWorker, SelfFacts, SetupCodeRecord,
-    StartSession, TokenRecord, WorkerRecord,
+    AnswerEscalation, ApplyResult, ClaimServer, EndSession, EnrolFacts, EnrolWorker, ExpireLease,
+    GrantLease, InstallationFacts, IssueEnrolmentToken, IssueSetupCode, LeaseRecord, LeaseWorker,
+    OpenSession, RevokeEnrolmentToken, RevokeWorker, RunFacts, RunRecord, SelfFacts,
+    SetupCodeRecord, StartRun, StartSession, TokenRecord, WorkerRecord,
 };
 use abc_core::credential::Digest;
 use abc_core::id::{
-    EnrolmentTokenId, EventId, FromUuid as _, PersonId, SessionId, WorkerId, WorkspaceId,
+    EnrolmentTokenId, EventId, FromUuid as _, LeaseId, PersonId, RunId, SessionId, WorkerId,
+    WorkspaceId,
 };
 use abc_core::identity::MachineLabel;
 use abc_core::time::Timestamp;
@@ -258,5 +260,121 @@ impl Load for EndSession {
             workspace: WorkspaceId::from_uuid(row.workspace_id),
             session: row.open_session.map(SessionId::from_uuid),
         }))
+    }
+}
+
+impl Executable for StartRun {}
+impl Load for StartRun {
+    /// Nothing: a run starts on the workspace and the graph the command names.
+    async fn load(
+        &self,
+        _conn: &mut PgConnection,
+        _principal: &Principal,
+    ) -> Result<(), StoreError> {
+        Ok(())
+    }
+}
+
+/// The run, with the live lease it holds.
+async fn run_record(conn: &mut PgConnection, run: RunId) -> Result<Option<RunRecord>, StoreError> {
+    let row = sqlx::query!(
+        "SELECT id, workspace_id, live_lease FROM run WHERE id = $1",
+        run.as_uuid()
+    )
+    .fetch_optional(&mut *conn)
+    .await?;
+    Ok(row.map(|row| RunRecord {
+        id: RunId::from_uuid(row.id),
+        workspace: WorkspaceId::from_uuid(row.workspace_id),
+        live_lease: row.live_lease.map(LeaseId::from_uuid),
+    }))
+}
+
+/// The run and the lease the command names.
+async fn lease_facts(
+    conn: &mut PgConnection,
+    run: RunId,
+    lease: LeaseId,
+) -> Result<RunFacts, StoreError> {
+    let row = sqlx::query!(
+        r#"SELECT id, run_id, ended IS NULL AS "live!" FROM run_lease WHERE id = $1"#,
+        lease.as_uuid()
+    )
+    .fetch_optional(&mut *conn)
+    .await?;
+    Ok(RunFacts {
+        run: run_record(conn, run).await?,
+        lease: row.map(|row| LeaseRecord {
+            id: LeaseId::from_uuid(row.id),
+            run: RunId::from_uuid(row.run_id),
+            live: row.live,
+        }),
+        worker: None,
+    })
+}
+
+impl Executable for GrantLease {}
+impl Load for GrantLease {
+    /// The run, and the worker with whether it is online and holds a live lease.
+    async fn load(
+        &self,
+        conn: &mut PgConnection,
+        _principal: &Principal,
+    ) -> Result<RunFacts, StoreError> {
+        let row = sqlx::query!(
+            r#"SELECT id, workspace_id, open_session IS NOT NULL AS "online!",
+                   EXISTS (SELECT 1 FROM run_lease WHERE worker_id = worker.id AND ended IS NULL)
+                       AS "busy!"
+               FROM worker WHERE id = $1 AND revoked_at IS NULL"#,
+            self.worker.as_uuid()
+        )
+        .fetch_optional(&mut *conn)
+        .await?;
+        Ok(RunFacts {
+            run: run_record(conn, self.run).await?,
+            lease: None,
+            worker: row.map(|row| LeaseWorker {
+                id: WorkerId::from_uuid(row.id),
+                workspace: WorkspaceId::from_uuid(row.workspace_id),
+                online: row.online,
+                busy: row.busy,
+            }),
+        })
+    }
+}
+
+impl Executable for ExpireLease {}
+impl Load for ExpireLease {
+    /// The run and the lease.
+    async fn load(
+        &self,
+        conn: &mut PgConnection,
+        _principal: &Principal,
+    ) -> Result<RunFacts, StoreError> {
+        lease_facts(conn, self.run, self.lease).await
+    }
+}
+
+impl Executable for ApplyResult {}
+impl Load for ApplyResult {
+    /// The run and the lease.
+    async fn load(
+        &self,
+        conn: &mut PgConnection,
+        _principal: &Principal,
+    ) -> Result<RunFacts, StoreError> {
+        lease_facts(conn, self.run, self.lease).await
+    }
+}
+
+impl Executable for AnswerEscalation {}
+impl Load for AnswerEscalation {
+    /// The run.
+    async fn load(
+        &self,
+        conn: &mut PgConnection,
+        _principal: &Principal,
+    ) -> Result<Option<RunRecord>, StoreError> {
+        run_record(conn, self.run).await
     }
 }

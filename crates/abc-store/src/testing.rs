@@ -15,14 +15,12 @@ use std::convert::Infallible;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
-use abc_core::actor::Actor;
 use abc_core::command::{
     ClaimServer, Claimed, EnrolWorker, Enrolled, IssueEnrolmentToken, TokenIssued, TokenTtl,
 };
 use abc_core::credential::{EnrolmentToken, SetupCode, WorkerKey};
 use abc_core::decision::{Mint, Origin};
-use abc_core::event::{Event, Position, Recorded, StreamKind, StreamRef};
-use abc_core::id::{CorrelationId, EventId, FromUuid as _, WorkspaceId};
+use abc_core::id::{CorrelationId, FromUuid as _, WorkspaceId};
 use abc_core::identity::{Arch, DisplayName, MachineInfo, Os, TailnetLogin, WorkspaceName};
 use abc_core::secret::Secret;
 use abc_core::time::{Clock, Timestamp};
@@ -329,47 +327,6 @@ async fn dump(
     Ok(dumps)
 }
 
-/// Every event in the log, in order.
-async fn log(conn: &mut PgConnection) -> Result<Vec<Recorded>, StoreError> {
-    let rows = sqlx::query!(
-        "SELECT position, id, recorded_at, workspace_id, stream_kind, stream_id, stream_seq,
-                schema_version, actor_kind, actor_id, correlation_id, causation_id, payload
-         FROM event ORDER BY position"
-    )
-    .fetch_all(conn)
-    .await?;
-    rows.into_iter()
-        .map(|row| {
-            let kind = StreamKind::parse(&row.stream_kind)
-                .ok_or(StoreError::Corrupt("event.stream_kind"))?;
-            Ok(Recorded {
-                position: Position::from_stored(row.position)
-                    .ok()
-                    .ok_or(StoreError::Corrupt("event.position"))?,
-                id: EventId::from_uuid(row.id),
-                recorded_at: Timestamp::from_utc(row.recorded_at),
-                workspace: WorkspaceId::from_uuid(row.workspace_id),
-                stream: StreamRef {
-                    kind,
-                    id: row.stream_id,
-                },
-                stream_seq: row.stream_seq,
-                actor: Actor::from_stored(&row.actor_kind, row.actor_id)
-                    .ok()
-                    .ok_or(StoreError::Corrupt("event.actor"))?,
-                correlation: CorrelationId::from_uuid(row.correlation_id),
-                causation: row.causation_id.map(EventId::from_uuid),
-                event: Event::decode(kind, row.schema_version, row.payload).map_err(|source| {
-                    StoreError::CorruptEvent {
-                        position: row.position,
-                        source,
-                    }
-                })?,
-            })
-        })
-        .collect()
-}
-
 /// Rebuilds every view from the log inside a transaction that is rolled back, and returns the
 /// first view table whose rows differ from the live ones, with both versions. `None` means the
 /// views are exactly what replaying the log produces.
@@ -390,7 +347,7 @@ pub async fn views_replay_diff(pool: &PgPool) -> Result<Option<String>, StoreErr
     sqlx::query(sqlx::AssertSqlSafe(format!("TRUNCATE {list}")))
         .execute(&mut *tx)
         .await?;
-    for recorded in log(&mut tx).await? {
+    for recorded in crate::log::all(&mut tx).await? {
         projection::apply(&mut tx, &recorded).await?;
     }
     let replayed = dump(&mut tx, &tables).await?;
