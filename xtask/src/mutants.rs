@@ -119,7 +119,9 @@ pub(crate) struct Report {
 }
 
 /// Runs cargo-mutants, with the cargo-mutants and cargo-nextest executables given, on the Rust
-/// lines changed since the merge base with `base`, in each workspace of the repository.
+/// lines changed since the merge base with `base`, in each workspace of the repository. Without a
+/// `base` it only runs the tests of each workspace's unmutated copy, the baseline (see
+/// [`Selection::Baseline`]).
 ///
 /// Every workspace's mutants are built and tested in copies of it, as many at once as
 /// `options.jobs`, never in the checkout: there, any other `cargo xtask` command would compile the
@@ -129,22 +131,28 @@ pub(crate) struct Report {
 /// in [`TEST_REPOSITORY`].
 pub(crate) fn run(
     root: &Path,
-    base: &str,
+    base: Option<&str>,
     options: &Options,
     tools: &Tools,
     out: &mut impl Write,
 ) -> anyhow::Result<Report> {
-    let commit = git::merge_base(root, base)?;
+    let commit = base.map(|base| git::merge_base(root, base)).transpose()?;
     let mut passed = true;
     let mut missed = Vec::new();
     let mut mutated = false;
     // The step's annotations, across every workspace's missed mutants.
     let mut step = annotation::Step::new(options.mode);
     for &workspace in check::REPOSITORY.workspaces {
-        let diff = workspace_diff(root, &commit, workspace)?;
-        if !changes_rust(&diff) {
-            continue;
-        }
+        let selection = match &commit {
+            Some(commit) => {
+                let diff = workspace_diff(root, commit, workspace)?;
+                if !changes_rust(&diff) {
+                    continue;
+                }
+                Selection::Diff(diff)
+            }
+            None => Selection::Baseline,
+        };
         mutated = true;
         // The main workspace's abc crate embeds the built web app, which the copies of the tree
         // take along.
@@ -158,7 +166,7 @@ pub(crate) fn run(
             options,
             tools,
         };
-        let result = run.mutate(&diff, &mut step, out);
+        let result = run.mutate(&selection, &mut step, out);
         if result.is_err() {
             write!(out, "{}", step.finish())?;
         }
@@ -206,6 +214,17 @@ fn workspace_diff(root: &Path, commit: &str, workspace: Workspace) -> anyhow::Re
     git::git(root, &args)
 }
 
+/// Which mutants one workspace's run tests.
+enum Selection {
+    /// The mutants of the lines this diff changes.
+    Diff(String),
+    /// One mutant of the workspace, whose verdict does not count: cargo-mutants runs the tests of
+    /// the unmutated copy first, and only when it has a mutant to test, so this is the way to run
+    /// that baseline alone. The copy is the one every real run tests in, so a tree whose tests
+    /// pass in no copy fails here, before it merges.
+    Baseline,
+}
+
 /// One workspace's cargo-mutants run.
 struct Run<'a> {
     root: &'a Path,
@@ -248,10 +267,11 @@ impl Run<'_> {
         self.root.join(OUTPUT).join(self.workspace.dir())
     }
 
-    /// Mutates the lines `diff` changes and reports whether the tests caught every mutant.
+    /// Mutates what `selection` names and reports whether the tests caught every mutant; for the
+    /// baseline, whether the unmutated tests pass.
     fn mutate(
         &self,
-        diff: &str,
+        selection: &Selection,
         step: &mut annotation::Step,
         out: &mut impl Write,
     ) -> anyhow::Result<Report> {
@@ -269,7 +289,9 @@ impl Run<'_> {
             crate::postgres::warm(out)?;
         }
         let diff_file = output.join("changes.diff");
-        fs::write(&diff_file, diff).context("could not write the diff for cargo-mutants")?;
+        if let Selection::Diff(diff) = selection {
+            fs::write(&diff_file, diff).context("could not write the diff for cargo-mutants")?;
+        }
         writeln!(
             out,
             "xtask: mutating the changed Rust code{}, in copies of it",
@@ -295,8 +317,6 @@ impl Run<'_> {
         let mut command = Command::new(&self.tools.mutants);
         command
             .arg("mutants")
-            .arg("--in-diff")
-            .arg(&diff_file)
             .args([
                 "--test-tool",
                 "nextest",
@@ -309,6 +329,10 @@ impl Run<'_> {
             .arg("--timeout-multiplier")
             .arg(timeout_multiplier(self.options.jobs).to_string())
             .args(["--minimum-test-timeout", MINIMUM_TEST_TIMEOUT]);
+        match selection {
+            Selection::Diff(_) => command.arg("--in-diff").arg(&diff_file),
+            Selection::Baseline => command.arg("-F").arg(self.first_mutant()?),
+        };
         if !self.workspace.dir().is_empty() {
             command.args(["--dir", self.workspace.dir()]);
         }
@@ -355,7 +379,58 @@ impl Run<'_> {
         // goes on every path, so repeated runs never fill the disk.
         let result = outcome(status.code())?;
         scratch.remove()?;
+        if let Selection::Baseline = selection {
+            writeln!(
+                out,
+                "mutants: the tests pass in the unmutated copy{}",
+                self.label()
+            )?;
+            return Ok(Report {
+                passed: true,
+                missed: Vec::new(),
+            });
+        }
         self.report(&results, result, step, out)
+    }
+
+    /// The workspace's directory as " of dir/", empty for the main workspace.
+    fn label(&self) -> String {
+        if self.workspace.dir().is_empty() {
+            String::new()
+        } else {
+            format!(" of {}/", self.workspace.dir())
+        }
+    }
+
+    /// A regular expression matching the first mutant of the workspace, as `--list` names it.
+    fn first_mutant(&self) -> anyhow::Result<String> {
+        let mut command = Command::new(&self.tools.mutants);
+        command.args(["mutants", "--list", "--colors", "never"]);
+        if !self.workspace.dir().is_empty() {
+            command.args(["--dir", self.workspace.dir()]);
+        }
+        let listing = command
+            .env("PATH", tools::path_with(&self.tools.nextest)?)
+            .current_dir(self.root)
+            .output()
+            .context("could not run cargo-mutants")?;
+        ensure!(
+            listing.status.success(),
+            "cargo-mutants could not list the mutants{}: {}",
+            self.label(),
+            String::from_utf8_lossy(&listing.stderr).trim()
+        );
+        let listing = String::from_utf8_lossy(&listing.stdout);
+        let first = listing
+            .lines()
+            .find(|line| !line.trim().is_empty())
+            .with_context(|| {
+                format!(
+                    "cargo-mutants found no mutant{} to run the baseline with",
+                    self.label()
+                )
+            })?;
+        Ok(escape_regex(first))
     }
 
     /// Reads the results cargo-mutants wrote in `results` and reports them, with its `result`;
@@ -388,6 +463,18 @@ impl Run<'_> {
         write!(out, "{}", step.emit(&annotations))?;
         Ok(Report { passed, missed })
     }
+}
+
+/// `text` as a regular expression that matches exactly it.
+fn escape_regex(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+    for character in text.chars() {
+        if r"\.+*?()|[]{}^$".contains(character) {
+            escaped.push('\\');
+        }
+        escaped.push(character);
+    }
+    escaped
 }
 
 /// How much memory, in KiB, each test process of a mutants run may make writable: 2 GiB, where
@@ -632,7 +719,7 @@ mod tests {
     use std::path::Path;
 
     use super::{
-        Options, Outcome, Shard, annotate, changes_rust, describe, listed, outcome,
+        Options, Outcome, Shard, annotate, changes_rust, describe, escape_regex, listed, outcome,
         test_env_config, test_runner, timeout_multiplier,
     };
 
@@ -644,7 +731,7 @@ mod tests {
         tools: &super::Tools,
         out: &mut impl std::io::Write,
     ) -> anyhow::Result<bool> {
-        super::run(root, base, options, tools, out).map(|report| report.passed)
+        super::run(root, Some(base), options, tools, out).map(|report| report.passed)
     }
     use crate::annotation::Mode;
     use crate::testing::{repository_with_change, script};
@@ -812,7 +899,7 @@ mod tests {
         let mut out = Vec::new();
         let report = super::run(
             &repo,
-            "base",
+            Some("base"),
             &TWO,
             &tools(&missing, &nextest, &web),
             &mut out,
@@ -928,6 +1015,122 @@ mod tests {
                 .contains("no Rust lines changed"),
             "said so"
         );
+    }
+
+    /// A fake cargo-mutants that lists two mutants, records how it was run, and ends with `code`.
+    fn baseline_fake(dir: &Path, code: i32) -> (std::path::PathBuf, std::path::PathBuf) {
+        let mutants = dir.join("cargo-mutants");
+        let args = dir.join("args");
+        script(
+            &mutants,
+            &format!(
+                "case \"$2\" in --list) echo 'src/a.rs:1:18: replace a -> bool with true'; echo 'src/a.rs:1:18: replace a -> bool with false'; exit 0 ;; esac\n\
+                 echo \"$*\" > {}\n\
+                 while [ $# -gt 0 ]; do case \"$1\" in --output) out=$2 ;; esac; shift; done\n\
+                 mkdir -p \"$out/mutants.out\"\n\
+                 echo 'src/a.rs:1:18: replace a -> bool with true' > \"$out/mutants.out/missed.txt\"\n\
+                 exit {code}\n",
+                args.display()
+            ),
+        );
+        (mutants, args)
+    }
+
+    #[test]
+    fn a_baseline_only_run_tests_one_mutant_of_each_workspace_and_ignores_its_verdict() {
+        let temp = tempfile::tempdir().unwrap();
+        // No Rust line changed: a baseline-only run needs no diff, no base and no change.
+        let repo = repository_with_change(&temp.path().join("repo"), &[("README.md", "# x\n")]);
+        let (mutants, args) = baseline_fake(temp.path(), 2);
+        let mut out = Vec::new();
+        let report = super::run(
+            &repo,
+            None,
+            &TWO,
+            &tools(&mutants, &temp.path().join("cargo-nextest"), &no_web()),
+            &mut out,
+        )
+        .unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(report.passed, "a missed mutant does not fail it: {text}");
+        assert!(report.missed.is_empty(), "{text}");
+        assert!(
+            text.contains("the tests pass in the unmutated copy"),
+            "{text}"
+        );
+        let args = fs::read_to_string(args).unwrap();
+        assert!(!args.contains("--in-diff"), "{args}");
+        assert!(
+            args.contains(r"-F src/a\.rs:1:18: replace a -> bool with true"),
+            "the first listed mutant alone: {args}"
+        );
+        assert!(!args.contains("--shard"), "{args}");
+    }
+
+    #[test]
+    fn a_baseline_only_run_fails_when_the_unmutated_tests_fail() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = repository_with_change(&temp.path().join("repo"), &[("README.md", "# x\n")]);
+        let (mutants, _) = baseline_fake(temp.path(), 4);
+        let error = super::run(
+            &repo,
+            None,
+            &TWO,
+            &tools(&mutants, &temp.path().join("cargo-nextest"), &no_web()),
+            &mut Vec::new(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("fail without any mutation"), "{error}");
+    }
+
+    #[test]
+    fn a_baseline_only_run_needs_a_mutant_to_run_with() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = repository_with_change(&temp.path().join("repo"), &[("README.md", "# x\n")]);
+        let mutants = temp.path().join("cargo-mutants");
+        script(&mutants, "exit 0\n");
+        let error = format!(
+            "{:#}",
+            super::run(
+                &repo,
+                None,
+                &TWO,
+                &tools(&mutants, &temp.path().join("cargo-nextest"), &no_web()),
+                &mut Vec::new(),
+            )
+            .unwrap_err()
+        );
+        assert!(
+            error.contains("found no mutant to run the baseline with"),
+            "{error}"
+        );
+        let broken = temp.path().join("broken");
+        script(&broken, "echo 'no manifest here' >&2\nexit 1\n");
+        let error = format!(
+            "{:#}",
+            super::run(
+                &repo,
+                None,
+                &TWO,
+                &tools(&broken, &temp.path().join("cargo-nextest"), &no_web()),
+                &mut Vec::new(),
+            )
+            .unwrap_err()
+        );
+        assert!(
+            error.contains("could not list the mutants: no manifest here"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_name_is_escaped_to_match_itself() {
+        assert_eq!(
+            escape_regex("src/a.rs:1:18: replace a -> b with (x + 1)"),
+            r"src/a\.rs:1:18: replace a -> b with \(x \+ 1\)"
+        );
+        assert_eq!(escape_regex("plain"), "plain");
     }
 
     #[test]

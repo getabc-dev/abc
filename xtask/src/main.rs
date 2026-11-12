@@ -167,8 +167,17 @@ enum Task {
     /// Run cargo-mutants on the Rust lines changed since the merge base and fail on missed mutants.
     Mutants {
         /// The revision whose merge base with HEAD the diff starts from.
-        #[arg(long)]
-        base: String,
+        #[arg(
+            long,
+            required_unless_present = "baseline_only",
+            conflicts_with = "baseline_only"
+        )]
+        base: Option<String>,
+        /// Run only the tests of cargo-mutants' unmutated copy of each workspace, the baseline,
+        /// with no diff: what a change to the gates needs to know before it merges, from the
+        /// checkout of the tree it judges. Missed mutants do not count and nothing is recorded.
+        #[arg(long, conflicts_with = "shard")]
+        baseline_only: bool,
         /// How many mutants to build and test at once.
         #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u32).range(1..))]
         jobs: u32,
@@ -436,11 +445,19 @@ fn gate_label(task: &Task) -> String {
     if let Task::Coverage { base } = task {
         return format!("{name} --base {base}");
     }
-    if let Task::Mutants { base, shard, .. } = task {
+    if let Task::Mutants {
+        base: Some(base),
+        shard,
+        ..
+    } = task
+    {
         return shard.map_or_else(
             || format!("{name} --base {base}"),
             |shard| format!("{name} --base {base} --shard {shard}"),
         );
+    }
+    if let Task::Mutants { .. } = task {
+        return format!("{name} --baseline-only");
     }
     if let Task::Fuzz { seconds } = task {
         return format!("{name} --seconds {seconds}");
@@ -494,13 +511,15 @@ fn run(
 fn run_mutants(
     invocation: &Invocation<'_>,
     label: &str,
-    base: &str,
+    base: Option<&str>,
     options: &mutants::Options,
     tools: &mutants::Tools,
     report: &mut impl Write,
 ) -> anyhow::Result<ExitCode> {
     let result = mutants::run(&invocation.root, base, options, tools, report)?;
-    if invocation.root == invocation.home
+    // A baseline-only run tested no mutant, so it has none to record.
+    if base.is_some()
+        && invocation.root == invocation.home
         && let Err(error) = progress::mutants_ran(
             &invocation.root,
             label,
@@ -539,10 +558,12 @@ fn perform(
             mode,
             report,
         )?)),
-        Task::Mutants { base, jobs, shard } => run_mutants(
+        Task::Mutants {
+            base, jobs, shard, ..
+        } => run_mutants(
             invocation,
             &label,
-            &base,
+            base.as_deref(),
             &mutants::Options { jobs, shard, mode },
             &mutants::Tools::pinned(tool, postgres()?)?,
             report,
@@ -1058,6 +1079,22 @@ mod tests {
             label(&["mutants", "--base", "origin/main"]),
             "mutants --base origin/main"
         );
+        assert_eq!(
+            label(&["mutants", "--baseline-only"]),
+            "mutants --baseline-only",
+            "a baseline-only run needs no base"
+        );
+        for refused in [
+            &["mutants"][..],
+            &["mutants", "--base", "b", "--baseline-only"],
+            &["mutants", "--baseline-only", "--shard", "0/2"],
+        ] {
+            assert!(
+                Cli::try_parse_from(std::iter::once("xtask").chain(refused.iter().copied()))
+                    .is_err(),
+                "{refused:?}"
+            );
+        }
         assert_eq!(label(&["coverage", "--base", "b"]), "coverage --base b");
         assert_eq!(label(&["fuzz", "--seconds", "5"]), "fuzz --seconds 5");
         assert_eq!(label(&["spec"]), "spec");
@@ -1149,7 +1186,8 @@ mod tests {
                 base: "base".to_owned(),
             },
             Task::Mutants {
-                base: "base".to_owned(),
+                base: Some("base".to_owned()),
+                baseline_only: false,
                 jobs: 1,
                 shard: None,
             },
@@ -1631,7 +1669,8 @@ mod tests {
             (
                 "mutants",
                 Task::Mutants {
-                    base: base(),
+                    base: Some(base()),
+                    baseline_only: false,
                     jobs: 1,
                     shard: None,
                 },
@@ -1724,7 +1763,8 @@ mod tests {
                 base: "base".to_owned(),
             },
             Task::Mutants {
-                base: "base".to_owned(),
+                base: Some("base".to_owned()),
+                baseline_only: false,
                 jobs: 1,
                 shard: None,
             },
@@ -1759,7 +1799,8 @@ mod tests {
         );
         // A mutants run is recorded too, with the mutants it missed or none.
         let mutants = || Task::Mutants {
-            base: "base".to_owned(),
+            base: Some("base".to_owned()),
+            baseline_only: false,
             jobs: 1,
             shard: Some(crate::mutants::Shard::parse("1/2").unwrap()),
         };
