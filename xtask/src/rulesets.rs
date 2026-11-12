@@ -301,8 +301,10 @@ fn installs_test_tools(workflows: &[(String, String)]) -> anyhow::Result<()> {
 fn names_tools_directory(script: &str) -> bool {
     script.match_indices(".tools").any(|(at, name)| {
         let word = |character: char| character.is_alphanumeric() || "_-.".contains(character);
-        let before = script[..at].chars().next_back();
-        let after = script[at.saturating_add(name.len())..].chars().next();
+        let before = script.get(..at).and_then(|text| text.chars().next_back());
+        let after = script
+            .get(at.saturating_add(name.len())..)
+            .and_then(|text| text.chars().next());
         !before.is_some_and(word) && !after.is_some_and(word)
     })
 }

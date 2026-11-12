@@ -663,6 +663,47 @@ fn starts_the_installed_broker_when_none_listens() {
 }
 
 #[test]
+fn lists_the_vms_as_text_and_as_json_on_stdout() {
+    let world = world("t");
+    let backend = subscribed();
+    let listed = act_streams(
+        &world,
+        &backend,
+        &FakeServices::default(),
+        Action::Ls { json: false },
+    );
+    assert_eq!(listed.stdout, "abc-w\tStopped\n", "this VM is not running");
+    let running = Fake {
+        running: true,
+        ..Fake::default()
+    };
+    assert_eq!(
+        running.list(true).unwrap(),
+        [Sandbox {
+            name: "abc-w".to_owned(),
+            status: "Running".to_owned()
+        }]
+    );
+    assert_eq!(backend.list(true).unwrap(), [], "--running leaves it out");
+    assert_eq!(listed.stderr, "", "no message beside the listing");
+    let json = act_streams(
+        &world,
+        &backend,
+        &FakeServices::default(),
+        Action::Ls { json: true },
+    );
+    assert_eq!(
+        serde_json::from_str::<Vec<Sandbox>>(&json.stdout).unwrap(),
+        [Sandbox {
+            name: "abc-w".to_owned(),
+            status: "Stopped".to_owned()
+        }],
+        "JSON on stdout"
+    );
+    assert_eq!(json.stderr, "", "nothing else is said");
+}
+
+#[test]
 fn shells_auths_syncs_lists_and_stops() {
     let mut world = world("t");
     let backend = subscribed();
@@ -711,41 +752,6 @@ fn shells_auths_syncs_lists_and_stops() {
     );
     let (_, synced) = act(&world, &backend, Action::Sync { worktree });
     assert!(synced.contains("already at"), "{synced}");
-    let listed = act_streams(
-        &world,
-        &backend,
-        &FakeServices::default(),
-        Action::Ls { json: false },
-    );
-    assert_eq!(listed.stdout, "abc-w\tStopped\n", "this VM is not running");
-    let running = Fake {
-        running: true,
-        ..Fake::default()
-    };
-    assert_eq!(
-        running.list(true).unwrap(),
-        [Sandbox {
-            name: "abc-w".to_owned(),
-            status: "Running".to_owned()
-        }]
-    );
-    assert_eq!(backend.list(true).unwrap(), [], "--running leaves it out");
-    assert_eq!(listed.stderr, "", "no message beside the listing");
-    let json = act_streams(
-        &world,
-        &backend,
-        &FakeServices::default(),
-        Action::Ls { json: true },
-    );
-    assert_eq!(
-        serde_json::from_str::<Vec<Sandbox>>(&json.stdout).unwrap(),
-        [Sandbox {
-            name: "abc-w".to_owned(),
-            status: "Stopped".to_owned()
-        }],
-        "JSON on stdout"
-    );
-    assert_eq!(json.stderr, "", "nothing else is said");
     stop_session(&world, &backend, false);
     assert!(
         world.root.join("state/w").exists(),

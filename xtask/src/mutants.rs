@@ -397,10 +397,13 @@ impl Run<'_> {
         let outcomes: serde_json::Value = serde_json::from_str(&outcomes)
             .with_context(|| format!("cargo-mutants' outcomes{} are not JSON", self.label()))?;
         ensure!(
-            outcomes["outcomes"]
-                .as_array()
+            outcomes
+                .get("outcomes")
+                .and_then(serde_json::Value::as_array)
                 .is_some_and(|all| all.iter().any(|outcome| {
-                    outcome["scenario"] == "Baseline" && outcome["summary"] == "Success"
+                    outcome.get("scenario").and_then(serde_json::Value::as_str) == Some("Baseline")
+                        && outcome.get("summary").and_then(serde_json::Value::as_str)
+                            == Some("Success")
                 })),
             "cargo-mutants ran no passing baseline{}",
             self.label()
