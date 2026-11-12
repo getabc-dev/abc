@@ -329,7 +329,7 @@ mod tests {
         let database = TestDatabase::migrated().await;
         let pool = database.pool();
         let (fixture, claimed) = Fixture::claimed(pool.clone()).await;
-        let workers = world(&fixture, claimed.workspace, 2).await;
+        let workers = world(&fixture, claimed.workspace, 3).await;
         let one = start(&fixture, claimed.workspace).await;
         let two = start(&fixture, claimed.workspace).await;
         grant(&fixture, one, workers[0]).await.unwrap();
@@ -361,17 +361,43 @@ mod tests {
             "a refusal wrote nothing"
         );
 
-        let both_live = sqlx::query(
-            "INSERT INTO run_lease (id, run_id, worker_id, epoch, granted_at, changed_at)
-             SELECT gen_random_uuid(), run_id, worker_id, epoch, granted_at, changed_at
-             FROM run_lease WHERE run_id = $1",
-        )
-        .bind(one.as_uuid())
-        .execute(&pool)
-        .await;
-        assert!(
-            both_live.is_err(),
-            "the database refuses a second live lease too"
+        // A third run and worker, so each row below breaks one unique index and no other rule.
+        let spare_worker = workers[2];
+        let three = start(&fixture, claimed.workspace).await;
+        let live = |run: RunId, worker: WorkerId| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query(
+                    "INSERT INTO run_lease (id, run_id, worker_id, granted_at, changed_at)
+                     SELECT gen_random_uuid(), $1, $2, granted_at, changed_at
+                     FROM run_lease WHERE run_id = $3",
+                )
+                .bind(run.as_uuid())
+                .bind(worker.as_uuid())
+                .bind(one.as_uuid())
+                .execute(&pool)
+                .await
+            }
+        };
+        let constraint = |refused: Result<sqlx::postgres::PgQueryResult, sqlx::Error>| {
+            let error = refused.expect_err("the database refuses the lease");
+            let database = error.as_database_error().expect("a database error");
+            assert_eq!(
+                database.code().as_deref(),
+                Some("23505"),
+                "a unique violation"
+            );
+            database.constraint().map(str::to_owned)
+        };
+        assert_eq!(
+            constraint(live(one, spare_worker).await).as_deref(),
+            Some("run_lease_one_live_per_run"),
+            "a second live lease on a run, held by the database too"
+        );
+        assert_eq!(
+            constraint(live(three, workers[0]).await).as_deref(),
+            Some("run_lease_one_live_per_worker"),
+            "a second live lease for a worker, held by the database too"
         );
         assert_views_replay(&pool).await;
     }
