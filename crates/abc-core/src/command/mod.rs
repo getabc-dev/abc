@@ -20,8 +20,8 @@ pub use enrolment::{
     RevokeTokenRejection, TokenIssued, TokenProof, TokenRecord, TokenTtl,
 };
 pub use run::{
-    AnswerEscalation, ApplyResult, ExpireLease, GrantLease, LeaseRecord, LeaseWorker, ResultFate,
-    RunFacts, RunProof, RunRecord, RunRejection, StartRun,
+    AnswerEscalation, AnswerRejection, ApplyResult, ExpireLease, GrantLease, LeaseRecord,
+    LeaseWorker, ResultFate, RunFacts, RunProof, RunRecord, RunRejection, StartRun,
 };
 pub use worker::{
     EndSession, OpenSession, RevokeWorker, RevokeWorkerRejection, SelfFacts, SelfProof,

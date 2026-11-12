@@ -84,6 +84,8 @@ pub struct LeaseRecord {
     pub id: LeaseId,
     /// The run it is on.
     pub run: RunId,
+    /// The worker it was given to.
+    pub worker: WorkerId,
     /// Whether it is live: not expired and its result not applied.
     pub live: bool,
 }
@@ -137,9 +139,6 @@ fn prove_run(facts: &RunFacts, run: RunId) -> Result<RunProof, DenialReason> {
 /// Why a recorder refuses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum RunRejection {
-    /// No such run in this workspace.
-    #[error("no such run in this workspace")]
-    UnknownRun,
     /// No such lease on this run.
     #[error("no such lease on this run")]
     UnknownLease,
@@ -276,6 +275,8 @@ pub enum ResultFate {
 pub struct ApplyResult {
     /// The run.
     pub run: RunId,
+    /// The worker that reports it: only the worker holding a lease may finish it.
+    pub worker: WorkerId,
     /// The lease the result is for.
     pub lease: LeaseId,
     /// What the worker reports.
@@ -306,14 +307,31 @@ impl Command for ApplyResult {
     ) -> Result<Decision<ResultFate>, RunRejection> {
         let mut decision = DecisionBuilder::new(&auth);
         let RunProof { run } = *auth.proof();
-        let Self { lease, result, .. } = auth.into_request();
-        if known_lease(&facts, run.id, lease)?.live {
+        let Self {
+            worker,
+            lease,
+            result,
+            ..
+        } = auth.into_request();
+        let record = known_lease(&facts, run.id, lease)?;
+        if record.worker != worker {
+            return Err(RunRejection::UnknownLease);
+        }
+        if record.live {
             decision.emit(run.id, RunEvent::ResultApplied { lease, result });
             Ok(decision.finish(ResultFate::Applied))
         } else {
             Ok(decision.finish(ResultFate::Discarded))
         }
     }
+}
+
+/// Why an answer is refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum AnswerRejection {
+    /// No such run in this workspace.
+    #[error("no such run in this workspace")]
+    NotFound,
 }
 
 /// A person answers the escalation a run is parked on (spec `answer`). That the run is parked is
@@ -343,19 +361,19 @@ impl Request for AnswerEscalation {
 
 impl Command for AnswerEscalation {
     type Outcome = ();
-    type Rejection = RunRejection;
+    type Rejection = AnswerRejection;
 
     fn decide(
         auth: Authorized<Self>,
         facts: Option<RunRecord>,
         _ctx: &DecideCtx<'_>,
-    ) -> Result<Decision<()>, RunRejection> {
+    ) -> Result<Decision<()>, AnswerRejection> {
         let mut decision = DecisionBuilder::new(&auth);
         let command = auth.into_request();
         // A run of another workspace is not found, as for a worker.
         let run = facts
             .filter(|record| record.id == command.run && record.workspace == command.workspace)
-            .ok_or(RunRejection::UnknownRun)?;
+            .ok_or(AnswerRejection::NotFound)?;
         decision.emit(
             run.id,
             RunEvent::Answered {
@@ -395,6 +413,7 @@ mod tests {
         LeaseRecord {
             id: id(30),
             run: id(20),
+            worker: id(3),
             live,
         }
     }
@@ -608,6 +627,7 @@ mod tests {
         });
         let apply = ApplyResult {
             run: id(20),
+            worker: id(3),
             lease: id(30),
             result,
         };
@@ -637,6 +657,17 @@ mod tests {
             Outcome::Rejected(RunRejection::UnknownLease),
             "no such lease"
         );
+        let stranger = ApplyResult {
+            worker: id(4),
+            ..apply
+        };
+        assert_eq!(
+            run(&Principal::Server, stranger, at(Some(lease(true))), now())
+                .map(|_| ())
+                .unwrap_err(),
+            Outcome::Rejected(RunRejection::UnknownLease),
+            "a worker that does not hold the lease cannot finish it"
+        );
     }
 
     #[test]
@@ -663,7 +694,7 @@ mod tests {
         for facts in [None, Some(elsewhere)] {
             assert_eq!(
                 run(&owner(), answer, facts, now()).map(|_| ()).unwrap_err(),
-                Outcome::Rejected(RunRejection::UnknownRun),
+                Outcome::Rejected(AnswerRejection::NotFound),
                 "not found"
             );
         }

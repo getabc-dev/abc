@@ -297,7 +297,7 @@ async fn lease_facts(
     lease: LeaseId,
 ) -> Result<RunFacts, StoreError> {
     let row = sqlx::query!(
-        r#"SELECT id, run_id, ended IS NULL AS "live!" FROM run_lease WHERE id = $1"#,
+        r#"SELECT id, run_id, worker_id, ended IS NULL AS "live!" FROM run_lease WHERE id = $1"#,
         lease.as_uuid()
     )
     .fetch_optional(&mut *conn)
@@ -307,6 +307,7 @@ async fn lease_facts(
         lease: row.map(|row| LeaseRecord {
             id: LeaseId::from_uuid(row.id),
             run: RunId::from_uuid(row.run_id),
+            worker: WorkerId::from_uuid(row.worker_id),
             live: row.live,
         }),
         worker: None,

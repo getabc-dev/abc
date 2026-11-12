@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT id, run_id, ended IS NULL AS \"live!\" FROM run_lease WHERE id = $1",
+  "query": "SELECT id, ended FROM run_lease WHERE run_id = $1 ORDER BY granted_at, id",
   "describe": {
     "columns": [
       {
@@ -16,20 +16,14 @@
       },
       {
         "ordinal": 1,
-        "name": "run_id",
-        "type_info": "Uuid",
+        "name": "ended",
+        "type_info": "Text",
         "origin": {
           "Table": {
             "table": "run_lease",
-            "name": "run_id"
+            "name": "ended"
           }
         }
-      },
-      {
-        "ordinal": 2,
-        "name": "live!",
-        "type_info": "Bool",
-        "origin": "Expression"
       }
     ],
     "parameters": {
@@ -39,9 +33,8 @@
     },
     "nullable": [
       false,
-      false,
-      null
+      true
     ]
   },
-  "hash": "d09272bfe0cc688528c27a792649db682af5c0a408c79504c29ece86faac713f"
+  "hash": "90b2d9681b728cbdd6c9b43aa8c68263157e6c5dc3a75fccc39a42bdb07f547c"
 }

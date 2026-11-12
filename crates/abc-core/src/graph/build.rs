@@ -107,11 +107,15 @@ impl GraphBuilder {
                 return Err(GraphError::RuleOfTwo(step.id.clone()));
             }
         }
-        for (from, to) in forward
+        let preset = steps
             .iter()
-            .map(|(a, b)| (a, b))
-            .chain(back.iter().map(|(a, b, _)| (a, b)))
-        {
+            .filter_map(|step| step.back_edge.as_ref().map(|edge| (&step.id, &edge.target)));
+        let edges = forward
+            .iter()
+            .map(|(from, to)| (from, to))
+            .chain(back.iter().map(|(from, to, _)| (from, to)))
+            .chain(preset);
+        for (from, to) in edges {
             for end in [from, to] {
                 if !known.contains(end) {
                     return Err(GraphError::EdgeToNowhere(end.clone()));
@@ -452,9 +456,12 @@ pub(crate) mod tests {
         );
         let mut nowhere = json.clone();
         nowhere["steps"][2]["back_edge"]["target"] = "zzz".into();
-        assert!(
-            serde_json::from_value::<Graph>(nowhere).is_err(),
-            "an edge to nowhere"
+        assert_eq!(
+            serde_json::from_value::<Graph>(nowhere)
+                .unwrap_err()
+                .to_string(),
+            GraphError::EdgeToNowhere(id("zzz")).to_string(),
+            "an edge to nowhere is named as one"
         );
         let mut empty = json;
         empty["steps"] = serde_json::json!([]);

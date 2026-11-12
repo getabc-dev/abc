@@ -33,14 +33,14 @@ pub struct GraphVersion([u8; 32]);
 pub struct InvalidGraphVersion;
 
 impl GraphVersion {
+    #[expect(
+        clippy::expect_used,
+        reason = "a graph is strings, integers and enums, which always serialize"
+    )]
     pub(super) fn of(graph: &Graph) -> Self {
         let mut hash = Sha256::new();
         hash.update(DOMAIN);
-        // These types always serialize: no map has a non-string key and no float is NaN.
-        match serde_json::to_vec(graph) {
-            Ok(bytes) => hash.update(bytes),
-            Err(_) => hash.update(b"unserializable"),
-        }
+        hash.update(serde_json::to_vec(graph).expect("a graph is plain data and serializes"));
         Self(hash.finalize().into())
     }
 

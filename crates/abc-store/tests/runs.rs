@@ -5,8 +5,8 @@
 mod tests {
     use abc_core::actor::Actor;
     use abc_core::command::{
-        AnswerEscalation, ApplyResult, ExpireLease, GrantLease, ResultFate, RunRejection, StartRun,
-        StartSession,
+        AnswerEscalation, AnswerRejection, ApplyResult, ExpireLease, GrantLease, ResultFate,
+        RunRejection, StartRun, StartSession,
     };
     use abc_core::event::{Event, RunEvent, StreamKind};
     use abc_core::graph::{
@@ -108,6 +108,7 @@ mod tests {
     async fn apply(
         fixture: &Fixture,
         run: RunId,
+        worker: WorkerId,
         lease: LeaseId,
         result: StepResult,
     ) -> ResultFate {
@@ -116,7 +117,12 @@ mod tests {
             .execute(
                 &Caller::Server,
                 &fixture.origin(),
-                ApplyResult { run, lease, result },
+                ApplyResult {
+                    run,
+                    worker,
+                    lease,
+                    result,
+                },
             )
             .await
             .unwrap()
@@ -159,7 +165,7 @@ mod tests {
     /// What the `run` and `run_lease` views hold after the life in the test above.
     async fn check_views(pool: &sqlx::PgPool, run: RunId, owner: abc_core::id::PersonId) {
         let row = sqlx::query!(
-            "SELECT graph, epoch, live_lease, last_answer, started_by FROM run WHERE id = $1",
+            "SELECT graph, live_lease, last_answer, started_by FROM run WHERE id = $1",
             run.as_uuid()
         )
         .fetch_one(pool)
@@ -170,28 +176,27 @@ mod tests {
             graph().as_bytes().to_vec(),
             "the view pins the graph"
         );
-        assert_eq!(row.epoch, 2, "two results were applied");
         assert_eq!(row.live_lease, None, "no lease is out");
         assert_eq!(row.last_answer.as_deref(), Some("accept"), "the answer");
         assert_eq!(row.started_by, owner.as_uuid(), "a person started it (I4)");
         let leases = sqlx::query!(
-            "SELECT id, ended, epoch FROM run_lease WHERE run_id = $1 ORDER BY granted_at, id",
+            "SELECT id, ended FROM run_lease WHERE run_id = $1 ORDER BY granted_at, id",
             run.as_uuid()
         )
         .fetch_all(pool)
         .await
         .unwrap();
-        let ended: Vec<(&str, i32)> = leases
+        let ended: Vec<&str> = leases
             .iter()
-            .map(|lease| (lease.ended.as_deref().unwrap(), lease.epoch))
+            .map(|lease| lease.ended.as_deref().unwrap())
             .collect();
         assert_eq!(
-            ended.iter().filter(|(how, _)| *how == "applied").count(),
+            ended.iter().filter(|how| **how == "applied").count(),
             2,
             "two leases ended by their result"
         );
         assert_eq!(
-            ended.iter().filter(|(how, _)| *how == "expired").count(),
+            ended.iter().filter(|how| **how == "expired").count(),
             1,
             "one by expiry"
         );
@@ -215,26 +220,26 @@ mod tests {
                 .unwrap();
         }
         let second = grant(&fixture, run, workers[1]).await.unwrap();
-        let made = apply(&fixture, run, second, StepResult::Made).await;
+        let made = apply(&fixture, run, workers[1], second, StepResult::Made).await;
         assert_eq!(
             made,
             ResultFate::Applied,
             "a live lease's result is applied"
         );
-        let late = apply(&fixture, run, first, judged(Verdict::Pass)).await;
+        let late = apply(&fixture, run, workers[0], first, judged(Verdict::Pass)).await;
         assert_eq!(
             late,
             ResultFate::Discarded,
             "an expired lease's result is not"
         );
         let third = grant(&fixture, run, workers[0]).await.unwrap();
-        let again = apply(&fixture, run, second, StepResult::Made).await;
+        let again = apply(&fixture, run, workers[1], second, StepResult::Made).await;
         assert_eq!(
             again,
             ResultFate::Discarded,
             "a result sent twice is applied once"
         );
-        apply(&fixture, run, third, judged(Verdict::Escalate)).await;
+        apply(&fixture, run, workers[0], third, judged(Verdict::Escalate)).await;
         fixture
             .store
             .execute(
@@ -446,6 +451,27 @@ mod tests {
             DenialReason::NotAMember,
             "strangers start nothing"
         );
+        let lease = grant(&fixture, run, workers[0]).await.unwrap();
+        let impostor = fixture
+            .store
+            .execute(
+                &Caller::Server,
+                &fixture.origin(),
+                ApplyResult {
+                    run,
+                    worker: WorkerId::from_uuid(uuid::Uuid::from_u128(88)),
+                    lease,
+                    result: StepResult::Made,
+                },
+            )
+            .await;
+        assert!(
+            matches!(
+                impostor,
+                Err(ExecuteError::Rejected(RunRejection::UnknownLease))
+            ),
+            "a worker that does not hold the lease cannot finish it"
+        );
         let wrong = fixture
             .store
             .execute(
@@ -459,7 +485,10 @@ mod tests {
             )
             .await;
         assert!(
-            matches!(wrong, Err(ExecuteError::Rejected(RunRejection::UnknownRun))),
+            matches!(
+                wrong,
+                Err(ExecuteError::Rejected(AnswerRejection::NotFound))
+            ),
             "answering a run that does not exist"
         );
         assert_views_replay(&pool).await;

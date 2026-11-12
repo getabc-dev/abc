@@ -364,8 +364,8 @@ async fn run(conn: &mut PgConnection, row: &Row, event: &RunEvent) -> Result<(),
         }
         RunEvent::LeaseGranted { lease, worker } => {
             sqlx::query!(
-                "INSERT INTO run_lease (id, run_id, worker_id, epoch, granted_at, changed_at)
-                 SELECT $1, id, $3, epoch, $4, $5 FROM run WHERE id = $2",
+                "INSERT INTO run_lease (id, run_id, worker_id, granted_at, changed_at)
+                 VALUES ($1, $2, $3, $4, $5)",
                 lease.as_uuid(),
                 stream,
                 worker.as_uuid(),
@@ -389,9 +389,6 @@ async fn run(conn: &mut PgConnection, row: &Row, event: &RunEvent) -> Result<(),
         RunEvent::ResultApplied { lease, result } => {
             let result = serde_json::to_value(result).map_err(StoreError::Encode)?;
             end_lease(conn, row, *lease, "applied", Some(result)).await?;
-            sqlx::query!("UPDATE run SET epoch = epoch + 1 WHERE id = $1", stream,)
-                .execute(&mut *conn)
-                .await?;
         }
         RunEvent::Answered { answer } => {
             let answer = serde_json::to_value(answer).map_err(StoreError::Encode)?;

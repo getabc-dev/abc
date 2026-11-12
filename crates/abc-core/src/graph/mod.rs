@@ -395,7 +395,7 @@ impl Graph {
         &self.steps
     }
 
-    /// Every edge: each step's forward edge, then its back edge.
+    /// Every edge: the forward edges in execution order, then the back edges in step order.
     pub fn edges(&self) -> impl Iterator<Item = Edge<'_>> {
         let forward = self
             .steps

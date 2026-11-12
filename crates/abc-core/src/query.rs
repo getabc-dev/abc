@@ -273,7 +273,8 @@ query!(
 );
 
 /// One run's events in the order they happened: the runner's recovery and the replay of the
-/// spec's traces read them. Server only.
+/// spec's traces read them. Server only. Every run starts with an event, so an unknown run's
+/// stream is empty.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RunEvents {
     /// The run.

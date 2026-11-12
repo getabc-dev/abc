@@ -19,8 +19,6 @@ CREATE TABLE run (
     started_event uuid       NOT NULL REFERENCES event (id),
     -- The lease that is live now, if any: at most one, and it names a lease of this run.
     live_lease   uuid        NULL,
-    -- How many results the run has applied: the fencing number of its next result.
-    epoch        integer     NOT NULL DEFAULT 0 CHECK (epoch >= 0),
     -- The last answer a person gave, if any.
     last_answer  text        NULL CHECK (last_answer IN ('retry', 'accept', 'cancel')),
     changed_at   bigint      NOT NULL REFERENCES event (position)
@@ -31,8 +29,6 @@ CREATE TABLE run_lease (
     id           uuid        PRIMARY KEY,
     run_id       uuid        NOT NULL REFERENCES run (id),
     worker_id    uuid        NOT NULL REFERENCES worker (id),
-    -- The run's epoch when the lease was granted.
-    epoch        integer     NOT NULL CHECK (epoch >= 0),
     granted_at   timestamptz NOT NULL,
     -- How the lease ended: expired, or its result applied. NULL while live.
     ended        text        NULL CHECK (ended IN ('expired', 'applied')),
