@@ -13,7 +13,7 @@ import { apiClient, type Fetch } from "./api/client";
 import { App, createAppRouter } from "./app";
 import type { LiveUpdate } from "./generated/LiveUpdate";
 import type { SessionView } from "./generated/SessionView";
-import { card, stubMatchMedia } from "./testing";
+import { card, enrolmentRequest, stubMatchMedia } from "./testing";
 
 // The router restores scroll positions, which jsdom cannot do.
 Reflect.set(window, "scrollTo", () => undefined);
@@ -253,9 +253,9 @@ test("machines appear live in the shell and on their screen, and go offline", as
   expect(screen.getByText("Live")).toBeDefined();
   live.send({
     type: "machines",
+    requests: [],
     head: 6,
     changed: [{ ...card("lab box", "w1", false), last_seen_at: "2026-11-06T09:30:00Z" }],
-    requests: [],
   });
   await within(region).findByText("Offline");
   expect(within(region).queryByText("Never connected")).toBeNull();
@@ -356,9 +356,9 @@ test("a revoked machine says so and leaves the shell's pills", async () => {
   );
   live.send({
     type: "snapshot",
+    requests: [],
     head: 1,
     machines: [{ ...card("old box", "w1", false), revoked: true }, card("mac", "w2", true)],
-    requests: [],
   });
   const region = await screen.findByRole("region", { name: "old box" });
   expect(within(region).getByText("Revoked")).toBeDefined();
@@ -393,11 +393,124 @@ test("a workspace with only revoked machines offers the first enrolment", async 
   );
   live.send({
     type: "snapshot",
+    requests: [],
     head: 1,
     machines: [{ ...card("old box", "w1", false), revoked: true }],
-    requests: [],
   });
   await screen.findByRole("heading", { name: "Enrol your first machine" });
   expect(screen.getByText("No machines")).toBeDefined();
   expect(screen.getByRole("region", { name: "old box" })).toBeDefined();
+});
+
+const REQUEST = "0190f5a2-0000-7000-8000-0000000000aa";
+
+test("Machines shows the setup command and a notice for each machine asking to join", async () => {
+  const live = stream();
+  const { fetcher } = server(({ path }) =>
+    path === "/api/session" ? json(200, member) : live.response,
+  );
+  const router = mount("/machines", fetcher);
+  live.send({
+    type: "snapshot",
+    head: 4,
+    machines: [card("lab box", "w1", true)],
+    requests: [
+      {
+        ...enrolmentRequest("mbp", REQUEST),
+        expires_at: new Date(Date.now() + 600_000).toISOString(),
+      },
+    ],
+  });
+  await screen.findByRole("region", { name: "lab box" });
+  const notice = await screen.findByRole("alert");
+  expect(within(notice).getByText("mbp wants to join")).toBeDefined();
+  expect(within(notice).getByText("K7QX-M2PD")).toBeDefined();
+  await userEvent.click(screen.getByRole("button", { name: "Enrol a machine" }));
+  expect(screen.getByText(`abc worker setup ${ORIGIN}`)).toBeDefined();
+  expect(screen.getByRole("button", { name: "Copy the setup command" })).toBeDefined();
+  await userEvent.click(within(notice).getByRole("link", { name: "Review request" }));
+  expect(router.state.location.pathname).toBe(`/machines/requests/${WORKSPACE}/${REQUEST}`);
+});
+
+test("a request that lapsed shows no notice", async () => {
+  const live = stream();
+  const { fetcher } = server(({ path }) =>
+    path === "/api/session" ? json(200, member) : live.response,
+  );
+  mount("/machines", fetcher);
+  live.send({
+    type: "snapshot",
+    head: 4,
+    machines: [card("lab box", "w1", true)],
+    requests: [enrolmentRequest("mbp", REQUEST)],
+  });
+  await screen.findByRole("region", { name: "lab box" });
+  expect(screen.queryByText("mbp wants to join")).toBeNull();
+});
+
+test("the Approve page shows who asks and the code, and Approve enrols", async () => {
+  const live = stream();
+  const base = `/api/workspaces/${WORKSPACE}/enrolment-requests/${REQUEST}`;
+  const { fetcher, requests } = server(({ method, path }) => {
+    if (path === "/api/session") {
+      return json(200, member);
+    }
+    if (path === base) {
+      return json(200, enrolmentRequest("mbp", REQUEST));
+    }
+    if (method === "POST" && path === `${base}/approve`) {
+      return new Response(null, { status: 204 });
+    }
+    return live.response;
+  });
+  mount(`/machines/requests/${WORKSPACE}/${REQUEST}`, fetcher);
+  await screen.findByRole("heading", { level: 1, name: "mbp wants to join" });
+  expect(screen.getByText("K7QX-M2PD")).toBeDefined();
+  expect(screen.getByText("alice@example.com")).toBeDefined();
+  expect(screen.getByText("alice-mbp.tail1234.ts.net")).toBeDefined();
+  expect(screen.getByText("macOS on ARM64")).toBeDefined();
+  expect(screen.getByText(/matches the code your terminal shows/)).toBeDefined();
+  await userEvent.click(screen.getByRole("button", { name: "Approve" }));
+  await screen.findByText("Approved");
+  expect(requests.some((entry) => entry.path === `${base}/approve`)).toBe(true);
+  expect(screen.getByRole("link", { name: "Back to Machines" })).toBeDefined();
+});
+
+test("the Approve page denies, and says when a request is not this workspace's", async () => {
+  const live = stream();
+  const base = `/api/workspaces/${WORKSPACE}/enrolment-requests`;
+  const { fetcher } = server(({ method, path }) => {
+    if (path === "/api/session") {
+      return json(200, member);
+    }
+    if (path === `${base}/${REQUEST}`) {
+      return json(200, enrolmentRequest("mbp", REQUEST));
+    }
+    if (method === "POST" && path === `${base}/${REQUEST}/deny`) {
+      return new Response(null, { status: 204 });
+    }
+    if (path.startsWith(base)) {
+      return refusal(404, "enrolment_request_unknown", "no such enrolment request");
+    }
+    return live.response;
+  });
+  mount(`/machines/requests/${WORKSPACE}/${REQUEST}`, fetcher);
+  await screen.findByRole("heading", { level: 1, name: "mbp wants to join" });
+  await userEvent.click(screen.getByRole("button", { name: "Deny" }));
+  await screen.findByText("Denied");
+  cleanup();
+  mount(`/machines/requests/${WORKSPACE}/0190f5a2-0000-7000-8000-0000000000cc`, fetcher);
+  await screen.findByRole("heading", { level: 1, name: "No such request" });
+  expect(screen.queryByRole("button", { name: "Try again" })).toBeNull();
+});
+
+test("the Approve page of another workspace's request asks nothing of the server", async () => {
+  const live = stream();
+  const { fetcher, requests } = server(({ path }) =>
+    path === "/api/session" ? json(200, member) : live.response,
+  );
+  mount(`/machines/requests/0190f5a2-0000-7000-8000-0000000000ff/${REQUEST}`, fetcher);
+  await screen.findByRole("heading", { level: 1, name: "No such request" });
+  expect(screen.getByText(/another workspace/)).toBeDefined();
+  expect(requests.some((entry) => entry.path.includes("enrolment-requests"))).toBe(false);
 });
