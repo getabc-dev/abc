@@ -59,7 +59,8 @@ impl TryFrom<Row> for Recorded {
     }
 }
 
-/// Every event in the log, in order.
+/// Every event in the log, in order: what replaying the views starts from.
+#[cfg(feature = "testing")]
 pub(crate) async fn all(conn: &mut PgConnection) -> Result<Vec<Recorded>, StoreError> {
     let rows = sqlx::query_as!(
         Row,

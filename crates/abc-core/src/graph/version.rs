@@ -15,7 +15,7 @@ use super::Graph;
 /// a change of the canonical form bumps.
 const DOMAIN: &[u8] = b"abc.graph.v1\n";
 
-/// The sha256 of a graph's canonical form: [`DOMAIN`], then the graph as compact JSON. The form
+/// The sha256 of a graph's canonical form: a fixed domain tag, then the graph as compact JSON. The form
 /// has no maps, no floats and no optional spacing, and its fields keep the order they are declared
 /// in (`graph/mod.rs`), so the same graph hashes the same on every build and machine. Any change
 /// to any step, name or edge changes the hash. A run pins one (decision 65).

@@ -419,7 +419,7 @@
       "type": "string"
     },
     "GraphVersion": {
-      "description": "The sha256 of a graph's canonical form: [`DOMAIN`], then the graph as compact JSON. The form\nhas no maps, no floats and no optional spacing, and its fields keep the order they are declared\nin (`graph/mod.rs`), so the same graph hashes the same on every build and machine. Any change\nto any step, name or edge changes the hash. A run pins one (decision 65).",
+      "description": "The sha256 of a graph's canonical form: a fixed domain tag, then the graph as compact JSON. The form\nhas no maps, no floats and no optional spacing, and its fields keep the order they are declared\nin (`graph/mod.rs`), so the same graph hashes the same on every build and machine. Any change\nto any step, name or edge changes the hash. A run pins one (decision 65).",
       "type": "string",
       "pattern": "^[0-9a-f]{64}$"
     },
