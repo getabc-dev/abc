@@ -381,13 +381,13 @@ mod tests {
         };
         let constraint = |refused: Result<sqlx::postgres::PgQueryResult, sqlx::Error>| {
             let error = refused.expect_err("the database refuses the lease");
-            let database = error.as_database_error().expect("a database error");
+            let violation = error.as_database_error().expect("a database error");
             assert_eq!(
-                database.code().as_deref(),
+                violation.code().as_deref(),
                 Some("23505"),
                 "a unique violation"
             );
-            database.constraint().map(str::to_owned)
+            violation.constraint().map(str::to_owned)
         };
         assert_eq!(
             constraint(live(one, spare_worker).await).as_deref(),
