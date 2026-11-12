@@ -863,10 +863,20 @@ fn check(
         sqlx: &|| tool("cargo-sqlx"),
     };
     let spec = || spec::Tools::pinned(tool);
+    // Both workspaces' test steps ask, and finding it can build the tree's own xtask: once.
+    let found = std::cell::RefCell::new(None::<PathBuf>);
+    let postgres_once = || -> anyhow::Result<PathBuf> {
+        if let Some(path) = found.borrow().as_ref() {
+            return Ok(path.clone());
+        }
+        let path = postgres_bin()?;
+        *found.borrow_mut() = Some(path.clone());
+        Ok(path)
+    };
     let tools = check::Tools {
         nextest: tool("cargo-nextest")?,
         shellcheck: tool("shellcheck")?,
-        postgres: postgres_bin,
+        postgres: &postgres_once,
         web: Some(web::Toolchain::pinned(tool)?),
         spec: Some(&spec),
     };
@@ -1208,6 +1218,32 @@ mod tests {
                 "the tree's own setup is missing, whatever xtask's home holds"
             );
         }
+        // `check` on a change that touches no crate runs no test, so the tree's Postgres is never
+        // asked for, and a tree without it still passes the check's other steps.
+        let asked = std::cell::Cell::new(0_u32);
+        let counting = |tree: &Path, name: &str| -> anyhow::Result<PathBuf> {
+            asked.set(asked.get().saturating_add(1));
+            missing(tree, name)
+        };
+        let checked = dispatch_with(
+            Task::Check {
+                changed: true,
+                wait_at_most: None,
+            },
+            &home,
+            &root,
+            &no_env,
+            &counting,
+        );
+        assert!(
+            !format!("{checked:?}").contains("is not set up"),
+            "no test ran: {checked:?}"
+        );
+        assert_eq!(
+            asked.get(),
+            0,
+            "check asked for the tests' tools: {checked:?}"
+        );
     }
 
     #[test]

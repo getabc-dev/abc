@@ -202,10 +202,12 @@ pub(crate) fn pinned_for_tests(name: &str) -> PathBuf {
 /// Models: node and pnpm as `web` runs them. Environment: pnpm needs node's directory first on
 /// `PATH`, as the real one does, and checks what `cargo xtask e2e` gives Playwright. Streams: it
 /// prints nothing and logs its arguments to a file. Exit codes: 0, or 1 for a call whose arguments
-/// hold `fail`. Its tests are those of every gate that uses it. pnpm logs each call's arguments to `dir/pnpm.log`, fails a call
-/// whose arguments contain `fail` (when it is not empty), refuses to run unless node's directory
-/// comes first on `PATH`, writes `web/dist/index.html` for the build and a Vitest lcov for the
-/// coverage run, and checks the environment `cargo xtask e2e` gives Playwright.
+/// hold `fail`. Its tests are those of every gate that uses it.
+///
+/// pnpm logs each call's arguments to `dir/pnpm.log`, fails a call whose arguments contain `fail`
+/// (when it is not empty), refuses to run unless node's directory comes first on `PATH`, writes
+/// `web/dist/index.html` for the build and a Vitest lcov for the coverage run, and checks the
+/// environment `cargo xtask e2e` gives Playwright.
 pub(crate) fn fake_web(dir: &Path, fail: &str) -> crate::web::Toolchain {
     fs::create_dir_all(dir).unwrap();
     script(&dir.join("node"), "exit 0\n");

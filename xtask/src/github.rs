@@ -198,6 +198,9 @@ pub(crate) struct OpenPull {
     pub(crate) title: String,
     /// The branch it comes from.
     pub(crate) branch: String,
+    /// The repository that branch is in, `owner/name`: a fork's for a fork's pull request; empty
+    /// when GitHub no longer has the fork.
+    pub(crate) head_repository: String,
 }
 
 /// Every open pull request, read through `page`. Fails on more than [`PULL_PAGES`] pages, which
@@ -228,6 +231,7 @@ pub(crate) fn open_pulls(
                         .with_context(|| format!("{path} lists a pull request with no number"))?,
                     title: text("/title"),
                     branch: text("/head/ref"),
+                    head_repository: text("/head/repo/full_name"),
                 });
             }
             Ok(batch.len())
@@ -479,7 +483,9 @@ mod tests {
         let mut asked = Vec::new();
         let pulls = super::open_pulls(&mut |path: &str| {
             asked.push(path.to_owned());
-            Ok(json!([{"number": 5, "title": "t", "head": {"ref": "agent/a"}}]))
+            Ok(
+                json!([{"number": 5, "title": "t", "head": {"ref": "agent/a", "repo": {"full_name": "o/r"}}}]),
+            )
         })
         .unwrap();
         assert_eq!(
@@ -487,7 +493,8 @@ mod tests {
             [super::OpenPull {
                 number: 5,
                 title: "t".to_owned(),
-                branch: "agent/a".to_owned()
+                branch: "agent/a".to_owned(),
+                head_repository: "o/r".to_owned()
             }]
         );
         assert_eq!(asked, ["pulls?state=open&per_page=100&page=1"]);

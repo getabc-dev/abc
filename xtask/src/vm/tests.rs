@@ -135,13 +135,18 @@ impl Backend for Fake {
         Ok(self.volumes.clone())
     }
 
-    /// Models `msb ls --format json` as the real msb answers it (`msb::tests::a_listing_means_the_same_to_the_fake_and_to_the_real_msb`): a list
-    /// of VMs, empty for none, with `--running` leaving out the stopped ones; the one VM here
-    /// runs. A failing msb is [`Msb`](super::msb::Msb)'s own test.
-    fn list(&self, _running_only: bool) -> anyhow::Result<Vec<Sandbox>> {
+    /// Models `msb ls --format json` as the real msb answers it
+    /// (`msb::tests::a_listing_means_the_same_to_the_fake_and_to_the_real_msb`): a list of VMs,
+    /// empty for none, and with `--running` only the running ones. The one VM here is `abc-w`,
+    /// running when [`Fake::running`] says so and stopped otherwise. A failing msb is
+    /// [`Msb`](super::msb::Msb)'s own test.
+    fn list(&self, running_only: bool) -> anyhow::Result<Vec<Sandbox>> {
+        if running_only && !self.running {
+            return Ok(Vec::new());
+        }
         Ok(vec![Sandbox {
             name: "abc-w".to_owned(),
-            status: "Running".to_owned(),
+            status: if self.running { "Running" } else { "Stopped" }.to_owned(),
         }])
     }
 
@@ -712,7 +717,19 @@ fn shells_auths_syncs_lists_and_stops() {
         &FakeServices::default(),
         Action::Ls { json: false },
     );
-    assert_eq!(listed.stdout, "abc-w\tRunning\n");
+    assert_eq!(listed.stdout, "abc-w\tStopped\n", "this VM is not running");
+    let running = Fake {
+        running: true,
+        ..Fake::default()
+    };
+    assert_eq!(
+        running.list(true).unwrap(),
+        [Sandbox {
+            name: "abc-w".to_owned(),
+            status: "Running".to_owned()
+        }]
+    );
+    assert_eq!(backend.list(true).unwrap(), [], "--running leaves it out");
     assert_eq!(listed.stderr, "", "no message beside the listing");
     let json = act_streams(
         &world,
@@ -724,7 +741,7 @@ fn shells_auths_syncs_lists_and_stops() {
         serde_json::from_str::<Vec<Sandbox>>(&json.stdout).unwrap(),
         [Sandbox {
             name: "abc-w".to_owned(),
-            status: "Running".to_owned()
+            status: "Stopped".to_owned()
         }],
         "JSON on stdout"
     );

@@ -262,15 +262,18 @@ fn opens_through_the_rest_api() {
 
 /// GitHub's replies about the open pull requests: #11 (from `agent/a`) changes `src/t.rs` and
 /// `docs/a.md`, #12 (from `agent/x`, the branch itself) changes `src/t.rs`, #13 (from `agent/c`)
-/// changes `README.md` alone, and #14 (from `agent/d`) renamed `old.rs` to `src/t.rs`.
+/// changes `README.md` alone, #14 (from `agent/d`) renamed `old.rs` to `src/t.rs`, and #15 (from
+/// a fork's own `agent/x`) changes `src/t.rs`.
 fn open_pulls(request: &Request) -> anyhow::Result<Value> {
     Ok(match request.path.as_str() {
         "/repos/o/r/pulls?state=open&per_page=100&page=1" => json!([
-            {"number": 11, "title": "fix t", "head": {"ref": "agent/a"}},
-            {"number": 12, "title": "this one", "head": {"ref": "agent/x"}},
-            {"number": 13, "title": "docs", "head": {"ref": "agent/c"}},
-            {"number": 14, "title": "move", "head": {"ref": "agent/d"}},
+            {"number": 11, "title": "fix t", "head": {"ref": "agent/a", "repo": {"full_name": "o/r"}}},
+            {"number": 12, "title": "this one", "head": {"ref": "agent/x", "repo": {"full_name": "o/r"}}},
+            {"number": 13, "title": "docs", "head": {"ref": "agent/c", "repo": {"full_name": "o/r"}}},
+            {"number": 14, "title": "move", "head": {"ref": "agent/d", "repo": {"full_name": "o/r"}}},
+            {"number": 15, "title": "fork", "head": {"ref": "agent/x", "repo": {"full_name": "someone/r"}}},
         ]),
+        "/repos/o/r/pulls/15/files?per_page=100&page=1" => json!([{"filename": "src/t.rs"}]),
         "/repos/o/r/pulls/11/files?per_page=100&page=1" => json!([
             {"filename": "src/t.rs"}, {"filename": "docs/a.md"}
         ]),
@@ -325,6 +328,10 @@ fn opening_lists_the_open_pull_requests_that_change_the_same_files() {
         "the branch's own pull request is not listed: {out}"
     );
     assert!(!out.contains("#13"), "no shared file, no warning: {out}");
+    assert!(
+        out.contains("open #15 (fork, agent/x)"),
+        "a fork's branch of the same name is another pull request: {out}"
+    );
     assert!(out.contains("merge main once it is in"), "{out}");
     assert!(
         out.ends_with("pr: opened #31 https://github.com/o/r/pull/31\n"),

@@ -166,10 +166,10 @@ code running the tree's tests, so it opens no new trust boundary.
   and the environment the gates give the tests (`ABC_TEST_POSTGRES_BIN`). A change to it must work
   in both directions: the base's xtask judging the new tree, and the new xtask judging a tree
   that still has the old one. If it cannot, the PR names the open PRs that must merge main first
-  (as #56 did for #47 and #48). A change to xtask is tried as the next judge before it merges:
-  from a separate checkout of it, `cargo xtask coverage --root <tree> --base <rev>` and
-  `cargo xtask mutants --root <tree> --baseline-only` on the tree, as CI's "Next gate" job runs
-  them.
+  (as #56 did for #47 and #48). A change to xtask should be tried as the next judge before it
+  merges, from a separate checkout of it: `cargo xtask coverage --root <tree> --base <rev>` and
+  `cargo xtask mutants --root <tree> --baseline-only` on the tree. CI's "Next gate" job will run
+  them (a workflow, so the maintainer's PR; until it lands, run them by hand when xtask changes).
 - **G2 · A defect on main that fails a gate on any branch gets its own PR first.** The branches
   that meet it merge main once it is in, and none carries its own copy of the fix, so no two
   branches fix it twice. `cargo xtask pr open` and `pr update` list the open PRs that change the

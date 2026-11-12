@@ -540,7 +540,9 @@ fn list_overlaps(
 ) -> anyhow::Result<()> {
     let mut page = |path: &str| github::get(send, repo.path(path));
     for pull in github::open_pulls(&mut page)? {
-        if pull.branch == branch {
+        // This branch's own pull request, which a fork's branch of the same name is not.
+        if pull.branch == branch && pull.head_repository == format!("{}/{}", repo.owner, repo.name)
+        {
             continue;
         }
         let shared: Vec<String> = github::pull_files(pull.number, &mut page)?

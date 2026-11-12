@@ -294,12 +294,12 @@ impl Run<'_> {
         }
         writeln!(
             out,
-            "xtask: mutating the changed Rust code{}, in copies of it",
-            if self.workspace.dir().is_empty() {
-                String::new()
-            } else {
-                format!(" of {}/", self.workspace.dir())
-            }
+            "xtask: {}{}, in copies of it",
+            match selection {
+                Selection::Diff(_) => "mutating the changed Rust code",
+                Selection::Baseline => "running the unmutated tests",
+            },
+            self.label()
         )?;
         // cargo-mutants copies the tree, once per job, into the temporary directory and builds
         // each copy there. That directory is small in an agent VM, where the build output has the
@@ -380,13 +380,31 @@ impl Run<'_> {
         let result = outcome(status.code())?;
         scratch.remove()?;
         if let Selection::Baseline = selection {
-            return self.baseline_passed(out);
+            return self.baseline_passed(&results, out);
         }
         self.report(&results, result, step, out)
     }
 
-    /// The report of a baseline-only run whose unmutated tests passed.
-    fn baseline_passed(&self, out: &mut impl Write) -> anyhow::Result<Report> {
+    /// The report of a baseline-only run that cargo-mutants ended well, once its `results` say it
+    /// ran the unmutated tests: with no mutant to test it runs none and still ends well.
+    fn baseline_passed(&self, results: &Path, out: &mut impl Write) -> anyhow::Result<Report> {
+        let outcomes = fs::read_to_string(results.join("outcomes.json")).with_context(|| {
+            format!(
+                "cargo-mutants wrote no outcomes{}, so it ran no tests",
+                self.label()
+            )
+        })?;
+        let outcomes: serde_json::Value = serde_json::from_str(&outcomes)
+            .with_context(|| format!("cargo-mutants' outcomes{} are not JSON", self.label()))?;
+        ensure!(
+            outcomes["outcomes"]
+                .as_array()
+                .is_some_and(|all| all.iter().any(|outcome| {
+                    outcome["scenario"] == "Baseline" && outcome["summary"] == "Success"
+                })),
+            "cargo-mutants ran no passing baseline{}",
+            self.label()
+        );
         writeln!(
             out,
             "mutants: the tests pass in the unmutated copy{}",
@@ -407,7 +425,7 @@ impl Run<'_> {
         }
     }
 
-    /// A regular expression matching the first mutant of the workspace, as `--list` names it.
+    /// A regular expression matching the first mutant of the workspace alone, as `--list` names it.
     fn first_mutant(&self) -> anyhow::Result<String> {
         let mut command = Command::new(&self.tools.mutants);
         command.args(["mutants", "--list", "--colors", "never"]);
@@ -435,7 +453,7 @@ impl Run<'_> {
                     self.label()
                 )
             })?;
-        Ok(escape_regex(first))
+        Ok(format!("^{}$", escape_regex(first)))
     }
 
     /// Reads the results cargo-mutants wrote in `results` and reports them, with its `result`;
@@ -1022,8 +1040,14 @@ mod tests {
         );
     }
 
-    /// A fake cargo-mutants that lists two mutants, records how it was run, and ends with `code`.
-    fn baseline_fake(dir: &Path, code: i32) -> (std::path::PathBuf, std::path::PathBuf) {
+    /// A fake cargo-mutants that lists two mutants, records how it was run, and ends with `code`,
+    /// writing the outcomes of a passing baseline unless `outcomes` is empty, as cargo-mutants
+    /// does when it ran the tests.
+    fn baseline_fake(
+        dir: &Path,
+        code: i32,
+        outcomes: &str,
+    ) -> (std::path::PathBuf, std::path::PathBuf) {
         let mutants = dir.join("cargo-mutants");
         let args = dir.join("args");
         script(
@@ -1034,6 +1058,7 @@ mod tests {
                  while [ $# -gt 0 ]; do case \"$1\" in --output) out=$2 ;; esac; shift; done\n\
                  mkdir -p \"$out/mutants.out\"\n\
                  echo 'src/a.rs:1:18: replace a -> bool with true' > \"$out/mutants.out/missed.txt\"\n\
+                 [ -z '{outcomes}' ] || echo '{outcomes}' > \"$out/mutants.out/outcomes.json\"\n\
                  exit {code}\n",
                 args.display()
             ),
@@ -1041,12 +1066,15 @@ mod tests {
         (mutants, args)
     }
 
+    /// What cargo-mutants writes to `outcomes.json` for a baseline that passed.
+    const PASSING_BASELINE: &str = r#"{"outcomes":[{"scenario":"Baseline","summary":"Success"}]}"#;
+
     #[test]
     fn a_baseline_only_run_tests_one_mutant_of_each_workspace_and_ignores_its_verdict() {
         let temp = tempfile::tempdir().unwrap();
         // No Rust line changed: a baseline-only run needs no diff, no base and no change.
         let repo = repository_with_change(&temp.path().join("repo"), &[("README.md", "# x\n")]);
-        let (mutants, args) = baseline_fake(temp.path(), 2);
+        let (mutants, args) = baseline_fake(temp.path(), 2, PASSING_BASELINE);
         let mut out = Vec::new();
         let report = super::run(
             &repo,
@@ -1066,7 +1094,7 @@ mod tests {
         let args = fs::read_to_string(args).unwrap();
         assert!(!args.contains("--in-diff"), "{args}");
         assert!(
-            args.contains(r"-F src/a\.rs:1:18: replace a -> bool with true"),
+            args.contains(r"-F ^src/a\.rs:1:18: replace a -> bool with true$"),
             "the first listed mutant alone: {args}"
         );
         assert!(!args.contains("--shard"), "{args}");
@@ -1076,7 +1104,7 @@ mod tests {
     fn a_baseline_only_run_fails_when_the_unmutated_tests_fail() {
         let temp = tempfile::tempdir().unwrap();
         let repo = repository_with_change(&temp.path().join("repo"), &[("README.md", "# x\n")]);
-        let (mutants, _) = baseline_fake(temp.path(), 4);
+        let (mutants, _) = baseline_fake(temp.path(), 4, "");
         let error = super::run(
             &repo,
             None,
@@ -1087,6 +1115,34 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(error.contains("fail without any mutation"), "{error}");
+    }
+
+    #[test]
+    fn a_baseline_only_run_needs_proof_that_the_tests_ran() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = repository_with_change(&temp.path().join("repo"), &[("README.md", "# x\n")]);
+        let ran = |outcomes: &str| {
+            let dir = tempfile::tempdir().unwrap();
+            let (mutants, _) = baseline_fake(dir.path(), 0, outcomes);
+            format!(
+                "{:#}",
+                super::run(
+                    &repo,
+                    None,
+                    &TWO,
+                    &tools(&mutants, &temp.path().join("cargo-nextest"), &no_web()),
+                    &mut Vec::new(),
+                )
+                .unwrap_err()
+            )
+        };
+        assert!(ran("").contains("wrote no outcomes, so it ran no tests"));
+        let garbled = ran("not json");
+        assert!(garbled.contains("outcomes are not JSON"), "{garbled}");
+        let failed = ran(r#"{"outcomes":[{"scenario":"Baseline","summary":"Failure"}]}"#);
+        assert!(failed.contains("ran no passing baseline"), "{failed}");
+        let none = ran(r#"{"outcomes":[]}"#);
+        assert!(none.contains("ran no passing baseline"), "{none}");
     }
 
     #[test]

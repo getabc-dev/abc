@@ -296,7 +296,18 @@ fn installs_test_tools(workflows: &[(String, String)]) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Fails when a `run:` step of `workflows` names `.tools/`: the pinned tools' paths come from
+/// Whether `script` names the `.tools` directory as a path component: `.tools/x`, `cd .tools`,
+/// `$PWD/.tools`, but not `example.tools` or `.toolshed`.
+fn names_tools_directory(script: &str) -> bool {
+    script.match_indices(".tools").any(|(at, name)| {
+        let word = |character: char| character.is_alphanumeric() || "_-.".contains(character);
+        let before = script[..at].chars().next_back();
+        let after = script[at.saturating_add(name.len())..].chars().next();
+        !before.is_some_and(word) && !after.is_some_and(word)
+    })
+}
+
+/// Fails when a `run:` step of `workflows` names the `.tools` directory: the pinned tools' paths come from
 /// `cargo xtask tool` and `cargo xtask test-tool` alone, never from a path built in shell, which
 /// duplicates xtask's layout and was wrong once (a relative `ABC_TEST_POSTGRES_BIN`, in
 /// `tailscale.yml`, that only a labelled run exercised).
@@ -304,7 +315,7 @@ fn names_no_tool_path(workflows: &[(String, String)]) -> anyhow::Result<()> {
     let mut found = Vec::new();
     for (file, text) in workflows {
         for (id, runs) in run_scripts(file, text)? {
-            if runs.iter().any(|run| run.contains(".tools/")) {
+            if runs.iter().any(|run| names_tools_directory(run)) {
                 found.push(format!("{file}: job {id}"));
             }
         }
@@ -810,6 +821,24 @@ mod tests {
         ))
         .unwrap();
         names_no_tool_path(&[("c.yml".to_owned(), "on: [push]\n".to_owned())]).unwrap();
+        for hand_built in [
+            "cd .tools && ls",
+            "B=$PWD/.tools; find $B/postgresql",
+            "ls \"${HOME}/.tools\"",
+            "ls ./.tools/",
+        ] {
+            assert!(
+                names_no_tool_path(&job(&format!("'{hand_built}'"))).is_err(),
+                "{hand_built}"
+            );
+        }
+        for fine in [
+            "curl https://example.tools/x",
+            "ls .toolshed",
+            "echo my.tools-list",
+        ] {
+            names_no_tool_path(&job(&format!("'{fine}'"))).unwrap();
+        }
     }
 
     #[test]
