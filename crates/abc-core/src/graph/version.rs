@@ -62,12 +62,12 @@ impl GraphVersion {
     ///
     /// Returns [`InvalidGraphVersion`] unless it is 64 lowercase hexadecimal characters.
     pub fn parse(text: &str) -> Result<Self, InvalidGraphVersion> {
-        let bytes = HEXLOWER
+        HEXLOWER
             .decode(text.as_bytes())
-            .map_err(|_| InvalidGraphVersion)?;
-        <[u8; 32]>::try_from(bytes.as_slice())
+            .ok()
+            .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
             .map(Self)
-            .map_err(|_| InvalidGraphVersion)
+            .ok_or(InvalidGraphVersion)
     }
 }
 
@@ -134,20 +134,34 @@ mod tests {
         );
     }
 
+    /// The base graph with its middle step changed.
+    fn edit(change: fn(&mut crate::graph::Step)) -> Graph {
+        let mut steps: Vec<_> = base().steps().to_vec();
+        change(&mut steps[1]);
+        let mut b = builder();
+        for step in &steps {
+            b = b.step(step.clone());
+        }
+        b.edge(id("a"), id("b"))
+            .edge(id("b"), id("c"))
+            .build()
+            .unwrap()
+    }
+
+    /// The base graph's steps under another name.
+    fn renamed() -> Graph {
+        let mut b = GraphBuilder::new(crate::graph::GraphName::parse("other").unwrap());
+        for step in base().steps() {
+            b = b.step(step.clone());
+        }
+        b.edge(id("a"), id("b"))
+            .edge(id("b"), id("c"))
+            .build()
+            .unwrap()
+    }
+
     /// Every way to change one step, or the graph around it.
     fn changed() -> Vec<(&'static str, Graph)> {
-        let edit = |change: fn(&mut crate::graph::Step)| {
-            let mut steps: Vec<_> = base().steps().to_vec();
-            change(&mut steps[1]);
-            let mut b = builder();
-            for step in &steps {
-                b = b.step(step.clone());
-            }
-            b.edge(id("a"), id("b"))
-                .edge(id("b"), id("c"))
-                .build()
-                .unwrap()
-        };
         vec![
             (
                 "kind",
@@ -230,16 +244,7 @@ mod tests {
                     .build()
                     .unwrap(),
             ),
-            ("name", {
-                let mut b = GraphBuilder::new(crate::graph::GraphName::parse("other").unwrap());
-                for step in base().steps() {
-                    b = b.step(step.clone());
-                }
-                b.edge(id("a"), id("b"))
-                    .edge(id("b"), id("c"))
-                    .build()
-                    .unwrap()
-            }),
+            ("name", renamed()),
         ]
     }
 

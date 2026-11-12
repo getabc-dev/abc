@@ -266,12 +266,12 @@ impl Load for EndSession {
 impl Executable for StartRun {}
 impl Load for StartRun {
     /// Nothing: a run starts on the workspace and the graph the command names.
-    async fn load(
-        &self,
-        _conn: &mut PgConnection,
-        _principal: &Principal,
-    ) -> Result<(), StoreError> {
-        Ok(())
+    fn load<'c>(
+        &'c self,
+        _conn: &'c mut PgConnection,
+        _principal: &'c Principal,
+    ) -> impl Future<Output = Result<(), StoreError>> + Send + 'c {
+        std::future::ready(Ok(()))
     }
 }
 

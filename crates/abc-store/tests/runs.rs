@@ -49,7 +49,7 @@ mod tests {
     /// A claimed server with `workers` enrolled workers that each have a session open.
     async fn world(fixture: &Fixture, workspace: WorkspaceId, workers: usize) -> Vec<WorkerId> {
         let mut ids = Vec::new();
-        for n in 0..workers {
+        for session in (1000_u128..).take(workers) {
             let issued = fixture.issue_token(workspace).await;
             let key = fixture.worker_key();
             let enrolled = fixture.enrol(&issued.token, &key).await.unwrap();
@@ -59,7 +59,7 @@ mod tests {
                     &Fixture::worker(&key),
                     &fixture.origin(),
                     StartSession {
-                        session: SessionId::from_uuid(uuid::Uuid::from_u128(1000 + n as u128)),
+                        session: SessionId::from_uuid(uuid::Uuid::from_u128(session)),
                         build: Version::new(0, 1, 0),
                     },
                 )
@@ -105,6 +105,23 @@ mod tests {
         }
     }
 
+    async fn apply(
+        fixture: &Fixture,
+        run: RunId,
+        lease: LeaseId,
+        result: StepResult,
+    ) -> ResultFate {
+        fixture
+            .store
+            .execute(
+                &Caller::Server,
+                &fixture.origin(),
+                ApplyResult { run, lease, result },
+            )
+            .await
+            .unwrap()
+    }
+
     async fn history(fixture: &Fixture, run: RunId) -> Vec<RunEvent> {
         fixture
             .store
@@ -114,7 +131,11 @@ mod tests {
             .into_iter()
             .map(|recorded| match recorded.event {
                 Event::Run(event) => event,
-                other => panic!("{other:?} is not a run event"),
+                other @ (Event::Installation(_)
+                | Event::Person(_)
+                | Event::Workspace(_)
+                | Event::Enrolment(_)
+                | Event::Worker(_)) => panic!("{other:?} is not a run event"),
             })
             .collect()
     }
@@ -135,6 +156,47 @@ mod tests {
         })
     }
 
+    /// What the `run` and `run_lease` views hold after the life in the test above.
+    async fn check_views(pool: &sqlx::PgPool, run: RunId, owner: abc_core::id::PersonId) {
+        let row = sqlx::query!(
+            "SELECT graph, epoch, live_lease, last_answer, started_by FROM run WHERE id = $1",
+            run.as_uuid()
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            row.graph,
+            graph().as_bytes().to_vec(),
+            "the view pins the graph"
+        );
+        assert_eq!(row.epoch, 2, "two results were applied");
+        assert_eq!(row.live_lease, None, "no lease is out");
+        assert_eq!(row.last_answer.as_deref(), Some("accept"), "the answer");
+        assert_eq!(row.started_by, owner.as_uuid(), "a person started it (I4)");
+        let leases = sqlx::query!(
+            "SELECT id, ended, epoch FROM run_lease WHERE run_id = $1 ORDER BY granted_at, id",
+            run.as_uuid()
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap();
+        let ended: Vec<(&str, i32)> = leases
+            .iter()
+            .map(|lease| (lease.ended.as_deref().unwrap(), lease.epoch))
+            .collect();
+        assert_eq!(
+            ended.iter().filter(|(how, _)| *how == "applied").count(),
+            2,
+            "two leases ended by their result"
+        );
+        assert_eq!(
+            ended.iter().filter(|(how, _)| *how == "expired").count(),
+            1,
+            "one by expiry"
+        );
+    }
+
     #[tokio::test]
     async fn a_runs_life_is_written_read_and_replayed() {
         let database = TestDatabase::migrated().await;
@@ -145,70 +207,34 @@ mod tests {
 
         let first = grant(&fixture, run, workers[0]).await.unwrap();
         let expire = ExpireLease { run, lease: first };
-        fixture
-            .store
-            .execute(&Caller::Server, &fixture.origin(), expire)
-            .await
-            .unwrap();
-        fixture
-            .store
-            .execute(&Caller::Server, &fixture.origin(), expire)
-            .await
-            .unwrap();
+        for _ in 0..2 {
+            fixture
+                .store
+                .execute(&Caller::Server, &fixture.origin(), expire)
+                .await
+                .unwrap();
+        }
         let second = grant(&fixture, run, workers[1]).await.unwrap();
-        let apply = |lease, result| ApplyResult { run, lease, result };
-        let made = fixture
-            .store
-            .execute(
-                &Caller::Server,
-                &fixture.origin(),
-                apply(second, StepResult::Made),
-            )
-            .await
-            .unwrap();
+        let made = apply(&fixture, run, second, StepResult::Made).await;
         assert_eq!(
             made,
             ResultFate::Applied,
             "a live lease's result is applied"
         );
-        let late = fixture
-            .store
-            .execute(
-                &Caller::Server,
-                &fixture.origin(),
-                apply(first, judged(Verdict::Pass)),
-            )
-            .await
-            .unwrap();
+        let late = apply(&fixture, run, first, judged(Verdict::Pass)).await;
         assert_eq!(
             late,
             ResultFate::Discarded,
             "an expired lease's result is not"
         );
         let third = grant(&fixture, run, workers[0]).await.unwrap();
-        let sent_again = fixture
-            .store
-            .execute(
-                &Caller::Server,
-                &fixture.origin(),
-                apply(second, StepResult::Made),
-            )
-            .await
-            .unwrap();
+        let again = apply(&fixture, run, second, StepResult::Made).await;
         assert_eq!(
-            sent_again,
+            again,
             ResultFate::Discarded,
             "a result sent twice is applied once"
         );
-        fixture
-            .store
-            .execute(
-                &Caller::Server,
-                &fixture.origin(),
-                apply(third, judged(Verdict::Escalate)),
-            )
-            .await
-            .unwrap();
+        apply(&fixture, run, third, judged(Verdict::Escalate)).await;
         fixture
             .store
             .execute(
@@ -255,47 +281,7 @@ mod tests {
             "the run's stream is its history, in order, and decodes to what was written"
         );
 
-        let row = sqlx::query!(
-            "SELECT graph, epoch, live_lease, last_answer, started_by FROM run WHERE id = $1",
-            run.as_uuid()
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert_eq!(
-            row.graph,
-            graph().as_bytes().to_vec(),
-            "the view pins the graph"
-        );
-        assert_eq!(row.epoch, 2, "two results were applied");
-        assert_eq!(row.live_lease, None, "no lease is out");
-        assert_eq!(row.last_answer.as_deref(), Some("accept"), "the answer");
-        assert_eq!(
-            row.started_by,
-            claimed.owner.as_uuid(),
-            "a person started it (I4)"
-        );
-        let leases = sqlx::query!(
-            "SELECT id, ended, epoch FROM run_lease WHERE run_id = $1 ORDER BY granted_at, id",
-            run.as_uuid()
-        )
-        .fetch_all(&pool)
-        .await
-        .unwrap();
-        let ended: Vec<(&str, i32)> = leases
-            .iter()
-            .map(|lease| (lease.ended.as_deref().unwrap(), lease.epoch))
-            .collect();
-        assert_eq!(
-            ended.iter().filter(|(how, _)| *how == "applied").count(),
-            2,
-            "two leases ended by their result"
-        );
-        assert_eq!(
-            ended.iter().filter(|(how, _)| *how == "expired").count(),
-            1,
-            "one by expiry"
-        );
+        check_views(&pool, run, claimed.owner).await;
         assert_views_replay(&pool).await;
     }
 

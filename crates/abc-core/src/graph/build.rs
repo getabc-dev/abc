@@ -461,8 +461,10 @@ pub(crate) mod tests {
         assert!(serde_json::from_value::<Graph>(empty).is_err(), "no steps");
     }
 
-    fn arbitrary_edges()
-    -> impl Strategy<Value = (usize, Vec<(usize, usize)>, Vec<(usize, usize, u32)>)> {
+    /// A step count, forward edges and back edges (with bounds), as indexes.
+    type Wiring = (usize, Vec<(usize, usize)>, Vec<(usize, usize, u32)>);
+
+    fn arbitrary_edges() -> impl Strategy<Value = Wiring> {
         (1_usize..6).prop_flat_map(|n| {
             (
                 Just(n),
