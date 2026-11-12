@@ -397,8 +397,8 @@ impl Backend for Local {
         self.fake.volumes()
     }
 
-    fn list(&self) -> anyhow::Result<String> {
-        self.fake.list()
+    fn list(&self, running_only: bool) -> anyhow::Result<Vec<super::super::Sandbox>> {
+        self.fake.list(running_only)
     }
 
     fn load_image(&self, archive: &mut dyn Read, tag: &str) -> anyhow::Result<()> {
@@ -981,6 +981,19 @@ fn one_run_is_active_and_the_queue_starts_the_rest_in_order() {
     );
     assert!(queue.contains(&format!("\n1\t{}\t", all[1].id)), "{queue}");
 
+    let streams = super::super::tests::act_streams(
+        &world,
+        &local.fake,
+        &services,
+        Action::Runs { json: true },
+    );
+    streams.result.unwrap();
+    assert_eq!(streams.stderr, "", "nothing but the JSON is said");
+    assert!(
+        serde_json::from_str::<Vec<Run>>(&streams.stdout).is_ok(),
+        "stdout holds the JSON alone: {}",
+        streams.stdout
+    );
     let listed = act(Action::Runs { json: false }).unwrap();
     assert!(listed.contains("\tqueued\t0 attempts\t"), "{listed}");
     assert!(
@@ -1475,16 +1488,18 @@ fn runs_are_none_before_the_first_and_a_runs_directory_that_cannot_be_read_is_an
     );
     std::fs::write(dir.path().join("runs"), "a file").unwrap();
     missing.list().unwrap_err();
-    let mut out = Vec::new();
+    let (mut out, mut data) = (Vec::new(), Vec::new());
     super::list(
         &Runs {
             dir: dir.path().join("none"),
         },
         false,
+        &mut data,
         &mut out,
     )
     .unwrap();
     assert_eq!(String::from_utf8(out).unwrap(), "vm runs: none\n");
+    assert_eq!(data, b"", "a message is not data");
 }
 
 #[test]
@@ -1879,12 +1894,27 @@ fn a_state_that_cannot_be_read_is_shown_and_holds_up_no_queue() {
     let started = super::start_next(&all, &services, MORNING).unwrap();
     assert_eq!(started.len(), 1);
     assert_eq!(started[0].id, queued.id);
-    let mut out = Vec::new();
-    super::list(&all, false, &mut out).unwrap();
+    let (mut out, mut data) = (Vec::new(), Vec::new());
+    super::list(&all, false, &mut data, &mut out).unwrap();
     let listed = String::from_utf8(out).unwrap();
     assert!(
-        listed.contains(&format!("{}\tunreadable: ", broken.id)),
+        listed.contains(&format!("vm runs: {}: unreadable: ", broken.id)),
         "{listed}"
+    );
+    assert!(
+        !String::from_utf8(data).unwrap().contains(&broken.id),
+        "an unreadable run is a message, not a row"
+    );
+    // The same with --json: the readable runs alone, as a JSON array, on stdout.
+    let (mut out, mut data) = (Vec::new(), Vec::new());
+    super::list(&all, true, &mut data, &mut out).unwrap();
+    let shown: Vec<Run> = serde_json::from_slice(&data).unwrap();
+    assert_eq!(shown.len(), 1, "{shown:?}");
+    assert!(
+        String::from_utf8(out)
+            .unwrap()
+            .contains(&format!("vm runs: {}: unreadable: ", broken.id)),
+        "said beside the JSON, not in it"
     );
 }
 
@@ -1962,10 +1992,13 @@ fn unavailable_errors_dates_and_sizes_are_read_exactly() {
     };
     std::fs::create_dir_all(runs.dir.join("broken")).unwrap();
     std::fs::write(runs.dir.join("broken/state.json"), "{").unwrap();
-    let mut out = Vec::new();
-    super::list(&runs, false, &mut out).unwrap();
+    let (mut out, mut data) = (Vec::new(), Vec::new());
+    super::list(&runs, false, &mut data, &mut out).unwrap();
     let listed = String::from_utf8(out).unwrap();
-    assert!(listed.starts_with("broken\tunreadable: "), "{listed}");
+    assert!(
+        listed.starts_with("vm runs: broken: unreadable: "),
+        "{listed}"
+    );
     assert!(!listed.contains("vm runs: none"), "{listed}");
 }
 

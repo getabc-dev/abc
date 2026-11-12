@@ -1028,7 +1028,15 @@ fn run_vm(
     vm::require_kvm(host.os, Path::new("/dev/kvm"))?;
     let msb = vm::microsandbox(tools::pinned(repo, "msb")?, &home, env)?;
     let services = vm::runs::service::Manager::of(host.os, &home, &host.runs, env)?;
-    vm::run(action, &host, &msb, &services, env, report)
+    vm::run(
+        action,
+        &host,
+        &msb,
+        &services,
+        env,
+        report,
+        &mut io::stdout(),
+    )
 }
 
 /// The repository root: the checkout xtask was built from, the directory around xtask's own,
@@ -1545,7 +1553,13 @@ mod tests {
         );
         let linked_error = format!(
             "{:#}",
-            dispatch(vm(crate::vm::Action::Ls), &linked, &linked, &clean).unwrap_err()
+            dispatch(
+                vm(crate::vm::Action::Ls { json: false }),
+                &linked,
+                &linked,
+                &clean
+            )
+            .unwrap_err()
         );
         assert!(
             linked_error.contains("run it from the main clone"),
@@ -1553,7 +1567,13 @@ mod tests {
         );
         let no_home = format!(
             "{:#}",
-            dispatch(vm(crate::vm::Action::Ls), &main, &main, &clean).unwrap_err()
+            dispatch(
+                vm(crate::vm::Action::Ls { json: false }),
+                &main,
+                &main,
+                &clean
+            )
+            .unwrap_err()
         );
         assert_eq!(no_home, "HOME is not set");
     }

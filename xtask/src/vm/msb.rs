@@ -9,7 +9,7 @@ use std::process::{Command, ExitStatus, Output, Stdio};
 
 use anyhow::{Context as _, ensure};
 
-use super::{Backend, Spec};
+use super::{Backend, Sandbox, Spec};
 
 /// microsandbox, as installed by `cargo xtask setup`.
 pub(crate) struct Msb {
@@ -96,10 +96,7 @@ pub(crate) fn run_args(spec: &Spec) -> Vec<OsString> {
 
 impl Backend for Msb {
     fn is_running(&self, name: &str) -> anyhow::Result<bool> {
-        let listing = self.succeed(&["ls".into(), "--running".into()])?;
-        Ok(listing
-            .lines()
-            .any(|line| line.split_whitespace().next() == Some(name)))
+        Ok(self.list(true)?.iter().any(|sandbox| sandbox.name == name))
     }
 
     fn start(&self, spec: &Spec) -> anyhow::Result<()> {
@@ -250,8 +247,16 @@ impl Backend for Msb {
         Ok(volumes)
     }
 
-    fn list(&self) -> anyhow::Result<String> {
-        self.succeed(&["ls".into()])
+    /// `msb ls --format json`: its human listing goes to stderr, where a script cannot read it,
+    /// and its JSON to stdout.
+    fn list(&self, running_only: bool) -> anyhow::Result<Vec<Sandbox>> {
+        let mut args: Vec<OsString> = ["ls", "--format", "json"].map(OsString::from).into();
+        if running_only {
+            args.push("--running".into());
+        }
+        let listing = self.succeed(&args)?;
+        serde_json::from_str(&listing)
+            .with_context(|| format!("msb ls --format json answered something else: {listing}"))
     }
 
     fn load_image(&self, archive: &mut dyn Read, tag: &str) -> anyhow::Result<()> {
@@ -305,6 +310,7 @@ mod tests {
 
     use super::{Msb, home, run_args};
     use crate::testing::script;
+    use crate::vm::Sandbox;
     use crate::vm::{Backend, Spec, Volume};
 
     fn spec() -> Spec {
@@ -378,7 +384,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let msb = fake(
             dir.path(),
-            "case $1 in\n  ls) printf 'NAME IMAGE STATUS\\nabc-w img running\\n' ;;\n  exec) cat; echo \" out\"; echo err >&2; exit 3 ;;\nesac\n",
+            "case $1 in\n  ls) echo 'a table, as a person reads it' >&2; echo '[{\"name\":\"abc-w\",\"status\":\"Running\",\"image\":\"img\"}]' ;;\n  exec) cat; echo \" out\"; echo err >&2; exit 3 ;;\nesac\n",
         );
         assert!(msb.is_running("abc-w").unwrap());
         assert!(!msb.is_running("abc").unwrap(), "whole names only");
@@ -389,7 +395,14 @@ mod tests {
         assert_eq!(String::from_utf8(output.stderr).unwrap(), "err\n");
         assert_eq!(output.status.code(), Some(3));
         msb.start(&spec()).unwrap();
-        assert!(msb.list().unwrap().contains("abc-w"));
+        assert_eq!(
+            msb.list(false).unwrap(),
+            [Sandbox {
+                name: "abc-w".to_owned(),
+                status: "Running".to_owned()
+            }],
+            "the JSON on stdout, and the fields xtask does not read left out"
+        );
         let home = dir.path().join("home");
         let log = log(dir.path());
         assert!(
@@ -404,11 +417,57 @@ mod tests {
         assert!(!log.contains("secret-in"), "stdin is not an argument");
     }
 
+    /// What `msb ls` does, which the fake of it in [`fake`] and the backend fake in `vm/tests.rs`
+    /// both model, checked against the pinned msb itself: with no VM, `ls` ends with 0 and says
+    /// "No sandboxes found." on stderr, where a human listing goes, and `ls --format json` prints
+    /// `[]` on stdout and nothing on stderr; `--running` changes nothing for no VM. (`msb ls`
+    /// needs no KVM, so this runs anywhere msb does.)
+    fn assert_listing_contract(msb: &Msb) {
+        assert_eq!(msb.list(false).unwrap(), Vec::<Sandbox>::new());
+        assert_eq!(msb.list(true).unwrap(), Vec::<Sandbox>::new());
+        assert!(!msb.is_running("abc-w").unwrap());
+        let human = msb.run(&["ls".into()]).unwrap();
+        assert!(human.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&human.stdout),
+            "",
+            "a human listing is never on stdout"
+        );
+        assert!(
+            String::from_utf8_lossy(&human.stderr).contains("No sandboxes found."),
+            "{}",
+            String::from_utf8_lossy(&human.stderr)
+        );
+        let json = msb
+            .run(&["ls".into(), "--format".into(), "json".into()])
+            .unwrap();
+        assert!(json.status.success());
+        assert_eq!(String::from_utf8_lossy(&json.stdout).trim(), "[]");
+        assert_eq!(String::from_utf8_lossy(&json.stderr), "");
+    }
+
+    #[test]
+    fn a_listing_means_the_same_to_the_fake_and_to_the_real_msb() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = Msb {
+            exe: crate::testing::pinned_for_tests("msb"),
+            home: dir.path().join("real"),
+        };
+        assert_listing_contract(&real);
+        let fake_dir = dir.path().join("fake");
+        std::fs::create_dir(&fake_dir).unwrap();
+        let fake = fake(
+            &fake_dir,
+            "case $1 in\n  ls) case \"$2\" in --format) echo '[]' ;; *) echo 'No sandboxes found.' >&2 ;; esac ;; esac\n",
+        );
+        assert_listing_contract(&fake);
+    }
+
     #[test]
     fn reports_msb_failures() {
         let dir = tempfile::tempdir().unwrap();
         let msb = fake(dir.path(), "echo 'boom' >&2\nexit 1\n");
-        let error = format!("{:#}", msb.list().unwrap_err());
+        let error = format!("{:#}", msb.list(false).unwrap_err());
         assert_eq!(error, "msb ls failed: boom");
         assert!(msb.start(&spec()).is_err());
         assert!(msb.remove("abc-w").is_err());
@@ -419,7 +478,7 @@ mod tests {
             exe: dir.path().join("none"),
             home: dir.path().to_path_buf(),
         };
-        assert!(format!("{:#}", missing.list().unwrap_err()).contains("could not run"));
+        assert!(format!("{:#}", missing.list(false).unwrap_err()).contains("could not run"));
         missing.exec("a", &[], b"").unwrap_err();
         missing.attach("a", &[], false).unwrap_err();
         assert!(missing.load_image(&mut &b""[..], "t").is_err());
