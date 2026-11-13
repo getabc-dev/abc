@@ -25,10 +25,11 @@ running() {
 # (NAME=VALUE lines), state/extra.env (the test's own additions, such as trust in a test CA) and a
 # PATH in its environment, as a service manager does, from state/
 # rather than the caller's directory (so nothing it writes there lands in the repository), its
-# output in state/NAME.log. It returns once the program has recorded its call (the program's
-# `record`, through FAKE_STARTED), or has ended, or ten seconds have passed, so a service that
-# `running` reports has really started: a manager's status never answers for a process still on
-# its way to its program.
+# output in state/NAME.log. When the program is one of the fakes in programs/ (a script that sources this file), it returns once the
+# program has recorded its call (the program's `record`, through FAKE_STARTED), or has ended, or
+# ten seconds have passed, so a service that `running` reports has really started: a manager's
+# status never answers for a process still on its way to its program. A real program (the
+# tests that run abc itself) records nothing and is not waited for.
 start() {
 	if running "$1"; then
 		return 0
@@ -53,6 +54,9 @@ start() {
 	) </dev/null >>"$STATE/$service.log" 2>&1 &
 	echo "$!" >"$STATE/$1.pid"
 	waited=0
+	if ! grep -qs 'bin/lib.sh' "$(head -n 1 "$STATE/$service.args")"; then
+		waited=200
+	fi
 	while [ ! -f "$STATE/$service.started" ] && running "$service" && [ "$waited" -lt 200 ]; do
 		sleep 0.05
 		waited=$((waited + 1))
