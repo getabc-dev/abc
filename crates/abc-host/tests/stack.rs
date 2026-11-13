@@ -1489,6 +1489,33 @@ mod tests {
         );
     }
 
+    /// A service manager that has started a program says it runs only once the program has: a
+    /// program slow to get going has still recorded its start when the install returns.
+    fn slow_worker_start(os: Os) {
+        let machine = Machine::new(os);
+        std::fs::write(machine.state("starts-slowly"), "").unwrap();
+        let host = machine.server().host;
+        let spec = worker_service(&machine);
+        abc_host::install_worker(&host, &spec, &mut Console::new(&mut Vec::new())).unwrap();
+        let calls = machine.take_calls();
+        assert!(
+            calls
+                .iter()
+                .any(|call| call.starts_with("abc worker --home")),
+            "the service has run the worker by the time the install returns: {calls:#?}"
+        );
+    }
+
+    #[test]
+    fn a_slow_worker_has_started_when_the_install_returns_on_macos() {
+        slow_worker_start(Os::MacOs);
+    }
+
+    #[test]
+    fn a_slow_worker_has_started_when_the_install_returns_on_linux() {
+        slow_worker_start(Os::Linux);
+    }
+
     #[test]
     fn a_worker_service_on_macos_installs_reports_and_uninstalls() {
         worker_service_lifecycle(Os::MacOs);

@@ -7,9 +7,13 @@
 
 STATE="$ROOT/state"
 
-# record WORD...: appends one line, the words joined by spaces, to state/calls.
+# record WORD...: appends one line, the words joined by spaces, to state/calls. A program a
+# service manager started (start, below) also says it has started, once its call is in the log.
 record() {
 	printf '%s\n' "$*" >>"$STATE/calls"
+	if [ -n "${FAKE_STARTED:-}" ]; then
+		: >"$FAKE_STARTED"
+	fi
 }
 
 # running NAME: whether the service NAME runs.
@@ -21,12 +25,16 @@ running() {
 # (NAME=VALUE lines), state/extra.env (the test's own additions, such as trust in a test CA) and a
 # PATH in its environment, as a service manager does, from state/
 # rather than the caller's directory (so nothing it writes there lands in the repository), its
-# output in state/NAME.log.
+# output in state/NAME.log. It returns once the program has recorded its call (the program's
+# `record`, through FAKE_STARTED), or has ended, or ten seconds have passed, so a service that
+# `running` reports has really started: a manager's status never answers for a process still on
+# its way to its program.
 start() {
 	if running "$1"; then
 		return 0
 	fi
 	service=$1
+	rm -f "$STATE/$service.started"
 	(
 		set --
 		while IFS= read -r pair; do
@@ -41,9 +49,14 @@ start() {
 			set -- "$@" "$word"
 		done <"$STATE/$service.args"
 		cd "$STATE" || exit 1
-		exec env -i PATH=/usr/bin:/bin "$@"
+		exec env -i PATH=/usr/bin:/bin "FAKE_STARTED=$STATE/$service.started" "$@"
 	) </dev/null >>"$STATE/$service.log" 2>&1 &
 	echo "$!" >"$STATE/$1.pid"
+	waited=0
+	while [ ! -f "$STATE/$service.started" ] && running "$service" && [ "$waited" -lt 200 ]; do
+		sleep 0.05
+		waited=$((waited + 1))
+	done
 }
 
 # stop NAME [SIGNAL]: signals the service (TERM unless named) and waits up to ten seconds for it

@@ -4,6 +4,10 @@
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 # shellcheck source-path=SCRIPTDIR source=../bin/lib.sh
 . "$ROOT/bin/lib.sh"
+# With state/starts-slowly the program takes a second to get going, as one does on a loaded machine.
+if [ -f "$STATE/starts-slowly" ]; then
+	sleep 1
+fi
 record abc "$@"
 env | grep '^ABC_' | sort >"$STATE/abc.environment"
 echo "$$" >"$STATE/abc.daemon"
