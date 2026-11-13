@@ -12,6 +12,7 @@
 mod checks;
 mod renovate;
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, bail, ensure};
@@ -67,11 +68,15 @@ pub(crate) enum Plan {
         body: String,
         branch: String,
         base: String,
+        /// The files the branch changes since it left the default branch.
+        files: BTreeSet<String>,
     },
     Update {
         number: u64,
         body: String,
         branch: String,
+        /// The files the branch changes since it left the default branch.
+        files: BTreeSet<String>,
         /// The size of the diff the review sends; the pull request's title adds to it.
         diff_bytes: usize,
     },
@@ -125,6 +130,7 @@ pub(crate) fn prepare(
                 body,
                 branch: checked.branch,
                 base,
+                files: checked.files,
             }))
         }
         Action::Update { number, body } => {
@@ -134,6 +140,7 @@ pub(crate) fn prepare(
                 number,
                 body,
                 branch: checked.branch,
+                files: checked.files,
                 diff_bytes: checked.diff.len(),
             }))
         }
@@ -187,6 +194,8 @@ struct Checked {
     base: String,
     /// The diff the review sends.
     diff: String,
+    /// The files the branch changes since it left the default branch.
+    files: BTreeSet<String>,
 }
 
 /// The checks every description goes through before it is sent: a clean tree on a branch, a
@@ -233,7 +242,13 @@ fn preflight(root: &Path, body: &str, out: &mut String) -> anyhow::Result<Checke
         crate::rulesets::check(root).context(".github/ changed and `rulesets check` fails")?;
     }
     let (diff, _) = git::reviewable_diff(root, &commit, git::To::WorkingTree)?;
-    Ok(Checked { branch, base, diff })
+    let files = changed_names(root, &commit, "HEAD")?;
+    Ok(Checked {
+        branch,
+        base,
+        diff,
+        files,
+    })
 }
 
 /// Carries out `plan` for the repository `repo` through `send`, with downloads from `fetch`,
@@ -266,7 +281,9 @@ pub(crate) fn send(
             body,
             branch,
             base,
+            files,
         } => {
+            overlaps(repo, send, &branch, &files, out);
             let opened = send(&github::Request {
                 method: "POST",
                 path: repo.path("pulls"),
@@ -289,8 +306,12 @@ pub(crate) fn send(
             number,
             body,
             branch,
+            files,
             diff_bytes,
-        } => update(root, repo, send, (number, &body, &branch, diff_bytes), out),
+        } => {
+            overlaps(repo, send, &branch, &files, out);
+            update(root, repo, send, (number, &body, &branch, diff_bytes), out)
+        }
     }
 }
 
@@ -312,7 +333,7 @@ fn stale(repo: &Repo, number: u64, send: &mut Send<'_>, out: &mut String) -> any
         !base.is_empty() && !head.is_empty(),
         "GitHub gave #{number} no base branch or head commit"
     );
-    let files = |comparison: &Value| -> std::collections::BTreeSet<String> {
+    let files = |comparison: &Value| -> BTreeSet<String> {
         comparison
             .get("files")
             .and_then(Value::as_array)
@@ -468,6 +489,95 @@ fn handover(root: &Path, head: &str, pusher: &str, number: u64) -> anyhow::Resul
     }
 }
 
+/// The files that differ between `commit` and `to`, a renamed file by both its names.
+fn changed_names(root: &Path, commit: &str, to: &str) -> anyhow::Result<BTreeSet<String>> {
+    Ok(git::git(
+        root,
+        &[
+            "-c",
+            "core.quotePath=false",
+            "diff",
+            "--no-renames",
+            "--name-only",
+            commit,
+            to,
+            "--",
+        ],
+    )?
+    .lines()
+    .map(str::to_owned)
+    .collect())
+}
+
+/// Warns in `out`, for each other open pull request that changes files this branch's `files` change
+/// too, naming them: two branches that edit one file meet in a merge, and one that fixes a defect
+/// on main the other hit too is a fix carried twice (#45 and #47 both fixed the same test). A
+/// warning only: a list GitHub cannot give is said, and never stops the pull request.
+fn overlaps(
+    repo: &Repo,
+    send: &mut Send<'_>,
+    branch: &str,
+    files: &BTreeSet<String>,
+    out: &mut String,
+) {
+    if let Err(error) = list_overlaps(repo, send, branch, files, out) {
+        say(
+            out,
+            &format!(
+                "pr: could not compare this branch with the other open pull requests, so whether \
+                 they change the same files is unknown: {error:#}"
+            ),
+        );
+    }
+}
+
+fn list_overlaps(
+    repo: &Repo,
+    send: &mut Send<'_>,
+    branch: &str,
+    files: &BTreeSet<String>,
+    out: &mut String,
+) -> anyhow::Result<()> {
+    let mut page = |path: &str| github::get(send, repo.path(path));
+    for pull in github::open_pulls(&mut page)? {
+        // This branch's own pull request, which a fork's branch of the same name is not.
+        if pull.branch == branch && pull.head_repository == format!("{}/{}", repo.owner, repo.name)
+        {
+            continue;
+        }
+        let shared: Vec<String> = github::pull_files(pull.number, &mut page)?
+            .intersection(files)
+            .cloned()
+            .collect();
+        if shared.is_empty() {
+            continue;
+        }
+        say(
+            out,
+            &format!(
+                "pr: warning: open #{} ({}, {}) changes {} file(s) this branch changes too:",
+                pull.number,
+                pull.title,
+                pull.branch,
+                shared.len()
+            ),
+        );
+        for path in &shared {
+            say(out, &format!("  {path}"));
+        }
+        say(
+            out,
+            &format!(
+                "pr: if #{} fixes a defect on main that this branch meets too, merge main once \
+                 it is in and carry no copy of the fix; otherwise expect to merge main after \
+                 whichever of the two lands first",
+                pull.number
+            ),
+        );
+    }
+    Ok(())
+}
+
 /// Fetches the default branch `base` (a remote-tracking ref) and warns in `out` when it changed,
 /// since HEAD left it, files that HEAD changes too. #33 and #38 were built at once, and #33
 /// broke on its merge with main once #38 merged: the fix is to merge the default branch and
@@ -484,29 +594,14 @@ fn behind(root: &Path, base: &str, out: &mut String) -> anyhow::Result<()> {
         );
     }
     let commit = git::merge_base(root, base)?;
-    let names = |to: &str| -> anyhow::Result<std::collections::BTreeSet<String>> {
-        Ok(git::git(
-            root,
-            &[
-                "-c",
-                "core.quotePath=false",
-                "diff",
-                "--no-renames",
-                "--name-only",
-                &commit,
-                to,
-                "--",
-            ],
-        )?
-        .lines()
-        .map(str::to_owned)
-        .collect())
-    };
-    let moved = names(base)?;
+    let moved = changed_names(root, &commit, base)?;
     if moved.is_empty() {
         return Ok(());
     }
-    let both: Vec<String> = names("HEAD")?.intersection(&moved).cloned().collect();
+    let both: Vec<String> = changed_names(root, &commit, "HEAD")?
+        .intersection(&moved)
+        .cloned()
+        .collect();
     if both.is_empty() {
         return Ok(());
     }

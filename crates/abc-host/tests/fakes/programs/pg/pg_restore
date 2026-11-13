@@ -1,6 +1,9 @@
 #!/bin/sh
 # A stand-in for pg_restore: --list reads a fake dump, and a load puts its content into --dbname,
 # unless the dump holds a line BROKEN, which fails to load.
+#
+# Models: pg_restore. Environment: none read. Streams: errors are on stderr. Exit codes: 0; 1 for
+# a file that is no fake dump, a BROKEN one or no --dbname.
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 # shellcheck source-path=SCRIPTDIR source=../../bin/lib.sh
 . "$ROOT/bin/lib.sh"

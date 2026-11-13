@@ -7,12 +7,19 @@ use std::path::{Path, PathBuf};
 use std::process::{ExitCode, ExitStatus, Output};
 
 use super::{
-    Action, Backend, Host, Os, Spec, TOKEN_ITEM, billing, microsandbox, refuse_linked_worktree,
-    require_kvm, run,
+    Action, Backend, Host, Os, Sandbox, Spec, TOKEN_ITEM, billing, microsandbox,
+    refuse_linked_worktree, require_kvm, run,
 };
 use crate::testing::{git, repository, script};
 
 /// A backend that records what it is asked and answers from a script.
+///
+/// Models: microsandbox's `msb`, as [`Backend`] drives it. Environment: none, since msb's own
+/// `MSB_HOME` is the real backend's concern. Streams: `exec` gives stdout and stderr apart, and
+/// `list` is the JSON `msb ls --format json` prints on stdout, never msb's human table, which
+/// goes to stderr. Exit codes: an `exec` carries the program's, and every other call succeeds.
+/// `msb::tests::a_listing_means_the_same_to_the_fake_and_to_the_real_msb` holds the listing to the
+/// real msb.
 #[derive(Default)]
 pub(super) struct Fake {
     pub(super) running: bool,
@@ -128,8 +135,19 @@ impl Backend for Fake {
         Ok(self.volumes.clone())
     }
 
-    fn list(&self) -> anyhow::Result<String> {
-        Ok("NAME\nabc-w\n".to_owned())
+    /// Models `msb ls --format json` as the real msb answers it
+    /// (`msb::tests::a_listing_means_the_same_to_the_fake_and_to_the_real_msb`): a list of VMs,
+    /// empty for none, and with `--running` only the running ones. The one VM here is `abc-w`,
+    /// running when [`Fake::running`] says so and stopped otherwise. A failing msb is
+    /// [`Msb`](super::msb::Msb)'s own test.
+    fn list(&self, running_only: bool) -> anyhow::Result<Vec<Sandbox>> {
+        if running_only && !self.running {
+            return Ok(Vec::new());
+        }
+        Ok(vec![Sandbox {
+            name: "abc-w".to_owned(),
+            status: if self.running { "Running" } else { "Stopped" }.to_owned(),
+        }])
     }
 
     fn load_image(&self, archive: &mut dyn Read, tag: &str) -> anyhow::Result<()> {
@@ -261,6 +279,12 @@ fn none(_: &str) -> Option<OsString> {
 }
 
 /// Services that record what they are asked to do.
+///
+/// Models: the host's service manager (launchd or systemd) as `runs::service::Services` drives
+/// it: install, start and retire a supervisor's service. Environment: none runs, so the empty
+/// environment launchd gives a service is `service`'s own tests' concern (and
+/// `crates/abc-host/tests/fakes.rs` holds a fake launchctl to it). Streams: none. Exit codes: every
+/// call succeeds. No real launchd or systemd runs in CI.
 #[derive(Default)]
 pub(super) struct FakeServices {
     pub(super) calls: RefCell<Vec<String>>,
@@ -286,28 +310,50 @@ impl super::runs::service::Services for FakeServices {
     }
 }
 
+/// What a run of an action did: its result, what a person would read (stderr), and what a script
+/// would read (stdout).
+pub(super) struct Streams {
+    pub(super) result: anyhow::Result<ExitCode>,
+    pub(super) stderr: String,
+    pub(super) stdout: String,
+}
+
+pub(super) fn act_streams(
+    world: &World,
+    backend: &Fake,
+    services: &FakeServices,
+    action: Action,
+) -> Streams {
+    let (mut out, mut data) = (Vec::new(), Vec::new());
+    let result = run(
+        action,
+        &world.host,
+        backend,
+        services,
+        &none,
+        &mut out,
+        &mut data,
+    );
+    Streams {
+        result,
+        stderr: String::from_utf8(out).unwrap(),
+        stdout: String::from_utf8(data).unwrap(),
+    }
+}
+
+/// [`act_streams`] with both streams as one text, the data first.
 pub(super) fn act_with(
     world: &World,
     backend: &Fake,
     services: &FakeServices,
     action: Action,
 ) -> (anyhow::Result<ExitCode>, String) {
-    let mut out = Vec::new();
-    let result = run(action, &world.host, backend, services, &none, &mut out);
-    (result, String::from_utf8(out).unwrap())
+    let streams = act_streams(world, backend, services, action);
+    (streams.result, streams.stdout + &streams.stderr)
 }
 
 fn act(world: &World, backend: &Fake, action: Action) -> (anyhow::Result<ExitCode>, String) {
-    let mut out = Vec::new();
-    let result = run(
-        action,
-        &world.host,
-        backend,
-        &FakeServices::default(),
-        &none,
-        &mut out,
-    );
-    (result, String::from_utf8(out).unwrap())
+    act_with(world, backend, &FakeServices::default(), action)
 }
 
 /// Starts the session for `world`'s worktree, which must fail, and returns why.
@@ -617,6 +663,47 @@ fn starts_the_installed_broker_when_none_listens() {
 }
 
 #[test]
+fn lists_the_vms_as_text_and_as_json_on_stdout() {
+    let world = world("t");
+    let backend = subscribed();
+    let listed = act_streams(
+        &world,
+        &backend,
+        &FakeServices::default(),
+        Action::Ls { json: false },
+    );
+    assert_eq!(listed.stdout, "abc-w\tStopped\n", "this VM is not running");
+    let running = Fake {
+        running: true,
+        ..Fake::default()
+    };
+    assert_eq!(
+        running.list(true).unwrap(),
+        [Sandbox {
+            name: "abc-w".to_owned(),
+            status: "Running".to_owned()
+        }]
+    );
+    assert_eq!(backend.list(true).unwrap(), [], "--running leaves it out");
+    assert_eq!(listed.stderr, "", "no message beside the listing");
+    let json = act_streams(
+        &world,
+        &backend,
+        &FakeServices::default(),
+        Action::Ls { json: true },
+    );
+    assert_eq!(
+        serde_json::from_str::<Vec<Sandbox>>(&json.stdout).unwrap(),
+        [Sandbox {
+            name: "abc-w".to_owned(),
+            status: "Stopped".to_owned()
+        }],
+        "JSON on stdout"
+    );
+    assert_eq!(json.stderr, "", "nothing else is said");
+}
+
+#[test]
 fn shells_auths_syncs_lists_and_stops() {
     let mut world = world("t");
     let backend = subscribed();
@@ -665,8 +752,6 @@ fn shells_auths_syncs_lists_and_stops() {
     );
     let (_, synced) = act(&world, &backend, Action::Sync { worktree });
     assert!(synced.contains("already at"), "{synced}");
-    let (_, listed) = act(&world, &backend, Action::Ls);
-    assert_eq!(listed, "NAME\nabc-w\n");
     stop_session(&world, &backend, false);
     assert!(
         world.root.join("state/w").exists(),
@@ -972,6 +1057,7 @@ fn the_billing_check_reads_the_sessions_settings() {
             &Fake::default(),
             &FakeServices::default(),
             &key,
+            &mut Vec::new(),
             &mut Vec::new()
         )
         .unwrap_err()

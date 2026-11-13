@@ -1,6 +1,11 @@
 #!/bin/sh
 # A stand-in for Postgres 18's server: says its version, or records how it was started and runs
 # until stopped.
+#
+# Models: Postgres 18's server (checked against the real one in tests/fakes.rs). Environment:
+# needs LC_ALL, as on macOS, or it exits with the real message. Streams: --version prints on
+# stdout; the FATAL is on stderr. Exit codes: 0 for --version; 1 without LC_ALL; otherwise it
+# never exits by itself.
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 # shellcheck source-path=SCRIPTDIR source=../../bin/lib.sh
 . "$ROOT/bin/lib.sh"

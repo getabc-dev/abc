@@ -160,6 +160,7 @@ features = ["postgres", "rustls"]
 
 [[tool]]
 name = "msb"
+for-tests = true
 version = "0.7.13"
 url = "https://github.com/superradcompany/microsandbox/releases/download/v{version}/microsandbox-{platform}.tar.gz"
 # microsandbox runs agent VMs (`cargo xtask vm`). It loads libkrunfw, the guest kernel, from beside

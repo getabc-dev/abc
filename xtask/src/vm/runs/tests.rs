@@ -397,8 +397,8 @@ impl Backend for Local {
         self.fake.volumes()
     }
 
-    fn list(&self) -> anyhow::Result<String> {
-        self.fake.list()
+    fn list(&self, running_only: bool) -> anyhow::Result<Vec<super::super::Sandbox>> {
+        self.fake.list(running_only)
     }
 
     fn load_image(&self, archive: &mut dyn Read, tag: &str) -> anyhow::Result<()> {
@@ -410,6 +410,12 @@ impl Backend for Local {
 /// for every later call), each a stream-json result, after an init line naming session `s<n>`;
 /// it records each call's arguments in `bin/calls`, one per line. An answer `hang` writes the
 /// init line and its pid to `bin/pid`, then sleeps.
+///
+/// Models: `claude -p --output-format stream-json`. Environment: none read. Streams: stream-json
+/// lines on stdout, whose results are those recorded from real runs ([`LIMIT`], [`DNS`],
+/// [`HANDOFF`]), and a line on stderr. Exit codes: always 0, where the real claude exits non-zero
+/// for some errors, so the supervisor reads the result line and never the exit code, which
+/// `classify`'s tests pin.
 fn fake_claude(bin: &Path, answers: &[&str]) {
     std::fs::create_dir_all(bin).unwrap();
     let mut cases = String::new();
@@ -1475,16 +1481,18 @@ fn runs_are_none_before_the_first_and_a_runs_directory_that_cannot_be_read_is_an
     );
     std::fs::write(dir.path().join("runs"), "a file").unwrap();
     missing.list().unwrap_err();
-    let mut out = Vec::new();
+    let (mut out, mut data) = (Vec::new(), Vec::new());
     super::list(
         &Runs {
             dir: dir.path().join("none"),
         },
         false,
+        &mut data,
         &mut out,
     )
     .unwrap();
     assert_eq!(String::from_utf8(out).unwrap(), "vm runs: none\n");
+    assert_eq!(data, b"", "a message is not data");
 }
 
 #[test]
@@ -1879,13 +1887,60 @@ fn a_state_that_cannot_be_read_is_shown_and_holds_up_no_queue() {
     let started = super::start_next(&all, &services, MORNING).unwrap();
     assert_eq!(started.len(), 1);
     assert_eq!(started[0].id, queued.id);
-    let mut out = Vec::new();
-    super::list(&all, false, &mut out).unwrap();
+    let (mut out, mut data) = (Vec::new(), Vec::new());
+    super::list(&all, false, &mut data, &mut out).unwrap();
     let listed = String::from_utf8(out).unwrap();
     assert!(
-        listed.contains(&format!("{}\tunreadable: ", broken.id)),
+        listed.contains(&format!("vm runs: {}: unreadable: ", broken.id)),
         "{listed}"
     );
+    assert!(
+        !String::from_utf8(data).unwrap().contains(&broken.id),
+        "an unreadable run is a message, not a row"
+    );
+    // The same with --json: the readable runs alone, as a JSON array, on stdout.
+    let (mut said, mut json) = (Vec::new(), Vec::new());
+    super::list(&all, true, &mut json, &mut said).unwrap();
+    let shown: Vec<Run> = serde_json::from_slice(&json).unwrap();
+    assert_eq!(shown.len(), 1, "{shown:?}");
+    assert!(
+        String::from_utf8(said)
+            .unwrap()
+            .contains(&format!("vm runs: {}: unreadable: ", broken.id)),
+        "said beside the JSON, not in it"
+    );
+}
+
+/// `vm runs` is for scripts: its listing, as a table or as `--json`, is on stdout alone, and a
+/// message is never in it.
+#[test]
+fn the_runs_listing_is_on_stdout_alone() {
+    let (world, local) = briefed();
+    let services = FakeServices::default();
+    let streams = |json| {
+        super::super::tests::act_streams(&world, &local.fake, &services, Action::Runs { json })
+    };
+    let empty_json = streams(true);
+    empty_json.result.unwrap();
+    assert_eq!(empty_json.stdout, "[]\n", "no run is an empty array");
+    assert_eq!(empty_json.stderr, "");
+    let empty_table = streams(false);
+    empty_table.result.unwrap();
+    assert_eq!(empty_table.stdout, "", "no row");
+    assert_eq!(empty_table.stderr, "vm runs: none\n", "a message");
+
+    let made = runs(&world)
+        .create(&session(&world), ".abc/brief.md", MORNING, Status::Queued)
+        .unwrap();
+    let json = streams(true);
+    json.result.unwrap();
+    assert_eq!(json.stderr, "", "nothing but the JSON is said");
+    let shown: Vec<Run> = serde_json::from_str(&json.stdout).unwrap();
+    assert_eq!(shown, std::slice::from_ref(&made));
+    let table = streams(false);
+    table.result.unwrap();
+    assert!(table.stdout.starts_with(&made.id), "{}", table.stdout);
+    assert_eq!(table.stderr, "");
 }
 
 /// Review finding: ended runs' directories, with every session's log, were never removed.
@@ -1962,10 +2017,13 @@ fn unavailable_errors_dates_and_sizes_are_read_exactly() {
     };
     std::fs::create_dir_all(runs.dir.join("broken")).unwrap();
     std::fs::write(runs.dir.join("broken/state.json"), "{").unwrap();
-    let mut out = Vec::new();
-    super::list(&runs, false, &mut out).unwrap();
+    let (mut out, mut data) = (Vec::new(), Vec::new());
+    super::list(&runs, false, &mut data, &mut out).unwrap();
     let listed = String::from_utf8(out).unwrap();
-    assert!(listed.starts_with("broken\tunreadable: "), "{listed}");
+    assert!(
+        listed.starts_with("vm runs: broken: unreadable: "),
+        "{listed}"
+    );
     assert!(!listed.contains("vm runs: none"), "{listed}");
 }
 

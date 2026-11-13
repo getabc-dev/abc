@@ -89,8 +89,12 @@ pub(crate) enum Action {
     },
     /// Build the agent image from xtask/vm/Containerfile and load it into microsandbox.
     Image,
-    /// List the agent VMs.
-    Ls,
+    /// List the agent VMs, one `name<TAB>status` a line on stdout; --json prints them as a JSON
+    /// array of `{"name", "status"}` on stdout instead. Messages go to stderr.
+    Ls {
+        #[arg(long)]
+        json: bool,
+    },
     /// Inside an agent VM: fail unless Claude Code can use only the subscription token.
     #[command(hide = true)]
     Billing,
@@ -199,7 +203,8 @@ pub(crate) trait Backend {
     fn remove_volumes(&self, names: &[String]) -> anyhow::Result<()>;
     /// Every volume's name and the bytes it takes on the host's disk.
     fn volumes(&self) -> anyhow::Result<Vec<(String, u64)>>;
-    fn list(&self) -> anyhow::Result<String>;
+    /// The VMs msb knows, the running ones alone with `running_only`.
+    fn list(&self, running_only: bool) -> anyhow::Result<Vec<Sandbox>>;
     fn load_image(&self, archive: &mut dyn Read, tag: &str) -> anyhow::Result<()>;
 }
 
@@ -362,8 +367,17 @@ pub(crate) fn require_kvm(os: Os, kvm: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Runs `action` on `host` with `backend`, installing supervisors with `services`, reporting to
-/// `out`.
+/// A VM as `msb ls --format json` lists it, reduced to what xtask reads and prints.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct Sandbox {
+    pub(crate) name: String,
+    /// msb's word for its state, such as `Running`.
+    pub(crate) status: String,
+}
+
+/// Runs `action` on `host` with `backend`, installing supervisors with `services`. What a person
+/// reads goes to `out` (stderr); what a script reads, a listing of VMs or of runs, goes to `data`
+/// (stdout), so `cargo xtask vm ls --json | jq` and `vm runs --json` never meet a message.
 pub(crate) fn run(
     action: Action,
     host: &Host,
@@ -371,6 +385,7 @@ pub(crate) fn run(
     services: &dyn runs::service::Services,
     env: &dyn Fn(&str) -> Option<OsString>,
     out: &mut impl Write,
+    data: &mut impl Write,
 ) -> anyhow::Result<ExitCode> {
     let all = runs::Runs {
         dir: host.runs.clone(),
@@ -424,7 +439,7 @@ pub(crate) fn run(
                 }
             }
         }
-        Action::Queue { action: None } => runs::queued(&all, out)?,
+        Action::Queue { action: None } => runs::queued(&all, data, out)?,
         Action::Queue {
             action: Some(QueueAction::Add { worktree, brief }),
         } => {
@@ -432,7 +447,7 @@ pub(crate) fn run(
             let run = runs::enqueue(&all, services, &session, &brief, now)?;
             writeln!(out, "vm: run {}: {}", run.id, run.status.describe())?;
         }
-        Action::Runs { json } => runs::list(&all, json, out)?,
+        Action::Runs { json } => runs::list(&all, json, data, out)?,
         Action::Cancel { run } => {
             writeln!(
                 out,
@@ -458,10 +473,31 @@ pub(crate) fn run(
         }
         Action::Gc { yes } => gc(host, backend, yes, out)?,
         Action::Image => image(host, backend, out)?,
-        Action::Ls => write!(out, "{}", backend.list()?)?,
+        Action::Ls { json } => list_vms(backend, json, data, out)?,
         Action::Billing => billing(env)?,
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// `vm ls`: the VMs msb knows, as `name<TAB>status` lines or as JSON, on `data`; a message on `out`.
+fn list_vms(
+    backend: &dyn Backend,
+    json: bool,
+    data: &mut impl Write,
+    out: &mut impl Write,
+) -> anyhow::Result<()> {
+    let sandboxes = backend.list(false)?;
+    if json {
+        writeln!(data, "{}", serde_json::to_string_pretty(&sandboxes)?)?;
+        return Ok(());
+    }
+    if sandboxes.is_empty() {
+        writeln!(out, "vm ls: no VMs")?;
+    }
+    for sandbox in &sandboxes {
+        writeln!(data, "{}\t{}", sandbox.name, sandbox.status)?;
+    }
+    Ok(())
 }
 
 /// `cargo xtask vm billing`, inside a VM: fails unless Claude Code there can use only the

@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -129,6 +130,7 @@ fn opens_only_what_integrity_the_review_and_the_rulesets_would_pass() {
             body: REASONED.to_owned(),
             branch: "agent/x".to_owned(),
             base: "main".to_owned(),
+            files: BTreeSet::from(["src/t.rs".to_owned()]),
         }
     );
     assert_eq!(out, "", "nothing to say before sending");
@@ -213,7 +215,11 @@ fn opens_through_the_rest_api() {
     let mut sent = Vec::new();
     let mut reply = |request: &Request| {
         sent.push(request.clone());
-        Ok(json!({"number": 31, "html_url": "https://github.com/o/r/pull/31"}))
+        Ok(if request.method == "GET" {
+            json!([])
+        } else {
+            json!({"number": 31, "html_url": "https://github.com/o/r/pull/31"})
+        })
     };
     let mut out = String::new();
     let plan = Plan::Open {
@@ -221,6 +227,7 @@ fn opens_through_the_rest_api() {
         body: "B".to_owned(),
         branch: "agent/x".to_owned(),
         base: "main".to_owned(),
+        files: BTreeSet::new(),
     };
     assert!(
         send(
@@ -236,11 +243,146 @@ fn opens_through_the_rest_api() {
     assert_eq!(out, "pr: opened #31 https://github.com/o/r/pull/31\n");
     assert_eq!(
         sent,
-        [Request {
-            method: "POST",
-            path: "/repos/o/r/pulls".to_owned(),
-            body: Some(json!({"title": "feat: x", "head": "agent/x", "base": "main", "body": "B"})),
-        }]
+        [
+            Request {
+                method: "GET",
+                path: "/repos/o/r/pulls?state=open&per_page=100&page=1".to_owned(),
+                body: None,
+            },
+            Request {
+                method: "POST",
+                path: "/repos/o/r/pulls".to_owned(),
+                body: Some(
+                    json!({"title": "feat: x", "head": "agent/x", "base": "main", "body": "B"})
+                ),
+            }
+        ]
+    );
+}
+
+/// GitHub's replies about the open pull requests: #11 (from `agent/a`) changes `src/t.rs` and
+/// `docs/a.md`, #12 (from `agent/x`, the branch itself) changes `src/t.rs`, #13 (from `agent/c`)
+/// changes `README.md` alone, #14 (from `agent/d`) renamed `old.rs` to `src/t.rs`, and #15 (from
+/// a fork's own `agent/x`) changes `src/t.rs`.
+fn open_pulls(request: &Request) -> anyhow::Result<Value> {
+    Ok(match request.path.as_str() {
+        "/repos/o/r/pulls?state=open&per_page=100&page=1" => json!([
+            {"number": 11, "title": "fix t", "head": {"ref": "agent/a", "repo": {"full_name": "o/r"}}},
+            {"number": 12, "title": "this one", "head": {"ref": "agent/x", "repo": {"full_name": "o/r"}}},
+            {"number": 13, "title": "docs", "head": {"ref": "agent/c", "repo": {"full_name": "o/r"}}},
+            {"number": 14, "title": "move", "head": {"ref": "agent/d", "repo": {"full_name": "o/r"}}},
+            {"number": 15, "title": "fork", "head": {"ref": "agent/x", "repo": {"full_name": "someone/r"}}},
+        ]),
+        "/repos/o/r/pulls/15/files?per_page=100&page=1" => json!([{"filename": "src/t.rs"}]),
+        "/repos/o/r/pulls/11/files?per_page=100&page=1" => json!([
+            {"filename": "src/t.rs"}, {"filename": "docs/a.md"}
+        ]),
+        "/repos/o/r/pulls/13/files?per_page=100&page=1" => json!([{"filename": "README.md"}]),
+        "/repos/o/r/pulls/14/files?per_page=100&page=1" => {
+            json!([{"filename": "src/t.rs", "previous_filename": "old.rs"}])
+        }
+        other if request.method == "GET" => anyhow::bail!("unexpected {other}"),
+        _ => json!({"number": 31, "html_url": "https://github.com/o/r/pull/31"}),
+    })
+}
+
+#[test]
+fn opening_lists_the_open_pull_requests_that_change_the_same_files() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut asked = Vec::new();
+    let mut reply = |request: &Request| {
+        asked.push(request.path.clone());
+        open_pulls(request)
+    };
+    let mut out = String::new();
+    let plan = Plan::Open {
+        title: "feat: x".to_owned(),
+        body: "B".to_owned(),
+        branch: "agent/x".to_owned(),
+        base: "main".to_owned(),
+        files: BTreeSet::from(["src/t.rs".to_owned(), "old.rs".to_owned()]),
+    };
+    assert!(
+        send(
+            plan,
+            temp.path(),
+            &repo(),
+            &mut reply,
+            &mut no_downloads,
+            &mut out
+        )
+        .unwrap()
+    );
+    assert!(
+        out.contains(
+            "pr: warning: open #11 (fix t, agent/a) changes 1 file(s) this branch changes too:\n  src/t.rs\n"
+        ),
+        "{out}"
+    );
+    assert!(
+        out.contains("open #14 (move, agent/d) changes 2 file(s) this branch changes too:\n  old.rs\n  src/t.rs\n"),
+        "a rename counts by both its names: {out}"
+    );
+    assert!(
+        !out.contains("#12"),
+        "the branch's own pull request is not listed: {out}"
+    );
+    assert!(!out.contains("#13"), "no shared file, no warning: {out}");
+    assert!(
+        out.contains("open #15 (fork, agent/x)"),
+        "a fork's branch of the same name is another pull request: {out}"
+    );
+    assert!(out.contains("merge main once it is in"), "{out}");
+    assert!(
+        out.ends_with("pr: opened #31 https://github.com/o/r/pull/31\n"),
+        "{out}"
+    );
+    assert!(
+        !asked.iter().any(|path| path.contains("pulls/12/files")),
+        "the branch's own files are not read: {asked:?}"
+    );
+}
+
+#[test]
+fn updating_lists_the_overlaps_too_and_a_failed_list_only_says_so() {
+    let temp = tempfile::tempdir().unwrap();
+    let work = checkout(temp.path());
+    let head = git(&work, &["rev-parse", "HEAD"]).trim().to_owned();
+    let mut listed = replies(&head, APP_LOGIN);
+    let (result, out, _) = update(&work, REASONED, |request| {
+        if request.method == "GET" && request.path.starts_with("/repos/o/r/pulls?state=open") {
+            return open_pulls(request).unwrap();
+        }
+        if request.path.starts_with("/repos/o/r/pulls/1") {
+            return open_pulls(request).unwrap();
+        }
+        listed(request)
+    });
+    assert!(result.unwrap(), "{out}");
+    assert!(
+        out.contains(
+            "open #11 (fix t, agent/a) changes 1 file(s) this branch changes too:\n  src/t.rs\n"
+        ),
+        "the branch deletes src/t.rs: {out}"
+    );
+    assert!(out.contains("pr: updated the description of #7"), "{out}");
+
+    // GitHub cannot list: said, and the update goes on.
+    let mut unlisted = replies(&head, APP_LOGIN);
+    let (broke, said, sent) = update(&work, REASONED, |request| {
+        if request.path.starts_with("/repos/o/r/pulls?state=open") {
+            return json!({"message": "not a list"});
+        }
+        unlisted(request)
+    });
+    assert!(broke.unwrap(), "{said}");
+    assert!(
+        said.contains("pr: could not compare this branch with the other open pull requests"),
+        "{said}"
+    );
+    assert!(
+        sent.iter().any(|request| request.method == "PATCH"),
+        "{sent:?}"
     );
 }
 
@@ -339,19 +481,23 @@ fn updates_the_description_when_the_app_pushed_last() {
         "pr: updated the description of #7\npr: the latest push to #7 is the agent App's; the \
          hand-over is done\n"
     );
-    assert_eq!(sent[0].path, "/repos/o/r/pulls/7");
     assert_eq!(
-        sent[1].path,
+        sent[0].path, "/repos/o/r/pulls?state=open&per_page=100&page=1",
+        "the other open pull requests first"
+    );
+    assert_eq!(sent[1].path, "/repos/o/r/pulls/7");
+    assert_eq!(
+        sent[2].path,
         "/repos/o/r/issues/7/timeline?per_page=100&page=1"
     );
     assert_eq!(
-        sent[2].path,
+        sent[3].path,
         format!(
             "/repos/o/r/actions/workflows/ci.yml/runs?event=pull_request&head_sha={head}&per_page=100&page=1"
         )
     );
     assert_eq!(
-        sent[3],
+        sent[4],
         Request {
             method: "PATCH",
             path: "/repos/o/r/pulls/7".to_owned(),
@@ -359,7 +505,7 @@ fn updates_the_description_when_the_app_pushed_last() {
         },
         "through the REST API, never gh pr edit"
     );
-    assert_eq!(sent.len(), 4);
+    assert_eq!(sent.len(), 5);
 }
 
 #[test]
@@ -370,7 +516,7 @@ fn after_the_maintainers_push_only_a_push_that_changes_the_diff_hands_over() {
     let (same, _, refused) = update(&work, REASONED, replies(&theirs, "snehilvj"));
     let same = format!("{:#}", same.unwrap_err());
     assert!(same.contains("HEAD changes nothing in it"), "{same}");
-    assert_eq!(refused.len(), 3, "refused before the description was sent");
+    assert_eq!(refused.len(), 4, "refused before the description was sent");
 
     // #25 lost a round this way: an empty commit is a new commit but no reviewable push.
     git(
@@ -399,7 +545,7 @@ fn after_the_maintainers_push_only_a_push_that_changes_the_diff_hands_over() {
         ),
         "{out}"
     );
-    assert_eq!(sent.len(), 4, "the description is sent");
+    assert_eq!(sent.len(), 5, "the description is sent");
 
     let unknown = "0123456789012345678901234567890123456789";
     let (missing, _, _) = update(&work, REASONED, replies(unknown, "snehilvj"));

@@ -167,8 +167,17 @@ enum Task {
     /// Run cargo-mutants on the Rust lines changed since the merge base and fail on missed mutants.
     Mutants {
         /// The revision whose merge base with HEAD the diff starts from.
-        #[arg(long)]
-        base: String,
+        #[arg(
+            long,
+            required_unless_present = "baseline_only",
+            conflicts_with = "baseline_only"
+        )]
+        base: Option<String>,
+        /// Run only the tests of cargo-mutants' unmutated copy of each workspace, the baseline,
+        /// with no diff: what a change to the gates needs to know before it merges, from the
+        /// checkout of the tree it judges. Missed mutants do not count and nothing is recorded.
+        #[arg(long, conflicts_with = "shard")]
+        baseline_only: bool,
         /// How many mutants to build and test at once.
         #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u32).range(1..))]
         jobs: u32,
@@ -436,11 +445,19 @@ fn gate_label(task: &Task) -> String {
     if let Task::Coverage { base } = task {
         return format!("{name} --base {base}");
     }
-    if let Task::Mutants { base, shard, .. } = task {
+    if let Task::Mutants {
+        base: Some(base),
+        shard,
+        ..
+    } = task
+    {
         return shard.map_or_else(
             || format!("{name} --base {base}"),
             |shard| format!("{name} --base {base} --shard {shard}"),
         );
+    }
+    if let Task::Mutants { .. } = task {
+        return format!("{name} --baseline-only");
     }
     if let Task::Fuzz { seconds } = task {
         return format!("{name} --seconds {seconds}");
@@ -494,13 +511,15 @@ fn run(
 fn run_mutants(
     invocation: &Invocation<'_>,
     label: &str,
-    base: &str,
+    base: Option<&str>,
     options: &mutants::Options,
     tools: &mutants::Tools,
     report: &mut impl Write,
 ) -> anyhow::Result<ExitCode> {
     let result = mutants::run(&invocation.root, base, options, tools, report)?;
-    if invocation.root == invocation.home
+    // A baseline-only run tested no mutant, so it has none to record.
+    if base.is_some()
+        && invocation.root == invocation.home
         && let Err(error) = progress::mutants_ran(
             &invocation.root,
             label,
@@ -531,9 +550,7 @@ fn perform(
     let mode = annotation::Mode::from_env(&env);
     let label = gate_label(&task);
     match task {
-        Task::Check { changed, .. } => {
-            Ok(verdict(check(root, changed, tool, postgres()?, report)?))
-        }
+        Task::Check { changed, .. } => Ok(verdict(check(root, changed, tool, &postgres, report)?)),
         Task::Coverage { base } => Ok(verdict(coverage::run(
             root,
             &base,
@@ -541,10 +558,12 @@ fn perform(
             mode,
             report,
         )?)),
-        Task::Mutants { base, jobs, shard } => run_mutants(
+        Task::Mutants {
+            base, jobs, shard, ..
+        } => run_mutants(
             invocation,
             &label,
-            &base,
+            base.as_deref(),
             &mutants::Options { jobs, shard, mode },
             &mutants::Tools::pinned(tool, postgres()?)?,
             report,
@@ -831,12 +850,12 @@ fn run_hook(event: hook::Event, home: &Path, report: &mut impl Write) -> anyhow:
 }
 
 /// `cargo xtask check` on `root`, with the pinned tools `tool` finds, the bin directory of the
-/// Postgres `root` pins for its tests and the warm Postgres.
+/// Postgres `root` pins for its tests, found only when a test step runs, and the warm Postgres.
 fn check(
     root: &Path,
     changed: bool,
     tool: &dyn Fn(&str) -> anyhow::Result<PathBuf>,
-    postgres_bin: PathBuf,
+    postgres_bin: &dyn Fn() -> anyhow::Result<PathBuf>,
     report: &mut impl Write,
 ) -> anyhow::Result<bool> {
     let postgres = check::Postgres {
@@ -844,10 +863,20 @@ fn check(
         sqlx: &|| tool("cargo-sqlx"),
     };
     let spec = || spec::Tools::pinned(tool);
+    // Both workspaces' test steps ask, and finding it can build the tree's own xtask: once.
+    let found = std::cell::RefCell::new(None::<PathBuf>);
+    let postgres_once = || -> anyhow::Result<PathBuf> {
+        if let Some(path) = found.borrow().as_ref() {
+            return Ok(path.clone());
+        }
+        let path = postgres_bin()?;
+        *found.borrow_mut() = Some(path.clone());
+        Ok(path)
+    };
     let tools = check::Tools {
         nextest: tool("cargo-nextest")?,
         shellcheck: tool("shellcheck")?,
-        postgres: postgres_bin,
+        postgres: &postgres_once,
         web: Some(web::Toolchain::pinned(tool)?),
         spec: Some(&spec),
     };
@@ -1009,7 +1038,15 @@ fn run_vm(
     vm::require_kvm(host.os, Path::new("/dev/kvm"))?;
     let msb = vm::microsandbox(tools::pinned(repo, "msb")?, &home, env)?;
     let services = vm::runs::service::Manager::of(host.os, &home, &host.runs, env)?;
-    vm::run(action, &host, &msb, &services, env, report)
+    vm::run(
+        action,
+        &host,
+        &msb,
+        &services,
+        env,
+        report,
+        &mut io::stdout(),
+    )
 }
 
 /// The repository root: the checkout xtask was built from, the directory around xtask's own,
@@ -1060,6 +1097,22 @@ mod tests {
             label(&["mutants", "--base", "origin/main"]),
             "mutants --base origin/main"
         );
+        assert_eq!(
+            label(&["mutants", "--baseline-only"]),
+            "mutants --baseline-only",
+            "a baseline-only run needs no base"
+        );
+        for refused in [
+            &["mutants"][..],
+            &["mutants", "--base", "b", "--baseline-only"],
+            &["mutants", "--baseline-only", "--shard", "0/2"],
+        ] {
+            assert!(
+                Cli::try_parse_from(std::iter::once("xtask").chain(refused.iter().copied()))
+                    .is_err(),
+                "{refused:?}"
+            );
+        }
         assert_eq!(label(&["coverage", "--base", "b"]), "coverage --base b");
         assert_eq!(label(&["fuzz", "--seconds", "5"]), "fuzz --seconds 5");
         assert_eq!(label(&["spec"]), "spec");
@@ -1142,16 +1195,16 @@ mod tests {
         let missing = |tree: &Path, name: &str| -> anyhow::Result<PathBuf> {
             anyhow::bail!("{name} is not set up in {}", tree.display())
         };
+        // `check` asks for the tree's Postgres only when a test step runs
+        // (`check::tests::postgres_is_looked_up_only_when_a_test_step_runs`); coverage and
+        // mutants ask at once.
         for task in [
-            Task::Check {
-                changed: false,
-                wait_at_most: None,
-            },
             Task::Coverage {
                 base: "base".to_owned(),
             },
             Task::Mutants {
-                base: "base".to_owned(),
+                base: Some("base".to_owned()),
+                baseline_only: false,
                 jobs: 1,
                 shard: None,
             },
@@ -1165,6 +1218,32 @@ mod tests {
                 "the tree's own setup is missing, whatever xtask's home holds"
             );
         }
+        // `check` on a change that touches no crate runs no test, so the tree's Postgres is never
+        // asked for, and a tree without it still passes the check's other steps.
+        let asked = std::cell::Cell::new(0_u32);
+        let counting = |tree: &Path, name: &str| -> anyhow::Result<PathBuf> {
+            asked.set(asked.get().saturating_add(1));
+            missing(tree, name)
+        };
+        let checked = dispatch_with(
+            Task::Check {
+                changed: true,
+                wait_at_most: None,
+            },
+            &home,
+            &root,
+            &no_env,
+            &counting,
+        );
+        assert!(
+            !format!("{checked:?}").contains("is not set up"),
+            "no test ran: {checked:?}"
+        );
+        assert_eq!(
+            asked.get(),
+            0,
+            "check asked for the tests' tools: {checked:?}"
+        );
     }
 
     #[test]
@@ -1509,7 +1588,13 @@ mod tests {
         );
         let linked_error = format!(
             "{:#}",
-            dispatch(vm(crate::vm::Action::Ls), &linked, &linked, &clean).unwrap_err()
+            dispatch(
+                vm(crate::vm::Action::Ls { json: false }),
+                &linked,
+                &linked,
+                &clean
+            )
+            .unwrap_err()
         );
         assert!(
             linked_error.contains("run it from the main clone"),
@@ -1517,7 +1602,13 @@ mod tests {
         );
         let no_home = format!(
             "{:#}",
-            dispatch(vm(crate::vm::Action::Ls), &main, &main, &clean).unwrap_err()
+            dispatch(
+                vm(crate::vm::Action::Ls { json: false }),
+                &main,
+                &main,
+                &clean
+            )
+            .unwrap_err()
         );
         assert_eq!(no_home, "HOME is not set");
     }
@@ -1633,7 +1724,8 @@ mod tests {
             (
                 "mutants",
                 Task::Mutants {
-                    base: base(),
+                    base: Some(base()),
+                    baseline_only: false,
                     jobs: 1,
                     shard: None,
                 },
@@ -1726,7 +1818,8 @@ mod tests {
                 base: "base".to_owned(),
             },
             Task::Mutants {
-                base: "base".to_owned(),
+                base: Some("base".to_owned()),
+                baseline_only: false,
                 jobs: 1,
                 shard: None,
             },
@@ -1761,7 +1854,8 @@ mod tests {
         );
         // A mutants run is recorded too, with the mutants it missed or none.
         let mutants = || Task::Mutants {
-            base: "base".to_owned(),
+            base: Some("base".to_owned()),
+            baseline_only: false,
             jobs: 1,
             shard: Some(crate::mutants::Shard::parse("1/2").unwrap()),
         };

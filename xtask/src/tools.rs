@@ -3588,11 +3588,13 @@ targets.aarch64-unknown-linux-gnu = {{ platform = "linux-arm64", sha256 = "{sha2
         // #25's Coverage and Mutants jobs installed only cargo-nextest, and xtask's tests failed
         // there for want of shellcheck. node and pnpm build the web app the abc binary embeds,
         // and run its tests; the JRE, Apalache and Quint check the specs; postgresql is the
-        // Postgres abc server setup's test runs.
+        // Postgres abc server setup's test runs; msb is what the fake of it in the VM tests is held
+        // to (`msb ls` needs no KVM).
         assert_eq!(
             names(&[], true),
             [
                 "cargo-nextest",
+                "msb",
                 "shellcheck",
                 "node",
                 "pnpm",
@@ -3607,6 +3609,7 @@ targets.aarch64-unknown-linux-gnu = {{ platform = "linux-arm64", sha256 = "{sha2
             [
                 "cargo-nextest",
                 "cargo-sqlx",
+                "msb",
                 "shellcheck",
                 "node",
                 "pnpm",

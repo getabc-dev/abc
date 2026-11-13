@@ -661,14 +661,23 @@ pub(crate) fn cancel(
         .map(|()| said)
 }
 
-/// `vm runs`: every run, oldest first, as a table or as JSON.
-pub(crate) fn list(runs: &Runs, json: bool, out: &mut dyn Write) -> anyhow::Result<()> {
+/// `vm runs`: every run, oldest first, as a table or as JSON, on `data`; the runs whose state
+/// cannot be read, and the lack of any run, are said on `out`.
+pub(crate) fn list(
+    runs: &Runs,
+    json: bool,
+    data: &mut dyn Write,
+    out: &mut dyn Write,
+) -> anyhow::Result<()> {
     let Listing {
         runs: all,
         unreadable,
     } = runs.list()?;
+    for (id, error) in &unreadable {
+        writeln!(out, "vm runs: {id}: unreadable: {error}")?;
+    }
     if json {
-        writeln!(out, "{}", serde_json::to_string_pretty(&all)?)?;
+        writeln!(data, "{}", serde_json::to_string_pretty(&all)?)?;
         return Ok(());
     }
     if all.is_empty() && unreadable.is_empty() {
@@ -676,7 +685,7 @@ pub(crate) fn list(runs: &Runs, json: bool, out: &mut dyn Write) -> anyhow::Resu
     }
     for run in &all {
         writeln!(
-            out,
+            data,
             "{}\t{}\t{} attempts\t{}\t{}",
             run.id,
             run.status.describe(),
@@ -684,9 +693,6 @@ pub(crate) fn list(runs: &Runs, json: bool, out: &mut dyn Write) -> anyhow::Resu
             run.worktree.join(&run.brief).display(),
             runs.log(&run.id).display()
         )?;
-    }
-    for (id, error) in &unreadable {
-        writeln!(out, "{id}\tunreadable: {error}")?;
     }
     Ok(())
 }
@@ -745,10 +751,10 @@ fn size_of(dir: &Path) -> u64 {
 }
 
 /// `vm queue`: the queued runs, in the order they start.
-pub(crate) fn queued(runs: &Runs, out: &mut dyn Write) -> anyhow::Result<()> {
+pub(crate) fn queued(runs: &Runs, data: &mut dyn Write, out: &mut dyn Write) -> anyhow::Result<()> {
     let all = runs.list()?.runs;
     for run in active(&all) {
-        writeln!(out, "active\t{}\t{}", run.id, run.status.describe())?;
+        writeln!(data, "active\t{}\t{}", run.id, run.status.describe())?;
     }
     let mut any = false;
     for (place, run) in all
@@ -758,7 +764,7 @@ pub(crate) fn queued(runs: &Runs, out: &mut dyn Write) -> anyhow::Result<()> {
     {
         any = true;
         writeln!(
-            out,
+            data,
             "{}\t{}\t{}",
             place.saturating_add(1),
             run.id,

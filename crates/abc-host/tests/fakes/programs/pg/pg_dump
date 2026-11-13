@@ -1,5 +1,8 @@
 #!/bin/sh
 # A stand-in for pg_dump: writes what abc's database holds to --file.
+#
+# Models: pg_dump. Environment: none read. Streams: writes the dump to --file, nothing on stdout.
+# Exit codes: 0; 1 without --file.
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 # shellcheck source-path=SCRIPTDIR source=../../bin/lib.sh
 . "$ROOT/bin/lib.sh"

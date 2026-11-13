@@ -4,6 +4,14 @@
 # abc writes wrong fails the test. With state/bootout-lingers, a booted-out agent is still
 # unloading when the next bootstrap of it comes, which then fails once, as launchd's does; with
 # state/bootstrap-refuses, every bootstrap fails.
+#
+# Models: launchd's launchctl for gui/<uid> user agents. Environment: an agent runs with only its
+# plist's EnvironmentVariables, the test's state/extra.env and PATH=/usr/bin:/bin, never the
+# caller's environment, as launchd starts a job, with stdin /dev/null. Streams: the agent's stdout
+# and stderr go to state/LABEL.log; launchctl's own errors go to stderr, a `print` to stdout. Exit
+# codes: 0; 5 to bootstrap an agent that is loaded or still unloading; 125 when refused; 3 to
+# bootout an agent that is not loaded; 113 to print or kickstart one that is unknown; 64 for any
+# other command.
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 # shellcheck source-path=SCRIPTDIR source=lib.sh
 . "$ROOT/bin/lib.sh"
