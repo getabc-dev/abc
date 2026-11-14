@@ -1,0 +1,64 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT graph, live_lease, last_answer, started_by FROM run WHERE id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "graph",
+        "type_info": "Bytea",
+        "origin": {
+          "Table": {
+            "table": "run",
+            "name": "graph"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "live_lease",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "run",
+            "name": "live_lease"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "last_answer",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "run",
+            "name": "last_answer"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "started_by",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "run",
+            "name": "started_by"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      true,
+      true,
+      false
+    ]
+  },
+  "hash": "ebd009e17acb978d97445739e9ff259f12ce86f4c8ec22268e33f7a0f33b1e73"
+}

@@ -10,7 +10,7 @@
 
 use abc_core::event::{
     EnrolledVia, EnrolmentEvent, EnrolmentRequestEvent, Event, InstallationEvent, PersonEvent,
-    Recorded, WorkerEvent, WorkspaceEvent,
+    Recorded, RunEvent, WorkerEvent, WorkspaceEvent,
 };
 use abc_core::identity::MachineLabel;
 use sqlx::PgConnection;
@@ -35,6 +35,7 @@ pub(crate) async fn apply(conn: &mut PgConnection, recorded: &Recorded) -> Resul
         Event::Enrolment(event) => enrolment(conn, &row, event).await,
         Event::EnrolmentRequest(event) => enrolment_request(conn, &row, event).await,
         Event::Worker(event) => worker(conn, &row, event).await,
+        Event::Run(event) => run(conn, &row, event).await,
     }
 }
 
@@ -400,5 +401,111 @@ async fn worker(conn: &mut PgConnection, row: &Row, event: &WorkerEvent) -> Resu
             .await?;
         }
     }
+    Ok(())
+}
+
+async fn run(conn: &mut PgConnection, row: &Row, event: &RunEvent) -> Result<(), StoreError> {
+    let Row {
+        at,
+        changed_at,
+        stream,
+        workspace,
+        actor,
+        event: event_id,
+    } = *row;
+    match event {
+        RunEvent::Started { graph } => {
+            let starter = actor.ok_or(StoreError::Corrupt("run.started has no actor"))?;
+            sqlx::query!(
+                "INSERT INTO run (id, workspace_id, graph, started_by, started_at, started_event,
+                    changed_at)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                stream,
+                workspace,
+                graph.as_bytes().as_slice(),
+                starter,
+                at,
+                event_id,
+                changed_at,
+            )
+            .execute(&mut *conn)
+            .await?;
+        }
+        RunEvent::LeaseGranted { lease, worker } => {
+            sqlx::query!(
+                "INSERT INTO run_lease (id, run_id, worker_id, granted_at, changed_at)
+                 VALUES ($1, $2, $3, $4, $5)",
+                lease.as_uuid(),
+                stream,
+                worker.as_uuid(),
+                at,
+                changed_at,
+            )
+            .execute(&mut *conn)
+            .await?;
+            sqlx::query!(
+                "UPDATE run SET live_lease = $2, changed_at = $3 WHERE id = $1",
+                stream,
+                lease.as_uuid(),
+                changed_at,
+            )
+            .execute(&mut *conn)
+            .await?;
+        }
+        RunEvent::LeaseExpired { lease } => {
+            end_lease(conn, row, *lease, "expired", None).await?;
+        }
+        RunEvent::ResultApplied { lease, result } => {
+            let result = serde_json::to_value(result).map_err(StoreError::Encode)?;
+            end_lease(conn, row, *lease, "applied", Some(result)).await?;
+        }
+        RunEvent::Answered { answer } => {
+            let answer = serde_json::to_value(answer).map_err(StoreError::Encode)?;
+            sqlx::query!(
+                "UPDATE run SET last_answer = $2, changed_at = $3 WHERE id = $1",
+                stream,
+                answer.as_str(),
+                changed_at,
+            )
+            .execute(&mut *conn)
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+/// Ends a lease and frees its run.
+async fn end_lease(
+    conn: &mut PgConnection,
+    row: &Row,
+    lease: abc_core::id::LeaseId,
+    how: &str,
+    result: Option<serde_json::Value>,
+) -> Result<(), StoreError> {
+    let Row {
+        at,
+        changed_at,
+        stream,
+        ..
+    } = *row;
+    sqlx::query!(
+        "UPDATE run_lease SET ended = $2, ended_at = $3, result = $4, changed_at = $5
+         WHERE id = $1",
+        lease.as_uuid(),
+        how,
+        at,
+        result,
+        changed_at,
+    )
+    .execute(&mut *conn)
+    .await?;
+    sqlx::query!(
+        "UPDATE run SET live_lease = NULL, changed_at = $3 WHERE id = $1 AND live_lease = $2",
+        stream,
+        lease.as_uuid(),
+        changed_at,
+    )
+    .execute(&mut *conn)
+    .await?;
     Ok(())
 }

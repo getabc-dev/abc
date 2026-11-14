@@ -1,0 +1,18 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE run_lease SET ended = $2, ended_at = $3, result = $4, changed_at = $5\n         WHERE id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Timestamptz",
+        "Jsonb",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "2155eac255d14497dba2b2cd249576beb4e6a2b548521b65cdf8ecde964d22fc"
+}

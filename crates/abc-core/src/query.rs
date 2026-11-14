@@ -457,6 +457,21 @@ query!(
     |_s| Scope::Installation
 );
 
+/// One run's events in the order they happened: the runner's recovery and the replay of the
+/// spec's traces read them. Server only. Every run starts with an event, so an unknown run's
+/// stream is empty.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RunEvents {
+    /// The run.
+    pub run: crate::id::RunId,
+}
+query!(
+    RunEvents,
+    ReadAction::ViewAsServer,
+    Vec<crate::event::Recorded>,
+    |_s| Scope::Installation
+);
+
 #[cfg(test)]
 mod tests {
     use time::macros::datetime;

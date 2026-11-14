@@ -1,0 +1,59 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT id, run_id, worker_id, ended IS NULL AS \"live!\" FROM run_lease WHERE id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "run_lease",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "run_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "run_lease",
+            "name": "run_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "worker_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "run_lease",
+            "name": "worker_id"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "live!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      null
+    ]
+  },
+  "hash": "6a24d08ea62b0b6ad6cba80d31aca2b20c584e3efec8ec45aa5eb0cfc3b0db1b"
+}

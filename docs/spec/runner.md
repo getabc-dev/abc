@@ -228,6 +228,49 @@ an answer resuming the parked step; a back edge taken once and then passed by; a
 result discarded; a resent result applied once; a crash recovered by replay; a run keeping its
 graph version; and leases refused where they may not go.
 
+## The events in Rust
+
+The spec's `Event` type is `RunEvent` in `abc-core` (`crates/abc-core/src/event.rs`), one variant
+for one variant. All of a run's events are on one stream of kind `run`, so the spec's `runId` is
+the stream's id, and the global position keeps the order the spec's single `log` has across runs.
+The store writes each event in the same transaction as its views (`run`, `run_lease`), through
+one command each (`crates/abc-core/src/command/run.rs`), and `RunEvents` reads a run's stream back
+for recovery and for replaying a trace.
+
+| Spec action | Spec event | Stored event (`type`) | Command, and who runs it |
+| --- | --- | --- | --- |
+| `startRun` | `RunStarted({ runId, version })` | `run.started { graph }` | `StartRun`, a person |
+| `grant` | `LeaseGranted({ lease, runId, worker })` | `run.lease_granted { lease, worker }` | `GrantLease`, the server |
+| `expire` | `LeaseExpired(lease)` | `run.lease_expired { lease }` | `ExpireLease`, the server |
+| `deliver` (applied) | `ResultApplied({ lease, outcome })` | `run.result_applied { lease, result }` | `ApplyResult`, the server |
+| `deliver` (discarded) | none | none: `ApplyResult` returns `Discarded` and records nothing | `ApplyResult` |
+| `answer` | `Answered({ runId, answer })` | `run.answered { answer }` | `AnswerEscalation`, a person |
+
+Actions with no event change nothing the server keeps: `take`, `finish`, `lose` and `back` are
+the worker's, `crash` and `recover` are the server's life, and `publish` makes no event, because
+a graph is a typed value of the build (decision 65) and not a record in the log.
+
+How the spec's values are written:
+
+- **Version.** The spec's integer `Version` is the graph's `GraphVersion`, the sha256 of its
+  canonical form (`abc-core/src/graph/`). `RunStarted`'s `version` is `run.started`'s `graph`.
+  Whether a version is the newest one belongs to the runner's registry (B2), not to the log.
+- **Outcome.** `Made`, `Pass`, `Loop`, `Bounce` and `Escalate` are `Outcome`. The stored `result`
+  is a `StepResult`: `{"type": "made"}`, or `{"type": "judged", "verdict": "pass", "confidence":
+  90}`. `StepResult::outcome()` gives the spec's outcome; the confidence (decision 33) is not in
+  the spec, since it does not change what the runner does.
+- **Answer.** `Retry`, `Accept` and `Cancel` are `retry`, `accept` and `cancel`.
+- **Lease, worker.** Their ids are `LeaseId` and `WorkerId`.
+- **Graph.** The spec's `StepDef { maxBounces, loop }` is `Step { max_bounces, back_edge }`. The
+  spec's steps are in a list, `loop.target` an index into it, and `Graph` keeps that order: a
+  step's index is its place in `Graph::steps()`, and `BackEdge::target` names a step by its id.
+
+What B1's commands check before they record, from what the store can show: the run and lease
+exist in the workspace, a lease is live (spec `accepts`), a run has at most one live lease and a
+worker at most one, and a worker is online. The database holds the last two too, as unique
+indexes. Which step is next, whether the run is parked and whether it is done need the graph,
+and stay with the runner (B2).
+
 ## Traces for the Rust runner
 
 `cargo xtask spec --traces <dir>` also simulates each model 100 times, up to 100 steps each, with

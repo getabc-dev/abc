@@ -15,6 +15,7 @@ use ts_rs::TS;
 use abc_core::command::{Claimed, TokenIssued, TokenTtl};
 use abc_core::credential::{EnrolmentToken, SetupCode};
 use abc_core::event::Position;
+use abc_core::graph::Graph;
 use abc_core::id::{EnrolmentTokenId, PersonId, WorkspaceId};
 use abc_core::identity::{DisplayName, MachineLabel, WorkspaceName};
 use abc_core::query::{MachineCard, RequestCard, SessionView, TokenSummary};
@@ -38,6 +39,7 @@ pub(crate) struct WebApi {
     enrolment_request: RequestCard,
     live: LiveUpdate,
     error: ApiErrorBody,
+    graph: Graph,
 }
 
 /// `POST /api/owner/claim`.

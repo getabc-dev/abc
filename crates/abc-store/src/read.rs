@@ -6,15 +6,15 @@ use std::future::Future;
 use abc_core::actor::{Principal, Role};
 use abc_core::command::OpenSession;
 use abc_core::command::RequestRecord;
-use abc_core::event::Position;
+use abc_core::event::{Position, Recorded, StreamKind, StreamRef};
 use abc_core::id::{EnrolmentTokenId, FromUuid as _, PersonId, SessionId, WorkerId, WorkspaceId};
 use abc_core::identity::{Arch, DisplayName, MachineLabel, Os, WorkspaceName};
 use abc_core::policy::{Authorized, authorize};
 use abc_core::query::{
     EnrolmentRequestStatus, InstallationState, InstallationStatus, ListEnrolmentTokens,
     ListMachines, MachineCard, MachinesSince, MachinesSnapshot, OpenSessions, Query, RequestCard,
-    RequestState, RequestStatus, SessionView, TokenStatus, TokenSummary, ViewEnrolmentRequest,
-    WhoAmI, WorkerIdentity, WorkerSelf, WorkspaceSummary,
+    RequestState, RequestStatus, RunEvents, SessionView, TokenStatus, TokenSummary,
+    ViewEnrolmentRequest, WhoAmI, WorkerIdentity, WorkerSelf, WorkspaceSummary,
 };
 use abc_core::time::Timestamp;
 use sqlx::PgConnection;
@@ -425,5 +425,27 @@ impl Fetchable for ViewEnrolmentRequest {
         .fetch_optional(&mut *conn)
         .await?;
         row.as_ref().map(|row| request_card(row, now)).transpose()
+    }
+}
+
+impl sealed::Sealed for RunEvents {}
+impl Fetchable for RunEvents {
+    no_facts!();
+
+    async fn fetch(
+        auth: &Authorized<Self>,
+        _principal: &Principal,
+        conn: &mut PgConnection,
+        _now: Timestamp,
+    ) -> Result<Vec<Recorded>, StoreError> {
+        let run = auth.request().run;
+        crate::log::stream(
+            conn,
+            StreamRef {
+                kind: StreamKind::Run,
+                id: run.as_uuid(),
+            },
+        )
+        .await
     }
 }

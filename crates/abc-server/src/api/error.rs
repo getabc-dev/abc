@@ -94,7 +94,8 @@ pub(crate) const fn status_of(code: ApiCode) -> StatusCode {
         ApiCode::NotFound
         | ApiCode::EnrolmentTokenUnknown
         | ApiCode::EnrolmentRequestUnknown
-        | ApiCode::UnknownWorker => StatusCode::NOT_FOUND,
+        | ApiCode::UnknownWorker
+        | ApiCode::UnknownRun => StatusCode::NOT_FOUND,
         ApiCode::MethodNotAllowed => StatusCode::METHOD_NOT_ALLOWED,
         ApiCode::TailnetIdentityRequired
         | ApiCode::InvalidWorkerKey
@@ -126,6 +127,7 @@ const fn denial_code(reason: DenialReason) -> ApiCode {
         DenialReason::SetupCodeExpired => ApiCode::SetupCodeExpired,
         DenialReason::ServerOnly => ApiCode::ServerOnly,
         DenialReason::UnknownWorker => ApiCode::UnknownWorker,
+        DenialReason::UnknownRun => ApiCode::UnknownRun,
         DenialReason::EnrolmentTokenRequired => ApiCode::EnrolmentTokenRequired,
         DenialReason::EnrolmentTokenUnknown => ApiCode::EnrolmentTokenUnknown,
         DenialReason::EnrolmentTokenExpired => ApiCode::EnrolmentTokenExpired,

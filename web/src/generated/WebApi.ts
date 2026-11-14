@@ -2,6 +2,7 @@
 import type { ApiErrorBody } from "./ApiErrorBody";
 import type { ClaimRequest } from "./ClaimRequest";
 import type { ClaimResponse } from "./ClaimResponse";
+import type { Graph } from "./Graph";
 import type { IssueTokenRequest } from "./IssueTokenRequest";
 import type { LiveUpdate } from "./LiveUpdate";
 import type { RequestCard } from "./RequestCard";
@@ -12,4 +13,4 @@ import type { TokenSummary } from "./TokenSummary";
 /**
  * The generation root. Never constructed.
  */
-export type WebApi = { session: SessionView, claim_request: ClaimRequest, claim_response: ClaimResponse, issue_token_request: IssueTokenRequest, token_issued: TokenIssuedResponse, tokens: Array<TokenSummary>, enrolment_request: RequestCard, live: LiveUpdate, error: ApiErrorBody, };
+export type WebApi = { session: SessionView, claim_request: ClaimRequest, claim_response: ClaimResponse, issue_token_request: IssueTokenRequest, token_issued: TokenIssuedResponse, tokens: Array<TokenSummary>, enrolment_request: RequestCard, live: LiveUpdate, error: ApiErrorBody, graph: Graph, };

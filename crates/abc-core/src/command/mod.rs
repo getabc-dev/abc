@@ -9,6 +9,7 @@
 mod claim;
 mod enrolment;
 mod request;
+mod run;
 mod worker;
 
 pub use claim::{
@@ -23,6 +24,10 @@ pub use request::{
     ApproveEnrolment, ApproveFacts, DecideRequestRejection, DenyEnrolment, EnrolmentRequested,
     REQUEST_TTL, RequestDecision, RequestEnrolment, RequestFacts, RequestRecord, RequestRejection,
     RequestStanding, RequesterProof,
+};
+pub use run::{
+    AnswerEscalation, AnswerRejection, ApplyResult, ExpireLease, GrantLease, LeaseRecord,
+    LeaseWorker, ResultFate, RunFacts, RunProof, RunRecord, RunRejection, StartRun,
 };
 pub use worker::{
     EndSession, OpenSession, RevokeWorker, RevokeWorkerRejection, SelfFacts, SelfProof,

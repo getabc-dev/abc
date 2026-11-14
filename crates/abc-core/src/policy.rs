@@ -79,6 +79,11 @@ pub enum Capability {
         /// The worker's workspace.
         workspace: WorkspaceId,
     },
+    /// The target run exists, in this workspace (loaded in the same transaction).
+    RunHome {
+        /// The run's workspace.
+        workspace: WorkspaceId,
+    },
     /// A redeemable enrolment token (or one already redeemed by the same key).
     EnrolmentToken {
         /// The worker the token reserved.
@@ -163,6 +168,10 @@ pub enum WriteAction {
     ActAsWorker,
     /// The server recording what it observed (a session's end).
     RecordAsServer,
+    /// Start runs and answer their escalations.
+    ManageRuns,
+    /// The server, as the runner, recording its decisions on a run.
+    RunAsServer,
 }
 
 /// Everything that only reads.
@@ -298,6 +307,12 @@ impl PolicyAction for WriteAction {
                 }
                 _ => Err(DenialReason::ServerOnly),
             },
+            Self::RunAsServer => match (principal, standing.capability) {
+                (Principal::Server, Capability::RunHome { workspace }) => {
+                    Ok(write(Actor::Server, workspace))
+                }
+                _ => Err(DenialReason::ServerOnly),
+            },
             Self::ClaimServer => match principal {
                 Principal::Visitor { .. } => match standing.capability {
                     Capability::OwnerSetup { owner, workspace } => {
@@ -306,6 +321,7 @@ impl PolicyAction for WriteAction {
                     Capability::None
                     | Capability::ReserveInstallation { .. }
                     | Capability::WorkerHome { .. }
+                    | Capability::RunHome { .. }
                     | Capability::EnrolmentToken { .. }
                     | Capability::Requester { .. }
                     | Capability::EnrolmentApplicant { .. } => Err(DenialReason::SetupCodeRequired),
@@ -315,7 +331,7 @@ impl PolicyAction for WriteAction {
                     Err(DenialReason::TailnetIdentityRequired)
                 }
             },
-            Self::ManageEnrolment | Self::ManageWorkers => owner_of(standing),
+            Self::ManageEnrolment | Self::ManageWorkers | Self::ManageRuns => owner_of(standing),
             Self::EnrolWorker => match standing.capability {
                 Capability::EnrolmentToken { worker, workspace } => {
                     Ok(write(Actor::Worker(worker), workspace))
@@ -324,6 +340,7 @@ impl PolicyAction for WriteAction {
                 | Capability::OwnerSetup { .. }
                 | Capability::ReserveInstallation { .. }
                 | Capability::WorkerHome { .. }
+                | Capability::RunHome { .. }
                 | Capability::Requester { .. }
                 | Capability::EnrolmentApplicant { .. } => {
                     Err(DenialReason::EnrolmentTokenRequired)
@@ -493,6 +510,9 @@ pub enum DenialReason {
     /// The worker named by the request does not exist.
     #[error("no such worker")]
     UnknownWorker,
+    /// The run named by the request does not exist.
+    #[error("no such run")]
+    UnknownRun,
     /// No enrolment token was presented.
     #[error("an enrolment token is required")]
     EnrolmentTokenRequired,
@@ -583,6 +603,9 @@ mod tests {
             Capability::WorkerHome {
                 workspace: id(HOME),
             },
+            Capability::RunHome {
+                workspace: id(HOME),
+            },
             Capability::EnrolmentToken {
                 worker: id(3),
                 workspace: id(HOME),
@@ -661,6 +684,18 @@ mod tests {
     }
 
     #[test]
+    fn only_the_server_records_the_runners_decisions() {
+        check(WriteAction::RunAsServer, |who, _, capability| {
+            match (who, capability) {
+                ("server", Capability::RunHome { workspace }) => {
+                    Ok(write(Actor::Server, workspace))
+                }
+                _ => Err(DenialReason::ServerOnly),
+            }
+        });
+    }
+
+    #[test]
     fn a_visitor_with_a_setup_code_claims_as_the_reserved_person() {
         check(WriteAction::ClaimServer, |who, _, capability| match who {
             "visitor" => {
@@ -677,7 +712,11 @@ mod tests {
 
     #[test]
     fn only_an_owner_of_the_named_workspace_manages_it() {
-        for action in [WriteAction::ManageEnrolment, WriteAction::ManageWorkers] {
+        for action in [
+            WriteAction::ManageEnrolment,
+            WriteAction::ManageWorkers,
+            WriteAction::ManageRuns,
+        ] {
             check(action, |who, scope, _| match who {
                 "owner" if scope == Scope::Workspace(id(HOME)) => {
                     Ok(write(Actor::Person(id(1)), id(HOME)))
